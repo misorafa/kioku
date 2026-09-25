@@ -431,9 +431,12 @@ HookOutcome {stdout, stderr, exit_code}`):
   `localhost`, 10/8, 172.16/12, 192.168/16, fc00::/7, fe80::/10, and host names
   ending in `.local`, `.lan` or `.internal`. Any other host follows
   `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` (add it to `NO_PROXY` to bypass).
-- Failure log: `<data_dir>/logs/hook.log` when the data dir exists, else
-  `~/.kioku/logs/hook.log`; one line `<ts> <event> session=<id> [status=<http>]
-  error: <message>`.
+- Failure log: `<data_dir>/logs/hook.log` when the data dir exists (and is an
+  absolute path), else `~/.kioku/logs/hook.log`; with no home directory
+  (`HOME` unset) nothing is logged — never a path relative to the cwd, which is
+  the user's repository. One line `<ts> <event> session=<id> [status=<http>]
+  error: <message>`. Before a line would take the file past 1 MiB it is
+  rotated to `hook.log.1` (a single old generation, replaced each time).
 
 Claude Code stdin fields: `session_id`, `transcript_path`, `cwd`,
 `hook_event_name`, plus per event: SessionStart `source`

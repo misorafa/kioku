@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::Context;
 use kioku_core::sanitize::sanitize_payload;
 use kioku_core::strings::{fill, strings};
-use kioku_core::util::{home_dir, now_ts, one_line};
+use kioku_core::util::{home_dir_opt, now_ts, one_line};
 use kioku_core::{
     Config, DataDir, NewObservation, ObservationKind, SessionInfo, SessionStartRequest,
     SessionStartResponse, identify,
@@ -25,6 +25,8 @@ use crate::event::{Agent, HookEvent, HookEventKind, parse_event};
 pub const NUDGE_MIN_TOOL_USES: u32 = kioku_core::HANDOFF_STALE_TOOL_USES;
 /// Exit code that makes Claude Code feed stderr back to the model (Stop nudge).
 pub const NUDGE_EXIT_CODE: i32 = 2;
+/// `hook.log` is rotated to `hook.log.1` (one generation) before it would exceed this.
+pub const HOOK_LOG_MAX_BYTES: u64 = 1024 * 1024;
 
 /// What a hook invocation prints and how it exits.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -210,14 +212,16 @@ pub fn observation_for(ev: &HookEvent) -> Option<NewObservation> {
     })
 }
 
-/// Where hook failures are logged: `<data_dir>/logs/hook.log` when the data dir exists,
-/// else `~/.kioku/logs/hook.log`.
-pub fn hook_log_path(cfg: &Config) -> PathBuf {
-    if cfg.data_dir.is_dir() {
-        DataDir::new(&cfg.data_dir).hook_log()
-    } else {
-        DataDir::new(&home_dir().join(".kioku")).hook_log()
+/// Where hook failures are logged: `<data_dir>/logs/hook.log` when the data dir exists
+/// (and is absolute), else `~/.kioku/logs/hook.log`; `None` when no home directory is known
+/// — never a path relative to the process cwd, which is the user's repository.
+pub fn hook_log_path(cfg: &Config) -> Option<PathBuf> {
+    if cfg.data_dir.is_absolute() && cfg.data_dir.is_dir() {
+        return Some(DataDir::new(&cfg.data_dir).hook_log());
     }
+    home_dir_opt()
+        .filter(|h| h.is_absolute())
+        .map(|h| DataDir::new(&h.join(".kioku")).hook_log())
 }
 
 /// Appends one line describing a hook failure; errors while logging are ignored.
@@ -231,12 +235,25 @@ pub fn log_failure(cfg: &Config, event: HookEventKind, session: &str, err: &anyh
         event.cli_name(),
         one_line(&format!("{err:#}"))
     );
-    append_line(&hook_log_path(cfg), &line);
+    if let Some(path) = hook_log_path(cfg) {
+        append_line(&path, &line);
+    }
 }
 
+/// Appends `line`, first rotating the file to `<name>.1` when it would grow past
+/// [`HOOK_LOG_MAX_BYTES`] (one old generation is kept).
 fn append_line(path: &Path, line: &str) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    if let Some(parent) = path.parent()
+        && !parent.exists()
+    {
+        let _ = kioku_core::util::create_private_dir(parent);
+    }
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.len() + line.len() as u64 > HOOK_LOG_MAX_BYTES
+    {
+        let mut rotated = path.as_os_str().to_os_string();
+        rotated.push(".1");
+        let _ = std::fs::rename(path, PathBuf::from(rotated));
     }
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -344,13 +361,46 @@ mod tests {
         let cfg = Config::for_data_dir(&dir.path().join("absent"));
         assert_eq!(
             hook_log_path(&cfg),
-            home_dir().join(".kioku").join("logs").join("hook.log")
+            home_dir_opt().map(|h| h.join(".kioku").join("logs").join("hook.log"))
         );
         let cfg = Config::for_data_dir(dir.path());
         assert_eq!(
             hook_log_path(&cfg),
-            dir.path().join("logs").join("hook.log")
+            Some(dir.path().join("logs").join("hook.log"))
         );
+        // a relative data dir (what `~/.kioku` becomes without HOME) is never used, even
+        // if it happens to exist relative to the cwd
+        let cfg = Config::for_data_dir(Path::new("."));
+        assert_ne!(hook_log_path(&cfg), Some(PathBuf::from("./logs/hook.log")));
+        assert!(hook_log_path(&cfg).is_none_or(|p| p.is_absolute()));
+    }
+
+    #[test]
+    fn hook_log_rotates_once_at_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("logs").join("hook.log");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, "x".repeat(HOOK_LOG_MAX_BYTES as usize - 10)).unwrap();
+        append_line(&log, "short\n");
+        assert_eq!(
+            std::fs::metadata(&log).unwrap().len(),
+            HOOK_LOG_MAX_BYTES - 10 + 6
+        );
+        append_line(&log, "this line crosses the cap\n");
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "this line crosses the cap\n"
+        );
+        let old = dir.path().join("logs").join("hook.log.1");
+        assert_eq!(
+            std::fs::metadata(&old).unwrap().len(),
+            HOOK_LOG_MAX_BYTES - 4
+        );
+        // the next rotation replaces the single old generation
+        std::fs::write(&log, "y".repeat(HOOK_LOG_MAX_BYTES as usize)).unwrap();
+        append_line(&log, "z\n");
+        assert!(std::fs::read_to_string(&old).unwrap().starts_with('y'));
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "z\n");
     }
 
     #[test]

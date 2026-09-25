@@ -317,7 +317,7 @@ becomes `proj`). Use `.kioku.toml` to merge or rename projects.
   up in `raw/`, SQLite and, in digested form, the git history of `wiki/`.
   Transcripts are not uploaded.
 - **Hooks are fail-open**: on any network or server error a hook logs one line
-  to `logs/hook.log`, prints nothing and exits 0 within `timeout_ms`, so a
+  to `logs/hook.log` (capped at 1 MiB, one rotated `hook.log.1`), prints nothing and exits 0 within `timeout_ms`, so a
   down server never blocks your agent. The only non-zero exit is the
   deliberate Stop nudge (2).
 
