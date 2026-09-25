@@ -227,12 +227,18 @@ fn has_server_section(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Writes config.toml (it holds the auth token): the file is 0600 and a newly created
+/// parent directory 0700 on unix.
 fn write_file(path: &Path, text: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        crate::util::create_private_dir(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+    crate::util::write_private_file(path, text)
+        .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 

@@ -1,11 +1,11 @@
 //! `kioku install|uninstall claude-code` (spec §8.5): idempotent merge of our hook entries
-//! into Claude Code's settings.json, plus MCP server registration via `claude mcp`.
+//! into Claude Code's settings.json, plus the MCP server entry in `~/.claude.json` (edited
+//! directly — never via `claude mcp add`, whose `--header` would put the token in `ps`).
 //!
 //! Our entries are recognized by the `kioku hook` command substring, so foreign hooks are
 //! never touched and re-installing (even from a moved binary) leaves one entry per event.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use anyhow::Context;
 use kioku_core::ClientConfig;
@@ -219,6 +219,9 @@ fn backup_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// Writes `value` as pretty JSON, backing the file up once first (only if it existed; an
+/// existing backup is never overwritten). The write goes through a temp file + rename that
+/// keeps the original's permissions (a new file is 0600: `~/.claude.json` holds the token).
 fn write_settings(path: &Path, existed: bool, value: &Value) -> anyhow::Result<Option<PathBuf>> {
     let mut backup = None;
     let bak = backup_path(path);
@@ -226,12 +229,22 @@ fn write_settings(path: &Path, existed: bool, value: &Value) -> anyhow::Result<O
         std::fs::copy(path, &bak).with_context(|| format!("backing up to {}", bak.display()))?;
         backup = Some(bak);
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    std::fs::create_dir_all(&parent).with_context(|| format!("creating {}", parent.display()))?;
     let text = serde_json::to_string_pretty(value).context("serializing settings")? + "\n";
-    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+    let tmp = parent.join(format!(
+        ".{}.kioku-tmp",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    kioku_core::util::write_private_file(&tmp, &text)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    if existed && let Ok(meta) = std::fs::metadata(path) {
+        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    }
+    std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))?;
     Ok(backup)
 }
 
@@ -284,90 +297,125 @@ pub fn mcp_url(cfg: &ClientConfig) -> String {
     format!("{}/mcp", cfg.server_url.trim().trim_end_matches('/'))
 }
 
-/// The `~/.claude.json` `mcpServers` snippet for manual registration.
-pub fn mcp_snippet(cfg: &ClientConfig) -> String {
+/// `~/.claude.json`, where Claude Code keeps user-scope MCP servers.
+pub fn claude_json_path() -> PathBuf {
+    kioku_core::util::home_dir().join(".claude.json")
+}
+
+/// Our `mcpServers.kioku` entry: `{type: "http", url, headers: {Authorization}}`.
+pub fn mcp_server_entry(cfg: &ClientConfig) -> Value {
     let mut server = json!({ "type": "http", "url": mcp_url(cfg) });
     if let Some(token) = cfg.auth_token.as_deref().filter(|t| !t.trim().is_empty()) {
         server["headers"] = json!({ "Authorization": format!("Bearer {}", token.trim()) });
     }
-    let snippet = json!({ "mcpServers": { MCP_NAME: server } });
+    server
+}
+
+/// The `~/.claude.json` `mcpServers` snippet for manual registration.
+pub fn mcp_snippet(cfg: &ClientConfig) -> String {
+    let snippet = json!({ "mcpServers": { MCP_NAME: mcp_server_entry(cfg) } });
     serde_json::to_string_pretty(&snippet).unwrap_or_default()
 }
 
-/// Finds an executable on `PATH`.
-pub fn find_on_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .flat_map(|dir| {
-            let mut c = vec![dir.join(name)];
-            if cfg!(windows) {
-                c.push(dir.join(format!("{name}.exe")));
-                c.push(dir.join(format!("{name}.cmd")));
-            }
-            c
-        })
-        .find(|p| p.is_file())
+/// Returns `claude_json` with `mcpServers.kioku` set to our entry (everything else kept,
+/// key order preserved).
+pub fn merge_mcp_server(claude_json: &Value, cfg: &ClientConfig) -> anyhow::Result<Value> {
+    let mut out = claude_json.clone();
+    let root = out
+        .as_object_mut()
+        .context("~/.claude.json is not a JSON object")?;
+    let servers = root
+        .entry("mcpServers")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let servers = servers
+        .as_object_mut()
+        .context("~/.claude.json `mcpServers` is not an object")?;
+    servers.insert(MCP_NAME.to_string(), mcp_server_entry(cfg));
+    Ok(out)
 }
 
-fn run_quiet(cmd: &mut Command) -> anyhow::Result<std::process::Output> {
-    cmd.stdin(Stdio::null())
-        .output()
-        .with_context(|| format!("running {cmd:?}"))
+/// Returns `claude_json` without `mcpServers.kioku` and whether it was present.
+pub fn remove_mcp_server(claude_json: &Value) -> (Value, bool) {
+    let mut out = claude_json.clone();
+    let removed = out
+        .get_mut("mcpServers")
+        .and_then(Value::as_object_mut)
+        .and_then(|servers| servers.shift_remove(MCP_NAME))
+        .is_some();
+    (out, removed)
 }
 
-/// Registers the MCP server with `claude mcp add` (re-adding if present); returns a report.
-/// Without `claude` on PATH, returns the manual snippet instead.
-pub fn register_mcp(cfg: &ClientConfig) -> String {
-    let Some(claude) = find_on_path("claude") else {
-        return format!(
-            "`claude` not found on PATH. Add this to ~/.claude.json to register the MCP server:\n{}",
+/// Registers the MCP server in the `~/.claude.json` at `path` (idempotent, one backup);
+/// returns a report. An unparseable file is left alone and the snippet is printed instead.
+pub fn register_mcp(path: &Path, cfg: &ClientConfig) -> String {
+    let manual = |why: String| {
+        format!(
+            "{why}\nAdd this to {} yourself to register the MCP server:\n{}",
+            path.display(),
             mcp_snippet(cfg)
-        );
+        )
     };
-    // Idempotency: `claude mcp add` refuses an existing name, so remove ours first.
-    let _ = run_quiet(Command::new(&claude).args(["mcp", "remove", MCP_NAME, "--scope", "user"]));
-    let mut cmd = Command::new(&claude);
-    cmd.args(["mcp", "add", "--transport", "http", MCP_NAME])
-        .arg(mcp_url(cfg));
-    if let Some(token) = cfg.auth_token.as_deref().filter(|t| !t.trim().is_empty()) {
-        cmd.arg("--header")
-            .arg(format!("Authorization: Bearer {}", token.trim()));
-    }
-    cmd.args(["--scope", "user"]);
-    match run_quiet(&mut cmd) {
-        Ok(out) if out.status.success() => format!(
-            "MCP server `{MCP_NAME}` registered with Claude Code (user scope): {}",
+    let current = match read_settings(path) {
+        Ok(c) => c,
+        Err(e) => return manual(format!("{e:#}")),
+    };
+    let existed = current.is_some();
+    let before = current.unwrap_or_else(|| Value::Object(Map::new()));
+    let after = match merge_mcp_server(&before, cfg) {
+        Ok(v) => v,
+        Err(e) => return manual(format!("{e:#}; not touching it")),
+    };
+    if existed && after == before {
+        return format!(
+            "MCP server `{MCP_NAME}` already registered in {}: {}",
+            path.display(),
             mcp_url(cfg)
-        ),
-        Ok(out) => format!(
-            "`claude mcp add` failed ({}): {}\nAdd this to ~/.claude.json instead:\n{}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim(),
-            mcp_snippet(cfg)
-        ),
-        Err(e) => format!(
-            "{e:#}\nAdd this to ~/.claude.json instead:\n{}",
-            mcp_snippet(cfg)
-        ),
+        );
+    }
+    match write_settings(path, existed, &after) {
+        Ok(backup) => {
+            let mut msg = format!(
+                "MCP server `{MCP_NAME}` registered in {} (user scope): {}",
+                path.display(),
+                mcp_url(cfg)
+            );
+            if let Some(b) = backup {
+                msg.push_str(&format!("\n  backup: {}", b.display()));
+            }
+            msg.push_str("\n  restart Claude Code to pick it up");
+            msg
+        }
+        Err(e) => manual(format!("{e:#}")),
     }
 }
 
-/// Removes the MCP server with `claude mcp remove`; returns a report.
-pub fn unregister_mcp() -> String {
-    let Some(claude) = find_on_path("claude") else {
-        return format!(
-            "`claude` not found on PATH: remove `mcpServers.{MCP_NAME}` from ~/.claude.json manually."
-        );
-    };
-    match run_quiet(Command::new(&claude).args(["mcp", "remove", MCP_NAME, "--scope", "user"])) {
-        Ok(out) if out.status.success() => {
-            format!("MCP server `{MCP_NAME}` removed from Claude Code.")
+/// Removes `mcpServers.kioku` from the `~/.claude.json` at `path` (nothing else); returns a
+/// report.
+pub fn unregister_mcp(path: &Path) -> String {
+    let current = match read_settings(path) {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            return format!(
+                "MCP server `{MCP_NAME}` not registered ({} does not exist).",
+                path.display()
+            );
         }
-        Ok(out) => format!(
-            "`claude mcp remove {MCP_NAME}` did not succeed ({}): {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ),
+        Err(e) => {
+            return format!(
+                "{e:#}\nRemove `mcpServers.{MCP_NAME}` from {} manually.",
+                path.display()
+            );
+        }
+    };
+    let (after, removed) = remove_mcp_server(&current);
+    if !removed {
+        return format!(
+            "MCP server `{MCP_NAME}` not registered in {}.",
+            path.display()
+        );
+    }
+    match write_settings(path, true, &after) {
+        Ok(_) => format!("MCP server `{MCP_NAME}` removed from {}.", path.display()),
         Err(e) => format!("{e:#}"),
     }
 }
@@ -531,6 +579,84 @@ mod tests {
         std::fs::write(&path, "{ not json").unwrap();
         assert!(install_settings(&path, BIN).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
+    }
+
+    fn mcp_cfg() -> ClientConfig {
+        ClientConfig {
+            server_url: "http://home:7391/".into(),
+            auth_token: Some("abc".into()),
+            ..ClientConfig::default()
+        }
+    }
+
+    #[test]
+    fn mcp_registration_edits_claude_json_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude.json");
+        let original = serde_json::to_string_pretty(&json!({
+            "numStartups": 42,
+            "mcpServers": {"other": {"type": "stdio", "command": "x"}},
+            "projects": {"/a": {"allowedTools": []}}
+        }))
+        .unwrap();
+        std::fs::write(&path, &original).unwrap();
+
+        let msg = register_mcp(&path, &mcp_cfg());
+        assert!(msg.contains("registered"), "{msg}");
+        assert!(!msg.contains("Bearer"), "the token is never printed: {msg}");
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            v["mcpServers"]["kioku"],
+            json!({"type": "http", "url": "http://home:7391/mcp", "headers": {"Authorization": "Bearer abc"}})
+        );
+        assert_eq!(v["mcpServers"]["other"]["command"], "x");
+        assert_eq!(v["numStartups"], 42);
+        let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["numStartups", "mcpServers", "projects"]);
+        let bak = dir.path().join(".claude.json.kioku-bak");
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), original);
+
+        // idempotent; a changed URL replaces the entry; the backup is kept from the first run
+        assert!(register_mcp(&path, &mcp_cfg()).contains("already registered"));
+        let mut moved = mcp_cfg();
+        moved.server_url = "https://kioku.lan".into();
+        register_mcp(&path, &moved);
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["mcpServers"]["kioku"]["url"], "https://kioku.lan/mcp");
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), original);
+
+        // uninstall removes only our entry
+        assert!(unregister_mcp(&path).contains("removed"));
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v, serde_json::from_str::<Value>(&original).unwrap());
+        assert!(unregister_mcp(&path).contains("not registered"));
+    }
+
+    #[test]
+    fn mcp_registration_new_file_and_unparseable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude.json");
+        register_mcp(&path, &mcp_cfg());
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["mcpServers"]["kioku"]["url"], "http://home:7391/mcp");
+        assert!(!dir.path().join(".claude.json.kioku-bak").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        std::fs::write(&path, "{ broken").unwrap();
+        let msg = register_mcp(&path, &mcp_cfg());
+        assert!(msg.contains("\"mcpServers\""), "prints the snippet: {msg}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ broken");
+        std::fs::write(&path, r#"{"mcpServers": []}"#).unwrap();
+        assert!(register_mcp(&path, &mcp_cfg()).contains("\"mcpServers\""));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"mcpServers": []}"#
+        );
     }
 
     #[test]

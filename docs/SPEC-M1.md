@@ -48,6 +48,9 @@ Gemini installers (the hook *handlers* must not assume Claude Code though — se
   logs/hook.log          # client-side hook log (fail-open diagnostics)
 ```
 
+On unix the data dir, `raw/` and `logs/` are created (and tightened) to 0700
+and `config.toml` is written 0600 — they hold the token and captured sessions.
+
 The wiki is `git init`-ed by `kioku init` (shell out to `git`; if `git` is
 absent, log a warning once and continue without commits). Every page write
 commits with message `kioku: <kind> <path>` as author `kioku <kioku@localhost>`.
@@ -109,6 +112,10 @@ Priority:
 `slug()` keeps `[a-z0-9-]`, lowercases, collapses runs of `-`; Japanese names
 are transliterated NOT — non-ASCII is dropped; other ASCII characters become
 `-`; if the slug is empty use `proj`.
+A project id must match `[A-Za-z0-9._-]+` and may not start with `.` or `_`
+(`_global` and other `_…` names are reserved for kioku's wiki directories); a
+`.kioku.toml` id that is not valid is slugged, and the API rejects invalid ids
+with 400.
 The remote-based id makes the same repo cloned on two machines map to the same
 memory. Document this in the README later.
 
@@ -407,8 +414,11 @@ HookOutcome {stdout, stderr, exit_code}`):
   `compact` `{trigger}`. Payloads go through core `sanitize_payload` first.
 - Stop → §8.4; SessionEnd → `finalize {reason}`. Stop records no observation.
 - Hard timeout: one deadline of `timeout_ms` shared by all requests of a hook
-  (reqwest blocking client). Requests to a loopback `server_url` bypass any
-  proxy from the environment.
+  (reqwest blocking client). Requests to a `server_url` on this machine or a
+  private network bypass any proxy from the environment: loopback /
+  `localhost`, 10/8, 172.16/12, 192.168/16, fc00::/7, fe80::/10, and host names
+  ending in `.local`, `.lan` or `.internal`. Any other host follows
+  `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` (add it to `NO_PROXY` to bypass).
 - Failure log: `<data_dir>/logs/hook.log` when the data dir exists, else
   `~/.kioku/logs/hook.log`; one line `<ts> <event> session=<id> [status=<http>]
   error: <message>`.
@@ -497,24 +507,29 @@ and exit 2. Claude Code feeds stderr back to the model and lets it continue;
   `Edit|Write|MultiEdit|NotebookEdit|Read|Bash`), Stop, PreCompact,
   SessionEnd. Use the absolute path of the running binary. Preserve every
   existing hook; be idempotent (detect our entries by the command prefix).
-- MCP: run `claude mcp add --transport http kioku <server_url>/mcp --header
-  "Authorization: Bearer <token>" --scope user` if `claude` is on PATH; else
-  print the equivalent `~/.claude.json` snippet.
-- Print what was changed. `kioku uninstall claude-code` reverses both: it
-  removes exactly the hook entries whose command contains `kioku hook` (event
-  lists / `hooks` left empty by that are removed; foreign hooks, even in the
-  same matcher group, stay) and runs `claude mcp remove kioku --scope user`
-  when `claude` is on PATH.
+- MCP: set `mcpServers.kioku` in `~/.claude.json` (Claude Code's user-scope
+  MCP config) directly to
+  `{"type":"http","url":"<server_url>/mcp","headers":{"Authorization":"Bearer <token>"}}`,
+  preserving every other key and their order; idempotent (no write when
+  already equal). The `claude` CLI is never run: `claude mcp add --header …`
+  would put the token on a command line visible in `ps`. If `~/.claude.json`
+  is not valid JSON (or `mcpServers` is not an object) it is left untouched and
+  the snippet below is printed instead. A new `~/.claude.json` is created 0600;
+  an existing one keeps its mode (written via temp file + rename).
+- Print what was changed (never the token). `kioku uninstall claude-code`
+  reverses both: it removes exactly the hook entries whose command contains
+  `kioku hook` (event lists / `hooks` left empty by that are removed; foreign
+  hooks, even in the same matcher group, stay) and only
+  `mcpServers.kioku` from `~/.claude.json`.
 - Entry shape: `{matcher?, hooks:[{type:"command", command:"<abs bin> hook
   <event>"}]}`; the SessionStart entry also has `"timeout": 10`. Re-installing
   replaces our entry in place (e.g. after the binary moved) — never a second
-  one. MCP registration first runs `claude mcp remove kioku` (ignored) so the
-  add is idempotent; the fallback snippet is
+  one. The fallback snippet is
   `{"mcpServers":{"kioku":{"type":"http","url":"<server_url>/mcp","headers":{"Authorization":"Bearer <token>"}}}}`.
   Server URL and token come from `[client]`.
-- Back up the settings file to `settings.json.kioku-bak` before the first
-  modification (only if the file existed; an existing backup is never
-  overwritten).
+- Back up the settings file to `settings.json.kioku-bak` (and `~/.claude.json`
+  to `.claude.json.kioku-bak`) before the first modification (only if the
+  file existed; an existing backup is never overwritten).
 
 ## 9. HTTP API (axum, JSON, `Authorization: Bearer <token>`)
 
@@ -539,7 +554,8 @@ POST /mcp                                    MCP streamable HTTP (rmcp)
 ```
 
 `/api/v1/health` is the only route reachable without the bearer token; `/mcp`
-requires it too (Claude Code sends it via `--header`). An empty token disables
+requires it too (Claude Code sends it from the `headers` of its
+`mcpServers.kioku` entry). An empty token disables
 auth entirely (`build_app` keeps that for tests); `kioku serve` refuses to
 start without a token on any bind address (planner decision, Step 3).
 `POST /api/v1/reindex` exists because a CLI on a client machine has no local

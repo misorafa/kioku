@@ -102,10 +102,50 @@ pub fn one_line(s: &str) -> String {
 
 /// Home directory from `$HOME` (or `%USERPROFILE%`), falling back to `.`.
 pub fn home_dir() -> std::path::PathBuf {
+    home_dir_opt().unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+/// Home directory from `$HOME` (or `%USERPROFILE%`); `None` when neither is set (or empty).
+pub fn home_dir_opt() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()))
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+/// Creates `dir` (with parents) and restricts it to its owner (0700 on unix). Tightening
+/// the mode of an existing directory we do not own fails silently (logged).
+pub fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let private = std::fs::Permissions::from_mode(0o700);
+        if let Err(e) = std::fs::set_permissions(dir, private) {
+            tracing::warn!(dir = %dir.display(), error = %e, "could not restrict directory to 0700");
+        }
+    }
+    Ok(())
+}
+
+/// Writes `text` to `path`, readable and writable only by the owner (0600 on unix, also
+/// when the file already existed with a wider mode).
+pub fn write_private_file(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        opts.mode(0o600);
+        // An existing file keeps its mode on open: tighten it before writing the secret.
+        if path.exists() {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(text.as_bytes())?;
+    Ok(())
 }
 
 /// Expands a leading `~` or `~/` against [`home_dir`].
@@ -131,6 +171,26 @@ mod tests {
         let t = truncate_chars(&"x".repeat(50), 10);
         assert_eq!(t.chars().count(), 10);
         assert_eq!(truncate_chars(&t, 10), t);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_files_and_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("a/b");
+        create_private_dir(&dir).unwrap();
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        let f = dir.join("config.toml");
+        std::fs::write(&f, "old").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private_file(&f, "token").unwrap();
+        assert_eq!(mode(&f), 0o600);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "token");
+        let g = dir.join("new.toml");
+        write_private_file(&g, "x").unwrap();
+        assert_eq!(mode(&g), 0o600);
     }
 
     #[test]

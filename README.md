@@ -91,10 +91,14 @@ kioku install claude-code     # in another terminal: hooks + MCP registration
 
 `kioku install claude-code` merges hook entries into `~/.claude/settings.json`
 (`--project` uses `./.claude/settings.json`; a `settings.json.kioku-bak` backup
-is made before the first change) and runs `claude mcp add --transport http
-kioku http://127.0.0.1:7391/mcp --header "Authorization: Bearer <token>"
---scope user`. If `claude` is not on PATH it prints the `~/.claude.json`
-snippet instead. `kioku uninstall claude-code` removes exactly what it added.
+is made before the first change) and registers the MCP server by setting
+`mcpServers.kioku` in `~/.claude.json` to `{"type": "http", "url":
+"http://127.0.0.1:7391/mcp", "headers": {"Authorization": "Bearer <token>"}}`
+(everything else in the file is kept; `.claude.json.kioku-bak` is made once).
+It does not run `claude mcp add`, so the token never appears on a command
+line. If `~/.claude.json` cannot be parsed, it is left alone and the snippet is
+printed for you to add. Restart Claude Code afterwards. `kioku uninstall
+claude-code` removes exactly what it added.
 
 Try it:
 
@@ -132,6 +136,12 @@ kioku install claude-code
 
 `--client-only` writes only a `[client]` section and checks the URL and token
 with an authenticated request.
+
+Hooks never send requests to a server on this machine or a private network
+through an `HTTP(S)_PROXY` from the environment (loopback, 10/8, 172.16/12,
+192.168/16, fc00::/7, fe80::/10, and `*.local` / `*.lan` / `*.internal`
+names). For any other host (e.g. a VPN name like `kioku.tailnet.ts.net`) that
+must not go through your proxy, add it to `NO_PROXY`.
 
 **Never expose kioku to the internet without TLS and the token.** kioku
 speaks plain HTTP and authenticates with one bearer token; put it behind one
@@ -274,7 +284,8 @@ becomes `proj`). Use `.kioku.toml` to merge or rename projects.
   requires `Authorization: Bearer <token>`, including `/mcp`, whose Host-header
   allowlist is disabled so the token is the guard. The default bind is
   `127.0.0.1`.
-- `config.toml` holds the token in plain text; `chmod 600` it.
+- `config.toml` holds the token in plain text; kioku writes it with mode 0600
+  and creates the data dir, `raw/` and `logs/` as 0700 (unix).
 - **Sanitizer** — hook payloads are redacted on the client before they are
   sent (and again by the server):
   - AWS access key ids (`AKIA…`), `sk-…` keys, Stripe `sk_live_…` /

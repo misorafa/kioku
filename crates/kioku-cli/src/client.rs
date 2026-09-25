@@ -49,8 +49,10 @@ impl ApiClient {
             anyhow::bail!("[client] server_url must be http(s): {}", cfg.server_url);
         }
         let mut builder = Client::builder().timeout(total);
-        if is_loopback_url(&base) {
-            // A proxy from the environment must never see requests to the local server.
+        if is_local_url(&base) {
+            // A proxy from the environment must never see requests to a server on this
+            // machine or the local network (it could not reach it, and would see the token).
+            // Other hosts follow HTTP(S)_PROXY / NO_PROXY as usual.
             builder = builder.no_proxy();
         }
         let http = builder.build().context("building HTTP client")?;
@@ -136,6 +138,34 @@ pub fn is_loopback_url(url: &Url) -> bool {
             .unwrap_or(false)
 }
 
+/// True when the URL points at this machine or a private network: loopback, `localhost`,
+/// 10/8, 172.16/12, 192.168/16, fc00::/7, fe80::/10, or a `*.local` / `*.lan` /
+/// `*.internal` name. Such requests bypass any proxy from the environment.
+pub fn is_local_url(url: &Url) -> bool {
+    use std::net::IpAddr;
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if is_loopback_url(url) {
+        return true;
+    }
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => ip.is_private(),
+        Ok(IpAddr::V6(ip)) => {
+            let first = ip.segments()[0];
+            (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+        }
+        Err(_) => [".local", ".lan", ".internal"]
+            .iter()
+            .any(|suffix| host.ends_with(suffix)),
+    }
+}
+
 /// The HTTP status of an error produced by [`ApiClient`], if it was a server response.
 pub fn http_status(err: &anyhow::Error) -> Option<u16> {
     err.downcast_ref::<HttpError>().map(|e| e.status)
@@ -179,6 +209,36 @@ mod tests {
         assert!(!is_loopback_url(
             &Url::parse("http://192.168.1.5:7391").unwrap()
         ));
+    }
+
+    #[test]
+    fn local_network_urls_bypass_the_proxy() {
+        for u in [
+            "http://127.0.0.1:7391",
+            "http://localhost:7391",
+            "http://10.0.0.5:7391",
+            "http://172.16.0.1",
+            "http://172.31.255.254",
+            "http://192.168.1.5:7391",
+            "http://[fd12:3456::1]:7391",
+            "http://[fe80::1]",
+            "http://homeserver.local:7391",
+            "https://nas.lan",
+            "http://kioku.internal.",
+            "http://KIOKU.Internal",
+        ] {
+            assert!(is_local_url(&Url::parse(u).unwrap()), "{u}");
+        }
+        for u in [
+            "http://172.32.0.1",
+            "http://8.8.8.8",
+            "https://kioku.example.com",
+            "http://[2001:db8::1]",
+            "http://local.example.com",
+            "http://mylan",
+        ] {
+            assert!(!is_local_url(&Url::parse(u).unwrap()), "{u}");
+        }
     }
 
     #[test]

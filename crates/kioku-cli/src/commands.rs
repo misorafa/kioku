@@ -328,7 +328,10 @@ fn install_claude_code(project: bool) -> anyhow::Result<()> {
             events.join(", ")
         );
     }
-    println!("{}", install::register_mcp(&cfg.client));
+    println!(
+        "{}",
+        install::register_mcp(&install::claude_json_path(), &cfg.client)
+    );
     if cfg
         .client
         .auth_token
@@ -355,7 +358,7 @@ fn uninstall_claude_code(project: bool) -> anyhow::Result<()> {
     if change.changed {
         println!("  {} kioku hook entries removed", change.removed);
     }
-    println!("{}", install::unregister_mcp());
+    println!("{}", install::unregister_mcp(&install::claude_json_path()));
     Ok(())
 }
 

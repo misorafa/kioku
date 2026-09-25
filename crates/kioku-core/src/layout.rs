@@ -64,14 +64,17 @@ impl DataDir {
         self.logs_dir().join("hook.log")
     }
 
-    /// Creates every directory of the layout (idempotent).
+    /// Creates every directory of the layout (idempotent). The data dir, `raw/` and `logs/`
+    /// are restricted to the owner (0700 on unix): they hold the token and captured sessions.
     pub fn ensure(&self) -> Result<()> {
+        for dir in [self.root.clone(), self.raw(), self.logs_dir()] {
+            crate::util::create_private_dir(&dir)
+                .with_context(|| format!("creating {}", dir.display()))?;
+        }
         for dir in [
             self.wiki().join(crate::page::GLOBAL_DIR),
-            self.raw(),
             self.root.join("db"),
             self.index_dir(),
-            self.logs_dir(),
         ] {
             std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         }
@@ -154,5 +157,23 @@ mod tests {
         assert!(!report.config_written);
         assert!(!report.token_generated);
         assert_eq!(again.server.auth_token.as_deref(), Some(token.as_str()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_restricts_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("kioku");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = Config::for_data_dir(&root);
+        init(&mut config).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let d = DataDir::new(&root);
+        assert_eq!(mode(&config.config_file), 0o600);
+        assert_eq!(mode(&root), 0o700);
+        assert_eq!(mode(&d.raw()), 0o700);
+        assert_eq!(mode(&d.logs_dir()), 0o700);
     }
 }

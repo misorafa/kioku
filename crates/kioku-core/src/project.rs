@@ -164,10 +164,12 @@ pub fn id_from_path(name: &str, root: &Path) -> String {
     )
 }
 
-/// True when `id` is safe to use as a directory name (`[a-z0-9-_.]`, no leading dot).
+/// True when `id` is safe to use as a directory name (`[a-z0-9-_.]`, no leading dot or `_`).
 pub fn is_valid_id(id: &str) -> bool {
     !id.is_empty()
         && !id.starts_with('.')
+        // `_global` (and any `_…` name) is reserved for kioku's own wiki directories.
+        && !id.starts_with('_')
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
@@ -238,6 +240,20 @@ mod tests {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    #[test]
+    fn reserved_ids_are_rejected() {
+        assert!(is_valid_id("kioku-3f9a1c2e"));
+        assert!(is_valid_id("a_b"));
+        for id in ["_global", "_x", ".hidden", "", "a/b"] {
+            assert!(!is_valid_id(id), "{id}");
+        }
+        // a .kioku.toml naming a reserved id is slugged instead
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(PROJECT_FILE), "project = \"_global\"\n").unwrap();
+        let id = identify(tmp.path()).unwrap().id;
+        assert_eq!(id, "global");
     }
 
     #[test]

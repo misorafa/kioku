@@ -85,10 +85,12 @@ kioku install claude-code     # 別のターミナルで: フック + MCP の登
 
 `kioku install claude-code` はフックの設定を `~/.claude/settings.json` にマージし
 （`--project` なら `./.claude/settings.json`。最初の変更の前に `settings.json.kioku-bak` へ
-バックアップします）、`claude mcp add --transport http kioku http://127.0.0.1:7391/mcp
---header "Authorization: Bearer <token>" --scope user` を実行します。`claude` が PATH に無ければ、
-代わりに `~/.claude.json` 用の設定断片を表示します。`kioku uninstall claude-code` は追加したものだけを
-正確に取り除きます。
+バックアップします）、`~/.claude.json` の `mcpServers.kioku` を `{"type": "http", "url":
+"http://127.0.0.1:7391/mcp", "headers": {"Authorization": "Bearer <token>"}}` に設定して MCP サーバーを
+登録します（ファイルのほかの内容はそのまま。`.claude.json.kioku-bak` へのバックアップは 1 回だけ）。
+`claude mcp add` は実行しないので、トークンがコマンドラインに現れることはありません。`~/.claude.json` を
+解析できない場合は触らずに、追加すべき設定断片を表示します。その後 Claude Code を再起動してください。
+`kioku uninstall claude-code` は追加したものだけを正確に取り除きます。
 
 試してみる:
 
@@ -124,6 +126,11 @@ kioku install claude-code
 ```
 
 `--client-only` は `[client]` セクションだけを書き、認証付きのリクエストで URL とトークンを確認します。
+
+フックは、このマシン上またはプライベートネットワーク上のサーバーへのリクエストを、環境変数の
+`HTTP(S)_PROXY` 経由では送りません（ループバック、10/8、172.16/12、192.168/16、fc00::/7、fe80::/10、
+`*.local` / `*.lan` / `*.internal` の名前）。それ以外のホスト（例: `kioku.tailnet.ts.net` のような
+VPN の名前）をプロキシに通したくない場合は `NO_PROXY` に追加してください。
 
 **TLS とトークンなしで kioku をインターネットに公開しないでください。** kioku は平文の HTTP を話し、
 1 つの Bearer トークンで認証します。次のいずれかの背後に置いてください:
@@ -256,7 +263,8 @@ slug 部分では非 ASCII 文字が落とされます（日本語だけの名�
   `kioku serve` は起動しません。`GET /api/v1/health` 以外のすべてのルートで
   `Authorization: Bearer <token>` が必要です。`/mcp` も同様で、Host ヘッダの許可リストは無効に
   してあるため、トークンが唯一の防御です。既定のバインドは `127.0.0.1` です。
-- `config.toml` にはトークンが平文で入っています。`chmod 600` してください。
+- `config.toml` にはトークンが平文で入っています。kioku はこれをモード 0600 で書き、データディレクトリ・
+  `raw/`・`logs/` を 0700 で作成します（unix）。
 - **サニタイザ** — フックのペイロードは送信前にクライアントで（サーバーでも再度）伏せ字にされます:
   - AWS アクセスキー ID（`AKIA…`）、`sk-…` 形式のキー、Stripe の `sk_live_…` / `sk_test_…` キー、
     GitHub の `ghp_` / `gho_` / `ghu_` / `ghs_` / `ghr_` / `github_pat_…` トークン、

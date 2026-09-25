@@ -86,7 +86,7 @@ pub enum Command {
 /// Agents `install` / `uninstall` know about.
 #[derive(Debug, Subcommand)]
 pub enum InstallTarget {
-    /// Claude Code: hooks in settings.json + `claude mcp add`.
+    /// Claude Code: hooks in settings.json + `mcpServers.kioku` in ~/.claude.json.
     ClaudeCode {
         /// Use ./.claude/settings.json instead of ~/.claude/settings.json.
         #[arg(long)]
