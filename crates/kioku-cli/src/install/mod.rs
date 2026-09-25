@@ -1,9 +1,17 @@
-//! `kioku install|uninstall claude-code` (spec §8.5): idempotent merge of our hook entries
-//! into Claude Code's settings.json, plus the MCP server entry in `~/.claude.json` (edited
-//! directly — never via `claude mcp add`, whose `--header` would put the token in `ps`).
+//! `kioku install|uninstall <agent>` (M1 §8.5, M2 §8): idempotent merges of our hook
+//! entries into each agent's hook file, the MCP server entry (edited directly — never via an
+//! agent CLI, whose `--header` would put the token in `ps`) and the instruction snippet.
+//!
+//! This module owns the Claude Code installer and the file primitives every installer shares
+//! (JSON hook merges for the nested and the flat hook format, backup-once writes that keep
+//! the file mode); [`agents`] owns the per-agent file table and `install all`, [`block`] the
+//! delimited managed blocks (Codex `config.toml`, AGENTS.md / GEMINI.md / CLAUDE.md).
 //!
 //! Our entries are recognized by the `kioku hook` command substring, so foreign hooks are
 //! never touched and re-installing (even from a moved binary) leaves one entry per event.
+
+pub mod agents;
+pub mod block;
 
 use std::path::{Path, PathBuf};
 
@@ -11,7 +19,7 @@ use anyhow::Context;
 use kioku_core::ClientConfig;
 use serde_json::{Map, Value, json};
 
-use crate::event::{ALL_EVENTS, HookEventKind};
+use crate::event::{ALL_EVENTS, Agent, HookEventKind};
 
 /// Suffix of the one-time backup written next to settings.json.
 pub const BACKUP_SUFFIX: &str = ".kioku-bak";
@@ -37,6 +45,15 @@ pub fn settings_path(project: bool) -> anyhow::Result<PathBuf> {
 /// Shell command registered for an event, e.g. `/usr/local/bin/kioku hook stop`.
 pub fn hook_command(bin: &str, event: HookEventKind) -> String {
     format!("{} hook {}", shell_quote(bin), event.cli_name())
+}
+
+/// Hook command for an agent: Claude Code keeps M1's form, the others add `--agent <name>`
+/// (M2 §8.1), e.g. `/usr/local/bin/kioku hook stop --agent codex`.
+pub fn agent_hook_command(agent: Agent, bin: &str, event: HookEventKind) -> String {
+    match agent {
+        Agent::ClaudeCode => hook_command(bin, event),
+        _ => format!("{} --agent {}", hook_command(bin, event), agent.as_str()),
+    }
 }
 
 /// True when a hook command is one of ours (`…kioku hook …`, quoted or `.exe`).
@@ -122,35 +139,128 @@ fn strip_groups(groups: &[Value]) -> (Vec<Value>, Option<usize>, usize) {
     (out, first, removed)
 }
 
+/// One hook registration: the event key in the agent's hook config and the JSON inserted
+/// under it — a matcher group (`{matcher?, hooks: [handler]}`) for the nested format of
+/// Claude Code / Codex / Gemini CLI, a bare handler for Cursor's flat format.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HookSpec {
+    /// Event key (`SessionStart`, `sessionStart`, `AfterTool`, …).
+    pub key: String,
+    /// Group (nested format) or handler (flat format).
+    pub entry: Value,
+}
+
 fn hooks_object(settings: &mut Value) -> anyhow::Result<&mut Map<String, Value>> {
     let root = settings
         .as_object_mut()
-        .context("settings.json is not a JSON object")?;
+        .context("the hook file is not a JSON object")?;
     let hooks = root
         .entry("hooks")
         .or_insert_with(|| Value::Object(Map::new()));
     hooks
         .as_object_mut()
-        .context("settings.json `hooks` is not an object")
+        .context("the hook file's `hooks` is not an object")
+}
+
+fn event_list(hooks: &Map<String, Value>, key: &str) -> anyhow::Result<Vec<Value>> {
+    match hooks.get(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(a)) => Ok(a.clone()),
+        Some(_) => anyhow::bail!("hooks.{key} is not an array"),
+    }
+}
+
+/// Nested format: returns `settings` with exactly our group per spec (foreign hooks kept; our
+/// group takes the place of the first group that held one of ours).
+pub fn merge_nested(settings: &Value, specs: &[HookSpec]) -> anyhow::Result<Value> {
+    let mut out = settings.clone();
+    let hooks = hooks_object(&mut out)?;
+    for spec in specs {
+        let existing = event_list(hooks, &spec.key)?;
+        let (mut groups, first, _) = strip_groups(&existing);
+        let at = first.unwrap_or(groups.len()).min(groups.len());
+        groups.insert(at, spec.entry.clone());
+        hooks.insert(spec.key.clone(), Value::Array(groups));
+    }
+    Ok(out)
+}
+
+/// Flat format (Cursor `hooks.json`): returns `settings` with exactly our handler per spec,
+/// in place of our old one, and `"version": 1` (first key) when the file had no version.
+pub fn merge_flat(settings: &Value, specs: &[HookSpec]) -> anyhow::Result<Value> {
+    let mut out = settings.clone();
+    let root = out
+        .as_object_mut()
+        .context("the hook file is not a JSON object")?;
+    if !root.contains_key("version") {
+        let mut with_version = Map::new();
+        with_version.insert("version".into(), json!(1));
+        with_version.extend(std::mem::take(root));
+        *root = with_version;
+    }
+    let hooks = hooks_object(&mut out)?;
+    for spec in specs {
+        let existing = event_list(hooks, &spec.key)?;
+        let first = existing.iter().position(is_ours);
+        let mut kept: Vec<Value> = existing.into_iter().filter(|h| !is_ours(h)).collect();
+        let at = first.unwrap_or(kept.len()).min(kept.len());
+        kept.insert(at, spec.entry.clone());
+        hooks.insert(spec.key.clone(), Value::Array(kept));
+    }
+    Ok(out)
+}
+
+/// Flat format: `settings` without our handlers and the number removed. Emptied event lists
+/// and an emptied `hooks` object are removed; so is a `version` that is then all that is left.
+pub fn remove_flat(settings: &Value) -> anyhow::Result<(Value, usize)> {
+    let mut out = settings.clone();
+    let Some(root) = out.as_object_mut() else {
+        anyhow::bail!("the hook file is not a JSON object");
+    };
+    let Some(Value::Object(hooks)) = root.get_mut("hooks") else {
+        return Ok((settings.clone(), 0));
+    };
+    let mut total = 0;
+    let keys: Vec<String> = hooks.keys().cloned().collect();
+    for key in keys {
+        let Some(Value::Array(list)) = hooks.get(&key) else {
+            continue;
+        };
+        let kept: Vec<Value> = list.iter().filter(|h| !is_ours(h)).cloned().collect();
+        let removed = list.len() - kept.len();
+        if removed == 0 {
+            continue;
+        }
+        total += removed;
+        if kept.is_empty() {
+            hooks.shift_remove(&key);
+        } else {
+            hooks.insert(key, Value::Array(kept));
+        }
+    }
+    if total > 0 && hooks.is_empty() {
+        root.shift_remove("hooks");
+        if root.len() == 1 && root.get("version") == Some(&json!(1)) {
+            root.shift_remove("version");
+        }
+    }
+    Ok((out, total))
+}
+
+/// Claude Code's hook specs (M1 §8.5).
+pub fn claude_specs(bin: &str) -> Vec<HookSpec> {
+    ALL_EVENTS
+        .iter()
+        .map(|&event| HookSpec {
+            key: event.claude_code_name().to_string(),
+            entry: our_group(bin, event),
+        })
+        .collect()
 }
 
 /// Returns `settings` with exactly one kioku entry per Claude Code event (foreign hooks kept).
 pub fn merge_hooks(settings: &Value, bin: &str) -> anyhow::Result<Value> {
-    let mut out = settings.clone();
-    let hooks = hooks_object(&mut out)?;
-    for event in ALL_EVENTS {
-        let key = event.claude_code_name();
-        let existing = match hooks.get(key) {
-            None | Some(Value::Null) => Vec::new(),
-            Some(Value::Array(a)) => a.clone(),
-            Some(_) => anyhow::bail!("settings.json hooks.{key} is not an array"),
-        };
-        let (mut groups, first, _) = strip_groups(&existing);
-        let at = first.unwrap_or(groups.len()).min(groups.len());
-        groups.insert(at, our_group(bin, event));
-        hooks.insert(key.to_string(), Value::Array(groups));
-    }
-    Ok(out)
+    merge_nested(settings, &claude_specs(bin))
 }
 
 /// Returns `settings` without any kioku hook entry and the number of entries removed.
@@ -158,7 +268,7 @@ pub fn merge_hooks(settings: &Value, bin: &str) -> anyhow::Result<Value> {
 pub fn remove_hooks(settings: &Value) -> anyhow::Result<(Value, usize)> {
     let mut out = settings.clone();
     let Some(root) = out.as_object_mut() else {
-        anyhow::bail!("settings.json is not a JSON object");
+        anyhow::bail!("the hook file is not a JSON object");
     };
     let Some(Value::Object(hooks)) = root.get_mut("hooks") else {
         return Ok((settings.clone(), 0));
@@ -199,7 +309,8 @@ pub struct SettingsChange {
     pub removed: usize,
 }
 
-fn read_settings(path: &Path) -> anyhow::Result<Option<Value>> {
+/// Reads a JSON file: `None` when missing, `{}` when empty, an error when not valid JSON.
+pub fn read_settings(path: &Path) -> anyhow::Result<Option<Value>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -213,19 +324,74 @@ fn read_settings(path: &Path) -> anyhow::Result<Option<Value>> {
     Ok(Some(v))
 }
 
-fn backup_path(path: &Path) -> PathBuf {
+/// `<file>.kioku-bak` next to `path`.
+pub fn backup_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(BACKUP_SUFFIX);
     path.with_file_name(name)
 }
 
-/// Writes `value` as pretty JSON, backing the file up once first (only if it existed; an
-/// existing backup is never overwritten). The write goes through a temp file + rename that
-/// keeps the original's permissions (a new file is 0600: `~/.claude.json` holds the token).
-fn write_settings(path: &Path, existed: bool, value: &Value) -> anyhow::Result<Option<PathBuf>> {
+/// Writes `value` as pretty JSON through [`write_text`].
+fn write_settings(
+    path: &Path,
+    existed: bool,
+    value: &Value,
+    secret: bool,
+) -> anyhow::Result<Option<PathBuf>> {
+    let text = serde_json::to_string_pretty(value).context("serializing settings")? + "\n";
+    write_text(path, existed, &text, secret)
+}
+
+/// Writes `text` to `path`, backing the file up once first (only if it existed; an existing
+/// backup is never overwritten). The write goes through a temp file + rename that keeps the
+/// original's permissions; a new file is 0600 when it holds the token (`secret`), else 0644.
+/// Parent directories are created as needed. Returns the backup written by this call.
+pub fn write_text(
+    path: &Path,
+    existed: bool,
+    text: &str,
+    secret: bool,
+) -> anyhow::Result<Option<PathBuf>> {
+    write_text_inner(path, existed, text, secret, true)
+}
+
+/// [`write_text`] for an uninstall: never writes a backup (install already backed up a
+/// pre-existing file; a file without one is kioku's own).
+pub fn rewrite_text(path: &Path, text: &str) -> anyhow::Result<()> {
+    write_text_inner(path, true, text, false, false).map(|_| ())
+}
+
+/// True when a JSON value holds nothing but what kioku may leave behind (`{}`, or an empty
+/// `mcpServers` object).
+pub fn is_blank_json(v: &Value) -> bool {
+    v.as_object().is_some_and(|m| {
+        m.iter()
+            .all(|(k, v)| k == "mcpServers" && v.as_object().is_some_and(Map::is_empty))
+    })
+}
+
+/// Writes a JSON file after removing our entries: without a backup, and a file kioku created
+/// (no `.kioku-bak`) that is now blank is deleted instead. Returns true when deleted.
+pub fn rewrite_json_after_removal(path: &Path, after: &Value) -> anyhow::Result<bool> {
+    if is_blank_json(after) && !backup_path(path).exists() {
+        std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
+        return Ok(true);
+    }
+    let text = serde_json::to_string_pretty(after).context("serializing settings")? + "\n";
+    rewrite_text(path, &text)?;
+    Ok(false)
+}
+
+fn write_text_inner(
+    path: &Path,
+    existed: bool,
+    text: &str,
+    secret: bool,
+    make_backup: bool,
+) -> anyhow::Result<Option<PathBuf>> {
     let mut backup = None;
     let bak = backup_path(path);
-    if existed && !bak.exists() {
+    if make_backup && existed && !bak.exists() {
         std::fs::copy(path, &bak).with_context(|| format!("backing up to {}", bak.display()))?;
         backup = Some(bak);
     }
@@ -234,15 +400,20 @@ fn write_settings(path: &Path, existed: bool, value: &Value) -> anyhow::Result<O
         _ => PathBuf::from("."),
     };
     std::fs::create_dir_all(&parent).with_context(|| format!("creating {}", parent.display()))?;
-    let text = serde_json::to_string_pretty(value).context("serializing settings")? + "\n";
     let tmp = parent.join(format!(
         ".{}.kioku-tmp",
         path.file_name().unwrap_or_default().to_string_lossy()
     ));
-    kioku_core::util::write_private_file(&tmp, &text)
+    kioku_core::util::write_private_file(&tmp, text)
         .with_context(|| format!("writing {}", tmp.display()))?;
     if existed && let Ok(meta) = std::fs::metadata(path) {
         let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    } else if !secret {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644));
+        }
     }
     std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))?;
     Ok(backup)
@@ -256,7 +427,7 @@ pub fn install_settings(path: &Path, bin: &str) -> anyhow::Result<SettingsChange
     let after = merge_hooks(&before, bin)?;
     let changed = !existed || after != before;
     let backup = if changed {
-        write_settings(path, existed, &after)?
+        write_settings(path, existed, &after, false)?
     } else {
         None
     };
@@ -280,7 +451,7 @@ pub fn uninstall_settings(path: &Path) -> anyhow::Result<SettingsChange> {
     };
     let (after, removed) = remove_hooks(&before)?;
     let backup = if removed > 0 {
-        write_settings(path, true, &after)?
+        write_settings(path, true, &after, false)?
     } else {
         None
     };
@@ -317,21 +488,33 @@ pub fn mcp_snippet(cfg: &ClientConfig) -> String {
     serde_json::to_string_pretty(&snippet).unwrap_or_default()
 }
 
-/// Returns `claude_json` with `mcpServers.kioku` set to our entry (everything else kept,
-/// key order preserved).
-pub fn merge_mcp_server(claude_json: &Value, cfg: &ClientConfig) -> anyhow::Result<Value> {
-    let mut out = claude_json.clone();
+/// `{"mcpServers": {"kioku": entry}}`, pretty-printed, for manual registration.
+pub fn mcp_entry_snippet(entry: &Value) -> String {
+    let snippet = json!({ "mcpServers": { MCP_NAME: entry } });
+    serde_json::to_string_pretty(&snippet).unwrap_or_default()
+}
+
+/// Returns `json` with `mcpServers.kioku` set to `entry` (everything else kept, key order
+/// preserved).
+pub fn merge_mcp_entry(json: &Value, entry: &Value) -> anyhow::Result<Value> {
+    let mut out = json.clone();
     let root = out
         .as_object_mut()
-        .context("~/.claude.json is not a JSON object")?;
+        .context("the file is not a JSON object")?;
     let servers = root
         .entry("mcpServers")
         .or_insert_with(|| Value::Object(Map::new()));
     let servers = servers
         .as_object_mut()
-        .context("~/.claude.json `mcpServers` is not an object")?;
-    servers.insert(MCP_NAME.to_string(), mcp_server_entry(cfg));
+        .context("`mcpServers` is not an object")?;
+    servers.insert(MCP_NAME.to_string(), entry.clone());
     Ok(out)
+}
+
+/// Returns `claude_json` with `mcpServers.kioku` set to our entry (everything else kept,
+/// key order preserved).
+pub fn merge_mcp_server(claude_json: &Value, cfg: &ClientConfig) -> anyhow::Result<Value> {
+    merge_mcp_entry(claude_json, &mcp_server_entry(cfg))
 }
 
 /// Returns `claude_json` without `mcpServers.kioku` and whether it was present.
@@ -345,15 +528,32 @@ pub fn remove_mcp_server(claude_json: &Value) -> (Value, bool) {
     (out, removed)
 }
 
-/// Registers the MCP server in the `~/.claude.json` at `path` (idempotent, one backup);
-/// returns a report. An unparseable file is left alone and the snippet is printed instead.
-pub fn register_mcp(path: &Path, cfg: &ClientConfig) -> String {
-    let manual = |why: String| {
-        format!(
+/// Outcome of registering or removing an MCP entry: a report (never the token) and
+/// whether the file was (or, in a dry run, would be) written.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpChange {
+    /// Human-readable report.
+    pub message: String,
+    /// True when the file changed.
+    pub changed: bool,
+}
+
+/// Sets `mcpServers.kioku` = `entry` in the JSON file at `path` (idempotent, one backup,
+/// new file 0600). An unparseable file is left alone and the snippet is reported instead.
+pub fn register_mcp_entry(path: &Path, entry: &Value, agent: &str, dry_run: bool) -> McpChange {
+    let url = entry
+        .get("url")
+        .or_else(|| entry.get("httpUrl"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let manual = |why: String| McpChange {
+        message: format!(
             "{why}\nAdd this to {} yourself to register the MCP server:\n{}",
             path.display(),
-            mcp_snippet(cfg)
-        )
+            mcp_entry_snippet(entry)
+        ),
+        changed: false,
     };
     let current = match read_settings(path) {
         Ok(c) => c,
@@ -361,63 +561,103 @@ pub fn register_mcp(path: &Path, cfg: &ClientConfig) -> String {
     };
     let existed = current.is_some();
     let before = current.unwrap_or_else(|| Value::Object(Map::new()));
-    let after = match merge_mcp_server(&before, cfg) {
+    let after = match merge_mcp_entry(&before, entry) {
         Ok(v) => v,
-        Err(e) => return manual(format!("{e:#}; not touching it")),
+        Err(e) => return manual(format!("{} {e:#}; not touching it", path.display())),
     };
     if existed && after == before {
-        return format!(
-            "MCP server `{MCP_NAME}` already registered in {}: {}",
-            path.display(),
-            mcp_url(cfg)
-        );
+        return McpChange {
+            message: format!(
+                "MCP server `{MCP_NAME}` already registered in {}: {url}",
+                path.display()
+            ),
+            changed: false,
+        };
     }
-    match write_settings(path, existed, &after) {
+    if dry_run {
+        return McpChange {
+            message: format!(
+                "would register MCP server `{MCP_NAME}` in {}: {url}",
+                path.display()
+            ),
+            changed: true,
+        };
+    }
+    match write_settings(path, existed, &after, true) {
         Ok(backup) => {
             let mut msg = format!(
-                "MCP server `{MCP_NAME}` registered in {} (user scope): {}",
-                path.display(),
-                mcp_url(cfg)
+                "MCP server `{MCP_NAME}` registered in {} (user scope): {url}",
+                path.display()
             );
             if let Some(b) = backup {
                 msg.push_str(&format!("\n  backup: {}", b.display()));
             }
-            msg.push_str("\n  restart Claude Code to pick it up");
-            msg
+            msg.push_str(&format!("\n  restart {agent} to pick it up"));
+            McpChange {
+                message: msg,
+                changed: true,
+            }
         }
         Err(e) => manual(format!("{e:#}")),
+    }
+}
+
+/// Registers the MCP server in the `~/.claude.json` at `path` (idempotent, one backup);
+/// returns a report. An unparseable file is left alone and the snippet is printed instead.
+pub fn register_mcp(path: &Path, cfg: &ClientConfig) -> String {
+    register_mcp_entry(path, &mcp_server_entry(cfg), "Claude Code", false).message
+}
+
+/// Removes `mcpServers.kioku` from the JSON file at `path` (nothing else).
+pub fn unregister_mcp_entry(path: &Path, dry_run: bool) -> McpChange {
+    let unchanged = |message: String| McpChange {
+        message,
+        changed: false,
+    };
+    let current = match read_settings(path) {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            return unchanged(format!(
+                "MCP server `{MCP_NAME}` not registered ({} does not exist).",
+                path.display()
+            ));
+        }
+        Err(e) => {
+            return unchanged(format!(
+                "{e:#}\nRemove `mcpServers.{MCP_NAME}` from {} manually.",
+                path.display()
+            ));
+        }
+    };
+    let (after, removed) = remove_mcp_server(&current);
+    if !removed {
+        return unchanged(format!(
+            "MCP server `{MCP_NAME}` not registered in {}.",
+            path.display()
+        ));
+    }
+    if dry_run {
+        return McpChange {
+            message: format!(
+                "would remove MCP server `{MCP_NAME}` from {}.",
+                path.display()
+            ),
+            changed: true,
+        };
+    }
+    match rewrite_json_after_removal(path, &after) {
+        Ok(_) => McpChange {
+            message: format!("MCP server `{MCP_NAME}` removed from {}.", path.display()),
+            changed: true,
+        },
+        Err(e) => unchanged(format!("{e:#}")),
     }
 }
 
 /// Removes `mcpServers.kioku` from the `~/.claude.json` at `path` (nothing else); returns a
 /// report.
 pub fn unregister_mcp(path: &Path) -> String {
-    let current = match read_settings(path) {
-        Ok(Some(v)) => v,
-        Ok(None) => {
-            return format!(
-                "MCP server `{MCP_NAME}` not registered ({} does not exist).",
-                path.display()
-            );
-        }
-        Err(e) => {
-            return format!(
-                "{e:#}\nRemove `mcpServers.{MCP_NAME}` from {} manually.",
-                path.display()
-            );
-        }
-    };
-    let (after, removed) = remove_mcp_server(&current);
-    if !removed {
-        return format!(
-            "MCP server `{MCP_NAME}` not registered in {}.",
-            path.display()
-        );
-    }
-    match write_settings(path, true, &after) {
-        Ok(_) => format!("MCP server `{MCP_NAME}` removed from {}.", path.display()),
-        Err(e) => format!("{e:#}"),
-    }
+    unregister_mcp_entry(path, false).message
 }
 
 #[cfg(test)]

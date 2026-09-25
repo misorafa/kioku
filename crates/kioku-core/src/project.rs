@@ -220,7 +220,8 @@ fn git_output(dir: &Path, args: &[&str]) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
-fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
+/// `git rev-parse --show-toplevel` run in `cwd`; `None` outside a repository or without git.
+pub fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
     git_output(cwd, &["rev-parse", "--show-toplevel"]).map(PathBuf::from)
 }
 

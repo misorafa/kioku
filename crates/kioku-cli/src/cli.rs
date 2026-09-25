@@ -65,17 +65,45 @@ pub enum Command {
         #[command(subcommand)]
         command: HookDumpCommand,
     },
-    /// Register kioku hooks and the MCP server with an agent.
+    /// Register kioku hooks, the MCP server and the instruction snippet with an agent.
     Install {
-        /// Target agent.
-        #[command(subcommand)]
+        /// Target agent, or `all` (every detected agent).
+        #[arg(value_enum)]
         target: InstallTarget,
+        /// Hooks and instructions in the current project instead of the user config (MCP
+        /// stays user-level: the token never goes into a repository).
+        #[arg(long)]
+        project: bool,
+        /// Do not write the instruction snippet.
+        #[arg(long, conflicts_with = "instructions")]
+        no_instructions: bool,
+        /// Write the instruction snippet even where it is off by default (Claude Code).
+        #[arg(long)]
+        instructions: bool,
+        /// Print what would change; write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// `all` only: restrict to these agents (comma-separated).
+        #[arg(long, value_enum, value_delimiter = ',')]
+        agents: Vec<Agent>,
+        /// Codex: also set `[features] hooks = true` (older Codex builds).
+        #[arg(long)]
+        enable_hooks_feature: bool,
+        /// Gemini CLI: register the MCP server with `"trust": true`.
+        #[arg(long)]
+        trust_mcp: bool,
     },
-    /// Remove kioku hooks and the MCP server from an agent.
+    /// Remove kioku hooks, the MCP server and the instruction snippet from an agent.
     Uninstall {
-        /// Target agent.
-        #[command(subcommand)]
+        /// Target agent, or `all` (every agent that has kioku entries).
+        #[arg(value_enum)]
         target: InstallTarget,
+        /// Remove the project's hooks and instructions instead of the user config's.
+        #[arg(long)]
+        project: bool,
+        /// Print what would change; write nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Project identity helpers.
     Project {
@@ -90,14 +118,31 @@ pub enum Command {
 }
 
 /// Agents `install` / `uninstall` know about.
-#[derive(Debug, Subcommand)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum InstallTarget {
-    /// Claude Code: hooks in settings.json + `mcpServers.kioku` in ~/.claude.json.
-    ClaudeCode {
-        /// Use ./.claude/settings.json instead of ~/.claude/settings.json.
-        #[arg(long)]
-        project: bool,
-    },
+    /// Claude Code: settings.json hooks + `mcpServers.kioku` in ~/.claude.json.
+    ClaudeCode,
+    /// Codex CLI: hooks.json + managed block in config.toml + AGENTS.md.
+    Codex,
+    /// Cursor: hooks.json + ~/.cursor/mcp.json (+ `.cursor/rules/kioku.mdc` with --project).
+    Cursor,
+    /// Gemini CLI: settings.json hooks + mcpServers + GEMINI.md.
+    GeminiCli,
+    /// Every detected agent.
+    All,
+}
+
+impl InstallTarget {
+    /// The single agent, or `None` for `all`.
+    pub fn agent(self) -> Option<Agent> {
+        match self {
+            InstallTarget::ClaudeCode => Some(Agent::ClaudeCode),
+            InstallTarget::Codex => Some(Agent::Codex),
+            InstallTarget::Cursor => Some(Agent::Cursor),
+            InstallTarget::GeminiCli => Some(Agent::GeminiCli),
+            InstallTarget::All => None,
+        }
+    }
 }
 
 /// `kioku hook-dump …`.
@@ -197,10 +242,30 @@ mod tests {
         assert!(matches!(
             p(&["install", "claude-code", "--project"]).unwrap().command,
             Command::Install {
-                target: InstallTarget::ClaudeCode { project: true }
+                target: InstallTarget::ClaudeCode,
+                project: true,
+                ..
             }
         ));
+        assert!(matches!(
+            p(&["install", "all", "--agents", "codex,gemini-cli", "--dry-run", "--no-instructions"]).unwrap().command,
+            Command::Install { target: InstallTarget::All, agents, dry_run: true, no_instructions: true, .. }
+                if agents == [Agent::Codex, Agent::GeminiCli]
+        ));
+        assert!(p(&["install", "codex", "--enable-hooks-feature"]).is_ok());
+        assert!(p(&["install", "gemini-cli", "--trust-mcp", "--instructions"]).is_ok());
+        assert!(p(&["install", "cursor", "--instructions", "--no-instructions"]).is_err());
+        assert!(p(&["install", "all", "--agents", "gemini"]).is_err());
+        assert!(p(&["install", "copilot"]).is_err());
         assert!(p(&["uninstall", "claude-code"]).is_ok());
+        assert!(matches!(
+            p(&["uninstall", "all", "--project"]).unwrap().command,
+            Command::Uninstall {
+                target: InstallTarget::All,
+                project: true,
+                dry_run: false
+            }
+        ));
         assert!(p(&["serve", "--bind", "0.0.0.0", "--port", "9000"]).is_ok());
         assert!(p(&["project", "id", "/tmp"]).is_ok());
         assert!(p(&["reindex"]).is_ok());

@@ -1,6 +1,6 @@
 //! kioku-cli: the `kioku` binary as a library — clap commands, fail-open hook handlers
-//! for Claude Code, Codex, Cursor and Gemini CLI (M1 §8, M2 §3–§6), the Claude Code
-//! installer (§8.5) and HTTP-client commands (§11).
+//! for Claude Code, Codex, Cursor and Gemini CLI (M1 §8, M2 §3–§6), the per-agent
+//! installers (M1 §8.5, M2 §8) and HTTP-client commands (§11).
 //!
 //! Hooks and `search` / `status` / `reindex` talk to the server over HTTP using the
 //! `[client]` config; only `init` and `serve` touch the data directory.

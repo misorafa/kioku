@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,9 +16,12 @@ use serde_json::Value;
 use crate::cli::{Cli, Command, HookDumpCommand, InstallTarget, ProjectCommand, ScopeArg};
 use crate::client::{ApiClient, COMMAND_TIMEOUT};
 use crate::dump;
-use crate::event::{ALL_EVENTS, Agent, HookEnv, HookEventKind};
+use crate::event::{Agent, HookEnv, HookEventKind};
 use crate::hook::log_failure;
-use crate::install;
+use crate::install::agents::{
+    AgentReport, AllStatus, InstallCtx, InstallOptions, Instructions, install_agent, install_all,
+    post_install_notes, uninstall_agent, uninstall_all, unstable_binary_warning,
+};
 use crate::render::{HookResult, render};
 
 /// Runs a parsed command line; returns the process exit code.
@@ -41,11 +44,35 @@ pub fn run(cli: Cli) -> i32 {
             limit,
         } => search(&query.join(" "), project, scope, limit),
         Command::Install {
-            target: InstallTarget::ClaudeCode { project },
-        } => install_claude_code(project),
+            target,
+            project,
+            no_instructions,
+            instructions,
+            dry_run,
+            agents,
+            enable_hooks_feature,
+            trust_mcp,
+        } => {
+            let opts = InstallOptions {
+                project,
+                instructions: if no_instructions {
+                    Instructions::Skip
+                } else if instructions {
+                    Instructions::Force
+                } else {
+                    Instructions::Default
+                },
+                dry_run,
+                enable_hooks_feature,
+                trust_mcp,
+            };
+            install_cmd(target, &opts, &agents)
+        }
         Command::Uninstall {
-            target: InstallTarget::ClaudeCode { project },
-        } => uninstall_claude_code(project),
+            target,
+            project,
+            dry_run,
+        } => uninstall_cmd(target, project, dry_run),
         Command::Project {
             command: ProjectCommand::Id { path },
         } => project_id(path),
@@ -155,7 +182,7 @@ fn init() -> anyhow::Result<()> {
     println!();
     println!("Next steps:");
     println!("  1. kioku serve                    # start the server (keep it running)");
-    println!("  2. kioku install claude-code      # hooks + MCP for Claude Code on this machine");
+    println!("  2. kioku install all              # hooks + MCP for every agent on this machine");
     println!(
         "  3. other machines: kioku init --client-only http://<this-host>:{} <auth_token from {}>",
         cfg.server.port, report.config_file
@@ -187,7 +214,7 @@ fn init_client_only(url: &str, token: &str) -> anyhow::Result<()> {
     }
     println!();
     println!("Next step:");
-    println!("  kioku install claude-code      # hooks + MCP for Claude Code on this machine");
+    println!("  kioku install all              # hooks + MCP for every agent on this machine");
     Ok(())
 }
 
@@ -338,28 +365,79 @@ fn current_binary() -> anyhow::Result<String> {
     Ok(exe.display().to_string())
 }
 
-fn install_claude_code(project: bool) -> anyhow::Result<()> {
+fn print_report(r: &AgentReport, indent: &str) {
+    for line in &r.lines {
+        for l in line.lines() {
+            println!("{indent}{l}");
+        }
+    }
+}
+
+/// `kioku install <agent>|all …` (M2 §8).
+fn install_cmd(
+    target: InstallTarget,
+    opts: &InstallOptions,
+    agents: &[Agent],
+) -> anyhow::Result<()> {
     let cfg = Config::load()?;
     let bin = current_binary()?;
-    let path = install::settings_path(project)?;
-    let change = install::install_settings(&path, &bin)?;
-    report_settings(
-        "installed",
-        &change.path,
-        change.changed,
-        change.backup.as_deref(),
-    );
-    if change.changed {
-        let events: Vec<&str> = ALL_EVENTS.iter().map(|e| e.claude_code_name()).collect();
-        println!(
-            "  kioku hook entries: {} → {bin} hook <event>",
-            events.join(", ")
-        );
+    if let Some(w) = unstable_binary_warning(&bin) {
+        println!("{w}");
     }
-    println!(
-        "{}",
-        install::register_mcp(&install::claude_json_path(), &cfg.client)
-    );
+    let ctx = InstallCtx::from_process(cfg.client.clone(), bin)?;
+    if opts.dry_run {
+        println!("dry run: nothing is written");
+    }
+    let mut failed = 0;
+    match target.agent() {
+        Some(agent) => {
+            if !agents.is_empty() {
+                anyhow::bail!("--agents only applies to `kioku install all`");
+            }
+            let r = install_agent(agent, &ctx, opts)?;
+            println!("{}:", agent.as_str());
+            print_report(&r, "  ");
+            for note in post_install_notes(agent, opts, &r) {
+                println!("{note}");
+            }
+        }
+        None => {
+            for (agent, status) in install_all(&ctx, opts, agents) {
+                let name = agent.as_str();
+                match status {
+                    AllStatus::Changed(r) | AllStatus::Unchanged(r) => {
+                        let what = if r.changed {
+                            if opts.dry_run {
+                                "would change"
+                            } else {
+                                "installed"
+                            }
+                        } else {
+                            "unchanged"
+                        };
+                        println!("{name:<12} {what}");
+                        print_report(&r, "  ");
+                        for note in post_install_notes(agent, opts, &r) {
+                            println!("  {note}");
+                        }
+                    }
+                    AllStatus::NotDetected(dir) => {
+                        println!(
+                            "{name:<12} skipped: not detected ({} missing)",
+                            dir.display()
+                        );
+                    }
+                    AllStatus::Error(e) => {
+                        failed += 1;
+                        println!("{name:<12} error:");
+                        for l in e.lines() {
+                            println!("  {l}");
+                        }
+                    }
+                }
+            }
+        }
+    }
     if cfg
         .client
         .auth_token
@@ -371,33 +449,50 @@ fn install_claude_code(project: bool) -> anyhow::Result<()> {
             cfg.config_file.display()
         );
     }
+    if !opts.dry_run {
+        println!("Restart running agents so they pick up the new hooks and MCP server.");
+    }
+    if failed > 0 {
+        anyhow::bail!("{failed} agent(s) failed");
+    }
     Ok(())
 }
 
-fn uninstall_claude_code(project: bool) -> anyhow::Result<()> {
-    let path = install::settings_path(project)?;
-    let change = install::uninstall_settings(&path)?;
-    report_settings(
-        "removed",
-        &change.path,
-        change.changed,
-        change.backup.as_deref(),
-    );
-    if change.changed {
-        println!("  {} kioku hook entries removed", change.removed);
-    }
-    println!("{}", install::unregister_mcp(&install::claude_json_path()));
-    Ok(())
-}
-
-fn report_settings(verb: &str, path: &Path, changed: bool, backup: Option<&Path>) {
-    if changed {
-        println!("hooks {verb}: {}", path.display());
-    } else {
-        println!("hooks unchanged: {} (nothing to do)", path.display());
-    }
-    if let Some(b) = backup {
-        println!("  backup of the original: {}", b.display());
+/// `kioku uninstall <agent>|all [--project]`.
+fn uninstall_cmd(target: InstallTarget, project: bool, dry_run: bool) -> anyhow::Result<()> {
+    let cfg = Config::load()?;
+    let bin = current_binary()?;
+    let ctx = InstallCtx::from_process(cfg.client.clone(), bin)?;
+    match target.agent() {
+        Some(agent) => {
+            let r = uninstall_agent(agent, &ctx, project, dry_run)?;
+            println!("{}:", agent.as_str());
+            print_report(&r, "  ");
+            Ok(())
+        }
+        None => {
+            let mut failed = 0;
+            for (agent, status) in uninstall_all(&ctx, project, dry_run) {
+                let name = agent.as_str();
+                match status {
+                    AllStatus::Changed(r) => {
+                        println!("{name:<12} removed");
+                        print_report(&r, "  ");
+                    }
+                    AllStatus::Unchanged(_) | AllStatus::NotDetected(_) => {
+                        println!("{name:<12} nothing to remove");
+                    }
+                    AllStatus::Error(e) => {
+                        failed += 1;
+                        println!("{name:<12} error: {e}");
+                    }
+                }
+            }
+            if failed > 0 {
+                anyhow::bail!("{failed} agent(s) failed");
+            }
+            Ok(())
+        }
     }
 }
 

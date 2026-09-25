@@ -300,6 +300,10 @@ must write the same values.
   **UNVERIFIED** (record `codex --version` in doctor). kioku does not write
   `[features]` by default; `kioku install codex --enable-hooks-feature` appends
   `hooks = true` into `[features]` via the managed block (§4.6) for old builds.
+  (Step 3: TOML forbids defining `[features]` twice, so when the file already has
+  its own `[features]` table the block omits it and install prints "add
+  `hooks = true` under it yourself". Once written, the feature line is kept on
+  later installs without the flag — it lives inside our block.)
   If `features.hooks` or `features.codex_hooks` is `false`, install warns and
   doctor fails the check.
 - **Trust review (verified)**: non-managed hooks must be reviewed and trusted
@@ -432,6 +436,9 @@ kioku edits `config.toml` only through the delimited managed block above:
 
 Uninstall removes the block (and the one blank line before it). Bytes outside
 the block are never changed. (`toml_edit` would be the alternative; not added.)
+A begin marker without an end marker → file untouched, snippet printed. A file
+that did not end with `\n` gets one before the appended block, so uninstall
+restores it with a trailing newline (the only byte that can differ).
 
 ### 4.7 Instructions (verified, C4)
 
@@ -770,7 +777,14 @@ Size < 1 KiB.
   absolute, machine-specific binary path and should not be committed.
 - Uninstall removes exactly our hook entries (empty event lists/objects left by
   that are removed), our MCP entry (Codex: the managed block) and our
-  instruction block / `.mdc`. Foreign content stays.
+  instruction block / `.mdc`. Foreign content stays. Like install, `uninstall
+  --project` also removes the user-level MCP entry (M1 Claude behaviour).
+  Uninstall never writes a backup: install backed up every pre-existing file
+  before its first change, so a file without `<file>.kioku-bak` is one kioku
+  created — such a file is deleted when nothing but `{}` / an empty
+  `mcpServers` / blank text is left (Step 3).
+- Claude Code's `settings.json` follows the same mode rule (new file 0644; M1
+  created it 0600 — it holds no token).
 
 ### 8.2 Per-agent file table
 
@@ -1130,7 +1144,7 @@ kioku service install|uninstall|start|stop|status|logs [-f] [-n N]
 kioku doctor [--json] [--agent <name>]
 kioku install   claude-code|codex|cursor|gemini-cli|all [--project] [--no-instructions|--instructions]
                 [--dry-run] [--agents a,b (all only)] [--enable-hooks-feature (codex)] [--trust-mcp (gemini-cli)]
-kioku uninstall claude-code|codex|cursor|gemini-cli|all [--project]
+kioku uninstall claude-code|codex|cursor|gemini-cli|all [--project] [--dry-run]
 kioku hook <event> [--agent claude-code|codex|cursor|gemini-cli]
 kioku hook-dump extract <agent> <event> [--out <dir>]
 kioku serve [--bind] [--port] [--log-file <path>]

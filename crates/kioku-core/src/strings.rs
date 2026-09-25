@@ -89,6 +89,11 @@ pub struct Strings {
     /// `{project}`, `{session}`: Stop nudge for the other agents (M2 §3.6) — no
     /// `stop_hook_active` reference.
     pub stop_nudge_generic: &'static str,
+    /// `{project_line}`: body of the instruction snippet written into AGENTS.md / GEMINI.md /
+    /// CLAUDE.md / `.cursor/rules/kioku.mdc` (M2 §7), without the block markers.
+    pub instructions_body: &'static str,
+    /// `{project_line}` of a global (user-level) snippet, which has no single project id.
+    pub instructions_global_project: &'static str,
 }
 
 /// Japanese strings.
@@ -128,6 +133,8 @@ pub const JA: Strings = Strings {
     start_footer: "セッション終了前に kioku_handoff_write（上の project と session を渡す）で要約・次の一手・未解決点を書くこと。\n関連する過去の記録は kioku_query で検索できる。",
     stop_nudge: "kioku: このセッションの引き継ぎがまだ書かれていないか、最後の引き継ぎ以降に作業が進んでいます。kioku_handoff_write（project={project}, session={session}）で 要約 / 次にやること / 未解決の質問 / 決定事項 を記録してから終了してください。記録済みなら stop_hook_active により再度この確認は出ません。",
     stop_nudge_generic: "kioku: このセッションの引き継ぎがまだ書かれていないか、最後の引き継ぎ以降に作業が進んでいます。kioku_handoff_write（project={project}, session={session}）で 要約 / 次にやること / 未解決の質問 / 決定事項 を記録してから終了してください。記録済みなら、そのまま終了してください。",
+    instructions_body: "## kioku（共有メモリ）\n- kioku の MCP ツール（kioku_*）はこのマシンと他のエージェントで共有される記憶。\n- セッション開始時に `<kioku>` ブロックがあれば、その project / session を使う。無ければ作業前に\n  `kioku_read` で `<project>/STATE.md` を読む（project id: {project_line}）。\n- 調べる前に `kioku_query` で過去の記録を検索する。\n- タスクを終える前に必ず `kioku_handoff_write`（project, session, summary, next_steps,\n  open_questions, decisions）で引き継ぎを書く。session が分からなければ省略してよい。\n",
+    instructions_global_project: "`kioku project id` の出力",
 };
 
 /// English strings.
@@ -167,6 +174,8 @@ pub const EN: Strings = Strings {
     start_footer: "Before ending the session, record a summary, next steps and open questions with kioku_handoff_write (pass the project and session above).\nSearch past records with kioku_query.",
     stop_nudge: "kioku: no handoff has been written for this session yet, or work continued after the last one. Record summary / next steps / open questions / decisions with kioku_handoff_write (project={project}, session={session}) before stopping. If you already did, stop_hook_active prevents this check from repeating.",
     stop_nudge_generic: "kioku: no handoff has been written for this session yet, or work continued after the last one. Record summary / next steps / open questions / decisions with kioku_handoff_write (project={project}, session={session}) before stopping. If you already did, just stop.",
+    instructions_body: "## kioku (shared memory)\n- The kioku MCP tools (kioku_*) are memory shared by this machine and other agents.\n- If a `<kioku>` block was given at session start, use its project / session. Otherwise, before\n  working, read `<project>/STATE.md` with `kioku_read` (project id: {project_line}).\n- Search past records with `kioku_query` before investigating.\n- Before finishing a task, always write a handoff with `kioku_handoff_write` (project, session,\n  summary, next_steps, open_questions, decisions). Omit session if you do not know it.\n",
+    instructions_global_project: "the output of `kioku project id`",
 };
 
 /// Returns the string table for a language.
