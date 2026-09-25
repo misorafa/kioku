@@ -20,6 +20,8 @@ pub enum Lang {
 pub struct Strings {
     /// Heading of the rule-generated handoff section.
     pub auto_handoff_heading: &'static str,
+    /// Heading of the rule-generated addendum appended to a stale agent handoff.
+    pub auto_handoff_delta_heading: &'static str,
     /// `{prompt}`: last user prompt line.
     pub auto_last_prompt: &'static str,
     /// `{files}`: touched files line.
@@ -74,19 +76,22 @@ pub struct Strings {
     pub state_hot_files: &'static str,
     /// `{name}`, `{id}`: SessionStart context: first line naming the project id.
     pub start_project_line: &'static str,
+    /// `{id}`: SessionStart context: line naming the session id.
+    pub start_session_line: &'static str,
     /// SessionStart context: heading of the pending handoff.
     pub start_handoff_heading: &'static str,
     /// SessionStart context: heading of the STATE.md excerpt.
     pub start_state_heading: &'static str,
     /// SessionStart context: closing instructions.
     pub start_footer: &'static str,
-    /// `{project}`: Stop hook nudge paragraph.
+    /// `{project}`, `{session}`: Stop hook nudge paragraph.
     pub stop_nudge: &'static str,
 }
 
 /// Japanese strings.
 pub const JA: Strings = Strings {
     auto_handoff_heading: "## 引き継ぎ（自動生成）",
+    auto_handoff_delta_heading: "## 引き継ぎ（自動生成・追記）",
     auto_last_prompt: "最後の指示: {prompt}",
     auto_files: "触ったファイル: {files}",
     auto_commands: "実行したコマンド: {commands}",
@@ -114,15 +119,17 @@ pub const JA: Strings = Strings {
     state_recent_sessions: "## 最近のセッション",
     state_hot_files: "## よく触るファイル（直近10セッション）",
     start_project_line: "project: {name} (id: {id})  ← kioku_* ツールの project 引数にはこの id を渡すこと",
+    start_session_line: "session: {id}  ← kioku_handoff_write の session 引数にはこの id を渡すこと",
     start_handoff_heading: "## 前回からの引き継ぎ",
     start_state_heading: "## 現在の状態（STATE.md 抜粋）",
-    start_footer: "セッション終了前に kioku_handoff_write で要約・次の一手・未解決点を書くこと。\n関連する過去の記録は kioku_query で検索できる。",
-    stop_nudge: "kioku: このセッションの引き継ぎがまだ書かれていません。kioku_handoff_write（project={project}）で 要約 / 次にやること / 未解決の質問 / 決定事項 を記録してから終了してください。記録済みなら stop_hook_active により再度この確認は出ません。",
+    start_footer: "セッション終了前に kioku_handoff_write（上の project と session を渡す）で要約・次の一手・未解決点を書くこと。\n関連する過去の記録は kioku_query で検索できる。",
+    stop_nudge: "kioku: このセッションの引き継ぎがまだ書かれていないか、最後の引き継ぎ以降に作業が進んでいます。kioku_handoff_write（project={project}, session={session}）で 要約 / 次にやること / 未解決の質問 / 決定事項 を記録してから終了してください。記録済みなら stop_hook_active により再度この確認は出ません。",
 };
 
 /// English strings.
 pub const EN: Strings = Strings {
     auto_handoff_heading: "## Handoff (auto-generated)",
+    auto_handoff_delta_heading: "## Handoff (auto-generated addendum)",
     auto_last_prompt: "Last instruction: {prompt}",
     auto_files: "Files touched: {files}",
     auto_commands: "Commands run: {commands}",
@@ -150,10 +157,11 @@ pub const EN: Strings = Strings {
     state_recent_sessions: "## Recent sessions",
     state_hot_files: "## Frequently touched files (last 10 sessions)",
     start_project_line: "project: {name} (id: {id})  ← pass this id as `project` to kioku_* tools",
+    start_session_line: "session: {id}  ← pass this id as `session` to kioku_handoff_write",
     start_handoff_heading: "## Handoff from the previous session",
     start_state_heading: "## Current state (STATE.md excerpt)",
-    start_footer: "Before ending the session, record a summary, next steps and open questions with kioku_handoff_write.\nSearch past records with kioku_query.",
-    stop_nudge: "kioku: no handoff has been written for this session yet. Record summary / next steps / open questions / decisions with kioku_handoff_write (project={project}) before stopping. If you already did, stop_hook_active prevents this check from repeating.",
+    start_footer: "Before ending the session, record a summary, next steps and open questions with kioku_handoff_write (pass the project and session above).\nSearch past records with kioku_query.",
+    stop_nudge: "kioku: no handoff has been written for this session yet, or work continued after the last one. Record summary / next steps / open questions / decisions with kioku_handoff_write (project={project}, session={session}) before stopping. If you already did, stop_hook_active prevents this check from repeating.",
 };
 
 /// Returns the string table for a language.

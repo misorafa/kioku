@@ -139,7 +139,8 @@ async fn session_lifecycle_round_trip() {
             "project_id": PROJECT,
             "status": "open",
             "counts": {"prompts": 1, "tool_uses": 2},
-            "has_agent_handoff": false
+            "has_agent_handoff": false,
+            "tool_uses_since_handoff": 2
         })
     );
     let (status, _) = srv.get("/api/v1/sessions/unknown-session").await;
@@ -269,6 +270,7 @@ async fn agent_handoff_write_and_accept() {
     let id = body["id"].as_str().unwrap().to_string();
     let (_, info) = srv.get("/api/v1/sessions/s-agent").await;
     assert_eq!(info["has_agent_handoff"], true);
+    assert_eq!(info["tool_uses_since_handoff"], 0);
 
     let (status, body) = srv
         .get(&format!(

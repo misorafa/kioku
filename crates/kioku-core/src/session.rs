@@ -123,6 +123,9 @@ pub struct Session {
     pub ended_at: Option<String>,
     /// Lifecycle status.
     pub status: SessionStatus,
+    /// Project root on the machine that ran this session (digest paths are relative to it).
+    #[serde(default)]
+    pub root_path: Option<String>,
 }
 
 /// Input of `Store::start_session` (`POST /api/v1/sessions/start`).
@@ -191,7 +194,27 @@ pub struct SessionInfo {
     pub counts: SessionCounts,
     /// Whether the agent wrote a handoff in this session.
     pub has_agent_handoff: bool,
+    /// Tool uses after the session's latest agent handoff (all of them when there is none).
+    /// `None` only when talking to a server that predates this field.
+    #[serde(default)]
+    pub tool_uses_since_handoff: Option<u32>,
 }
+
+impl SessionInfo {
+    /// [`SessionInfo::tool_uses_since_handoff`], derived from the other fields for old servers.
+    pub fn tool_uses_since_handoff(&self) -> u32 {
+        self.tool_uses_since_handoff
+            .unwrap_or(if self.has_agent_handoff {
+                0
+            } else {
+                self.counts.tool_uses
+            })
+    }
+}
+
+/// Tool uses since the last agent handoff at which the Stop hook nudges for a (new) handoff
+/// and finalize appends an auto-generated addendum to an existing agent handoff (spec §7.1).
+pub const HANDOFF_STALE_TOOL_USES: u32 = 3;
 
 /// Output of `Store::finalize_session`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

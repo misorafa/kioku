@@ -158,6 +158,11 @@ fn full_session_lifecycle_with_nudge_and_handoff() {
         out.stdout
     );
     assert!(out.stdout.contains(&format!("server: {}", server.base)));
+    assert!(
+        out.stdout.contains("\nsession: e2e-session-1  ←"),
+        "{}",
+        out.stdout
+    );
     assert!(!out.stdout.contains("## 前回からの引き継ぎ"));
     assert!(out.stdout.ends_with("</kioku>\n"));
 
@@ -177,7 +182,7 @@ fn full_session_lifecycle_with_nudge_and_handoff() {
     assert!(out.stdout.is_empty());
     assert!(
         out.stderr
-            .contains("kioku_handoff_write（project=e2e-proj）"),
+            .contains("kioku_handoff_write（project=e2e-proj, session=e2e-session-1）"),
         "{}",
         out.stderr
     );
@@ -203,12 +208,33 @@ fn full_session_lifecycle_with_nudge_and_handoff() {
     assert!(resp.status().is_success());
 
     // 5. Stop again (even with stop_hook_active=false) → finalize, silent exit 0.
-    let out = hook(&cfg, HookEventKind::Stop, stop_payload);
+    let out = hook(&cfg, HookEventKind::Stop, stop_payload.clone());
     assert_eq!(out, HookOutcome::ok());
     let info = api_get(&server.base, &format!("sessions/{sid}"));
     assert_eq!(info["status"], "finalized");
     assert_eq!(info["has_agent_handoff"], true);
+    assert_eq!(info["tool_uses_since_handoff"], 0);
 
+    // 5b. Another turn of work after the handoff: the nudge comes back (the handoff is
+    // stale); ignoring it, the finalize appends a rules addendum for the delta.
+    run_turn(&cfg, sid, cwd);
+    let info = api_get(&server.base, &format!("sessions/{sid}"));
+    assert_eq!(info["tool_uses_since_handoff"], 3);
+    let out = hook(&cfg, HookEventKind::Stop, stop_payload.clone());
+    assert_eq!(out.exit_code, 2, "stale handoff → nudge");
+    let active = with(
+        base_payload(sid, cwd, HookEventKind::Stop),
+        json!({"stop_hook_active": true}),
+    );
+    assert_eq!(hook(&cfg, HookEventKind::Stop, active), HookOutcome::ok());
+    let pending = api_get(&server.base, &format!("handoffs/pending?project={PROJECT}"));
+    let md = pending["handoff"]["content_md"].as_str().unwrap();
+    assert_eq!(pending["handoff"]["source"], "rules");
+    assert!(
+        md.contains("日本語検索と引き継ぎの自動化を実装した"),
+        "{md}"
+    );
+    assert!(md.contains("## 引き継ぎ（自動生成・追記）"), "{md}");
     // PreCompact and SessionEnd succeed silently too.
     let out = hook(
         &cfg,

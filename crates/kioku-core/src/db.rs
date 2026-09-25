@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS sessions(
     source TEXT,
     started_at TEXT NOT NULL,
     ended_at TEXT,
-    status TEXT NOT NULL DEFAULT 'open'
+    status TEXT NOT NULL DEFAULT 'open',
+    root_path TEXT
 );
 CREATE INDEX IF NOT EXISTS sessions_project ON sessions(project_id, started_at);
 CREATE TABLE IF NOT EXISTS observations(
@@ -47,7 +48,9 @@ CREATE TABLE IF NOT EXISTS handoffs(
     content_md TEXT NOT NULL,
     created_at TEXT NOT NULL,
     accepted_at TEXT,
-    accepted_by TEXT
+    accepted_by TEXT,
+    updated_at TEXT,
+    seq_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS handoffs_project ON handoffs(project_id, created_at);
 CREATE INDEX IF NOT EXISTS handoffs_session ON handoffs(session_id);
@@ -111,7 +114,29 @@ pub fn open(path: &Path) -> anyhow::Result<Connection> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.execute_batch(SCHEMA).context("applying schema")?;
+    migrate(&conn).context("migrating schema")?;
     Ok(conn)
+}
+
+/// Columns added after the first M1 schema; `CREATE TABLE IF NOT EXISTS` does not add them
+/// to an existing database, so they are added here.
+const ADDED_COLUMNS: [(&str, &str, &str); 3] = [
+    ("sessions", "root_path", "TEXT"),
+    ("handoffs", "updated_at", "TEXT"),
+    ("handoffs", "seq_at", "INTEGER"),
+];
+
+fn migrate(conn: &Connection) -> anyhow::Result<()> {
+    for (table, column, decl) in ADDED_COLUMNS {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let names = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if !names.iter().any(|n| n == column) {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+        }
+    }
+    Ok(())
 }
 
 /// Inserts or updates a project (name/root/remote follow the latest identity).
@@ -158,7 +183,8 @@ pub fn list_projects(conn: &Connection) -> anyhow::Result<Vec<ProjectRow>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-const SESSION_COLS: &str = "id, project_id, agent, cwd, source, started_at, ended_at, status";
+const SESSION_COLS: &str =
+    "id, project_id, agent, cwd, source, started_at, ended_at, status, root_path";
 
 fn session_from_row(r: &Row<'_>) -> rusqlite::Result<Session> {
     let status: String = r.get(7)?;
@@ -175,16 +201,26 @@ fn session_from_row(r: &Row<'_>) -> rusqlite::Result<Session> {
         } else {
             SessionStatus::Open
         },
+        root_path: r.get(8)?,
     })
 }
 
 /// Creates a session, or reopens an existing one (resume) keeping its project and start time.
 pub fn upsert_session(conn: &Connection, s: &Session) -> anyhow::Result<()> {
     conn.execute(
-        "INSERT INTO sessions(id, project_id, agent, cwd, source, started_at, ended_at, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 'open')
-         ON CONFLICT(id) DO UPDATE SET status = 'open', ended_at = NULL, source = excluded.source",
-        params![s.id, s.project_id, s.agent, s.cwd, s.source, s.started_at],
+        "INSERT INTO sessions(id, project_id, agent, cwd, source, started_at, ended_at, status, root_path)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 'open', ?7)
+         ON CONFLICT(id) DO UPDATE SET status = 'open', ended_at = NULL, source = excluded.source,
+           root_path = COALESCE(excluded.root_path, sessions.root_path)",
+        params![
+            s.id,
+            s.project_id,
+            s.agent,
+            s.cwd,
+            s.source,
+            s.started_at,
+            s.root_path
+        ],
     )?;
     Ok(())
 }
@@ -200,18 +236,46 @@ pub fn get_session(conn: &Connection, id: &str) -> anyhow::Result<Option<Session
         .optional()?)
 }
 
-/// The most recently started open session of a project.
+/// The open session of a project that received the newest observation (the one the agent
+/// is working in); sessions without observations rank last, newest start first.
 pub fn newest_open_session(conn: &Connection, project: &str) -> anyhow::Result<Option<Session>> {
     Ok(conn
         .query_row(
             &format!(
-                "SELECT {SESSION_COLS} FROM sessions WHERE project_id = ?1 AND status = 'open'
-                 ORDER BY started_at DESC, rowid DESC LIMIT 1"
+                "SELECT {SESSION_COLS} FROM sessions s WHERE project_id = ?1 AND status = 'open'
+                 ORDER BY (SELECT MAX(o.id) FROM observations o WHERE o.session_id = s.id)
+                          DESC NULLS LAST,
+                          started_at DESC, rowid DESC LIMIT 1"
             ),
             params![project],
             session_from_row,
         )
         .optional()?)
+}
+
+/// Marks a session finalized only if its newest observation seq is still `max_seq`
+/// (an observation that arrived while finalize ran keeps it open); returns whether it did.
+pub fn finalize_if_unchanged(
+    conn: &Connection,
+    id: &str,
+    max_seq: i64,
+    ended_at: &str,
+) -> anyhow::Result<bool> {
+    let n = conn.execute(
+        "UPDATE sessions SET status = 'finalized', ended_at = ?2 WHERE id = ?1
+           AND (SELECT COALESCE(MAX(seq), 0) FROM observations WHERE session_id = ?1) = ?3",
+        params![id, ended_at, max_seq],
+    )?;
+    Ok(n > 0)
+}
+
+/// Highest observation seq of a session (0 when it has none).
+pub fn max_seq(conn: &Connection, session_id: &str) -> anyhow::Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COALESCE(MAX(seq), 0) FROM observations WHERE session_id = ?1",
+        params![session_id],
+        |r| r.get(0),
+    )?)
 }
 
 /// Sets status (and `ended_at`) of a session.
@@ -280,11 +344,72 @@ pub fn insert_observation(
 
 /// All observations of a session in seq order.
 pub fn list_observations(conn: &Connection, session_id: &str) -> anyhow::Result<Vec<Observation>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, session_id, project_id, seq, kind, ts, payload, text FROM observations
-         WHERE session_id = ?1 ORDER BY seq",
+    list_observations_after(conn, session_id, None)
+}
+
+/// Where the session's latest agent handoff was written: the observation seq at that
+/// moment (`seq_at`, NULL on rows from before it was recorded) and its `created_at`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HandoffMark {
+    /// Highest observation seq of the session when the handoff was written.
+    pub seq_at: Option<i64>,
+    /// RFC 3339 creation time (fallback when `seq_at` is unknown).
+    pub created_at: String,
+}
+
+/// SQL condition "observation comes after the mark"; binds `?2` = seq_at, `?3` = created_at
+/// (both NULL = no mark = every observation).
+const AFTER_MARK: &str = "((?2 IS NULL AND ?3 IS NULL) OR (?2 IS NOT NULL AND seq > ?2)
+    OR (?2 IS NULL AND ?3 IS NOT NULL AND ts > ?3))";
+
+/// The mark of the newest agent handoff of a session, if any.
+pub fn agent_handoff_mark(conn: &Connection, session: &str) -> anyhow::Result<Option<HandoffMark>> {
+    Ok(conn
+        .query_row(
+            "SELECT seq_at, created_at FROM handoffs WHERE session_id = ?1 AND source = 'agent'
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            params![session],
+            |r| {
+                Ok(HandoffMark {
+                    seq_at: r.get(0)?,
+                    created_at: r.get(1)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+/// Tool uses of a session after its latest agent handoff (all of them when there is none).
+pub fn tool_uses_since_handoff(conn: &Connection, session: &str) -> anyhow::Result<u32> {
+    let mark = agent_handoff_mark(conn, session)?;
+    let n: i64 = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM observations WHERE session_id = ?1 AND kind = 'tool_use'
+               AND {AFTER_MARK}"
+        ),
+        params![
+            session,
+            mark.as_ref().and_then(|m| m.seq_at),
+            mark.as_ref().map(|m| m.created_at.clone())
+        ],
+        |r| r.get(0),
     )?;
-    let rows = stmt.query_map(params![session_id], |r| {
+    Ok(n as u32)
+}
+
+/// Observations of a session after `mark` (all when `None`), in seq order.
+pub fn list_observations_after(
+    conn: &Connection,
+    session_id: &str,
+    mark: Option<&HandoffMark>,
+) -> anyhow::Result<Vec<Observation>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, session_id, project_id, seq, kind, ts, payload, text FROM observations
+         WHERE session_id = ?1 AND {AFTER_MARK} ORDER BY seq"
+    ))?;
+    let seq_at = mark.and_then(|m| m.seq_at);
+    let created = mark.map(|m| m.created_at.clone());
+    let rows = stmt.query_map(params![session_id, seq_at, created], |r| {
         let kind: String = r.get(4)?;
         let payload: String = r.get(6)?;
         Ok(Observation {
@@ -317,8 +442,12 @@ pub fn session_counts(conn: &Connection, session_id: &str) -> anyhow::Result<Ses
 }
 
 const HANDOFF_SELECT: &str = "SELECT h.id, h.project_id, h.session_id, h.source, h.content_md,
-    h.created_at, h.accepted_at, h.accepted_by, s.agent
+    h.created_at, h.accepted_at, h.accepted_by, s.agent, h.updated_at
     FROM handoffs h LEFT JOIN sessions s ON s.id = h.session_id";
+
+/// Newest first; on equal `created_at` an agent-written handoff wins over a rules one.
+const HANDOFF_ORDER: &str =
+    "ORDER BY h.created_at DESC, (h.source = 'agent') DESC, h.rowid DESC LIMIT 1";
 
 fn handoff_from_row(r: &Row<'_>) -> rusqlite::Result<Handoff> {
     let source: String = r.get(3)?;
@@ -332,14 +461,15 @@ fn handoff_from_row(r: &Row<'_>) -> rusqlite::Result<Handoff> {
         accepted_at: r.get(6)?,
         accepted_by: r.get(7)?,
         agent: r.get(8)?,
+        updated_at: r.get(9)?,
     })
 }
 
-/// Inserts a handoff.
-pub fn insert_handoff(conn: &Connection, h: &Handoff) -> anyhow::Result<()> {
+/// Inserts a handoff; `seq_at` = the session's highest observation seq at that moment.
+pub fn insert_handoff(conn: &Connection, h: &Handoff, seq_at: Option<i64>) -> anyhow::Result<()> {
     conn.execute(
-        "INSERT INTO handoffs(id, project_id, session_id, source, content_md, created_at, accepted_at, accepted_by)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO handoffs(id, project_id, session_id, source, content_md, created_at, accepted_at, accepted_by, updated_at, seq_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             h.id,
             h.project_id,
@@ -348,13 +478,16 @@ pub fn insert_handoff(conn: &Connection, h: &Handoff) -> anyhow::Result<()> {
             h.content_md,
             h.created_at,
             h.accepted_at,
-            h.accepted_by
+            h.accepted_by,
+            h.updated_at,
+            seq_at
         ],
     )?;
     Ok(())
 }
 
-/// Replaces content (and bumps `created_at`) of an existing handoff.
+/// Replaces content of an existing handoff and sets `updated_at`; `created_at` is kept so a
+/// refresh never outranks a newer handoff.
 pub fn update_handoff_content(
     conn: &Connection,
     id: &str,
@@ -362,7 +495,7 @@ pub fn update_handoff_content(
     now: &str,
 ) -> anyhow::Result<()> {
     conn.execute(
-        "UPDATE handoffs SET content_md = ?2, created_at = ?3 WHERE id = ?1",
+        "UPDATE handoffs SET content_md = ?2, updated_at = ?3 WHERE id = ?1",
         params![id, content, now],
     )?;
     Ok(())
@@ -392,10 +525,7 @@ pub fn newest_handoff(
     };
     Ok(conn
         .query_row(
-            &format!(
-                "{HANDOFF_SELECT} WHERE h.project_id = ?1 {cond}
-                 ORDER BY h.created_at DESC, h.rowid DESC LIMIT 1"
-            ),
+            &format!("{HANDOFF_SELECT} WHERE h.project_id = ?1 {cond} {HANDOFF_ORDER}"),
             params![project],
             handoff_from_row,
         )
@@ -418,7 +548,7 @@ pub fn newest_session_handoff(
         .query_row(
             &format!(
                 "{HANDOFF_SELECT} WHERE h.session_id = ?1 AND (?2 IS NULL OR h.source = ?2) {accepted}
-                 ORDER BY h.created_at DESC, h.rowid DESC LIMIT 1"
+                 {HANDOFF_ORDER}"
             ),
             params![session, source.map(HandoffSource::as_str)],
             handoff_from_row,

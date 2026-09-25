@@ -214,6 +214,7 @@ mod tests {
             started_at: "2026-09-25T02:14:00.000Z".into(),
             ended_at: Some("2026-09-25T03:40:11.000Z".into()),
             status: SessionStatus::Open,
+            root_path: None,
         }
     }
 
@@ -267,6 +268,7 @@ mod tests {
             accepted_at: None,
             accepted_by: None,
             agent: Some("claude-code".into()),
+            updated_at: None,
         };
         let recent = vec![StateSession {
             date: "2026-09-25".into(),

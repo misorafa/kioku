@@ -44,25 +44,27 @@ kioku は自分で管理するサーバーに記憶を一つだけ持ち、フ�
 ```
 SessionStart      kioku hook session-start --> POST /api/v1/sessions/start
                   stdout（エージェントのコンテキストに追加される）:
-                    <kioku> project id、未受領の引き継ぎ、STATE.md 抜粋 </kioku>
+                    <kioku> project id、session id、未受領の引き継ぎ、STATE.md 抜粋 </kioku>
 UserPromptSubmit  \
 PostToolUse        > サニタイズ済みの観測 --> POST /api/v1/observations
 PreCompact        /
-Stop              引き継ぎ未記録 かつ ツール実行 3 回以上？
+Stop              最後の引き継ぎ以降（無ければ開始以降）のツール実行 3 回以上？
                     はい   -> exit 2 + 催促:「kioku_handoff_write で引き継ぎを書くこと」
                     いいえ -> finalize: セッションページ + STATE.md（+ ルール生成の引き継ぎ）
 SessionEnd        finalize（冪等）
 ```
 
-- **SessionStart での注入**: フックが `<kioku>` ブロックを出力します。中身はプロジェクト id、
-  未受領の引き継ぎ（あれば）、プロジェクトの `STATE.md` の抜粋です。
-- **Stop 時の催促**: エージェントがツールを 3 回以上使い、まだ `kioku_handoff_write` を呼んでいなければ、
-  Stop フックは終了コード 2 で終わり、要約・次にやること・未解決の質問・決定事項を記録するよう求めます。
-  `stop_hook_active` によりループはしません。`[client] stop_nudge = false` または
-  `KIOKU_STOP_NUDGE=0` で無効にできます。
+- **SessionStart での注入**: フックが `<kioku>` ブロックを出力します。中身はプロジェクト id と
+  セッション id（どちらも `kioku_handoff_write` に渡す）、未受領の引き継ぎ（あれば）、
+  プロジェクトの `STATE.md` の抜粋です。
+- **Stop 時の催促**: このセッションで最後に `kioku_handoff_write` を呼んでから（一度も呼んでいなければ
+  セッション開始から）ツールを 3 回以上使っていれば、Stop フックは終了コード 2 で終わり、要約・次にやること・
+  未解決の質問・決定事項を記録するよう求めます。`stop_hook_active` によりループはしません。
+  `[client] stop_nudge = false` または `KIOKU_STOP_NUDGE=0` で無効にできます。
 - **finalize** はセッションページを書き、`STATE.md` を書き直し、エージェントが引き継ぎを書かなかった
   場合はルールで生成します（最後の指示、触ったファイル、コマンド、コミット、エラー件数）。
-  ページの書き込みはすべて git コミットになります。
+  エージェントの引き継ぎの後にツールを 3 回以上使っていた場合は、その後の作業分をルールで生成した追記
+  （「引き継ぎ（自動生成・追記）」）を付けて両方を引き継ぎます。ページの書き込みはすべて git コミットになります。
 - **引き継ぎは一度きり**: 同じプロジェクトの次の SessionStart が最新の未受領の引き継ぎを受け取ります
   （それより古い未受領のものは置き換え済みとして受領扱いになります）。`kioku_handoff_pending` を
   `accept=false` で呼ぶと、消費せずに覗くだけです。
@@ -92,7 +94,8 @@ kioku install claude-code     # 別のターミナルで: フック + MCP の登
 
 1. git リポジトリで Claude Code を開き、タスクを与えます。そのディレクトリに kioku が使う
    プロジェクト id は `kioku project id` で確認できます。
-2. ツールを何回か使ったターンが終わると、Stop の催促が `kioku_handoff_write` を呼ぶよう求めます。
+2. （最後の引き継ぎ以降に）ツールを何回か使ったターンが終わると、Stop の催促が `kioku_handoff_write` を
+   呼ぶよう求めます。
 3. 同じリポジトリで新しいセッションを始めると（または `/clear`）、SessionStart で引き継ぎが注入されます。
 4. ターミナルから検索します:
 

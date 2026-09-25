@@ -46,26 +46,30 @@ Session lifecycle (Claude Code):
 ```
 SessionStart      kioku hook session-start --> POST /api/v1/sessions/start
                   stdout (added to the agent's context):
-                    <kioku> project id, pending handoff, STATE.md excerpt </kioku>
+                    <kioku> project id, session id, pending handoff, STATE.md excerpt </kioku>
 UserPromptSubmit  \
 PostToolUse        > sanitized observation --> POST /api/v1/observations
 PreCompact        /
-Stop              no handoff written yet and >= 3 tool calls?
+Stop              >= 3 tool calls since the last handoff (or since start)?
                     yes -> exit 2 + nudge: "write a handoff with kioku_handoff_write"
                     no  -> finalize: session page + STATE.md (+ rule-based handoff)
 SessionEnd        finalize (idempotent)
 ```
 
 - **SessionStart injection**: the hook prints a `<kioku>` block with the project
-  id, the pending handoff (if any) and an excerpt of the project's `STATE.md`.
-- **Stop nudge**: if the agent used at least 3 tools and has not called
-  `kioku_handoff_write`, the Stop hook exits with code 2 and asks it to record a
-  summary, next steps, open questions and decisions. `stop_hook_active`
-  prevents a loop. Disable with `[client] stop_nudge = false` or
-  `KIOKU_STOP_NUDGE=0`.
+  id and the session id (both to be passed to `kioku_handoff_write`), the
+  pending handoff (if any) and an excerpt of the project's `STATE.md`.
+- **Stop nudge**: if the agent used at least 3 tools since its last
+  `kioku_handoff_write` in this session (or since the session started, if it
+  wrote none), the Stop hook exits with code 2 and asks it to record a summary,
+  next steps, open questions and decisions. `stop_hook_active` prevents a loop.
+  Disable with `[client] stop_nudge = false` or `KIOKU_STOP_NUDGE=0`.
 - **Finalize** writes a session page, rewrites `STATE.md` and, when the agent
   wrote no handoff, generates one from rules (last instruction, files touched,
-  commands, commits, error count). Every page write is a git commit.
+  commands, commits, error count). When the agent's handoff is stale (3+ tool
+  calls after it), finalize appends a rule-based addendum for that later work
+  (「引き継ぎ（自動生成・追記）」) and hands over both. Every page write is a git
+  commit.
 - **Handoffs are single-use**: the next SessionStart of the same project
   consumes the newest pending handoff (older pending ones are marked
   superseded). `kioku_handoff_pending` with `accept=false` only peeks.
@@ -96,8 +100,8 @@ Try it:
 
 1. Open Claude Code in a git repository and give it a task. `kioku project id`
    prints the project id kioku uses for that directory.
-2. When it finishes a turn after using a few tools, the Stop nudge asks it to
-   call `kioku_handoff_write`.
+2. When it finishes a turn after using a few tools (since its last handoff),
+   the Stop nudge asks it to call `kioku_handoff_write`.
 3. Start a new session in the same repository (or `/clear`): the handoff is
    injected at SessionStart.
 4. Search from the terminal:

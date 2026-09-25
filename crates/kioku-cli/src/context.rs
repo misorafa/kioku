@@ -17,6 +17,8 @@ pub struct StartContext {
     pub project_name: String,
     /// Project id (what the agent must pass as `project` to kioku_* tools).
     pub project_id: String,
+    /// Agent session id (what the agent must pass as `session` to kioku_handoff_write).
+    pub session_id: String,
     /// Server URL shown to the agent.
     pub server_url: String,
     /// Markdown of the handoff consumed by this session, if any.
@@ -81,6 +83,10 @@ fn assemble(lang: Lang, ctx: &StartContext, handoff: Option<&str>, state: Option
         &[("name", &ctx.project_name), ("id", &ctx.project_id)],
     ));
     out.push('\n');
+    if !ctx.session_id.is_empty() {
+        out.push_str(&fill(t.start_session_line, &[("id", &ctx.session_id)]));
+        out.push('\n');
+    }
     out.push_str(&format!("server: {}\n", ctx.server_url));
     if let Some(h) = handoff {
         out.push_str(&format!("\n{}\n{h}\n", t.start_handoff_heading));
@@ -152,6 +158,7 @@ mod tests {
         StartContext {
             project_name: "kioku".into(),
             project_id: "kioku-3f9a1c2e".into(),
+            session_id: "0c2f1a2b-aaaa".into(),
             server_url: "http://127.0.0.1:7391".into(),
             handoff,
             state,
@@ -170,7 +177,9 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "<kioku>");
         assert!(lines[1].starts_with("project: kioku (id: kioku-3f9a1c2e)"));
-        assert_eq!(lines[2], "server: http://127.0.0.1:7391");
+        assert!(lines[2].starts_with("session: 0c2f1a2b-aaaa  ← kioku_handoff_write の session"));
+        assert_eq!(lines[3], "server: http://127.0.0.1:7391");
+        assert!(out.contains("kioku_handoff_write（上の project と session を渡す）"));
         assert!(out.contains("## 前回からの引き継ぎ\n## 引き継ぎ（claude-code"));
         assert!(out.contains("## 現在の状態（STATE.md 抜粋）"));
         assert!(out.contains("kioku_handoff_write"));
@@ -212,6 +221,7 @@ mod tests {
         assert!(!out.contains("## Handoff from"));
         assert!(!out.contains("## Current state"));
         assert!(out.contains("pass this id as `project`"));
+        assert!(out.contains("session: 0c2f1a2b-aaaa  ← pass this id as `session`"));
     }
 
     #[test]

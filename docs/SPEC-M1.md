@@ -117,16 +117,23 @@ memory. Document this in the README later.
 ```sql
 projects(id TEXT PK, name TEXT, root_path TEXT, remote_url TEXT, created_at TEXT);
 sessions(id TEXT PK, project_id TEXT FK, agent TEXT, cwd TEXT, source TEXT,
-         started_at TEXT, ended_at TEXT, status TEXT  -- open|finalized
+         started_at TEXT, ended_at TEXT, status TEXT, -- open|finalized
+         root_path TEXT  -- project root on the machine that ran the session
         );
 observations(id INTEGER PK, session_id TEXT FK, project_id TEXT, seq INTEGER,
              kind TEXT,      -- prompt|tool_use|stop|compact|note
              ts TEXT, payload TEXT /*json*/, text TEXT /*sanitized, searchable*/);
 handoffs(id TEXT PK, project_id TEXT, session_id TEXT, source TEXT, -- agent|rules
-         content_md TEXT, created_at TEXT, accepted_at TEXT, accepted_by TEXT);
+         content_md TEXT, created_at TEXT, accepted_at TEXT, accepted_by TEXT,
+         updated_at TEXT,  -- last in-place refresh (rules); created_at never moves
+         seq_at INTEGER);  -- session's MAX(observations.seq) when written
 pages(path TEXT PK, project_id TEXT, scope TEXT, kind TEXT, title TEXT,
       tags TEXT /*json array*/, created_at TEXT, updated_at TEXT, hash TEXT);
 ```
+
+Columns added after the first M1 release (`sessions.root_path`,
+`handoffs.updated_at`, `handoffs.seq_at`) are added with `ALTER TABLE` when an
+older database is opened.
 
 Timestamps are RFC 3339 UTC. IDs: sessions use the agent's session id
 verbatim; handoffs/pages use ULID-like `chrono` ms + 6 random hex.
@@ -229,27 +236,50 @@ SessionStart hook ─► POST /api/v1/sessions/start ─► {project, pending ha
 UserPromptSubmit / PostToolUse / PreCompact ─► POST /api/v1/observations (fire-and-forget)
 agent may call MCP kioku_handoff_write at any time (source = agent)
 Stop hook ─► GET /api/v1/sessions/{id}
-   if no agent handoff && observations.tool_use >= 3 && !stop_hook_active && nudge enabled
+   if tool_uses_since_handoff >= 3 && !stop_hook_active && nudge enabled
       → exit 2, stderr = nudge text (§8.4)   [agent writes handoff, stops again]
    else → POST /api/v1/sessions/{id}/finalize
 SessionEnd hook ─► POST /api/v1/sessions/{id}/finalize (idempotent)
 ```
 
+`tool_uses_since_handoff` = the session's `tool_use` observations with
+`seq > seq_at` of its latest agent handoff (all of them when it has none; for
+rows without `seq_at`, those with `ts > created_at`). A sequence mark rather
+than timestamps, because observation `ts` comes from the client's clock.
+`GET /api/v1/sessions/{id}` returns it; the constant 3 is
+`HANDOFF_STALE_TOOL_USES`.
+
 `finalize` (idempotent; second call is a no-op returning the same result):
-1. Build `SessionDigest` from observations (§7.2).
-2. If the session has < 1 prompt and < 1 tool_use → mark finalized, write
-   nothing, return `{substantive: false}`.
+1. Record `MAX(seq)` of the session's observations, then build
+   `SessionDigest` from observations (§7.2).
+2. If the session has < 1 prompt and < 1 tool_use → mark finalized (step 6
+   rule), write nothing, return `{substantive: false}`.
 3. Write session page `<project>/sessions/YYYY-MM-DD-<first 8 of session>.md`
    (§7.3), index it, commit.
 4. If no agent handoff exists for this session → create one from rules
-   (`source = rules`, content = digest "Handoff" section).
+   (`source = rules`, content = digest "Handoff" section). If one exists but
+   `tool_uses_since_handoff >= 3` → create (or refresh) a rules handoff whose
+   content is the agent handoff followed by the Handoff section of a digest of
+   only the observations after it, headed `## 引き継ぎ（自動生成・追記）`
+   (`## Handoff (auto-generated addendum)`); the session page shows the same.
 5. Rewrite `<project>/STATE.md` (§7.4), index, commit.
-6. Mark session finalized.
+6. Mark session finalized — only if `MAX(seq)` is still the value from step 1
+   (one conditional `UPDATE`). Observations do not take the write lock, so one
+   that arrived meanwhile keeps the session open for the next finalize instead
+   of being silently left out.
 
 Claude Code fires Stop after every turn, so finalize runs many times per
 session: a `prompt`/`tool_use` observation on a finalized session reopens it,
 and the next finalize rewrites the same session page, refreshes the session's
-pending rules handoff in place (no pile-up), and rewrites STATE.md.
+pending rules handoff in place (no pile-up; `created_at` kept, `updated_at`
+set — an addendum is refreshed only if it is newer than the agent handoff it
+extends, otherwise a new one is created), and rewrites STATE.md.
+
+Handoff order ("newest"): `created_at` descending, and on a tie an agent
+handoff before a rules one. Because refreshes keep `created_at`, a rules
+handoff never outranks a newer agent handoff from another session; within a
+session a rules handoff outranks the agent's only when it is the addendum
+created after it (which embeds the agent's text).
 
 Handoffs are single-use per project: `sessions/start` returns the newest
 unaccepted handoff for the project and marks it accepted by the new session;
@@ -264,8 +294,10 @@ From the session's observations, in order:
 - `prompts: Vec<String>` — each `prompt` text truncated to 300 chars.
 - `files: Vec<(path, edits: u32)>` — from tool_use where tool ∈
   {Edit, Write, MultiEdit, NotebookEdit} using `tool_input.file_path`
-  (or `notebook_path`); relative to project root when possible; sorted by
-  edits desc.
+  (or `notebook_path`); relative to the session's own `root_path` (the
+  project root on the machine that ran it; `projects.root_path` only as a
+  fallback, since it follows whichever machine started a session last) when
+  possible; sorted by edits desc.
 - `reads: Vec<path>` — tool ∈ {Read} (top 20 by count).
 - `commands: Vec<String>` — tool == Bash: `tool_input.command` first line,
   truncated 160 chars, deduplicated preserving order, max 30.
@@ -342,8 +374,12 @@ Rendered as:
 - …
 ```
 
-If `session` is omitted, attach to the newest open session of that project
-(the MCP transport cannot see cwd). Store `source = agent`.
+The SessionStart block (§8.3) names the session id and tells the agent to
+pass `project` and `session`; the MCP tool description says the same. If
+`session` is omitted anyway, attach to the open session of that project with
+the newest observation (the one being worked in; the MCP transport cannot see
+cwd), falling back to the newest started. Store `source = agent` and
+`seq_at` = the session's current `MAX(seq)`.
 
 ## 8. Hooks (client side, `kioku hook <event>`)
 
@@ -414,6 +450,7 @@ Print plain text (Claude Code adds stdout of SessionStart hooks as context):
 ```
 <kioku>
 project: <name> (id: <id>)  ← pass this id as `project` to kioku_* tools   (localized, strings.rs)
+session: <session id>  ← pass this id as `session` to kioku_handoff_write     (localized)
 server: <url>
 
 ## 前回からの引き継ぎ            (only if a pending handoff existed)
@@ -422,7 +459,7 @@ server: <url>
 ## 現在の状態（STATE.md 抜粋）    (first 60 lines of STATE.md, if any)
 …
 
-セッション終了前に kioku_handoff_write で要約・次の一手・未解決点を書くこと。
+セッション終了前に kioku_handoff_write（上の project と session を渡す）で要約・次の一手・未解決点を書くこと。
 関連する過去の記録は kioku_query で検索できる。
 </kioku>
 ```
@@ -438,11 +475,15 @@ budget left is dropped). Text comes from `strings.rs` in `[client] lang`.
 
 ### 8.4 Stop nudge
 
-Conditions in §7.1. When triggered, write to stderr exactly one paragraph:
+Conditions in §7.1 (`tool_uses_since_handoff >= 3`, so the nudge returns when
+work continued after a handoff; a server response without that field — an
+older server — falls back to "no agent handoff and ≥ 3 tool uses"). When
+triggered, write to stderr exactly one paragraph:
 
-「kioku: このセッションの引き継ぎがまだ書かれていません。kioku_handoff_write
-（project=<id>）で 要約 / 次にやること / 未解決の質問 / 決定事項 を記録してから
-終了してください。記録済みなら stop_hook_active により再度この確認は出ません。」
+「kioku: このセッションの引き継ぎがまだ書かれていないか、最後の引き継ぎ以降に作業が
+進んでいます。kioku_handoff_write（project=<id>, session=<session id>）で 要約 /
+次にやること / 未解決の質問 / 決定事項 を記録してから終了してください。記録済みなら
+stop_hook_active により再度この確認は出ません。」
 
 and exit 2. Claude Code feeds stderr back to the model and lets it continue;
 `stop_hook_active=true` on the next Stop prevents loops. Disable with
@@ -484,7 +525,7 @@ Loopback requests without a token are rejected too — simpler, one rule.
 GET  /api/v1/health                          → {ok:true, version}
 POST /api/v1/sessions/start                  {session_id, agent, cwd, source, project:{id,name,root,remote}}
                                              → {project_id, pending_handoff?, state_excerpt?, recent_sessions:[{title,path,date}]}
-GET  /api/v1/sessions/{id}                   → {project_id, status, counts:{prompts,tool_uses}, has_agent_handoff}
+GET  /api/v1/sessions/{id}                   → {project_id, status, counts:{prompts,tool_uses}, has_agent_handoff, tool_uses_since_handoff}
 POST /api/v1/sessions/{id}/finalize          {reason?} → {substantive, session_page?, handoff_id?}
 POST /api/v1/observations                    {session_id, kind, ts?, payload} → {seq}
 GET  /api/v1/search?q=&project=&scope=&limit= → {hits:[Hit]}

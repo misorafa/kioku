@@ -27,9 +27,9 @@ use crate::render::{
 };
 use crate::sanitize::{redact, sanitize_payload};
 use crate::session::{
-    FinalizeResult, NewObservation, Observation, ObservationKind, RecentSession, Session,
-    SessionInfo, SessionStartRequest, SessionStartResponse, SessionStatus, is_valid_session_id,
-    observation_text,
+    FinalizeResult, HANDOFF_STALE_TOOL_USES, NewObservation, Observation, ObservationKind,
+    RecentSession, Session, SessionInfo, SessionStartRequest, SessionStartResponse, SessionStatus,
+    is_valid_session_id, observation_text,
 };
 use crate::util::{self, display_date, display_minute, now_ts, sha256_hex};
 
@@ -189,6 +189,7 @@ impl Store {
                     started_at: now.clone(),
                     ended_at: None,
                     status: SessionStatus::Open,
+                    root_path: Some(req.project.root.clone()).filter(|r| !r.is_empty()),
                 },
             )?;
             let pending = db::newest_handoff(&tx, &project_id, true)?;
@@ -232,11 +233,13 @@ impl Store {
         let counts = db::session_counts(&conn, id)?;
         let has_agent_handoff =
             db::newest_session_handoff(&conn, id, Some(HandoffSource::Agent), false)?.is_some();
+        let since = db::tool_uses_since_handoff(&conn, id)?;
         Ok(SessionInfo {
             project_id: session.project_id,
             status: session.status,
             counts,
             has_agent_handoff,
+            tool_uses_since_handoff: Some(since),
         })
     }
 
@@ -307,18 +310,47 @@ impl Store {
         digest_for(&conn, &session)
     }
 
-    /// Finalize (spec §7.1): session page, rules handoff if the agent wrote none, STATE.md.
+    /// Finalize (spec §7.1): session page, rules handoff if the agent wrote none (or an
+    /// addendum when work continued after it), STATE.md.
     /// Idempotent: calling it again without new observations returns the same result.
     pub fn finalize_session(&self, session_id: &str) -> Result<FinalizeResult> {
+        self.finalize_with(session_id, &|_| {})
+    }
+
+    /// [`Store::finalize_session`] with a callback run after the digest was built and before
+    /// the session is marked finalized (tests use it to inject a concurrent observation).
+    fn finalize_with(
+        &self,
+        session_id: &str,
+        before_mark: &dyn Fn(&Store),
+    ) -> Result<FinalizeResult> {
         let _write = self.write_lock.lock();
-        let (mut session, project, digest) = {
+        let (mut session, project, digest, max_seq, delta) = {
             let conn = self.db.lock();
             let session = db::get_session(&conn, session_id)?
                 .ok_or_else(|| Error::not_found(format!("session {session_id}")))?;
             let project = db::get_project(&conn, &session.project_id)?
                 .ok_or_else(|| Error::not_found(format!("project {}", session.project_id)))?;
+            // Read the high-water mark first: anything newer is not in this digest.
+            let max_seq = db::max_seq(&conn, session_id)?;
             let digest = digest_for(&conn, &session)?;
-            (session, project, digest)
+            let delta = match &digest.agent_handoff {
+                Some(_)
+                    if db::tool_uses_since_handoff(&conn, session_id)?
+                        >= HANDOFF_STALE_TOOL_USES =>
+                {
+                    let mark = db::agent_handoff_mark(&conn, session_id)?;
+                    let obs = db::list_observations_after(&conn, session_id, mark.as_ref())?;
+                    let obs: Vec<Observation> =
+                        obs.into_iter().filter(|o| o.seq <= max_seq).collect();
+                    Some(SessionDigest::from_observations(
+                        &obs,
+                        session_root(&conn, &session)?.as_deref(),
+                    ))
+                }
+                _ => None,
+            };
+            (session, project, digest, max_seq, delta)
         };
 
         if session.status == SessionStatus::Finalized {
@@ -335,21 +367,22 @@ impl Store {
 
         let now = now_ts();
         if !digest.is_substantive() {
-            db::set_session_status(
-                &self.db.lock(),
-                session_id,
-                SessionStatus::Finalized,
-                Some(&now),
-            )?;
+            before_mark(self);
+            db::finalize_if_unchanged(&self.db.lock(), session_id, max_seq, &now)?;
             return Ok(FinalizeResult::default());
         }
         session.ended_at = Some(now.clone());
         let lang = self.config.lang();
 
         // 3. session page
-        let handoff_md = match &digest.agent_handoff {
-            Some(h) => h.content_md.clone(),
-            None => digest.handoff_section(lang),
+        let handoff_md = match (&digest.agent_handoff, &delta) {
+            (Some(h), Some(d)) => format!(
+                "{}\n\n{}",
+                h.content_md.trim_end(),
+                d.handoff_delta_section(lang)
+            ),
+            (Some(h), None) => h.content_md.clone(),
+            (None, _) => digest.handoff_section(lang),
         };
         let page_path = session_page_path(&session);
         let fm = Frontmatter {
@@ -368,17 +401,22 @@ impl Store {
             &session_body(lang, &session, &digest, &handoff_md),
         )?;
 
-        // 4. rules handoff (one pending rules handoff per session, refreshed on re-finalize)
-        let handoff_id = match &digest.agent_handoff {
-            Some(h) => h.id.clone(),
-            None => {
+        // 4. rules handoff: one pending rules handoff per session (or per agent handoff, for
+        // the addendum), refreshed in place on re-finalize with its created_at kept.
+        let handoff_id = match (&digest.agent_handoff, &delta) {
+            (Some(h), None) => h.id.clone(),
+            (agent, _) => {
                 let conn = self.db.lock();
-                match db::newest_session_handoff(
+                let existing = db::newest_session_handoff(
                     &conn,
                     session_id,
                     Some(HandoffSource::Rules),
                     true,
-                )? {
+                )?
+                // An addendum must be newer than the agent handoff it extends; an older
+                // rules handoff predates it and is left alone (it ranks below the agent's).
+                .filter(|r| agent.as_ref().is_none_or(|a| r.created_at >= a.created_at));
+                match existing {
                     Some(existing) => {
                         db::update_handoff_content(&conn, &existing.id, &handoff_md, &now)?;
                         existing.id
@@ -394,8 +432,9 @@ impl Store {
                             accepted_at: None,
                             accepted_by: None,
                             agent: Some(session.agent.clone()),
+                            updated_at: None,
                         };
-                        db::insert_handoff(&conn, &h)?;
+                        db::insert_handoff(&conn, &h, Some(max_seq))?;
                         h.id
                     }
                 }
@@ -405,13 +444,10 @@ impl Store {
         // 5. STATE.md
         self.write_state(&project, Some(session_id))?;
 
-        // 6. mark finalized
-        db::set_session_status(
-            &self.db.lock(),
-            session_id,
-            SessionStatus::Finalized,
-            Some(&now),
-        )?;
+        // 6. mark finalized — unless an observation arrived meanwhile (then it stays open
+        // and the next Stop / SessionEnd finalizes it with that observation included).
+        before_mark(self);
+        db::finalize_if_unchanged(&self.db.lock(), session_id, max_seq, &now)?;
         Ok(FinalizeResult {
             substantive: true,
             session_page: Some(page_path),
@@ -421,8 +457,8 @@ impl Store {
 
     // ---------------------------------------------------------------- handoffs
 
-    /// Records an agent-written handoff (spec §7.5); attaches to the newest open session
-    /// of the project when `session` is omitted.
+    /// Records an agent-written handoff (spec §7.5); when `session` is omitted it attaches to
+    /// the open session of the project with the newest observation.
     pub fn write_handoff(&self, input: &HandoffInput) -> Result<Handoff> {
         if input.summary.trim().is_empty() {
             return Err(Error::invalid("summary must not be empty"));
@@ -460,9 +496,14 @@ impl Store {
             created_at: now,
             accepted_at: None,
             accepted_by: None,
-            agent: session.map(|s| s.agent),
+            agent: session.as_ref().map(|s| s.agent.clone()),
+            updated_at: None,
         };
-        db::insert_handoff(&conn, &h)?;
+        let seq_at = match &session {
+            Some(s) => Some(db::max_seq(&conn, &s.id)?),
+            None => None,
+        };
+        db::insert_handoff(&conn, &h, seq_at)?;
         Ok(h)
     }
 
@@ -710,8 +751,16 @@ fn recent_sessions(
     Ok(out)
 }
 
+/// The root a session's paths are relative to: its own (per machine), else the project's.
+fn session_root(conn: &Connection, session: &Session) -> Result<Option<String>> {
+    if let Some(root) = session.root_path.clone().filter(|r| !r.is_empty()) {
+        return Ok(Some(root));
+    }
+    Ok(db::get_project(conn, &session.project_id)?.and_then(|p| p.root_path))
+}
+
 fn digest_for(conn: &Connection, session: &Session) -> Result<SessionDigest> {
-    let root = db::get_project(conn, &session.project_id)?.and_then(|p| p.root_path);
+    let root = session_root(conn, session)?;
     let observations = db::list_observations(conn, &session.id)?;
     let mut digest = SessionDigest::from_observations(&observations, root.as_deref());
     digest.agent_handoff =
@@ -1063,6 +1112,269 @@ mod tests {
         assert!(resp.state_excerpt.unwrap().starts_with("## 最新の引き継ぎ"));
         assert_eq!(resp.recent_sessions.len(), 1);
         assert_eq!(resp.recent_sessions[0].path, page_path);
+    }
+
+    fn start_at(store: &Store, session: &str, root: &str) {
+        let mut p = project();
+        p.root = root.into();
+        store
+            .start_session(&SessionStartRequest {
+                session_id: session.into(),
+                agent: "claude-code".into(),
+                cwd: root.into(),
+                source: "startup".into(),
+                project: p,
+            })
+            .unwrap();
+    }
+
+    fn tool(store: &Store, session: &str, path: &str) {
+        observe(
+            store,
+            session,
+            ObservationKind::ToolUse,
+            json!({"tool_name": "Edit", "tool_input": {"file_path": path}, "tool_response": {}}),
+        );
+    }
+
+    #[test]
+    fn observation_during_finalize_keeps_session_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path());
+        start(&store, "race");
+        work(&store, "race");
+        let r = store
+            .finalize_with("race", &|s| {
+                observe(
+                    s,
+                    "race",
+                    ObservationKind::Prompt,
+                    json!({"prompt": "途中で届いた指示"}),
+                )
+            })
+            .unwrap();
+        assert!(r.substantive);
+        assert_eq!(
+            store.session_info("race").unwrap().status,
+            SessionStatus::Open,
+            "a late observation must not be swallowed by finalize"
+        );
+        // the next finalize includes it and closes the session
+        let r2 = store.finalize_session("race").unwrap();
+        let page = store
+            .read_page(r2.session_page.as_deref().unwrap())
+            .unwrap();
+        assert!(page.body.contains("途中で届いた指示"));
+        assert_eq!(
+            store.session_info("race").unwrap().status,
+            SessionStatus::Finalized
+        );
+
+        // same for a non-substantive session
+        start(&store, "race-empty");
+        store
+            .finalize_with("race-empty", &|s| {
+                observe(
+                    s,
+                    "race-empty",
+                    ObservationKind::Prompt,
+                    json!({"prompt": "x"}),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            store.session_info("race-empty").unwrap().status,
+            SessionStatus::Open
+        );
+    }
+
+    #[test]
+    fn handoff_without_session_prefers_session_with_newest_observation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path());
+        start(&store, "working");
+        start(&store, "idle-but-newer");
+        tool(&store, "working", "/home/u/kioku/a.rs");
+        let h = store
+            .write_handoff(&agent_handoff(&project().id, None, "作業中のセッション"))
+            .unwrap();
+        assert_eq!(h.session_id.as_deref(), Some("working"));
+        tool(&store, "idle-but-newer", "/home/u/kioku/b.rs");
+        let h = store
+            .write_handoff(&agent_handoff(&project().id, None, "もう一方"))
+            .unwrap();
+        assert_eq!(h.session_id.as_deref(), Some("idle-but-newer"));
+    }
+
+    #[test]
+    fn tool_uses_since_handoff_and_addendum() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path());
+        let pid = project().id;
+        start(&store, "s");
+        work(&store, "s");
+        tool(&store, "s", "/home/u/kioku/c.rs");
+        let info = store.session_info("s").unwrap();
+        assert_eq!(info.tool_uses_since_handoff, Some(3));
+        let agent = store
+            .write_handoff(&agent_handoff(&pid, Some("s"), "検索を実装した"))
+            .unwrap();
+        let info = store.session_info("s").unwrap();
+        assert_eq!(info.tool_uses_since_handoff, Some(0));
+        assert_eq!(info.counts.tool_uses, 3);
+
+        // two more tool uses: still covered by the agent handoff
+        tool(&store, "s", "/home/u/kioku/d.rs");
+        tool(&store, "s", "/home/u/kioku/d.rs");
+        let r = store.finalize_session("s").unwrap();
+        assert_eq!(r.handoff_id.as_deref(), Some(agent.id.as_str()));
+
+        // a third one makes the agent handoff stale → rules addendum for the delta
+        observe(
+            &store,
+            "s",
+            ObservationKind::Prompt,
+            json!({"prompt": "ドキュメントも直して"}),
+        );
+        tool(&store, "s", "/home/u/kioku/README.md");
+        assert_eq!(
+            store.session_info("s").unwrap().tool_uses_since_handoff,
+            Some(3)
+        );
+        let r = store.finalize_session("s").unwrap();
+        let addendum_id = r.handoff_id.clone().unwrap();
+        assert_ne!(addendum_id, agent.id);
+        let pending = store.pending_handoff(&pid, false, None).unwrap().unwrap();
+        assert_eq!(pending.id, addendum_id);
+        assert_eq!(pending.source, HandoffSource::Rules);
+        let md = &pending.content_md;
+        assert!(md.contains("### 要約\n検索を実装した"), "{md}");
+        assert!(md.contains("## 引き継ぎ（自動生成・追記）"), "{md}");
+        assert!(md.contains("最後の指示: ドキュメントも直して"), "{md}");
+        assert!(
+            md.contains("d.rs (2)") && md.contains("README.md (1)"),
+            "{md}"
+        );
+        assert!(!md.contains("index.rs"), "delta only: {md}");
+        let page = store.read_page(r.session_page.as_deref().unwrap()).unwrap();
+        assert!(page.body.contains("## 引き継ぎ（自動生成・追記）"));
+
+        // re-finalize refreshes the same addendum, keeping created_at
+        tool(&store, "s", "/home/u/kioku/e.rs");
+        let r = store.finalize_session("s").unwrap();
+        assert_eq!(r.handoff_id.as_deref(), Some(addendum_id.as_str()));
+        let refreshed = store.pending_handoff(&pid, false, None).unwrap().unwrap();
+        assert_eq!(refreshed.created_at, pending.created_at);
+        assert!(refreshed.updated_at.is_some());
+        assert!(refreshed.content_md.contains("e.rs (1)"));
+
+        // a new agent handoff supersedes the addendum again
+        let agent2 = store
+            .write_handoff(&agent_handoff(&pid, Some("s"), "全部終わった"))
+            .unwrap();
+        assert_eq!(
+            store.session_info("s").unwrap().tool_uses_since_handoff,
+            Some(0)
+        );
+        let r = store.finalize_session("s").unwrap();
+        assert_eq!(r.handoff_id.as_deref(), Some(agent2.id.as_str()));
+        assert_eq!(
+            store
+                .pending_handoff(&pid, false, None)
+                .unwrap()
+                .unwrap()
+                .id,
+            agent2.id
+        );
+    }
+
+    #[test]
+    fn refreshed_rules_handoff_does_not_outrank_newer_agent_handoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path());
+        let pid = project().id;
+        start(&store, "b");
+        start(&store, "a");
+        work(&store, "a");
+        let rules = store.finalize_session("a").unwrap().handoff_id.unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let agent = store
+            .write_handoff(&agent_handoff(&pid, Some("b"), "B の引き継ぎ"))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // session a keeps working and re-finalizes: its rules handoff is refreshed in place
+        observe(
+            &store,
+            "a",
+            ObservationKind::Prompt,
+            json!({"prompt": "続き"}),
+        );
+        assert_eq!(
+            store.finalize_session("a").unwrap().handoff_id.as_deref(),
+            Some(rules.as_str())
+        );
+        let pending = store.pending_handoff(&pid, false, None).unwrap().unwrap();
+        assert_eq!(
+            pending.id, agent.id,
+            "the newer agent handoff must stay on top"
+        );
+    }
+
+    #[test]
+    fn digest_paths_are_relative_to_the_sessions_own_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path());
+        start_at(&store, "mac", "/Users/u/src/kioku");
+        observe(
+            &store,
+            "mac",
+            ObservationKind::Prompt,
+            json!({"prompt": "x"}),
+        );
+        tool(&store, "mac", "/Users/u/src/kioku/src/lib.rs");
+        // another machine starts a session later and overwrites the project's root
+        start_at(&store, "linux", "/home/u/kioku");
+        tool(&store, "linux", "/home/u/kioku/src/main.rs");
+        assert_eq!(
+            store.project(&project().id).unwrap().root_path.as_deref(),
+            Some("/home/u/kioku")
+        );
+        let d = store.digest("mac").unwrap();
+        assert_eq!(d.files[0].path, "src/lib.rs");
+        let d = store.digest("linux").unwrap();
+        assert_eq!(d.files[0].path, "src/main.rs");
+        assert_eq!(
+            store.session("mac").unwrap().root_path.as_deref(),
+            Some("/Users/u/src/kioku")
+        );
+    }
+
+    #[test]
+    fn old_database_is_migrated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("db").join("kioku.sqlite");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        {
+            let conn = Connection::open(&file).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions(id TEXT PRIMARY KEY, project_id TEXT NOT NULL, agent TEXT NOT NULL,
+                   cwd TEXT, source TEXT, started_at TEXT NOT NULL, ended_at TEXT,
+                   status TEXT NOT NULL DEFAULT 'open');
+                 CREATE TABLE handoffs(id TEXT PRIMARY KEY, project_id TEXT NOT NULL, session_id TEXT,
+                   source TEXT NOT NULL, content_md TEXT NOT NULL, created_at TEXT NOT NULL,
+                   accepted_at TEXT, accepted_by TEXT);",
+            )
+            .unwrap();
+        }
+        let store = open_store(tmp.path());
+        start(&store, "after-migration");
+        work(&store, "after-migration");
+        assert!(
+            store
+                .finalize_session("after-migration")
+                .unwrap()
+                .substantive
+        );
     }
 
     #[test]

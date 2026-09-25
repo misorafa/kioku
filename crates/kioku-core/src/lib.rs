@@ -33,8 +33,9 @@ pub use layout::{DataDir, InitReport, init};
 pub use page::{Frontmatter, Page, PageKind, PageScope};
 pub use project::{ProjectIdentity, identify};
 pub use session::{
-    FinalizeResult, NewObservation, Observation, ObservationKind, RecentSession, Session,
-    SessionCounts, SessionInfo, SessionStartRequest, SessionStartResponse, SessionStatus,
+    FinalizeResult, HANDOFF_STALE_TOOL_USES, NewObservation, Observation, ObservationKind,
+    RecentSession, Session, SessionCounts, SessionInfo, SessionStartRequest, SessionStartResponse,
+    SessionStatus,
 };
 pub use store::{StatusReport, Store, WritePageRequest};
 pub use strings::Lang;

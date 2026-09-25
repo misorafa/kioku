@@ -21,7 +21,7 @@ use serde::Deserialize;
 use crate::shared::{DEFAULT_MCP_LIMIT, blocking, clamp_limit, resolve_scope, with_project_hint};
 
 /// `instructions` returned on initialize.
-pub const INSTRUCTIONS: &str = "kioku は、このユーザーのすべてのマシン・すべてのコーディングエージェントで共有される記憶（過去のセッション要約、STATE.md、保存済みページ、引き継ぎ）です。作業を始めるとき、特にコードベースを探索したり調査を繰り返したりする前に、まず kioku_query で関連する過去の記録・決定事項を検索し、見つかったページは kioku_read で読んでください（project には SessionStart で渡された id を使う）。後で役立つ知見や設計判断は kioku_write_page で残し、セッションを終える前（または作業の区切りやコンテキストが尽きる前）には必ず kioku_handoff_write で 要約 / 次にやること / 未解決の質問 / 決定事項 を記録してください。次のセッションはそれを自動で受け取ります。 kioku is shared memory across agents and machines: query it before exploring, and write a handoff with kioku_handoff_write before you stop.";
+pub const INSTRUCTIONS: &str = "kioku は、このユーザーのすべてのマシン・すべてのコーディングエージェントで共有される記憶（過去のセッション要約、STATE.md、保存済みページ、引き継ぎ）です。作業を始めるとき、特にコードベースを探索したり調査を繰り返したりする前に、まず kioku_query で関連する過去の記録・決定事項を検索し、見つかったページは kioku_read で読んでください（project には SessionStart で渡された id を使う）。後で役立つ知見や設計判断は kioku_write_page で残し、セッションを終える前（または作業の区切りやコンテキストが尽きる前）には必ず kioku_handoff_write（project と、SessionStart で渡された session の id を指定）で 要約 / 次にやること / 未解決の質問 / 決定事項 を記録してください。次のセッションはそれを自動で受け取ります。 kioku is shared memory across agents and machines: query it before exploring, and write a handoff with kioku_handoff_write before you stop.";
 
 const QUERY_DESC: &str = "kioku の記憶（過去のセッション要約・各プロジェクトの STATE.md・保存済みページ）を全文検索する。日本語・英語どちらのクエリも使える（形態素解析済み）。コードを探索したり同じ調査を繰り返したりする前に、まずこれを呼ぶこと。project を渡すとそのプロジェクトとグローバルのページに絞られる。結果の path は kioku_read で全文を読める。\nSearch kioku's shared memory (past sessions, STATE.md, pages) before exploring; Japanese and English queries both work.";
 
@@ -29,7 +29,7 @@ const READ_DESC: &str = "kioku のページを path（kioku_query の結果に�
 
 const WRITE_PAGE_DESC: &str = "後で役に立つ知見・設計判断・手順・調査結果を Markdown ページとして kioku に保存する（検索対象になり、git に履歴が残る）。同じ title（または path）で書くと本文を置き換える。scope=project（project を渡した場合の既定）はそのプロジェクト専用、scope=global はプロジェクトを横断する個人的なメモ。セッションの引き継ぎには使わず kioku_handoff_write を使うこと。\nSave durable knowledge as a searchable page; writing the same title/path replaces it.";
 
-const HANDOFF_WRITE_DESC: &str = "このセッションの引き継ぎを記録する。このプロジェクトで次に始まるセッション（別のエージェントや別マシンでも）の冒頭に自動で渡される。作業を終える前、区切りがついたとき、コンテキストが尽きそうなときに必ず呼ぶこと。summary=何をしたか・今どういう状態か、next_steps=次の一手（ファイル名やコマンドまで具体的に）、open_questions=未解決の点、decisions=決めたこととその理由。\nRecord a handoff for the next session of this project; always call it before you stop.";
+const HANDOFF_WRITE_DESC: &str = "このセッションの引き継ぎを記録する。このプロジェクトで次に始まるセッション（別のエージェントや別マシンでも）の冒頭に自動で渡される。作業を終える前、区切りがついたとき、コンテキストが尽きそうなときに必ず呼ぶこと。project と session には SessionStart の <kioku> ブロックに書かれた project の id と session の id を渡すこと（session を省略すると、そのプロジェクトで最後に観測のあった開いているセッションに紐づく）。summary=何をしたか・今どういう状態か、next_steps=次の一手（ファイル名やコマンドまで具体的に）、open_questions=未解決の点、decisions=決めたこととその理由。\nRecord a handoff for the next session of this project; always call it before you stop. Pass `project` and `session` from the SessionStart <kioku> block.";
 
 const HANDOFF_PENDING_DESC: &str = "プロジェクトの未受領の引き継ぎ（最新のもの）を取得する。既定の accept=false では覗くだけで消費しない。accept=true にすると受領済みにして、同じプロジェクトの古い未受領の引き継ぎもまとめて受領済みにする（通常は SessionStart フックが自動で行うので不要）。\nPeek at (or accept) the pending handoff of a project.";
 
@@ -124,8 +124,9 @@ pub struct WritePageParams {
 pub struct HandoffWriteParams {
     /// プロジェクト id（SessionStart で渡されたもの）/ project id from the SessionStart context.
     pub project: String,
-    /// セッション id（省略時はそのプロジェクトの最新の開いているセッション）/ session id;
-    /// defaults to the newest open session of the project.
+    /// セッション id（SessionStart の `session:` 行。省略時はそのプロジェクトで最後に観測のあった
+    /// 開いているセッション）/ session id from the SessionStart `session:` line; defaults to the
+    /// open session of the project with the newest observation.
     #[serde(default)]
     pub session: Option<String>,
     /// 何をしたか・現在の状態の要約 / what was done and where things stand.

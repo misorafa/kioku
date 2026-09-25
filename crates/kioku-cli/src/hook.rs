@@ -21,8 +21,8 @@ use crate::client::{ApiClient, http_status};
 use crate::context::{StartContext, render_session_start};
 use crate::event::{Agent, HookEvent, HookEventKind, parse_event};
 
-/// Minimum tool uses in a session before the Stop hook nudges for a handoff.
-pub const NUDGE_MIN_TOOL_USES: u32 = 3;
+/// Minimum tool uses since the last agent handoff before the Stop hook nudges for one.
+pub const NUDGE_MIN_TOOL_USES: u32 = kioku_core::HANDOFF_STALE_TOOL_USES;
 /// Exit code that makes Claude Code feed stderr back to the model (Stop nudge).
 pub const NUDGE_EXIT_CODE: i32 = 2;
 
@@ -53,19 +53,15 @@ pub enum StopDecision {
     Finalize,
 }
 
-/// Stop-hook rule (spec §7.1): nudge only when no agent handoff exists, the session used
-/// at least [`NUDGE_MIN_TOOL_USES`] tools, the agent is not already continuing because of
-/// a Stop hook, and the nudge is enabled.
+/// Stop-hook rule (spec §7.1): nudge only when at least [`NUDGE_MIN_TOOL_USES`] tools were
+/// used since the session's latest agent handoff (or since the start, without one), the
+/// agent is not already continuing because of a Stop hook, and the nudge is enabled.
 pub fn stop_decision(
     info: &SessionInfo,
     stop_hook_active: bool,
     nudge_enabled: bool,
 ) -> StopDecision {
-    if nudge_enabled
-        && !stop_hook_active
-        && !info.has_agent_handoff
-        && info.counts.tool_uses >= NUDGE_MIN_TOOL_USES
-    {
+    if nudge_enabled && !stop_hook_active && info.tool_uses_since_handoff() >= NUDGE_MIN_TOOL_USES {
         StopDecision::Nudge
     } else {
         StopDecision::Finalize
@@ -135,6 +131,7 @@ fn session_start(ev: &HookEvent, cfg: &Config, client: &ApiClient) -> anyhow::Re
     let ctx = StartContext {
         project_name: project.name,
         project_id: resp.project_id,
+        session_id: ev.session_id.clone(),
         server_url: cfg.client.server_url.clone(),
         handoff: resp.pending_handoff.map(|h| h.content_md),
         state: resp.state_excerpt,
@@ -156,7 +153,7 @@ fn stop(ev: &HookEvent, cfg: &Config, client: &ApiClient) -> anyhow::Result<Hook
                 "{}\n",
                 fill(
                     strings(cfg.client.lang).stop_nudge,
-                    &[("project", &info.project_id)]
+                    &[("project", &info.project_id), ("session", &ev.session_id)]
                 )
             ),
             exit_code: NUDGE_EXIT_CODE,
@@ -264,18 +261,45 @@ mod tests {
                 tool_uses,
             },
             has_agent_handoff,
+            tool_uses_since_handoff: None,
+        }
+    }
+
+    fn since(total: u32, since: u32) -> SessionInfo {
+        SessionInfo {
+            tool_uses_since_handoff: Some(since),
+            ..info(total, true)
         }
     }
 
     #[test]
     fn stop_decision_rules() {
         use StopDecision::*;
+        // old server (no tool_uses_since_handoff): cumulative count without a handoff
         assert_eq!(stop_decision(&info(3, false), false, true), Nudge);
         assert_eq!(stop_decision(&info(10, false), false, true), Nudge);
         assert_eq!(stop_decision(&info(2, false), false, true), Finalize);
         assert_eq!(stop_decision(&info(3, true), false, true), Finalize);
         assert_eq!(stop_decision(&info(3, false), true, true), Finalize);
         assert_eq!(stop_decision(&info(3, false), false, false), Finalize);
+    }
+
+    #[test]
+    fn stop_decision_counts_tool_uses_since_the_last_handoff() {
+        use StopDecision::*;
+        // a handoff covers earlier work: many tool uses overall, none since → no nudge
+        assert_eq!(stop_decision(&since(40, 0), false, true), Finalize);
+        assert_eq!(stop_decision(&since(40, 2), false, true), Finalize);
+        // work continued after the handoff → nudge to refresh it
+        assert_eq!(stop_decision(&since(40, 3), false, true), Nudge);
+        assert_eq!(stop_decision(&since(40, 3), true, true), Finalize);
+        assert_eq!(stop_decision(&since(40, 3), false, false), Finalize);
+        // the field wins over has_agent_handoff / counts
+        let mut i = since(3, 3);
+        i.has_agent_handoff = false;
+        assert_eq!(stop_decision(&i, false, true), Nudge);
+        i.tool_uses_since_handoff = Some(0);
+        assert_eq!(stop_decision(&i, false, true), Finalize);
     }
 
     fn cfg_unreachable(dir: &Path) -> Config {

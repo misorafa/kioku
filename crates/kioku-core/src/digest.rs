@@ -148,8 +148,18 @@ impl SessionDigest {
 
     /// The auto-generated "Handoff" section (used when the agent wrote none).
     pub fn handoff_section(&self, lang: Lang) -> String {
+        self.section_with_heading(lang, strings(lang).auto_handoff_heading)
+    }
+
+    /// The auto-generated addendum (「引き継ぎ（自動生成・追記）」) for work done after the
+    /// agent's handoff; `self` is the digest of the observations after that handoff.
+    pub fn handoff_delta_section(&self, lang: Lang) -> String {
+        self.section_with_heading(lang, strings(lang).auto_handoff_delta_heading)
+    }
+
+    fn section_with_heading(&self, lang: Lang, heading: &str) -> String {
         let s = strings(lang);
-        let mut lines = vec![s.auto_handoff_heading.to_string()];
+        let mut lines = vec![heading.to_string()];
         let last_prompt = self
             .prompts
             .last()

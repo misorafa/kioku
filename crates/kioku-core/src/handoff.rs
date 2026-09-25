@@ -54,6 +54,9 @@ pub struct Handoff {
     pub accepted_by: Option<String>,
     /// Agent of the producing session, if known.
     pub agent: Option<String>,
+    /// RFC 3339 time of the last in-place refresh (rules handoffs), if any.
+    #[serde(default)]
+    pub updated_at: Option<String>,
 }
 
 /// Input of `kioku_handoff_write` / `POST /api/v1/handoffs` (spec §7.5).
@@ -61,7 +64,7 @@ pub struct Handoff {
 pub struct HandoffInput {
     /// Project id.
     pub project: String,
-    /// Session id; the newest open session of the project when omitted.
+    /// Session id; when omitted, the open session of the project with the newest observation.
     #[serde(default)]
     pub session: Option<String>,
     /// What was done.
