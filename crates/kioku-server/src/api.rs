@@ -1,4 +1,4 @@
-//! The JSON HTTP API of spec §9 (`/api/v1/*`): thin handlers that run one `Store` call
+//! The JSON HTTP API of spec §9 + M2 §9 (`/api/v1/*`): thin handlers that run one `Store` call
 //! each on the blocking pool, plus the error type mapping core errors to status codes.
 
 use std::sync::Arc;
@@ -21,6 +21,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::shared::{DEFAULT_HTTP_LIMIT, blocking, clamp_limit, resolve_scope, with_project_hint};
+
+/// Version of the kioku-server crate, reported by `GET /api/v1/status`.
+const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// An HTTP error response: `{error: "<message>"}` with a status code.
 #[derive(Debug)]
@@ -90,6 +93,7 @@ pub fn protected_routes(store: Arc<Store>) -> Router {
     Router::new()
         .route("/api/v1/sessions/start", post(start_session))
         .route("/api/v1/sessions/{id}", get(session_info))
+        .route("/api/v1/sessions/{id}/context", get(session_context))
         .route("/api/v1/sessions/{id}/finalize", post(finalize_session))
         .route("/api/v1/observations", post(add_observation))
         .route("/api/v1/search", get(search))
@@ -124,6 +128,11 @@ async fn start_session(
 /// `GET /api/v1/sessions/{id}`.
 async fn session_info(State(store): State<Arc<Store>>, Path(id): Path<String>) -> ApiResult {
     to_json(blocking(&store, move |s| s.session_info(&id)).await?)
+}
+
+/// `GET /api/v1/sessions/{id}/context` → the SessionStart response shape, read-only (M2 §9.1).
+async fn session_context(State(store): State<Arc<Store>>, Path(id): Path<String>) -> ApiResult {
+    to_json(blocking(&store, move |s| s.session_context(&id)).await?)
 }
 
 /// Optional body of `POST /api/v1/sessions/{id}/finalize`.
@@ -239,9 +248,11 @@ async fn write_handoff(
     Ok(Json(json!({ "id": handoff.id })))
 }
 
-/// `GET /api/v1/status`.
+/// `GET /api/v1/status` (M2 §9.2: `version` is this server crate's version).
 async fn status(State(store): State<Arc<Store>>) -> ApiResult {
-    to_json(blocking(&store, |s| s.status()).await?)
+    let mut report = blocking(&store, |s| s.status()).await?;
+    report.version = SERVER_VERSION.to_string();
+    to_json(report)
 }
 
 /// `POST /api/v1/reindex` → `{docs}` (planner addition: remote CLIs have no data dir).

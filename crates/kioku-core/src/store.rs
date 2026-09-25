@@ -80,6 +80,16 @@ pub struct StatusReport {
     pub index_docs: u64,
     /// Whether wiki writes are committed to git.
     pub git_enabled: bool,
+    /// Server version (M2 §9.2; empty from a server that predates the field).
+    #[serde(default)]
+    pub version: String,
+    /// Index schema version recorded on disk (`index/schema-version`); `None` if missing.
+    #[serde(default)]
+    pub index_schema_version: Option<u32>,
+    /// Index schema version this build expects ([`INDEX_SCHEMA_VERSION`]; 0 from an older
+    /// server).
+    #[serde(default)]
+    pub index_schema_expected: u32,
 }
 
 /// The kioku store. `Send + Sync`; share it as `Arc<Store>`.
@@ -128,10 +138,14 @@ impl Store {
 
     /// Schema version the on-disk index was built with (1 when unrecorded: pre-versioning).
     pub fn index_version(&self) -> u32 {
+        self.index_version_on_disk().unwrap_or(1)
+    }
+
+    /// The version recorded in `index/schema-version`, `None` when missing or unreadable.
+    pub fn index_version_on_disk(&self) -> Option<u32> {
         std::fs::read_to_string(self.dirs.index_version_file())
             .ok()
             .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(1)
     }
 
     /// True when the index predates [`INDEX_SCHEMA_VERSION`] and needs `kioku reindex`.
@@ -239,14 +253,32 @@ impl Store {
             project_id: project_id.clone(),
             pending_handoff,
             state_excerpt: self.state_excerpt(&project_id),
-            recent_sessions: recent
-                .into_iter()
-                .map(|(s, title)| RecentSession {
-                    title,
-                    path: session_page_path(&s),
-                    date: display_date(&s.started_at),
-                })
-                .collect(),
+            recent_sessions: recent.into_iter().map(recent_entry).collect(),
+        })
+    }
+
+    /// The SessionStart context of an existing session, without side effects (M2 §9.1):
+    /// the handoff that session accepted (newest), the STATE.md excerpt and the project's
+    /// recent session pages (the session's own page excluded).
+    pub fn session_context(&self, id: &str) -> Result<SessionStartResponse> {
+        let (session, pending_handoff, recent) = {
+            let conn = self.db.lock();
+            let session = db::get_session(&conn, id)?
+                .ok_or_else(|| Error::not_found(format!("session {id}")))?;
+            let pending = db::newest_handoff_accepted_by(&conn, id)?;
+            let recent: Vec<(Session, String)> =
+                recent_sessions(&conn, &session.project_id, None, RECENT_SESSIONS + 1)?
+                    .into_iter()
+                    .filter(|(s, _)| s.id != session.id)
+                    .take(RECENT_SESSIONS)
+                    .collect();
+            (session, pending, recent)
+        };
+        Ok(SessionStartResponse {
+            state_excerpt: self.state_excerpt(&session.project_id),
+            project_id: session.project_id,
+            pending_handoff,
+            recent_sessions: recent.into_iter().map(recent_entry).collect(),
         })
     }
 
@@ -677,6 +709,9 @@ impl Store {
             handoffs: db::count(&conn, "handoffs")?,
             index_docs: self.index.num_docs(),
             git_enabled: self.git.enabled(),
+            version: crate::VERSION.to_string(),
+            index_schema_version: self.index_version_on_disk(),
+            index_schema_expected: INDEX_SCHEMA_VERSION,
         })
     }
 
@@ -781,6 +816,14 @@ fn recent_sessions(
         }
     }
     Ok(out)
+}
+
+fn recent_entry((s, title): (Session, String)) -> RecentSession {
+    RecentSession {
+        title,
+        path: session_page_path(&s),
+        date: display_date(&s.started_at),
+    }
 }
 
 /// The root a session's paths are relative to: its own (per machine), else the project's.
@@ -1379,6 +1422,155 @@ mod tests {
             store.session("mac").unwrap().root_path.as_deref(),
             Some("/Users/u/src/kioku")
         );
+    }
+
+    fn start_as(store: &Store, session: &str, agent: &str, source: &str) -> SessionStartResponse {
+        store
+            .start_session(&SessionStartRequest {
+                session_id: session.into(),
+                agent: agent.into(),
+                cwd: "/home/u/kioku".into(),
+                source: source.into(),
+                project: project(),
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn session_context_has_no_side_effects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path());
+        let pid = project().id;
+        assert!(matches!(
+            store.session_context("unknown"),
+            Err(Error::NotFound(_))
+        ));
+
+        // an earlier session leaves a rules handoff and a session page
+        start(&store, "earlier");
+        work(&store, "earlier");
+        let rules = store
+            .finalize_session("earlier")
+            .unwrap()
+            .handoff_id
+            .unwrap();
+
+        // a Cursor session starts (consuming it); nothing was accepted by "earlier" itself
+        let started = start_as(&store, "cursor-1", "cursor", "startup");
+        assert_eq!(started.pending_handoff.as_ref().unwrap().id, rules);
+        let ctx = store.session_context("earlier").unwrap();
+        assert!(ctx.pending_handoff.is_none());
+
+        // a new handoff arrives meanwhile: context must neither return nor consume it
+        let newer = store
+            .write_handoff(&agent_handoff(&pid, Some("earlier"), "別の引き継ぎ"))
+            .unwrap();
+        let status_before = store.session("cursor-1").unwrap().status;
+        for _ in 0..2 {
+            let ctx = store.session_context("cursor-1").unwrap();
+            assert_eq!(ctx.project_id, pid);
+            let h = ctx.pending_handoff.unwrap();
+            assert_eq!(h.id, rules);
+            assert_eq!(h.accepted_by.as_deref(), Some("cursor-1"));
+            assert_eq!(ctx.state_excerpt, started.state_excerpt);
+            assert!(
+                ctx.state_excerpt
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("## 最新の引き継ぎ")
+            );
+            assert_eq!(ctx.recent_sessions, started.recent_sessions);
+            assert_eq!(ctx.recent_sessions.len(), 1);
+        }
+        assert_eq!(store.session("cursor-1").unwrap().status, status_before);
+        let pending = store.pending_handoff(&pid, false, None).unwrap().unwrap();
+        assert_eq!(pending.id, newer.id);
+        assert!(pending.accepted_at.is_none(), "context must not consume");
+
+        // once the session has its own page, it is not listed among the recent sessions
+        observe(
+            &store,
+            "cursor-1",
+            ObservationKind::Prompt,
+            json!({"prompt": "続きをやって"}),
+        );
+        store.finalize_session("cursor-1").unwrap();
+        let ctx = store.session_context("cursor-1").unwrap();
+        assert_eq!(ctx.recent_sessions.len(), 1);
+        assert!(ctx.recent_sessions[0].path.ends_with("-earlier.md"));
+        assert_eq!(ctx.pending_handoff.unwrap().id, rules);
+    }
+
+    #[test]
+    fn implicit_and_fork_sources_and_agent_labels() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path());
+        start_as(&store, "codex-fork", "codex", "fork");
+        assert_eq!(store.session("codex-fork").unwrap().source, "fork");
+        let resp = start_as(&store, "gemini-implicit", "gemini-cli", "implicit");
+        assert_eq!(resp.project_id, project().id);
+        let s = store.session("gemini-implicit").unwrap();
+        assert_eq!(s.source, "implicit");
+        assert_eq!(s.agent, "gemini-cli");
+        assert_eq!(s.status, SessionStatus::Open);
+
+        // Codex apply_patch, normalized to Edit + file_paths; the patch exceeds the
+        // tool_input cap, the path list survives server-side sanitization
+        observe(
+            &store,
+            "codex-fork",
+            ObservationKind::Prompt,
+            json!({"prompt": "二つのファイルを直して"}),
+        );
+        observe(
+            &store,
+            "codex-fork",
+            ObservationKind::ToolUse,
+            json!({
+                "tool_name": "Edit",
+                "native_tool": "apply_patch",
+                "tool_input": {
+                    "file_paths": ["/home/u/kioku/src/a.rs", "/home/u/kioku/src/b.rs"],
+                    "patch": format!("*** Begin Patch\n{}", "+x\n".repeat(3000)),
+                },
+                "tool_response": "Success. Updated the following files",
+            }),
+        );
+        let stored = &store.observations("codex-fork").unwrap()[1].payload;
+        assert!(stored["tool_input"].to_string().chars().count() <= 4000);
+        let r = store.finalize_session("codex-fork").unwrap();
+        let page = store.read_page(r.session_page.as_deref().unwrap()).unwrap();
+        assert_eq!(page.frontmatter.agent.as_deref(), Some("codex"));
+        assert_eq!(page.frontmatter.tags, vec!["codex"]);
+        assert!(
+            page.frontmatter
+                .title
+                .contains(" codex — 二つのファイルを直して")
+        );
+        assert!(page.body.contains("- src/a.rs (1)"), "{}", page.body);
+        assert!(page.body.contains("- src/b.rs (1)"), "{}", page.body);
+        let state = store.read_page("kioku-3f9a1c2e/STATE.md").unwrap();
+        assert!(state.body.contains(" codex — 二つのファイルを直して"));
+    }
+
+    #[test]
+    fn status_reports_versions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path());
+        let s = store.status().unwrap();
+        assert_eq!(s.version, crate::VERSION);
+        assert_eq!(s.index_schema_version, Some(INDEX_SCHEMA_VERSION));
+        assert_eq!(s.index_schema_expected, INDEX_SCHEMA_VERSION);
+        std::fs::remove_file(DataDir::new(tmp.path()).index_version_file()).unwrap();
+        assert_eq!(store.status().unwrap().index_schema_version, None);
+        // a status body from an M1 server still deserializes
+        let old: StatusReport = serde_json::from_value(json!({
+            "data_dir": "/d", "projects": 0, "pages": 0, "sessions": 0, "observations": 0,
+            "handoffs": 0, "index_docs": 0, "git_enabled": false
+        }))
+        .unwrap();
+        assert_eq!(old.index_schema_version, None);
+        assert_eq!(old.version, "");
     }
 
     #[test]

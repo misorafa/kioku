@@ -94,7 +94,7 @@ impl SessionDigest {
                         .unwrap_or_default();
                     let input = obs.payload.get("tool_input").unwrap_or(&Value::Null);
                     if EDIT_TOOLS.contains(&tool) {
-                        if let Some(p) = input_path(input) {
+                        for p in edit_paths(input) {
                             bump(&mut edits, &relative(&p, root));
                         }
                     } else if tool == "Read" {
@@ -212,6 +212,22 @@ fn input_path(input: &Value) -> Option<String> {
         .or_else(|| input.get("notebook_path"))
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+/// Paths an edit-type tool call touched: `file_path` / `notebook_path`, plus every string in
+/// `file_paths` (M2 §9.3: Codex `apply_patch` edits several files in one call). Each distinct
+/// path counts once per call.
+fn edit_paths(input: &Value) -> Vec<String> {
+    let mut out: Vec<String> = input_path(input).into_iter().collect();
+    if let Some(list) = input.get("file_paths").and_then(Value::as_array) {
+        for p in list.iter().filter_map(Value::as_str) {
+            let p = p.trim();
+            if !p.is_empty() && !out.iter().any(|q| q == p) {
+                out.push(p.to_string());
+            }
+        }
+    }
+    out
 }
 
 fn relative(path: &str, root: Option<&str>) -> String {
@@ -479,6 +495,68 @@ mod tests {
         assert!(h.ends_with("次にやること: （エージェントが明示的に書かなかったため不明。上記を手がかりに再開すること）\n"));
         let en = d.handoff_section(Lang::En);
         assert!(en.starts_with("## Handoff (auto-generated)"));
+    }
+
+    #[test]
+    fn edit_entries_accept_file_paths() {
+        let root = "/home/u/kioku";
+        let observations = vec![
+            obs(
+                1,
+                ObservationKind::Prompt,
+                json!({"prompt": "パッチを当てて"}),
+            ),
+            // Codex apply_patch, normalized client-side (M2 §3.5)
+            tool(
+                2,
+                "Edit",
+                json!({"file_paths": [format!("{root}/src/a.rs"), "src/b.rs", format!("{root}/src/a.rs"), 7, ""],
+                       "patch": "*** Begin Patch"}),
+                json!("Success. Updated the following files"),
+            ),
+            tool(
+                3,
+                "Edit",
+                json!({"file_path": format!("{root}/src/a.rs"), "file_paths": [format!("{root}/src/c.rs")]}),
+                json!({}),
+            ),
+            // Cursor postToolUseFailure / Gemini error, normalized client-side
+            tool(
+                4,
+                "Bash",
+                json!({"command": "npm test"}),
+                json!({"is_error": true, "error": "Command timed out after 30s", "failure_type": "timeout"}),
+            ),
+            tool(
+                5,
+                "Edit",
+                json!({"file_path": format!("{root}/src/c.rs")}),
+                json!({"llmContent": "failed", "returnDisplay": "…", "error": {"message": "no match"}}),
+            ),
+        ];
+        let d = SessionDigest::from_observations(&observations, Some(root));
+        assert_eq!(
+            d.files,
+            vec![
+                FileCount {
+                    path: "src/a.rs".into(),
+                    count: 2
+                },
+                FileCount {
+                    path: "src/c.rs".into(),
+                    count: 2
+                },
+                FileCount {
+                    path: "src/b.rs".into(),
+                    count: 1
+                },
+            ]
+        );
+        assert_eq!(d.errors, 2);
+        assert!(
+            d.handoff_section(Lang::Ja)
+                .contains("触ったファイル: src/a.rs (2), src/c.rs (2), src/b.rs (1)")
+        );
     }
 
     #[test]

@@ -556,6 +556,21 @@ pub fn newest_session_handoff(
         .optional()?)
 }
 
+/// Newest handoff accepted by `session` (the one its SessionStart consumed; older ones it
+/// superseded carry the same `accepted_by` but rank below).
+pub fn newest_handoff_accepted_by(
+    conn: &Connection,
+    session: &str,
+) -> anyhow::Result<Option<Handoff>> {
+    Ok(conn
+        .query_row(
+            &format!("{HANDOFF_SELECT} WHERE h.accepted_by = ?1 {HANDOFF_ORDER}"),
+            params![session],
+            handoff_from_row,
+        )
+        .optional()?)
+}
+
 /// Marks every pending handoff of a project as accepted by `by` (consume + supersede).
 pub fn accept_pending_handoffs(
     conn: &Connection,

@@ -27,6 +27,7 @@ async fn everything_else_requires_the_token() {
     let routes = [
         (Method::POST, "/api/v1/sessions/start"),
         (Method::GET, "/api/v1/sessions/abc"),
+        (Method::GET, "/api/v1/sessions/abc/context"),
         (Method::POST, "/api/v1/sessions/abc/finalize"),
         (Method::POST, "/api/v1/observations"),
         (
@@ -484,6 +485,101 @@ async fn reindex_and_status() {
     assert_eq!(body["pages"], 1);
     assert_eq!(body["index_docs"], 1);
     assert_eq!(srv.store.status().unwrap().index_docs, 1);
+}
+
+#[tokio::test]
+async fn status_reports_versions() {
+    let srv = spawn().await;
+    let (status, body) = srv.get("/api/v1/status").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(body["index_schema_version"], 2);
+    assert_eq!(body["index_schema_expected"], 2);
+    let file = srv.dir.path().join("index/schema-version");
+    std::fs::remove_file(&file).unwrap();
+    let (_, body) = srv.get("/api/v1/status").await;
+    assert!(body["index_schema_version"].is_null(), "{body}");
+    assert_eq!(body["index_schema_expected"], 2);
+    std::fs::write(&file, "1\n").unwrap();
+    let (_, body) = srv.get("/api/v1/status").await;
+    assert_eq!(body["index_schema_version"], 1);
+}
+
+#[tokio::test]
+async fn session_context_is_read_only() {
+    let srv = spawn().await;
+    let (status, body) = srv.get("/api/v1/sessions/unknown-session/context").await;
+    assert_eq!(status, 404);
+    assert!(body["error"].as_str().unwrap().contains("unknown-session"));
+
+    // a Codex session whose apply_patch touched two files leaves a rules handoff
+    let mut start = start_body("codex-0001");
+    start["agent"] = json!("codex");
+    let (status, _) = srv.post("/api/v1/sessions/start", start).await;
+    assert_eq!(status, 200);
+    for obs in [
+        json!({"session_id": "codex-0001", "kind": "prompt", "payload": {"prompt": "認証のバグを直して"}}),
+        json!({"session_id": "codex-0001", "kind": "tool_use", "payload": {
+            "tool_name": "Edit", "native_tool": "apply_patch",
+            "tool_input": {"file_paths": ["/home/u/kioku/src/auth.rs", "/home/u/kioku/src/login.rs"],
+                           "patch": "*** Begin Patch\n*** Update File: src/auth.rs\n*** End Patch"},
+            "tool_response": "Success. Updated the following files"
+        }}),
+    ] {
+        let (status, body) = srv.post("/api/v1/observations", obs).await;
+        assert_eq!(status, 200, "{body}");
+    }
+    let (_, fin) = srv
+        .post("/api/v1/sessions/codex-0001/finalize", json!({}))
+        .await;
+    let handoff_id = fin["handoff_id"].as_str().unwrap().to_string();
+    let page_path = fin["session_page"].as_str().unwrap().to_string();
+    let (_, page) = srv.get(&format!("/api/v1/pages/{page_path}")).await;
+    let page_body = page["body"].as_str().unwrap();
+    assert!(page_body.contains("- src/auth.rs (1)"), "{page_body}");
+    assert!(page_body.contains("- src/login.rs (1)"), "{page_body}");
+    assert_eq!(page["frontmatter"]["agent"], "codex");
+
+    // a Cursor session started implicitly (M2 §3.9) consumes it
+    let mut start = start_body("cursor-0002");
+    start["agent"] = json!("cursor");
+    start["source"] = json!("implicit");
+    let (status, started) = srv.post("/api/v1/sessions/start", start).await;
+    assert_eq!(status, 200, "{started}");
+    assert_eq!(started["pending_handoff"]["id"], handoff_id.as_str());
+    assert_eq!(srv.store.session("cursor-0002").unwrap().source, "implicit");
+
+    // a newer handoff is written; context returns the accepted one and consumes nothing
+    let (status, _) = srv
+        .post(
+            "/api/v1/handoffs",
+            json!({"project": PROJECT, "session": "codex-0001", "summary": "追加の引き継ぎ"}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    for _ in 0..2 {
+        let (status, ctx) = srv.get("/api/v1/sessions/cursor-0002/context").await;
+        assert_eq!(status, 200, "{ctx}");
+        assert_eq!(ctx["project_id"], PROJECT);
+        assert_eq!(ctx["pending_handoff"]["id"], handoff_id.as_str());
+        assert_eq!(ctx["pending_handoff"]["accepted_by"], "cursor-0002");
+        assert_eq!(ctx["state_excerpt"], started["state_excerpt"]);
+        assert_eq!(ctx["recent_sessions"], started["recent_sessions"]);
+        assert_eq!(ctx["recent_sessions"][0]["path"], page_path.as_str());
+    }
+    let (_, pending) = srv
+        .get(&format!("/api/v1/handoffs/pending?project={PROJECT}"))
+        .await;
+    assert!(pending["handoff"]["accepted_at"].is_null(), "{pending}");
+    assert_eq!(pending["handoff"]["source"], "agent");
+    let (_, info) = srv.get("/api/v1/sessions/cursor-0002").await;
+    assert_eq!(info["status"], "open");
+    assert_eq!(info["counts"], json!({"prompts": 0, "tool_uses": 0}));
+
+    // a session that accepted nothing gets pending_handoff: null
+    let (status, ctx) = srv.get("/api/v1/sessions/codex-0001/context").await;
+    assert_eq!(status, 200);
+    assert!(ctx["pending_handoff"].is_null(), "{ctx}");
 }
 
 /// Percent-encodes a query-string value.

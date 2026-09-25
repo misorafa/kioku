@@ -778,19 +778,26 @@ detected or not.
 
 Returns the `SessionStartResponse` shape for an existing session without
 side effects: `project_id`, `pending_handoff` = the handoff with `accepted_by
-= {id}` (newest), `state_excerpt`, `recent_sessions`. 404 for an unknown
-session. Used by Cursor late context (§5.6).
+= {id}` (newest; `null` when the session accepted none), `state_excerpt`,
+`recent_sessions` (as in `sessions/start`, but the session's own page is left
+out — Stop may already have finalized it once). 404 for an unknown session.
+Used by Cursor late context (§5.6). Core: `Store::session_context`.
 
 ### 9.2 `GET /api/v1/status` additions
 
 `version` (server crate version), `index_schema_version` (on disk, from
 `index/schema-version`; `null` if missing), `index_schema_expected`
-(`INDEX_SCHEMA_VERSION`). Used by doctor.
+(`INDEX_SCHEMA_VERSION`). Used by doctor. The fields are `#[serde(default)]`
+in `StatusReport`, so a newer CLI still reads an M1 server's status (`version`
+empty, `index_schema_version` null, `index_schema_expected` 0). The MCP
+`kioku_status` text is unchanged.
 
 ### 9.3 Digest
 
 - Edit-type entries accept `tool_input.file_paths` (array) in addition to
-  `file_path` / `notebook_path`.
+  `file_path` / `notebook_path`; each distinct path counts once per tool call
+  (non-string / empty entries are ignored). The server-side sanitizer shrinks
+  the longest string first, so the path list survives a 4 000-char patch.
 - `errors` counts `tool_response.is_error == true` (already) — normalizers set
   it for Cursor failures and Gemini `error`.
 - Session page / STATE labels use the stored agent label (`codex`, `cursor`,
@@ -799,7 +806,8 @@ session. Used by Cursor late context (§5.6).
 ### 9.4 Sessions
 
 `sessions/start` accepts `source = "implicit"` (§3.9) and `"fork"` (Codex);
-`source` stays free text. No schema change.
+`source` stays free text. No schema change. (M1 already stored any string, so
+this needed tests only.)
 
 ## 10. Service management
 
