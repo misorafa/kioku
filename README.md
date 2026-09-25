@@ -76,7 +76,7 @@ SessionEnd        finalize (idempotent)
 
 ## Quickstart (one machine)
 
-Requirements: Rust 1.95+ to build, `git` (optional; without it the wiki is not
+Requirements: Rust 1.91+ to build (`rustup update` if older), `git` (optional; without it the wiki is not
 versioned). The build downloads the IPADIC dictionary, so it needs network
 access. Prebuilt binaries for Linux (x86_64, aarch64) and macOS (arm64,
 x86_64) are attached to tagged GitHub releases.

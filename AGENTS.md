@@ -11,7 +11,7 @@ the spec in the same change and say so in the commit message.
 
 ## Toolchain (pinned — do not "upgrade" without a reason stated in the commit)
 
-- Rust 1.95, edition 2024, workspace at repo root.
+- Rust: MSRV 1.91 (`rust-version` in Cargo.toml; CI and Docker build on 1.95), edition 2024, workspace at repo root.
 - tantivy 0.26, lindera-tantivy 5 (+ lindera 5 with `embed-ipadic`), rmcp 3.4
   (`server`, `transport-streamable-http-server`, `macros`, `schemars`),
   axum 0.8, tokio (multi-thread), rusqlite 0.40 (`bundled`), clap 4 (`derive`),

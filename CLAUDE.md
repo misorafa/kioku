@@ -11,7 +11,7 @@ the spec in the same change and say so in the commit message.
 
 ## Toolchain (pinned — do not "upgrade" without a reason stated in the commit)
 
-- Rust 1.95, edition 2024, workspace at repo root.
+- Rust: MSRV 1.91 (`rust-version` in Cargo.toml; CI and Docker build on 1.95), edition 2024, workspace at repo root.
 - tantivy 0.26, lindera-tantivy 5 (+ lindera 5 with `embed-ipadic`, and
   lindera-analysis 5 for the NFKC character filter — already a lindera-tantivy
   dependency), rmcp 3.4
