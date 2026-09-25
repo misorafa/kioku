@@ -1,24 +1,57 @@
-//! Agent-neutral hook events (spec §8.1) and the per-agent stdin parsers.
+//! Agent-neutral hook events (M1 §8.1, M2 §3) and the per-agent stdin parsers.
 //!
-//! M1 ships only the Claude Code parser; `--agent <name>` selects it so later agents
-//! (Codex, Cursor, Gemini) can add their own without touching the handlers.
+//! `kioku hook <neutral event> --agent <name>` picks the parser; each one maps its agent's
+//! payload onto [`HookEvent`] — session id / cwd resolution (M2 §3.4) and tool
+//! normalization onto Claude Code's tool names (§3.5) included — so the handlers and the
+//! core digest have a single code path. Parsers are tolerant: a missing optional field
+//! never fails the event, only a missing session id does.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use clap::ValueEnum;
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 
 /// Which agent produced the hook payload on stdin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Agent {
     /// Anthropic Claude Code.
     ClaudeCode,
+    /// OpenAI Codex CLI.
+    Codex,
+    /// Cursor (desktop editor and the `agent` CLI).
+    Cursor,
+    /// Google Gemini CLI.
+    GeminiCli,
 }
 
+/// Every agent, in the order of the spec tables.
+pub const ALL_AGENTS: [Agent; 4] = [
+    Agent::ClaudeCode,
+    Agent::Codex,
+    Agent::Cursor,
+    Agent::GeminiCli,
+];
+
 impl Agent {
-    /// Agent name as stored on sessions (`claude-code`).
+    /// Agent name as stored on sessions and passed to `--agent` (`claude-code`, `codex`, …).
     pub fn as_str(self) -> &'static str {
         match self {
             Agent::ClaudeCode => "claude-code",
+            Agent::Codex => "codex",
+            Agent::Cursor => "cursor",
+            Agent::GeminiCli => "gemini-cli",
+        }
+    }
+
+    /// Environment variables naming the project dir, in resolution order (M2 §3.4 step 3).
+    pub fn project_dir_env(self) -> &'static [&'static str] {
+        match self {
+            Agent::ClaudeCode => &["CLAUDE_PROJECT_DIR"],
+            Agent::Codex => &[],
+            Agent::Cursor => &["CURSOR_PROJECT_DIR", "CLAUDE_PROJECT_DIR"],
+            Agent::GeminiCli => &["GEMINI_PROJECT_DIR", "GEMINI_CWD", "CLAUDE_PROJECT_DIR"],
         }
     }
 }
@@ -76,30 +109,81 @@ impl HookEventKind {
     }
 }
 
+/// Hook timeout (ms) that `kioku install` registers for an agent's event (M2 §4.2, §5.2,
+/// §6.2; Claude Code: 10 s SessionStart, the agent's 60 s default elsewhere).
+pub fn registered_timeout_ms(agent: Agent, event: HookEventKind) -> u64 {
+    use HookEventKind::*;
+    match (agent, event) {
+        (_, SessionStart) => 10_000,
+        (Agent::ClaudeCode, _) => 60_000,
+        (Agent::Codex, SessionEnd) => 3_000,
+        (_, Stop) => 10_000,
+        _ => 5_000,
+    }
+}
+
+/// Hard deadline (ms) of one invocation: `[client] timeout_ms`, capped at the registered
+/// agent timeout minus 500 ms (M2 §3.10; Codex SessionEnd → 2 500 ms).
+pub fn hook_deadline_ms(agent: Agent, event: HookEventKind, timeout_ms: u64) -> u64 {
+    let cap = registered_timeout_ms(agent, event).saturating_sub(500);
+    timeout_ms.min(cap).max(1)
+}
+
+/// The environment a hook runs in; injected so tests never read or mutate the real one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HookEnv {
+    /// Environment variables.
+    pub vars: HashMap<String, String>,
+    /// Home directory (`~/.cursor/hooks.json`, `~/.kioku` fallback).
+    pub home: Option<PathBuf>,
+    /// Process working directory (last-resort cwd for every agent but Cursor).
+    pub cwd: Option<PathBuf>,
+}
+
+impl HookEnv {
+    /// The real process environment, home directory and cwd.
+    pub fn from_process() -> HookEnv {
+        HookEnv {
+            vars: std::env::vars().collect(),
+            home: kioku_core::util::home_dir_opt(),
+            cwd: std::env::current_dir().ok(),
+        }
+    }
+
+    /// A non-empty environment variable.
+    pub fn var(&self, key: &str) -> Option<&str> {
+        self.vars
+            .get(key)
+            .map(String::as_str)
+            .filter(|v| !v.is_empty())
+    }
+}
+
 /// A hook payload in agent-neutral form.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HookEvent {
-    /// Agent name (`claude-code`).
+    /// Agent label (`claude-code`, `codex`, `cursor`, `gemini-cli`).
     pub agent: String,
     /// Which event this is.
     pub event: HookEventKind,
     /// Agent session id.
     pub session_id: String,
-    /// Working directory of the agent (may be empty if the agent did not send one).
+    /// Resolved working directory (M2 §3.4 steps 1–3); empty when none was found.
     pub cwd: String,
-    /// SessionStart source (`startup` | `resume` | `clear` | `compact`).
+    /// SessionStart source (`startup` | `resume` | `clear` | `compact` | `fork`).
     pub source: Option<String>,
     /// UserPromptSubmit prompt text.
     pub prompt: Option<String>,
-    /// PostToolUse tool name.
+    /// PostToolUse tool name, normalized to Claude Code's names (M2 §3.5).
     pub tool_name: Option<String>,
-    /// PostToolUse tool input.
+    /// PostToolUse tool input (normalized).
     pub tool_input: Option<Value>,
-    /// PostToolUse tool response.
+    /// PostToolUse tool response (normalized).
     pub tool_response: Option<Value>,
     /// PostToolUse tool call id.
     pub tool_use_id: Option<String>,
-    /// Stop: true when the agent is already continuing because of a Stop hook.
+    /// Stop: true when the agent is already continuing because of a Stop hook
+    /// (Cursor: `loop_count > 0`).
     pub stop_hook_active: bool,
     /// PreCompact trigger (`manual` | `auto`).
     pub trigger: Option<String>,
@@ -107,153 +191,390 @@ pub struct HookEvent {
     pub reason: Option<String>,
     /// The payload exactly as received.
     pub raw: Value,
+    /// Native event name as sent (`hook_event_name`), empty if absent.
+    pub native_event: String,
+    /// Workspace roots (Cursor `workspace_roots`); empty for other agents.
+    pub workspace_roots: Vec<String>,
+    /// Native tool name before normalization, e.g. `apply_patch`, `Shell`, `run_shell_command`.
+    pub native_tool: Option<String>,
+    /// Turn id (Codex `turn_id`), informational.
+    pub turn_id: Option<String>,
+    /// Cursor stop `loop_count` (0 on the first stop of a follow-up chain).
+    pub loop_count: Option<u32>,
+    /// Cursor stop `status` (`completed` | `aborted` | `error`).
+    pub stop_status: Option<String>,
 }
 
-/// Parses a hook payload from stdin for the given agent and event.
+/// Parses a hook payload using only the payload (no environment fallbacks).
 pub fn parse_event(agent: Agent, event: HookEventKind, stdin: &str) -> anyhow::Result<HookEvent> {
+    parse_event_env(agent, event, stdin, &HookEnv::default())
+}
+
+/// Parses a hook payload from stdin for the given agent and event; `env` supplies the
+/// project-dir variables of M2 §3.4.
+pub fn parse_event_env(
+    agent: Agent,
+    event: HookEventKind,
+    stdin: &str,
+    env: &HookEnv,
+) -> anyhow::Result<HookEvent> {
     let raw: Value = serde_json::from_str(stdin.trim()).context("hook stdin is not JSON")?;
+    parse_value(agent, event, raw, env)
+}
+
+/// [`parse_event_env`] on an already-parsed payload.
+pub fn parse_value(
+    agent: Agent,
+    event: HookEventKind,
+    raw: Value,
+    env: &HookEnv,
+) -> anyhow::Result<HookEvent> {
     match agent {
-        Agent::ClaudeCode => parse_claude_code(event, raw),
+        Agent::ClaudeCode => parse_claude_code_env(event, raw, env),
+        Agent::Codex => parse_codex(event, raw, env),
+        Agent::Cursor => parse_cursor(event, raw, env),
+        Agent::GeminiCli => parse_gemini(event, raw, env),
     }
 }
 
-/// Claude Code stdin → [`HookEvent`] (fields per spec §8.1). The event comes from the
-/// command line; `hook_event_name` is informational only.
+/// Claude Code stdin → [`HookEvent`] (fields per M1 §8.1), without environment fallbacks.
 pub fn parse_claude_code(event: HookEventKind, raw: Value) -> anyhow::Result<HookEvent> {
+    parse_claude_code_env(event, raw, &HookEnv::default())
+}
+
+fn parse_claude_code_env(
+    event: HookEventKind,
+    raw: Value,
+    env: &HookEnv,
+) -> anyhow::Result<HookEvent> {
+    let ev = common(Agent::ClaudeCode, event, raw, env, &["session_id"])?;
+    Ok(HookEvent {
+        tool_name: text(&ev.raw, "tool_name"),
+        tool_input: value(&ev.raw, "tool_input"),
+        tool_response: value(&ev.raw, "tool_response"),
+        ..ev
+    })
+}
+
+/// Codex CLI stdin → [`HookEvent`] (M2 §4.3): `Bash` and `apply_patch` normalized.
+pub fn parse_codex(event: HookEventKind, raw: Value, env: &HookEnv) -> anyhow::Result<HookEvent> {
+    let mut ev = common(Agent::Codex, event, raw, env, &["session_id"])?;
+    ev.tool_response = value(&ev.raw, "tool_response");
+    let input = value(&ev.raw, "tool_input");
+    if let Some(native) = text(&ev.raw, "tool_name") {
+        let (name, input) = match native.as_str() {
+            "Bash" | "shell" | "exec_command" => ("Bash".to_string(), bash_input(input)),
+            "apply_patch" => ("Edit".to_string(), apply_patch_input(input, &ev.cwd)),
+            _ => (native.clone(), input),
+        };
+        ev.tool_name = Some(name);
+        ev.tool_input = input;
+        ev.native_tool = Some(native);
+    } else {
+        ev.tool_input = input;
+    }
+    Ok(ev)
+}
+
+/// Cursor stdin → [`HookEvent`] (M2 §5.3). Accepts the native shape (`conversation_id`,
+/// `workspace_roots`) and a Claude-shaped one (`session_id`, `cwd`) alike (§3.7).
+pub fn parse_cursor(event: HookEventKind, raw: Value, env: &HookEnv) -> anyhow::Result<HookEvent> {
+    let mut ev = common(
+        Agent::Cursor,
+        event,
+        raw,
+        env,
+        &["conversation_id", "session_id"],
+    )?;
+    ev.stop_hook_active = ev.stop_hook_active || ev.loop_count.is_some_and(|n| n > 0);
+    if event != HookEventKind::PostToolUse {
+        return Ok(ev);
+    }
+    let raw = &ev.raw;
+    let is_file_edit = ev.native_event == "afterFileEdit"
+        || (raw.get("tool_name").is_none() && raw.get("edits").is_some());
+    if is_file_edit {
+        let edits = raw
+            .get("edits")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        ev.native_tool = Some("afterFileEdit".to_string());
+        ev.tool_name = Some("Edit".to_string());
+        ev.tool_input = text(raw, "file_path").map(|p| json!({ "file_path": p }));
+        ev.tool_response = Some(json!({ "edits": edits }));
+        return Ok(ev);
+    }
+    let input = value(raw, "tool_input");
+    let native = text(raw, "tool_name");
+    let (name, input) = match native.as_deref() {
+        Some("Shell") => (Some("Bash".to_string()), bash_input(input)),
+        Some("Read") => {
+            let path = input.as_ref().and_then(|i| {
+                ["file_path", "path", "target_file", "filePath"]
+                    .iter()
+                    .find_map(|k| text(i, k))
+            });
+            let input = match path {
+                Some(p) => Some(json!({ "file_path": p })),
+                None => input,
+            };
+            (Some("Read".to_string()), input)
+        }
+        _ => (native.clone(), input),
+    };
+    ev.tool_name = name;
+    ev.tool_input = input;
+    ev.native_tool = native;
+    ev.tool_response = match raw.get("tool_output") {
+        Some(Value::String(s)) => {
+            Some(serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.clone())))
+        }
+        Some(Value::Null) | None => value(raw, "tool_response"),
+        Some(other) => Some(other.clone()),
+    };
+    let failed = ev.native_event == "postToolUseFailure" || raw.get("error_message").is_some();
+    if failed {
+        let mut resp = Map::new();
+        resp.insert("is_error".into(), Value::Bool(true));
+        resp.insert(
+            "error".into(),
+            raw.get("error_message").cloned().unwrap_or(Value::Null),
+        );
+        if let Some(t) = value(raw, "failure_type") {
+            resp.insert("failure_type".into(), t);
+        }
+        ev.tool_response = Some(Value::Object(resp));
+    }
+    Ok(ev)
+}
+
+/// Gemini CLI stdin → [`HookEvent`] (M2 §6.3): shell / file tools normalized, an
+/// `tool_response.error` marks the call as failed.
+pub fn parse_gemini(event: HookEventKind, raw: Value, env: &HookEnv) -> anyhow::Result<HookEvent> {
+    let mut ev = common(Agent::GeminiCli, event, raw, env, &["session_id"])?;
+    let input = value(&ev.raw, "tool_input");
+    let file_input = |input: Option<Value>| {
+        let path = input.as_ref().and_then(|i| {
+            ["file_path", "absolute_path", "path"]
+                .iter()
+                .find_map(|k| text(i, k))
+        });
+        match path {
+            Some(p) => Some(json!({ "file_path": p })),
+            None => input,
+        }
+    };
+    if let Some(native) = text(&ev.raw, "tool_name") {
+        let (name, input) = match native.as_str() {
+            "run_shell_command" => ("Bash", bash_input(input)),
+            "write_file" => ("Write", file_input(input)),
+            "replace" => ("Edit", file_input(input)),
+            "read_file" => ("Read", file_input(input)),
+            other => (other, input),
+        };
+        ev.tool_name = Some(name.to_string());
+        ev.tool_input = input;
+        ev.native_tool = Some(native);
+    } else {
+        ev.tool_input = input;
+    }
+    ev.tool_response = value(&ev.raw, "tool_response").map(|mut resp| {
+        let failed = resp
+            .get("error")
+            .is_some_and(|e| !e.is_null() && e.as_str() != Some(""));
+        if failed && let Value::Object(map) = &mut resp {
+            map.insert("is_error".into(), Value::Bool(true));
+        }
+        resp
+    });
+    Ok(ev)
+}
+
+/// Fields every agent shares; tool fields are left to the agent parser.
+fn common(
+    agent: Agent,
+    event: HookEventKind,
+    raw: Value,
+    env: &HookEnv,
+    session_keys: &[&str],
+) -> anyhow::Result<HookEvent> {
     if !raw.is_object() {
         anyhow::bail!("hook stdin is not a JSON object");
     }
-    let text = |k: &str| {
-        raw.get(k)
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    };
-    let session_id = text("session_id").context("hook payload has no session_id")?;
-    let value = |k: &str| raw.get(k).filter(|v| !v.is_null()).cloned();
+    let mut session_id = session_keys.iter().find_map(|k| text(&raw, k));
+    if session_id.is_none() && agent == Agent::GeminiCli {
+        session_id = env.var("GEMINI_SESSION_ID").map(str::to_string);
+    }
+    let session_id = session_id.with_context(|| {
+        format!(
+            "hook payload has no session id ({})",
+            session_keys.join(" / ")
+        )
+    })?;
+    let workspace_roots: Vec<String> = raw
+        .get("workspace_roots")
+        .and_then(Value::as_array)
+        .map(|roots| {
+            roots
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let cwd = resolve_cwd(agent, &raw, &workspace_roots, env);
     Ok(HookEvent {
-        agent: Agent::ClaudeCode.as_str().to_string(),
+        agent: agent.as_str().to_string(),
         event,
         session_id,
-        cwd: text("cwd").unwrap_or_default(),
-        source: text("source"),
+        cwd,
+        source: text(&raw, "source"),
         // The prompt is kept verbatim even when empty-looking: an empty prompt is still a prompt.
         prompt: raw
             .get("prompt")
             .and_then(Value::as_str)
             .map(str::to_string),
-        tool_name: text("tool_name"),
-        tool_input: value("tool_input"),
-        tool_response: value("tool_response"),
-        tool_use_id: text("tool_use_id"),
+        tool_name: None,
+        tool_input: None,
+        tool_response: None,
+        tool_use_id: text(&raw, "tool_use_id"),
         stop_hook_active: raw
             .get("stop_hook_active")
             .and_then(Value::as_bool)
             .unwrap_or(false),
-        trigger: text("trigger"),
-        reason: text("reason"),
+        trigger: text(&raw, "trigger"),
+        reason: text(&raw, "reason"),
+        native_event: text(&raw, "hook_event_name").unwrap_or_default(),
+        workspace_roots,
+        native_tool: None,
+        turn_id: text(&raw, "turn_id"),
+        loop_count: raw
+            .get("loop_count")
+            .and_then(Value::as_u64)
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
+        stop_status: text(&raw, "status"),
         raw,
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const SID: &str = "8d3c1f0e-5b7a-4c2d-9e1f-0a2b3c4d5e6f";
-
-    fn fixture(kind: HookEventKind, file: &str) -> HookEvent {
-        let path = format!("{}/tests/fixtures/{file}", env!("CARGO_MANIFEST_DIR"));
-        let text = std::fs::read_to_string(&path).unwrap();
-        let ev = parse_event(Agent::ClaudeCode, kind, &text).unwrap();
-        assert_eq!(ev.agent, "claude-code");
-        assert_eq!(ev.event, kind);
-        assert_eq!(ev.session_id, SID);
-        assert_eq!(ev.cwd, "/home/u/kioku");
-        assert_eq!(
-            ev.raw["hook_event_name"].as_str(),
-            Some(kind.claude_code_name())
-        );
-        ev
-    }
-
-    #[test]
-    fn session_start_fixture() {
-        let ev = fixture(HookEventKind::SessionStart, "session_start.json");
-        assert_eq!(ev.source.as_deref(), Some("startup"));
-        assert!(ev.prompt.is_none() && ev.tool_name.is_none());
-    }
-
-    #[test]
-    fn user_prompt_submit_fixture() {
-        let ev = fixture(HookEventKind::UserPromptSubmit, "user_prompt_submit.json");
-        assert!(
-            ev.prompt
-                .as_deref()
-                .unwrap()
-                .starts_with("引き継ぎ書の自動生成")
-        );
-    }
-
-    #[test]
-    fn post_tool_use_fixture() {
-        let ev = fixture(HookEventKind::PostToolUse, "post_tool_use.json");
-        assert_eq!(ev.tool_name.as_deref(), Some("Edit"));
-        assert_eq!(
-            ev.tool_input.as_ref().unwrap()["file_path"],
-            "/home/u/kioku/crates/kioku-core/src/handoff.rs"
-        );
-        assert_eq!(ev.tool_response.as_ref().unwrap()["userModified"], false);
-        assert_eq!(
-            ev.tool_use_id.as_deref(),
-            Some("toolu_01KxQ7mY3bT9pVwE2rN8sL4d")
-        );
-    }
-
-    #[test]
-    fn stop_fixture() {
-        let ev = fixture(HookEventKind::Stop, "stop.json");
-        assert!(!ev.stop_hook_active);
-        let mut raw = ev.raw.clone();
-        raw["stop_hook_active"] = Value::Bool(true);
-        let ev = parse_claude_code(HookEventKind::Stop, raw).unwrap();
-        assert!(ev.stop_hook_active);
-    }
-
-    #[test]
-    fn pre_compact_fixture() {
-        let ev = fixture(HookEventKind::PreCompact, "pre_compact.json");
-        assert_eq!(ev.trigger.as_deref(), Some("auto"));
-    }
-
-    #[test]
-    fn session_end_fixture() {
-        let ev = fixture(HookEventKind::SessionEnd, "session_end.json");
-        assert_eq!(ev.reason.as_deref(), Some("prompt_input_exit"));
-    }
-
-    #[test]
-    fn rejects_garbage() {
-        let k = HookEventKind::Stop;
-        assert!(parse_event(Agent::ClaudeCode, k, "").is_err());
-        assert!(parse_event(Agent::ClaudeCode, k, "[1]").is_err());
-        assert!(parse_event(Agent::ClaudeCode, k, r#"{"cwd":"/x"}"#).is_err());
-        let ev = parse_event(Agent::ClaudeCode, k, r#"{"session_id":"s1"}"#).unwrap();
-        assert_eq!(ev.cwd, "");
-        assert!(!ev.stop_hook_active);
-    }
-
-    #[test]
-    fn cli_names_match_value_enum() {
-        for kind in ALL_EVENTS {
-            assert_eq!(
-                HookEventKind::from_str(kind.cli_name(), false).unwrap(),
-                kind
-            );
+/// cwd per M2 §3.4 steps 1–3: payload `cwd`, `workspace_roots[0]`, then the agent's
+/// project-dir variables — the first non-empty absolute path. Empty when none qualifies
+/// (the handler decides about the process cwd, which Cursor never uses).
+fn resolve_cwd(agent: Agent, raw: &Value, roots: &[String], env: &HookEnv) -> String {
+    let payload = text(raw, "cwd");
+    let candidates = payload.into_iter().chain(roots.first().cloned()).chain(
+        agent
+            .project_dir_env()
+            .iter()
+            .filter_map(|k| env.var(k).map(str::to_string)),
+    );
+    for c in candidates {
+        if Path::new(&c).is_absolute() || looks_like_windows_abs(&c) {
+            return c;
         }
-        assert_eq!(
-            Agent::from_str("claude-code", false).unwrap(),
-            Agent::ClaudeCode
-        );
     }
+    String::new()
 }
+
+/// `C:\…` / `C:/…` count as absolute even when kioku runs on unix (payload from Windows).
+fn looks_like_windows_abs(p: &str) -> bool {
+    let b = p.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+}
+
+/// `{command}` from a shell tool input whose `command` is a string or an argv array.
+fn bash_input(input: Option<Value>) -> Option<Value> {
+    let command = match input.as_ref().and_then(|i| i.get("command")) {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .map(|p| match p {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => return input,
+    };
+    Some(json!({ "command": command }))
+}
+
+/// Maximum chars of an `apply_patch` patch kept in the observation (M2 §3.5).
+pub const PATCH_KEEP_CHARS: usize = 4000;
+
+/// Codex `apply_patch` input → `{file_paths, patch}`; paths are extracted from the whole
+/// patch before it is truncated, relative ones joined onto the session cwd.
+fn apply_patch_input(input: Option<Value>, cwd: &str) -> Option<Value> {
+    let patch = match input.as_ref() {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(obj) => ["command", "patch", "input"]
+            .iter()
+            .find_map(|k| match obj.get(*k) {
+                Some(Value::String(s)) => Some(s.clone()),
+                // `["apply_patch", "<patch>"]`: the element that holds the patch.
+                Some(Value::Array(parts)) => parts
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .find(|s| s.contains("*** "))
+                    .map(str::to_string),
+                _ => None,
+            }),
+        None => None,
+    };
+    let Some(patch) = patch else {
+        return input;
+    };
+    let paths: Vec<Value> = patch_paths(&patch)
+        .into_iter()
+        .map(|p| {
+            if Path::new(&p).is_absolute() || cwd.is_empty() {
+                Value::String(p)
+            } else {
+                Value::String(Path::new(cwd).join(&p).display().to_string())
+            }
+        })
+        .collect();
+    Some(json!({
+        "file_paths": paths,
+        "patch": kioku_core::util::truncate_chars(&patch, PATCH_KEEP_CHARS),
+    }))
+}
+
+/// File paths named by an `apply_patch` patch: `*** Add|Update|Delete File: <p>` and
+/// `*** Move to: <p>` lines, deduplicated in order.
+pub fn patch_paths(patch: &str) -> Vec<String> {
+    const PREFIXES: [&str; 4] = [
+        "*** Add File: ",
+        "*** Update File: ",
+        "*** Delete File: ",
+        "*** Move to: ",
+    ];
+    let mut out: Vec<String> = Vec::new();
+    for line in patch.lines() {
+        let line = line.trim_end_matches('\r');
+        if let Some(p) = PREFIXES.iter().find_map(|pre| line.strip_prefix(pre)) {
+            let p = p.trim();
+            if !p.is_empty() && !out.iter().any(|x| x == p) {
+                out.push(p.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// A non-empty string field.
+fn text(raw: &Value, key: &str) -> Option<String> {
+    raw.get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// A non-null field.
+fn value(raw: &Value, key: &str) -> Option<Value> {
+    raw.get(key).filter(|v| !v.is_null()).cloned()
+}
+
+#[cfg(test)]
+mod tests;

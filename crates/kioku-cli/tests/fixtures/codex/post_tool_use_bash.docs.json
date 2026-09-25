@@ -1,0 +1,17 @@
+{
+  "session_id": "019a6f1e-3c2b-7d10-9a55-2f8e4b1c0d77",
+  "transcript_path": null,
+  "cwd": "/Users/me/src/kioku",
+  "hook_event_name": "PostToolUse",
+  "model": "gpt-5-codex",
+  "permission_mode": "default",
+  "turn_id": "turn_3",
+  "tool_name": "Bash",
+  "tool_use_id": "call_Ab12",
+  "tool_input": {
+    "command": "cargo test -p kioku-core",
+    "workdir": "/Users/me/src/kioku",
+    "timeout_ms": 120000
+  },
+  "tool_response": "test result: ok. 126 passed; 0 failed"
+}

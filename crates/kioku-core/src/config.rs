@@ -62,6 +62,10 @@ pub struct ClientConfig {
     pub stop_nudge: bool,
     /// Language of the SessionStart context block and the Stop nudge (`ja` | `en`).
     pub lang: Lang,
+    /// Append every raw hook payload to `logs/hook-dump.jsonl` (M2 §3.8; also `KIOKU_HOOK_DUMP=1`).
+    pub hook_dump: bool,
+    /// Deliver the `<kioku>` block on the first Cursor tool use of a session (M2 §5.6).
+    pub cursor_late_context: bool,
 }
 
 impl Default for ClientConfig {
@@ -72,6 +76,8 @@ impl Default for ClientConfig {
             timeout_ms: DEFAULT_TIMEOUT_MS,
             stop_nudge: true,
             lang: Lang::Ja,
+            hook_dump: false,
+            cursor_late_context: true,
         }
     }
 }
@@ -264,6 +270,8 @@ mod tests {
         assert_eq!(c.client.timeout_ms, 3000);
         assert!(c.client.stop_nudge);
         assert_eq!(c.client.lang, Lang::Ja);
+        assert!(!c.client.hook_dump);
+        assert!(c.client.cursor_late_context);
         assert!(c.is_loopback_bind());
     }
 
@@ -272,7 +280,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(CONFIG_FILE),
-            "[server]\nbind = \"0.0.0.0\"\nport = 9000\nauth_token = \"filetok\"\nsummary_lang = \"en\"\n\n[client]\nserver_url = \"http://home:9000\"\ntimeout_ms = 500\nlang = \"en\"\n",
+            "[server]\nbind = \"0.0.0.0\"\nport = 9000\nauth_token = \"filetok\"\nsummary_lang = \"en\"\n\n[client]\nserver_url = \"http://home:9000\"\ntimeout_ms = 500\nlang = \"en\"\nhook_dump = true\ncursor_late_context = false\n",
         )
         .unwrap();
         let d = dir.path().to_str().unwrap();
@@ -284,6 +292,8 @@ mod tests {
         assert_eq!(c.lang(), Lang::En);
         assert_eq!(c.client.timeout_ms, 500);
         assert_eq!(c.client.lang, Lang::En);
+        assert!(c.client.hook_dump);
+        assert!(!c.client.cursor_late_context);
 
         let c = Config::load_with_env(&env(&[
             ("KIOKU_DATA_DIR", d),

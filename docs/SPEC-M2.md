@@ -126,7 +126,8 @@ Session id (first non-empty wins; if none → parse error, logged, exit 0):
 
 | agent | order |
 |-------|-------|
-| claude-code, codex, gemini-cli | `session_id` |
+| claude-code, codex | `session_id` |
+| gemini-cli | `session_id`, then env `GEMINI_SESSION_ID` (G1) |
 | cursor | `conversation_id`, then `session_id` (U1: sessionStart/End carry `session_id` "same as conversation_id"; U9: `conversation_id` is intermittently empty on tool events) |
 
 cwd (first non-empty, absolute path wins):
@@ -135,7 +136,8 @@ cwd (first non-empty, absolute path wins):
 2. `workspace_roots[0]` (Cursor; a multi-root workspace uses the first root —
    documented limitation);
 3. environment: `CURSOR_PROJECT_DIR`, `GEMINI_PROJECT_DIR`, `GEMINI_CWD`,
-   `CLAUDE_PROJECT_DIR` (the one(s) belonging to the agent, then the Claude alias);
+   `CLAUDE_PROJECT_DIR` (the one(s) belonging to the agent, then the Claude alias;
+   Codex documents none, so it goes straight to step 4); `C:\…` counts as absolute;
 4. process cwd — **except for Cursor**: user-level Cursor hooks run with cwd
    `~/.cursor/` (U1), so a Cursor event with no root is dropped (logged) rather
    than filed under a bogus project.
@@ -149,7 +151,7 @@ observation payload as `native_tool`.
 | agent | native tool (payload) | → `tool_name` | → `tool_input` |
 |-------|----------------------|---------------|----------------|
 | codex | `Bash` (`tool_input.command`: string; accept an array and join with spaces) | `Bash` | `{command}` |
-| codex | `apply_patch` (`tool_input.command` = patch text) | `Edit` | `{file_paths:[…], patch:<first 4000 chars>}` — paths from lines `^\*\*\* (Add|Update|Delete) File: (.+)$` and `^\*\*\* Move to: (.+)$`, extracted **before** truncation/sanitization |
+| codex | `apply_patch` (`tool_input.command` = patch text; also accepted: `tool_input` itself a string, `patch`/`input` keys, or an argv array whose element holds the patch) | `Edit` | `{file_paths:[…], patch:<first 4000 chars>}` — paths from lines `^\*\*\* (Add|Update|Delete) File: (.+)$` and `^\*\*\* Move to: (.+)$`, extracted **before** truncation/sanitization; relative paths are joined onto the resolved cwd so the digest can relativize them to the project root |
 | cursor | `Shell` (`tool_input.command`, `working_directory`) | `Bash` | `{command}` |
 | cursor | `Read` | `Read` | `{file_path}` from `tool_input.file_path` / `path` / `target_file` / `filePath` (key **UNVERIFIED — check with a captured payload**) |
 | cursor | afterFileEdit (`file_path`, `edits[]`) | `Edit` | `{file_path}`; `tool_response` = `{edits: <count>}` |
@@ -158,6 +160,9 @@ observation payload as `native_tool`.
 | gemini-cli | `write_file` | `Write` | `{file_path}` |
 | gemini-cli | `replace` | `Edit` | `{file_path}` |
 | gemini-cli | `read_file` | `Read` | `{file_path}` |
+
+Gemini file tools take the path from `file_path`, else `absolute_path` / `path`
+(tolerance for older builds). Any other native tool keeps its name and input.
 
 `tool_response` normalization: Cursor `tool_output` is a JSON **string** (U1)
 → parse it, fall back to the raw string. Gemini `tool_response.error` present
@@ -186,7 +191,9 @@ and `render(agent, event, result) -> HookOutcome {stdout, stderr, exit_code}`:
 
 Errors stay fail-open (M1 §8.1): render `Silent` for the agent (Gemini/Cursor
 still print `{}`) and exit 0. Nudge only on Cursor `stop` with `status ==
-"completed"` (aborted/error stops finalize without a nudge).
+"completed"` (aborted/error stops finalize without a nudge); a stop payload
+without `status` (Claude-shaped, §3.7) counts as completed. JSON replies are
+one object followed by `\n`.
 
 Nudge text: new strings `stop_nudge_generic` (ja/en) in `strings.rs` for
 non-Claude agents — same content as M1 §8.4 but the last sentence reads
@@ -230,14 +237,21 @@ env), every `kioku hook` invocation appends one JSON line to
 (`outcome` is filled after handling; write the line once, at exit.)
 
 - `env` contains only variables whose names start with `CURSOR_`, `GEMINI_`,
-  `CODEX_`, `CLAUDE_`, plus `KIOKU_*` except `KIOKU_AUTH_TOKEN`.
+  `CODEX_`, `CLAUDE_`, plus `KIOKU_*` except `KIOKU_AUTH_TOKEN`. Values of names
+  containing `TOKEN`, `SECRET`, `PASSW`, `API_KEY`/`APIKEY`, `CREDENTIAL` or
+  `AUTH` are replaced by `[REDACTED]` (agents export e.g.
+  `CLAUDE_CODE_OAUTH_TOKEN`; the names are what matters for capture).
 - `stdin` is raw (unsanitized — the point is capturing exact shapes). The file
   is created 0600, rotated like `hook.log` but at 5 MiB. Dumping never changes
   the outcome and never fails the hook.
 - `kioku doctor` warns while dumping is on (§12). `kioku hook-dump extract
   <agent> <event> [--out dir]` (small helper) writes the newest matching
-  `stdin` as a pretty-printed fixture `<agent>/<event>.captured.json`, so
-  captured payloads replace the docs-derived fixtures (§16).
+  `stdin` as a pretty-printed fixture `<out>/<agent>/<event>.captured.json`
+  (`--out` defaults to the cwd), so captured payloads replace the docs-derived
+  fixtures (§16). `<event>` matches the neutral event or the native
+  `hook_event_name` (`post-tool-use`, `afterFileEdit`, `BeforeAgent`, …) and is
+  snake_cased for the file name (`after_file_edit`); `hook-dump.jsonl.1` is
+  searched after the current file.
 
 ### 3.9 Implicit session start
 
@@ -252,13 +266,19 @@ before `kioku install`, Cursor sessionStart race), the hook:
    the block is delivered by the late-context path (§5.6).
 
 Stop on an unknown session after implicit start has nothing to finalize →
-`Silent`. At most one implicit start per invocation.
+`Silent`. At most one implicit start per invocation. This applies to Claude Code
+too and replaces M1 §9's "unknown session on `observations` → hook silently
+drops" (the M1 e2e test was updated accordingly); SessionEnd on an unknown
+session still just logs the 404.
 
 ### 3.10 Per-agent deadlines
 
 M1's single deadline stays `timeout_ms`, capped per invocation at the
 registered agent timeout minus 500 ms: Codex SessionEnd 2 500 ms (C1: SessionEnd
 max 3 s); all other registrations use ≥ 5 s so `timeout_ms` (3 000) applies.
+The registered timeouts live in `event::registered_timeout_ms` (Claude Code:
+10 s SessionStart as installed, else its 60 s default) — Step 3's installers
+must write the same values.
 
 ## 4. Codex CLI
 

@@ -84,8 +84,11 @@ pub struct Strings {
     pub start_state_heading: &'static str,
     /// SessionStart context: closing instructions.
     pub start_footer: &'static str,
-    /// `{project}`, `{session}`: Stop hook nudge paragraph.
+    /// `{project}`, `{session}`: Stop hook nudge paragraph (Claude Code, M1 §8.4).
     pub stop_nudge: &'static str,
+    /// `{project}`, `{session}`: Stop nudge for the other agents (M2 §3.6) — no
+    /// `stop_hook_active` reference.
+    pub stop_nudge_generic: &'static str,
 }
 
 /// Japanese strings.
@@ -124,6 +127,7 @@ pub const JA: Strings = Strings {
     start_state_heading: "## 現在の状態（STATE.md 抜粋）",
     start_footer: "セッション終了前に kioku_handoff_write（上の project と session を渡す）で要約・次の一手・未解決点を書くこと。\n関連する過去の記録は kioku_query で検索できる。",
     stop_nudge: "kioku: このセッションの引き継ぎがまだ書かれていないか、最後の引き継ぎ以降に作業が進んでいます。kioku_handoff_write（project={project}, session={session}）で 要約 / 次にやること / 未解決の質問 / 決定事項 を記録してから終了してください。記録済みなら stop_hook_active により再度この確認は出ません。",
+    stop_nudge_generic: "kioku: このセッションの引き継ぎがまだ書かれていないか、最後の引き継ぎ以降に作業が進んでいます。kioku_handoff_write（project={project}, session={session}）で 要約 / 次にやること / 未解決の質問 / 決定事項 を記録してから終了してください。記録済みなら、そのまま終了してください。",
 };
 
 /// English strings.
@@ -162,6 +166,7 @@ pub const EN: Strings = Strings {
     start_state_heading: "## Current state (STATE.md excerpt)",
     start_footer: "Before ending the session, record a summary, next steps and open questions with kioku_handoff_write (pass the project and session above).\nSearch past records with kioku_query.",
     stop_nudge: "kioku: no handoff has been written for this session yet, or work continued after the last one. Record summary / next steps / open questions / decisions with kioku_handoff_write (project={project}, session={session}) before stopping. If you already did, stop_hook_active prevents this check from repeating.",
+    stop_nudge_generic: "kioku: no handoff has been written for this session yet, or work continued after the last one. Record summary / next steps / open questions / decisions with kioku_handoff_write (project={project}, session={session}) before stopping. If you already did, just stop.",
 };
 
 /// Returns the string table for a language.
@@ -194,5 +199,28 @@ mod tests {
             &[("agent", "codex"), ("date", "2026-09-25")],
         );
         assert_eq!(s, "## Handoff (codex, 2026-09-25)");
+    }
+
+    #[test]
+    fn generic_nudge_differs_only_in_the_last_sentence() {
+        for (t, tail_m1, tail) in [
+            (
+                &JA,
+                "記録済みなら stop_hook_active により再度この確認は出ません。",
+                "記録済みなら、そのまま終了してください。",
+            ),
+            (
+                &EN,
+                "If you already did, stop_hook_active prevents this check from repeating.",
+                "If you already did, just stop.",
+            ),
+        ] {
+            assert!(t.stop_nudge_generic.ends_with(tail));
+            assert!(!t.stop_nudge_generic.contains("stop_hook_active"));
+            assert_eq!(
+                t.stop_nudge.strip_suffix(tail_m1),
+                t.stop_nudge_generic.strip_suffix(tail)
+            );
+        }
     }
 }

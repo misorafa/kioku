@@ -1,5 +1,6 @@
-//! Implementations of the non-hook commands: init, serve, search, status, reindex,
-//! project id, install / uninstall.
+//! Implementations of the commands: the `hook` entry point (config / stdin / dump
+//! plumbing around the handlers), init, serve, search, status, reindex, project id,
+//! install / uninstall and `hook-dump extract`.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -12,16 +13,21 @@ use kioku_core::util::home_dir;
 use kioku_core::{Config, Hit, StatusReport, Store, identify};
 use serde_json::Value;
 
-use crate::cli::{Cli, Command, InstallTarget, ProjectCommand, ScopeArg};
+use crate::cli::{Cli, Command, HookDumpCommand, InstallTarget, ProjectCommand, ScopeArg};
 use crate::client::{ApiClient, COMMAND_TIMEOUT};
-use crate::event::{ALL_EVENTS, Agent, HookEventKind};
-use crate::hook::{log_failure, run_hook};
+use crate::dump;
+use crate::event::{ALL_EVENTS, Agent, HookEnv, HookEventKind};
+use crate::hook::log_failure;
 use crate::install;
+use crate::render::{HookResult, render};
 
 /// Runs a parsed command line; returns the process exit code.
 pub fn run(cli: Cli) -> i32 {
     let result = match cli.command {
         Command::Hook { event, agent } => return hook(event, agent),
+        Command::HookDump {
+            command: HookDumpCommand::Extract { agent, event, out },
+        } => hook_dump_extract(agent, &event, out),
         Command::Init { client_only } => match client_only.as_deref() {
             Some([url, token]) => init_client_only(url, token),
             Some(_) => Err(anyhow::anyhow!("--client-only takes <url> <token>")),
@@ -59,10 +65,28 @@ fn env_map() -> HashMap<String, String> {
     std::env::vars().collect()
 }
 
-/// `kioku hook <event>`: stdin → server → stdout/stderr/exit code. Always fail-open.
+/// `kioku hook <event> --agent <a>`: stdin → server → stdout/stderr/exit code. Always
+/// fail-open; with `KIOKU_HOOK_DUMP` the invocation is also captured (M2 §3.8).
 fn hook(event: HookEventKind, agent: Agent) -> i32 {
-    let cfg = match Config::load() {
-        Ok(cfg) => cfg,
+    let env = HookEnv::from_process();
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut stdin = String::new();
+    let stdin_err = std::io::stdin().read_to_string(&mut stdin).err();
+    let outcome = match Config::load() {
+        Ok(cfg) => match stdin_err {
+            None => dump::run_hook_invocation(event, agent, &argv, &stdin, &cfg, &env),
+            Some(err) => {
+                log_failure(
+                    &cfg,
+                    event,
+                    "-",
+                    &anyhow::Error::new(err).context("reading stdin"),
+                );
+                let outcome = render(agent, event, HookResult::Silent);
+                dump::dump_invocation(&cfg, &env, agent, event, &argv, &stdin, &outcome);
+                outcome
+            }
+        },
         Err(err) => {
             let fallback = Config::for_data_dir(&home_dir().join(".kioku"));
             log_failure(
@@ -71,23 +95,27 @@ fn hook(event: HookEventKind, agent: Agent) -> i32 {
                 "-",
                 &anyhow::Error::new(err).context("loading config"),
             );
-            return 0;
+            let outcome = render(agent, event, HookResult::Silent);
+            dump::dump_invocation(&fallback, &env, agent, event, &argv, &stdin, &outcome);
+            outcome
         }
     };
-    let mut stdin = String::new();
-    if let Err(err) = std::io::stdin().read_to_string(&mut stdin) {
-        log_failure(
-            &cfg,
-            event,
-            "-",
-            &anyhow::Error::new(err).context("reading stdin"),
-        );
-        return 0;
-    }
-    let outcome = run_hook(event, agent, &stdin, &cfg);
     print!("{}", outcome.stdout);
     eprint!("{}", outcome.stderr);
     outcome.exit_code
+}
+
+/// `kioku hook-dump extract <agent> <event> [--out dir]`.
+fn hook_dump_extract(agent: Agent, event: &str, out: Option<PathBuf>) -> anyhow::Result<()> {
+    let cfg = Config::load()?;
+    let path = dump::dump_path(&cfg).context("no log directory (HOME is not set)")?;
+    let out = match out {
+        Some(o) => o,
+        None => std::env::current_dir().context("reading current directory")?,
+    };
+    let written = dump::extract(&path, agent, event, &out)?;
+    println!("wrote {}", written.display());
+    Ok(())
 }
 
 fn init() -> anyhow::Result<()> {

@@ -1,0 +1,23 @@
+{
+  "conversation_id": "c7e1a4b2-9f3d-4e8a-b6c1-0d2e3f4a5b6c",
+  "generation_id": "g-7f3a91",
+  "model": "composer-2.5",
+  "hook_event_name": "postToolUseFailure",
+  "cursor_version": "3.1.0",
+  "workspace_roots": [
+    "/Users/me/src/kioku"
+  ],
+  "user_email": null,
+  "transcript_path": null,
+  "tool_name": "Shell",
+  "tool_input": {
+    "command": "npm test",
+    "working_directory": "/Users/me/src/kioku"
+  },
+  "tool_use_id": "tool_7d3a",
+  "cwd": "/Users/me/src/kioku",
+  "error_message": "Command timed out after 30s",
+  "failure_type": "timeout",
+  "duration": 30000,
+  "is_interrupt": false
+}

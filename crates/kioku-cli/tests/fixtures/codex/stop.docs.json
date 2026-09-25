@@ -1,0 +1,11 @@
+{
+  "session_id": "019a6f1e-3c2b-7d10-9a55-2f8e4b1c0d77",
+  "transcript_path": null,
+  "cwd": "/Users/me/src/kioku",
+  "hook_event_name": "Stop",
+  "model": "gpt-5-codex",
+  "permission_mode": "default",
+  "turn_id": "turn_3",
+  "stop_hook_active": false,
+  "last_assistant_message": "Done. 126 tests pass."
+}

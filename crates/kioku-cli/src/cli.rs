@@ -59,6 +59,12 @@ pub enum Command {
         #[arg(long, value_enum, default_value_t = Agent::ClaudeCode)]
         agent: Agent,
     },
+    /// Captured hook payloads (`KIOKU_HOOK_DUMP=1` / `[client] hook_dump = true`).
+    HookDump {
+        /// Subcommand.
+        #[command(subcommand)]
+        command: HookDumpCommand,
+    },
     /// Register kioku hooks and the MCP server with an agent.
     Install {
         /// Target agent.
@@ -91,6 +97,22 @@ pub enum InstallTarget {
         /// Use ./.claude/settings.json instead of ~/.claude/settings.json.
         #[arg(long)]
         project: bool,
+    },
+}
+
+/// `kioku hook-dump …`.
+#[derive(Debug, Subcommand)]
+pub enum HookDumpCommand {
+    /// Write the newest captured payload as `<out>/<agent>/<event>.captured.json`.
+    Extract {
+        /// Agent whose payload to extract.
+        #[arg(value_enum)]
+        agent: Agent,
+        /// Neutral event (`post-tool-use`) or native name (`afterFileEdit`, `BeforeAgent`).
+        event: String,
+        /// Output directory (default: current directory).
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
     },
 }
 
@@ -150,6 +172,23 @@ mod tests {
             }
         ));
         assert!(p(&["hook", "stop", "--agent", "claude-code"]).is_ok());
+        for (name, agent) in [
+            ("codex", Agent::Codex),
+            ("cursor", Agent::Cursor),
+            ("gemini-cli", Agent::GeminiCli),
+        ] {
+            assert!(matches!(
+                p(&["hook", "session-start", "--agent", name]).unwrap().command,
+                Command::Hook { event: HookEventKind::SessionStart, agent: a } if a == agent
+            ));
+        }
+        assert!(p(&["hook", "stop", "--agent", "gemini"]).is_err());
+        assert!(matches!(
+            p(&["hook-dump", "extract", "cursor", "afterFileEdit", "--out", "/tmp/f"]).unwrap().command,
+            Command::HookDump { command: HookDumpCommand::Extract { agent: Agent::Cursor, event, out: Some(_) } }
+                if event == "afterFileEdit"
+        ));
+        assert!(p(&["hook-dump", "extract", "codex"]).is_err());
         assert!(p(&["hook", "bogus"]).is_err());
         assert!(matches!(
             p(&["search", "引き継ぎ", "自動化", "--scope", "global", "--limit", "3"]).unwrap().command,
