@@ -405,6 +405,11 @@ server: <url>
 </kioku>
 ```
 
+When a pending handoff is printed, the STATE excerpt omits its
+`## 最新の引き継ぎ` / `## Latest handoff` section (heading up to the next `## `
+heading, either language) — it repeats the same handoff; `最近のセッション` and
+`よく触るファイル` stay. If nothing is left, the STATE section is omitted.
+
 Cap the whole block at 6 000 chars (truncate STATE excerpt first, at line
 boundaries with a `…` marker, then the handoff; a section with < 40 chars of
 budget left is dropped). Text comes from `strings.rs` in `[client] lang`.

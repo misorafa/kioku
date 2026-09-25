@@ -250,6 +250,15 @@ fn full_session_lifecycle_with_nudge_and_handoff() {
     );
     assert!(out.stdout.contains("Stop フックのテストを増やす"));
     assert!(out.stdout.contains("## 現在の状態（STATE.md 抜粋）"));
+    // STATE.md's "latest handoff" section would repeat the handoff: it is stripped.
+    assert!(!out.stdout.contains("## 最新の引き継ぎ"), "{}", out.stdout);
+    assert_eq!(
+        out.stdout
+            .matches("日本語検索と引き継ぎの自動化を実装した")
+            .count(),
+        1
+    );
+    assert!(out.stdout.contains("## 最近のセッション"));
     assert!(out.stdout.chars().count() <= kioku_cli::SESSION_START_CAP);
 
     // The handoff was consumed: a third session gets none.

@@ -1,7 +1,7 @@
 //! The plain-text `<kioku>` block printed by the SessionStart hook (spec §8.3), capped at
 //! 6 000 chars by shrinking the STATE.md excerpt first, then the handoff.
 
-use kioku_core::strings::{Lang, fill, strings};
+use kioku_core::strings::{EN, JA, Lang, fill, strings};
 use kioku_core::util::truncate_chars;
 
 /// Maximum size of the SessionStart block, in chars.
@@ -40,6 +40,12 @@ pub fn render_with_cap(lang: Lang, ctx: &StartContext, cap: usize) -> String {
     };
     let mut handoff = clean(&ctx.handoff);
     let mut state = clean(&ctx.state);
+    if handoff.is_some() {
+        // STATE.md's first section repeats the pending handoff verbatim; print it once.
+        state = state
+            .map(|s| strip_latest_handoff(&s))
+            .filter(|s| !s.is_empty());
+    }
 
     let mut out = assemble(lang, ctx, handoff.as_deref(), state.as_deref());
     if len(&out) <= cap {
@@ -84,6 +90,29 @@ fn assemble(lang: Lang, ctx: &StartContext, handoff: Option<&str>, state: Option
     }
     out.push_str(&format!("\n{}\n{CLOSE}", t.start_footer));
     out
+}
+
+/// Removes STATE.md's "latest handoff" section (either language — STATE.md is written in
+/// the server's `summary_lang`, which may differ from the client's `lang`), i.e. from its
+/// `## ` heading up to the next `## ` heading. Nested handoff headings are demoted to
+/// `###`+ in STATE.md, so they never end the section early.
+fn strip_latest_handoff(state: &str) -> String {
+    let headings = [JA.state_latest_handoff, EN.state_latest_handoff];
+    let mut out: Vec<&str> = Vec::new();
+    let mut skipping = false;
+    for line in state.lines() {
+        if headings.contains(&line.trim_end()) {
+            skipping = true;
+            continue;
+        }
+        if skipping && line.starts_with("## ") {
+            skipping = false;
+        }
+        if !skipping {
+            out.push(line);
+        }
+    }
+    out.join("\n").trim().to_string()
 }
 
 /// Keeps whole lines of `text` within `budget` chars (plus a `…` marker); `None` when the
@@ -135,7 +164,7 @@ mod tests {
             Lang::Ja,
             &ctx(
                 Some("## 引き継ぎ（claude-code, 2026-09-25）\n### 要約\nMCP を実装した".into()),
-                Some("## 最新の引き継ぎ\n…".into()),
+                Some("## 最新の引き継ぎ\n…\n## 最近のセッション\n- s".into()),
             ),
         );
         let lines: Vec<&str> = out.lines().collect();
@@ -146,6 +175,35 @@ mod tests {
         assert!(out.contains("## 現在の状態（STATE.md 抜粋）"));
         assert!(out.contains("kioku_handoff_write"));
         assert!(out.ends_with("</kioku>\n"));
+    }
+
+    const STATE: &str = "## 最新の引き継ぎ\n_2026-09-25 10:00 / claude-code / source: agent_\n\n### 引き継ぎ（claude-code, 2026-09-25）\n#### 要約\nMCP を実装した\n\n## 最近のセッション\n- 2026-09-25 claude-code — MCP (sessions/a.md)\n\n## よく触るファイル（直近10セッション）\n- src/mcp.rs (4)";
+
+    #[test]
+    fn pending_handoff_strips_duplicate_state_section() {
+        let handoff = "## 引き継ぎ（claude-code, 2026-09-25）\n### 要約\nMCP を実装した";
+        let out = render_session_start(Lang::Ja, &ctx(Some(handoff.into()), Some(STATE.into())));
+        assert_eq!(out.matches("MCP を実装した").count(), 1, "{out}");
+        assert!(!out.contains("## 最新の引き継ぎ"));
+        assert!(!out.contains("source: agent"));
+        assert!(out.contains("## 現在の状態（STATE.md 抜粋）\n## 最近のセッション\n- 2026-09-25"));
+        assert!(out.contains("## よく触るファイル（直近10セッション）\n- src/mcp.rs (4)"));
+
+        // English STATE.md (server summary_lang = en) is stripped too, whatever the client lang.
+        let en = "## Latest handoff\n_meta_\n### Handoff (x, y)\nbody\n## Recent sessions\n- s";
+        let out = render_session_start(Lang::Ja, &ctx(Some("h".into()), Some(en.into())));
+        assert!(!out.contains("Latest handoff") && !out.contains("body"));
+        assert!(out.contains("## Recent sessions\n- s"));
+
+        // Only the handoff section in the excerpt → the STATE section disappears entirely.
+        let only = "## 最新の引き継ぎ\n_meta_\n### 引き継ぎ\nbody";
+        let out = render_session_start(Lang::Ja, &ctx(Some("h".into()), Some(only.into())));
+        assert!(!out.contains("## 現在の状態"));
+
+        // Without a pending handoff the excerpt is printed as is.
+        let out = render_session_start(Lang::Ja, &ctx(None, Some(STATE.into())));
+        assert!(out.contains("## 最新の引き継ぎ\n_2026-09-25"));
+        assert!(out.contains("MCP を実装した"));
     }
 
     #[test]
