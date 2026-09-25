@@ -86,13 +86,17 @@ existing one), creates the data dir via core, and prints next steps.
 Priority:
 1. `.kioku.toml` in `cwd` or any ancestor: `project = "<id>"` (and optional
    `name`). Stops the search.
-2. Git: `git -C <cwd> rev-parse --show-toplevel`; `name` = basename of root;
-   `remote` = `git remote get-url origin` normalized (strip `.git`, strip
+2. Git: `git -C <cwd> rev-parse --show-toplevel`; `remote` = `git remote get-url origin` normalized (strip `.git`, strip
    credentials, `git@host:a/b` → `host/a/b`, lowercase host).
    `id` = `<slug(repo)>-<first 8 hex of sha256(remote)>` when a remote exists
    (`repo` = last path segment of the normalized remote, so clones in
    differently named directories still agree), else
-   `<slug(name)>-<first 8 hex of sha256(canonical root path)>`.
+   `<slug(name)>-<first 8 hex of sha256(canonical root path)>` (`name` = basename
+   of root). With a remote, `name` = `repo` verbatim (folder `proj`, remote
+   `…/chord-life` → id `chord-life-ace9dc4a`, name `chord-life`), so the
+   SessionStart line and STATE.md title match the id; if `repo` has no ASCII
+   (the id then uses the root basename's slug) `name` is the root basename too.
+   `.kioku.toml` `name` always wins.
    Normalization also strips the scheme and port, so `git@host:a/b.git` and
    `https://user@host/a/b` both become `host/a/b`.
 3. No git: `name` = basename of cwd, `id` as in 2 using the canonical path.

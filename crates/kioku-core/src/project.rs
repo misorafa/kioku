@@ -17,7 +17,8 @@ pub const PROJECT_FILE: &str = ".kioku.toml";
 pub struct ProjectIdentity {
     /// Stable id, e.g. `kioku-3f9a1c2e`.
     pub id: String,
-    /// Human name (basename of the project root unless overridden).
+    /// Human name: `.kioku.toml` `name`, else the remote's repo name when the id comes
+    /// from the remote, else the basename of the project root.
     pub name: String,
     /// Absolute project root.
     pub root: String,
@@ -43,11 +44,11 @@ pub fn identify(cwd: &Path) -> Result<ProjectIdentity> {
 
     if let Some(root) = git_toplevel(&cwd) {
         let root = std::fs::canonicalize(&root).unwrap_or(root);
-        let name = basename(&root);
+        let dir_name = basename(&root);
         let remote = git_remote(&root).map(|r| normalize_remote(&r));
-        let id = match &remote {
-            Some(r) => id_from_remote(&name, r),
-            None => id_from_path(&name, &root),
+        let (id, name) = match &remote {
+            Some(r) => (id_from_remote(&dir_name, r), name_from_remote(&dir_name, r)),
+            None => (id_from_path(&dir_name, &root), dir_name),
         };
         return Ok(ProjectIdentity {
             id,
@@ -143,6 +144,15 @@ pub fn id_from_remote(name: &str, remote: &str) -> String {
         slug(repo)
     };
     format!("{base}-{}", &sha256_hex(remote)[..8])
+}
+
+/// Display name matching [`id_from_remote`]: the remote's repository name when the id is
+/// built from it, else the local directory name.
+pub fn name_from_remote(dir_name: &str, remote: &str) -> String {
+    match remote.rsplit('/').next() {
+        Some(repo) if !slug_raw(repo).is_empty() => repo.to_string(),
+        _ => dir_name.to_string(),
+    }
 }
 
 /// Project id derived from a canonical root path.
@@ -277,10 +287,59 @@ mod tests {
         assert_eq!(ia.id, ib.id);
         assert!(ia.id.starts_with("widget-"), "{}", ia.id);
         assert_eq!(ia.remote.as_deref(), Some("github.com/acme/widget"));
-        assert_eq!(ia.name, "clone-a");
-        assert_eq!(ib.name, "other-name");
+        // The name follows the remote (like the id), not the local directory name.
+        assert_eq!(ia.name, "widget");
+        assert_eq!(ib.name, "widget");
         // stable across calls
         assert_eq!(identify(&a).unwrap(), ia);
+    }
+
+    #[test]
+    fn name_from_remote_rules() {
+        assert_eq!(
+            name_from_remote("proj", "github.com/me/chord-life"),
+            "chord-life"
+        );
+        assert_eq!(
+            name_from_remote("proj", "github.com/me/Chord_Life"),
+            "Chord_Life"
+        );
+        // No ASCII in the repo name → the id falls back to the directory slug, so does the name.
+        assert_eq!(
+            name_from_remote("記憶-dir", "github.com/me/記憶"),
+            "記憶-dir"
+        );
+    }
+
+    #[test]
+    fn remote_name_differs_from_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        if !git(&dir, &["init", "-q"]) {
+            return;
+        }
+        assert!(git(
+            &dir,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:me/chord-life.git"
+            ]
+        ));
+        let id = identify(&dir).unwrap();
+        assert!(id.id.starts_with("chord-life-"), "{}", id.id);
+        assert_eq!(id.name, "chord-life");
+
+        // `.kioku.toml` `name` still wins.
+        std::fs::write(
+            dir.join(PROJECT_FILE),
+            "project = \"cl\"\nname = \"コード帳\"\n",
+        )
+        .unwrap();
+        let id = identify(&dir).unwrap();
+        assert_eq!((id.id.as_str(), id.name.as_str()), ("cl", "コード帳"));
     }
 
     #[test]
