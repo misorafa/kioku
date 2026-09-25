@@ -72,6 +72,8 @@ pub struct Strings {
     pub state_recent_sessions: &'static str,
     /// STATE.md: frequently touched files heading.
     pub state_hot_files: &'static str,
+    /// `{name}`, `{id}`: SessionStart context: first line naming the project id.
+    pub start_project_line: &'static str,
     /// SessionStart context: heading of the pending handoff.
     pub start_handoff_heading: &'static str,
     /// SessionStart context: heading of the STATE.md excerpt.
@@ -111,6 +113,7 @@ pub const JA: Strings = Strings {
     state_no_handoff: "（まだ引き継ぎはありません）",
     state_recent_sessions: "## 最近のセッション",
     state_hot_files: "## よく触るファイル（直近10セッション）",
+    start_project_line: "project: {name} (id: {id})  ← kioku_* ツールの project 引数にはこの id を渡すこと",
     start_handoff_heading: "## 前回からの引き継ぎ",
     start_state_heading: "## 現在の状態（STATE.md 抜粋）",
     start_footer: "セッション終了前に kioku_handoff_write で要約・次の一手・未解決点を書くこと。\n関連する過去の記録は kioku_query で検索できる。",
@@ -146,6 +149,7 @@ pub const EN: Strings = Strings {
     state_no_handoff: "(no handoff yet)",
     state_recent_sessions: "## Recent sessions",
     state_hot_files: "## Frequently touched files (last 10 sessions)",
+    start_project_line: "project: {name} (id: {id})  ← pass this id as `project` to kioku_* tools",
     start_handoff_heading: "## Handoff from the previous session",
     start_state_heading: "## Current state (STATE.md excerpt)",
     start_footer: "Before ending the session, record a summary, next steps and open questions with kioku_handoff_write.\nSearch past records with kioku_query.",

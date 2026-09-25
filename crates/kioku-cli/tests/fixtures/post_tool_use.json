@@ -1,0 +1,32 @@
+{
+  "session_id": "8d3c1f0e-5b7a-4c2d-9e1f-0a2b3c4d5e6f",
+  "transcript_path": "/home/u/.claude/projects/-home-u-kioku/8d3c1f0e-5b7a-4c2d-9e1f-0a2b3c4d5e6f.jsonl",
+  "cwd": "/home/u/kioku",
+  "permission_mode": "default",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Edit",
+  "tool_input": {
+    "file_path": "/home/u/kioku/crates/kioku-core/src/handoff.rs",
+    "old_string": "pub fn render_agent_handoff(",
+    "new_string": "/// 引き継ぎを Markdown に整形する。\npub fn render_agent_handoff(",
+    "replace_all": false
+  },
+  "tool_response": {
+    "filePath": "/home/u/kioku/crates/kioku-core/src/handoff.rs",
+    "oldString": "pub fn render_agent_handoff(",
+    "newString": "/// 引き継ぎを Markdown に整形する。\npub fn render_agent_handoff(",
+    "originalFile": "//! Handoffs.\n\npub fn render_agent_handoff(lang: Lang) {}\n",
+    "structuredPatch": [
+      {
+        "oldStart": 3,
+        "oldLines": 1,
+        "newStart": 3,
+        "newLines": 2,
+        "lines": ["+/// 引き継ぎを Markdown に整形する。", " pub fn render_agent_handoff(lang: Lang) {}"]
+      }
+    ],
+    "userModified": false,
+    "replaceAll": false
+  },
+  "tool_use_id": "toolu_01KxQ7mY3bT9pVwE2rN8sL4d"
+}

@@ -1,0 +1,8 @@
+{
+  "session_id": "8d3c1f0e-5b7a-4c2d-9e1f-0a2b3c4d5e6f",
+  "transcript_path": "/home/u/.claude/projects/-home-u-kioku/8d3c1f0e-5b7a-4c2d-9e1f-0a2b3c4d5e6f.jsonl",
+  "cwd": "/home/u/kioku",
+  "permission_mode": "default",
+  "hook_event_name": "UserPromptSubmit",
+  "prompt": "引き継ぎ書の自動生成を実装して。テスト用の api_key=sk-live_abcdefghijklmnop1234 は使っていい"
+}

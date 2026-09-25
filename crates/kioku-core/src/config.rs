@@ -60,6 +60,8 @@ pub struct ClientConfig {
     pub timeout_ms: u64,
     /// Whether the Stop hook may nudge the agent to write a handoff.
     pub stop_nudge: bool,
+    /// Language of the SessionStart context block and the Stop nudge (`ja` | `en`).
+    pub lang: Lang,
 }
 
 impl Default for ClientConfig {
@@ -69,6 +71,7 @@ impl Default for ClientConfig {
             auth_token: None,
             timeout_ms: DEFAULT_TIMEOUT_MS,
             stop_nudge: true,
+            lang: Lang::Ja,
         }
     }
 }
@@ -254,6 +257,7 @@ mod tests {
         assert_eq!(c.data_dir, dir.path());
         assert_eq!(c.client.timeout_ms, 3000);
         assert!(c.client.stop_nudge);
+        assert_eq!(c.client.lang, Lang::Ja);
         assert!(c.is_loopback_bind());
     }
 
@@ -262,7 +266,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(CONFIG_FILE),
-            "[server]\nbind = \"0.0.0.0\"\nport = 9000\nauth_token = \"filetok\"\nsummary_lang = \"en\"\n\n[client]\nserver_url = \"http://home:9000\"\ntimeout_ms = 500\n",
+            "[server]\nbind = \"0.0.0.0\"\nport = 9000\nauth_token = \"filetok\"\nsummary_lang = \"en\"\n\n[client]\nserver_url = \"http://home:9000\"\ntimeout_ms = 500\nlang = \"en\"\n",
         )
         .unwrap();
         let d = dir.path().to_str().unwrap();
@@ -273,6 +277,7 @@ mod tests {
         assert_eq!(c.server.auth_token.as_deref(), Some("filetok"));
         assert_eq!(c.lang(), Lang::En);
         assert_eq!(c.client.timeout_ms, 500);
+        assert_eq!(c.client.lang, Lang::En);
 
         let c = Config::load_with_env(&env(&[
             ("KIOKU_DATA_DIR", d),
