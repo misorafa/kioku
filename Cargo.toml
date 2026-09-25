@@ -13,6 +13,7 @@ kioku-core = { path = "crates/kioku-core" }
 kioku-server = { path = "crates/kioku-server" }
 tantivy = "0.26"
 lindera-tantivy = "5"
+lindera-analysis = "5"  # already a lindera-tantivy dependency; used for the NFKC character filter
 lindera = { version = "5", features = ["embed-ipadic"] }
 rmcp = { version = "3.4", features = ["server", "transport-streamable-http-server", "macros", "schemars"] }
 axum = "0.8"

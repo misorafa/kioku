@@ -1236,6 +1236,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "lindera",
+ "lindera-analysis",
  "lindera-tantivy",
  "parking_lot",
  "regex",

@@ -45,6 +45,7 @@ Gemini installers (the hook *handlers* must not assume Claude Code though — se
   raw/<project_id>/<session_id>.jsonl   # append-only raw observations
   db/kioku.sqlite        # metadata; rebuildable from wiki+raw except handoffs
   index/tantivy/         # derived; `kioku reindex` rebuilds from wiki
+  index/schema-version   # INDEX_SCHEMA_VERSION the index was built with
   logs/hook.log          # client-side hook log (fail-open diagnostics)
 ```
 
@@ -169,8 +170,11 @@ rewrite (keep a `BTreeMap<String, Value>` for extras).
 
 `kioku_write_page` path rules: `scope=global` → `_global/<slug(title)>.md`;
 else `<project_id>/pages/<slug(title)>.md`. For page file names, a title
-containing non-ASCII gets `-<6 hex of sha256(title)>` appended (or becomes
-`page-<6 hex>` when nothing ASCII is left) so Japanese titles do not collide.
+whose slug dropped anything — i.e. that is not ASCII alphanumeric words joined
+by single ` `, `-` or `_` (non-ASCII, `C++`, `v1.2`, doubled separators) — gets
+`-<6 hex of sha256(title)>` appended (or becomes `page-<6 hex>` when nothing
+ASCII is left) so titles like `C++ tips` / `C tips` or Japanese titles do not
+collide.
 Caller may pass an explicit relative `path` inside its scope; for project
 scope it is confined to `<project_id>/pages/` (STATE.md and session pages are
 not writable through this path). Writing an existing path replaces the body,
@@ -190,11 +194,18 @@ keeps `created`, bumps `updated`. Reject paths containing `..` or absolute.
 | updated     | DATE   | fast, stored                             |
 
 Tokenizer `ja` = `lindera_tantivy::tokenizer::LinderaTokenizer` with the
-embedded IPADIC dictionary, `Mode::Normal`, followed by tantivy's
-`LowerCaser`. Register it once on the `Index` at open time. Rationale: SQLite
+embedded IPADIC dictionary, `Mode::Normal`, with lindera's `unicode_normalize`
+(NFKC) character filter in front (offsets stay in original-text coordinates,
+so snippets still highlight correctly; full-width ASCII and half-width kana
+fold to their normal forms, for documents and queries alike), followed by
+tantivy's `LowerCaser`. Register it once on the `Index` at open time. Rationale: SQLite
 FTS5 `unicode61` cannot segment Japanese; every competing tool fails here.
 
 Index one document per page. `kioku reindex` clears and rebuilds from `wiki/`.
+`INDEX_SCHEMA_VERSION` (currently 2: NFKC) is written to
+`index/schema-version` whenever the index is built; `Store::open` on an index
+with an older (or missing) version logs a warning asking for `kioku reindex`
+and does not rebuild silently. A missing/empty index is rebuilt as before.
 Index writes happen synchronously in the same `spawn_blocking` as the page
 write (M1 scale is thousands of pages; keep it simple).
 
@@ -216,7 +227,8 @@ write (M1 scale is thousands of pages; keep it simple).
   match); single-hiragana and punctuation tokens are dropped from it unless
   nothing else is left.
 - `Hit { path, title, kind, snippet, score, updated, global }`. Snippet via
-  `tantivy::snippet::SnippetGenerator` on `body`, max 200 chars, `<b>`
+  `tantivy::snippet::SnippetGenerator` on `body` (its limit counts bytes, so
+  ask for 600 and then cut the rendered snippet to 200 chars), max 200 chars, `<b>`
   removed (plain text with `【】` around highlighted terms).
 
 ### 6.4 Required search tests (Japanese)

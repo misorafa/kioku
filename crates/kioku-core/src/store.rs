@@ -18,7 +18,7 @@ use crate::digest::{SessionDigest, aggregate_files};
 use crate::error::{Error, Result};
 use crate::git::Git;
 use crate::handoff::{Handoff, HandoffInput, HandoffSource, render_agent_handoff};
-use crate::index::{Hit, IndexDoc, SearchIndex, SearchScope};
+use crate::index::{Hit, INDEX_SCHEMA_VERSION, IndexDoc, SearchIndex, SearchScope};
 use crate::layout::DataDir;
 use crate::page::{Frontmatter, Page, PageKind, PageScope, resolve_write_path, validate_rel_path};
 use crate::project::{ProjectIdentity, is_valid_id};
@@ -108,11 +108,42 @@ impl Store {
             git,
             write_lock: Mutex::new(()),
         };
-        if fresh && !list_wiki_pages(&store.dirs.wiki())?.is_empty() {
-            let n = store.reindex()?;
-            tracing::info!(pages = n, "index was empty; rebuilt from wiki");
+        if fresh {
+            if list_wiki_pages(&store.dirs.wiki())?.is_empty() {
+                store.write_index_version()?;
+            } else {
+                let n = store.reindex()?;
+                tracing::info!(pages = n, "index was empty; rebuilt from wiki");
+            }
+        } else if store.index_outdated() {
+            tracing::warn!(
+                built_with = store.index_version(),
+                current = INDEX_SCHEMA_VERSION,
+                "the search index was built by an older kioku; run `kioku reindex` so search \
+                 matches this version (e.g. full-width / half-width text)"
+            );
         }
         Ok(store)
+    }
+
+    /// Schema version the on-disk index was built with (1 when unrecorded: pre-versioning).
+    pub fn index_version(&self) -> u32 {
+        std::fs::read_to_string(self.dirs.index_version_file())
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(1)
+    }
+
+    /// True when the index predates [`INDEX_SCHEMA_VERSION`] and needs `kioku reindex`.
+    pub fn index_outdated(&self) -> bool {
+        self.index_version() < INDEX_SCHEMA_VERSION
+    }
+
+    fn write_index_version(&self) -> Result<()> {
+        let file = self.dirs.index_version_file();
+        std::fs::write(&file, format!("{INDEX_SCHEMA_VERSION}\n"))
+            .with_context(|| format!("writing {}", file.display()))?;
+        Ok(())
     }
 
     /// The configuration the store was opened with.
@@ -630,6 +661,7 @@ impl Store {
             tx.commit().context("committing reindex")?;
         }
         self.index.upsert_many(&docs, true)?;
+        self.write_index_version()?;
         Ok(docs.len())
     }
 
@@ -1575,6 +1607,42 @@ mod tests {
         assert_eq!(
             store.search("WireGuard", &SearchScope::All, 10).unwrap()[0].path,
             global
+        );
+    }
+
+    #[test]
+    fn old_index_version_is_detected_until_reindex() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path());
+        assert!(!store.index_outdated(), "a fresh index is current");
+        store
+            .write_page(&WritePageRequest {
+                title: "全角".into(),
+                content: "Ｆｌｕｔｔｅｒ ｱﾌﾟﾘ".into(),
+                ..WritePageRequest::default()
+            })
+            .unwrap();
+        drop(store);
+        // an index from before versioning (no version file) is reported, not rebuilt
+        let version = DataDir::new(tmp.path()).index_version_file();
+        std::fs::remove_file(&version).unwrap();
+        let store = open_store(tmp.path());
+        assert_eq!(store.index_version(), 1);
+        assert!(store.index_outdated());
+        assert_eq!(
+            store.status().unwrap().index_docs,
+            1,
+            "not silently rebuilt"
+        );
+        store.reindex().unwrap();
+        assert!(!store.index_outdated());
+        assert_eq!(
+            std::fs::read_to_string(&version).unwrap().trim(),
+            INDEX_SCHEMA_VERSION.to_string()
+        );
+        assert_eq!(
+            store.search("アプリ", &SearchScope::All, 10).unwrap().len(),
+            1
         );
     }
 

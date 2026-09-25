@@ -190,7 +190,7 @@ the container speaks plain HTTP.
 | `kioku_query` | `query`, `project?`, `scope?` (`project`/`global`/`all`), `limit?` (default 8) | full-text search (Japanese and English); `project` narrows to that project plus global pages |
 | `kioku_read` | `path` | reads a page by its wiki-relative path (as shown in query results) |
 | `kioku_write_page` | `title`, `content`, `project?`, `scope?` (`project`/`global`), `tags?`, `path?` | saves a searchable Markdown page; the same title/path replaces it |
-| `kioku_handoff_write` | `project`, `session?`, `summary`, `next_steps`, `open_questions`, `decisions` | records the handoff the next session of the project receives |
+| `kioku_handoff_write` | `project`, `session?` (from the SessionStart block), `summary`, `next_steps`, `open_questions`, `decisions` | records the handoff the next session of the project receives |
 | `kioku_handoff_pending` | `project`, `accept?` (default false) | peeks at (or consumes) the pending handoff |
 | `kioku_status` | — | counts, data dir and known project ids |
 
@@ -211,6 +211,7 @@ write a handoff before stopping.
   raw/<project_id>/<session_id>.jsonl   # append-only sanitized observations
   db/kioku.sqlite               # metadata, sessions, observations, handoffs
   index/tantivy/                # derived; `kioku reindex` rebuilds it from wiki/
+  index/schema-version          # index format; an older one → run `kioku reindex`
   logs/hook.log                 # client-side hook failures
 ```
 
@@ -218,6 +219,13 @@ Pages are Markdown with YAML frontmatter; you can read and edit them with any
 editor (run `kioku reindex` afterwards so search sees the change). kioku commits but never pushes: backing up (for example, pushing
 `wiki/` to a private remote, and copying `db/`, where handoffs live) is up to
 you.
+
+Page file names are the ASCII slug of the title; when slugging drops anything
+(non-ASCII, punctuation, repeated separators — `C++ tips` vs `C tips`) a
+6-hex hash of the title is appended so different titles never share a file.
+Search normalizes text with NFKC, so full-width `Ｆｌｕｔｔｅｒ` and half-width
+`ｱﾌﾟﾘ` match `flutter` / `アプリ`. **After upgrading kioku, run `kioku reindex`**
+if the server log warns that the index was built by an older version.
 
 ## Configuration
 

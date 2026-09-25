@@ -54,6 +54,11 @@ impl DataDir {
         self.root.join("index").join("tantivy")
     }
 
+    /// `index/schema-version` — [`crate::index::INDEX_SCHEMA_VERSION`] the index was built with.
+    pub fn index_version_file(&self) -> PathBuf {
+        self.root.join("index").join("schema-version")
+    }
+
     /// `logs/`.
     pub fn logs_dir(&self) -> PathBuf {
         self.root.join("logs")

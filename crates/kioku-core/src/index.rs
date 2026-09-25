@@ -8,6 +8,9 @@ use chrono::{DateTime, Utc};
 use lindera::dictionary::load_dictionary;
 use lindera::mode::Mode;
 use lindera::segmenter::Segmenter;
+use lindera_analysis::character_filter::unicode_normalize::{
+    UnicodeNormalizeCharacterFilter, UnicodeNormalizeKind,
+};
 use lindera_tantivy::tokenizer::LinderaTokenizer;
 use parking_lot::Mutex;
 use regex::Regex;
@@ -34,6 +37,10 @@ use crate::page::GLOBAL_DIR;
 pub const JA_TOKENIZER: &str = "ja";
 /// Max snippet length in chars.
 pub const SNIPPET_MAX: usize = 200;
+/// Version of what the index contains / how it was analyzed. Bump it whenever documents
+/// indexed by an older build would be searched wrongly; `Store::open` then warns until
+/// `kioku reindex` has been run. 2 = NFKC normalization in the `ja` analyzer.
+pub const INDEX_SCHEMA_VERSION: u32 = 2;
 const TITLE_BOOST: f32 = 2.0;
 const WRITER_HEAP: usize = 50_000_000;
 
@@ -138,14 +145,20 @@ fn build_schema() -> (Schema, Fields) {
     (b.build(), fields)
 }
 
-/// The `ja` analyzer: lindera (embedded IPADIC, `Mode::Normal`) + `LowerCaser`.
+/// The `ja` analyzer: NFKC normalization (lindera character filter, so offsets still point
+/// into the original text) → lindera (embedded IPADIC, `Mode::Normal`) → `LowerCaser`.
+/// NFKC folds full-width ASCII (`Ｆｌｕｔｔｅｒ`) and half-width kana (`ｱﾌﾟﾘ`).
 pub fn ja_analyzer() -> anyhow::Result<TextAnalyzer> {
     static TOKENIZER: OnceLock<Result<LinderaTokenizer, String>> = OnceLock::new();
     let tokenizer = TOKENIZER
         .get_or_init(|| {
             let dictionary = load_dictionary("embedded://ipadic").map_err(|e| e.to_string())?;
             let segmenter = Segmenter::new(Mode::Normal, dictionary, None);
-            Ok(LinderaTokenizer::from_segmenter(segmenter))
+            let mut tokenizer = LinderaTokenizer::from_segmenter(segmenter);
+            tokenizer.append_character_filter(
+                UnicodeNormalizeCharacterFilter::new(UnicodeNormalizeKind::NFKC).into(),
+            );
+            Ok(tokenizer)
         })
         .clone()
         .map_err(|e| anyhow!("loading IPADIC dictionary: {e}"))?;
@@ -303,7 +316,8 @@ impl SearchIndex {
             .context("running search")?;
         let mut snippets =
             SnippetGenerator::create(&searcher, &*user_query, f.body).context("snippets")?;
-        snippets.set_max_num_chars(SNIPPET_MAX);
+        // tantivy counts bytes here; Japanese is 3 bytes/char. Ask for ~3× and cut to chars.
+        snippets.set_max_num_chars(SNIPPET_MAX * 3);
 
         let mut hits = Vec::with_capacity(top.len());
         for (score, addr) in top {
@@ -318,10 +332,11 @@ impl SearchIndex {
             let body = text(f.body);
             let snippet = snippets.snippet(&body);
             let snippet = if snippet.highlighted().is_empty() {
-                crate::util::truncate_chars(&crate::util::one_line(&body), SNIPPET_MAX)
+                crate::util::one_line(&body)
             } else {
                 plain_snippet(snippet.fragment(), snippet.highlighted())
             };
+            let snippet = crate::util::truncate_chars(&snippet, SNIPPET_MAX);
             let updated = doc
                 .get_first(f.updated)
                 .and_then(|v| v.as_datetime())
@@ -636,6 +651,49 @@ mod tests {
         assert_eq!(paths(&idx, "rust").len(), 3);
         idx.upsert_many(&[], true).unwrap();
         assert_eq!(idx.num_docs(), 0);
+    }
+
+    #[test]
+    fn snippet_length_is_counted_in_chars() {
+        let dir = tempfile::tempdir().unwrap();
+        let (idx, _) = SearchIndex::open(dir.path()).unwrap();
+        let body = format!(
+            "{}引き継ぎの自動化について{}",
+            "日本語の長い前置き。".repeat(30),
+            "後続の説明文。".repeat(60)
+        );
+        idx.upsert(&doc("p/pages/long.md", Some("p"), "長文", &body))
+            .unwrap();
+        let hits = idx.search("自動化", &SearchScope::All, 10).unwrap();
+        let n = hits[0].snippet.chars().count();
+        assert!(n <= SNIPPET_MAX, "{n}");
+        assert!(
+            n > 150,
+            "a 200-char snippet, not 200 bytes (~66 chars): {n}"
+        );
+        assert!(
+            hits[0].snippet.contains("【自動化】"),
+            "{}",
+            hits[0].snippet
+        );
+    }
+
+    #[test]
+    fn nfkc_folds_full_width_and_half_width() {
+        let dir = tempfile::tempdir().unwrap();
+        let (idx, _) = SearchIndex::open(dir.path()).unwrap();
+        idx.upsert(&doc(
+            "p/pages/w.md",
+            Some("p"),
+            "全角メモ",
+            "Ｆｌｕｔｔｅｒ ｱﾌﾟﾘ を作った",
+        ))
+        .unwrap();
+        for q in ["flutter", "Flutter", "アプリ", "ｱﾌﾟﾘ", "Ｆｌｕｔｔｅｒ"] {
+            assert_eq!(paths(&idx, q), vec!["p/pages/w.md"], "{q}");
+        }
+        let hits = idx.search("アプリ", &SearchScope::All, 10).unwrap();
+        assert!(hits[0].snippet.contains("【ｱﾌﾟﾘ】"), "{}", hits[0].snippet);
     }
 
     #[test]

@@ -173,7 +173,7 @@ Compose の場合（`docker-compose.yml` 参照）は、同じ場所の `.env` �
 | `kioku_query` | `query`、`project?`、`scope?`（`project`/`global`/`all`）、`limit?`（既定 8） | 全文検索（日本語・英語）。`project` を渡すとそのプロジェクトとグローバルのページに絞る |
 | `kioku_read` | `path` | wiki 内の相対パス（検索結果に表示されるもの）でページを読む |
 | `kioku_write_page` | `title`、`content`、`project?`、`scope?`（`project`/`global`）、`tags?`、`path?` | 検索可能な Markdown ページを保存する。同じ title/path なら置き換える |
-| `kioku_handoff_write` | `project`、`session?`、`summary`、`next_steps`、`open_questions`、`decisions` | そのプロジェクトの次のセッションが受け取る引き継ぎを記録する |
+| `kioku_handoff_write` | `project`、`session?`（SessionStart のブロックにある id）、`summary`、`next_steps`、`open_questions`、`decisions` | そのプロジェクトの次のセッションが受け取る引き継ぎを記録する |
 | `kioku_handoff_pending` | `project`、`accept?`（既定 false） | 未受領の引き継ぎを覗く（または受領する） |
 | `kioku_status` | — | 件数、データディレクトリ、登録済みプロジェクト id |
 
@@ -193,6 +193,7 @@ Compose の場合（`docker-compose.yml` 参照）は、同じ場所の `.env` �
   raw/<project_id>/<session_id>.jsonl   # 追記のみ・サニタイズ済みの観測
   db/kioku.sqlite               # メタデータ、セッション、観測、引き継ぎ
   index/tantivy/                # 派生データ。`kioku reindex` で wiki/ から再構築
+  index/schema-version          # 索引の形式。古ければ `kioku reindex` を実行
   logs/hook.log                 # クライアント側フックの失敗ログ
 ```
 
@@ -200,6 +201,12 @@ Compose の場合（`docker-compose.yml` 参照）は、同じ場所の `.env` �
 `kioku reindex` を実行すると検索に反映されます）。kioku はコミットはしますが push はしません。
 バックアップ（たとえば `wiki/` をプライベートなリモートに push し、引き継ぎが入っている `db/` を
 コピーする）はご自身で行ってください。
+
+ページのファイル名はタイトルの ASCII slug です。slug 化で何かが落ちる場合（非 ASCII、記号、連続した区切り —
+`C++ tips` と `C tips` など）は、タイトルの 6 桁のハッシュを付けるので、別のタイトルが同じファイルになることは
+ありません。検索は NFKC で正規化するので、全角の `Ｆｌｕｔｔｅｒ` や半角の `ｱﾌﾟﾘ` も `flutter` / `アプリ` で
+見つかります。**kioku を更新した後、索引が古いバージョンで作られたという警告がサーバーのログに出たら
+`kioku reindex` を実行してください。**
 
 ## 設定
 

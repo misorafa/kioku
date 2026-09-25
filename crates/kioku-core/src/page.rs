@@ -301,19 +301,38 @@ fn tags_from_value(v: &Value) -> Vec<String> {
     }
 }
 
-/// File-name slug for a page title: ASCII slug, plus a short hash when the title has non-ASCII.
+/// File-name slug for a page title: ASCII slug, plus a short hash whenever slugging dropped
+/// characters (anything but ASCII alphanumerics joined by single ` `, `-` or `_`).
 ///
-/// Japanese titles would otherwise collapse to the same (or an empty) slug and overwrite
-/// each other, so e.g. `設計メモ` → `page-1a2b3c` and `Rust の設計` → `rust-9f8e7d`.
+/// Titles would otherwise collapse to the same (or an empty) slug and overwrite each other:
+/// `設計メモ` → `page-1a2b3c`, `Rust の設計` → `rust-9f8e7d`, `C++ tips` → `c-tips-4d5e6f`
+/// (while `C tips` stays `c-tips`).
 pub fn page_slug(title: &str) -> String {
     let base = slug_raw(title);
-    let has_non_ascii = !title.is_ascii();
     let hash = &sha256_hex(title.trim())[..6];
-    match (base.is_empty(), has_non_ascii) {
-        (true, _) => format!("page-{hash}"),
-        (false, true) => format!("{base}-{hash}"),
-        (false, false) => base,
+    if base.is_empty() {
+        format!("page-{hash}")
+    } else if slug_is_lossless(title.trim()) {
+        base
+    } else {
+        format!("{base}-{hash}")
     }
+}
+
+/// True when `title` is ASCII alphanumeric words joined by single ` `, `-` or `_`, i.e. the
+/// slug keeps every character that tells two titles apart (apart from case).
+fn slug_is_lossless(title: &str) -> bool {
+    let mut prev_sep = true;
+    for c in title.chars() {
+        if c.is_ascii_alphanumeric() {
+            prev_sep = false;
+        } else if matches!(c, ' ' | '-' | '_') && !prev_sep {
+            prev_sep = true;
+        } else {
+            return false;
+        }
+    }
+    !prev_sep
 }
 
 /// Validates a wiki-relative path: relative, no `..`/`.`/empty components, no backslashes.
@@ -445,6 +464,30 @@ mod tests {
         assert!(a.starts_with("page-"));
         assert_ne!(a, b);
         assert!(page_slug("Rust の設計").starts_with("rust-"));
+    }
+
+    #[test]
+    fn page_slugs_do_not_collide_when_characters_are_dropped() {
+        assert_eq!(page_slug("C tips"), "c-tips");
+        let cpp = page_slug("C++ tips");
+        assert!(
+            cpp.starts_with("c-tips-") && cpp.len() == "c-tips-".len() + 6,
+            "{cpp}"
+        );
+        assert_ne!(page_slug("C# tips"), cpp);
+        assert_ne!(page_slug("v1.2 notes"), page_slug("v12 notes"));
+        assert_eq!(page_slug("v12 notes"), "v12-notes");
+        for plain in ["Design Notes", "design-notes", "snake_case_name", "Tips"] {
+            assert!(!page_slug(plain).contains(char::is_uppercase));
+            assert_eq!(page_slug(plain), slug_raw(plain), "{plain}");
+        }
+        assert_ne!(
+            page_slug("a  b"),
+            "a-b",
+            "double separator is dropped information"
+        );
+        // 日本語タイトルも従来どおりハッシュ付き
+        assert!(page_slug("設計メモ").starts_with("page-"));
     }
 
     #[test]
