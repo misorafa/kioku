@@ -150,6 +150,11 @@ impl Store {
             .ok_or_else(|| Error::not_found(format!("project {id}")))
     }
 
+    /// All registered projects, ordered by id.
+    pub fn list_projects(&self) -> Result<Vec<ProjectRow>> {
+        Ok(db::list_projects(&self.db.lock())?)
+    }
+
     // ---------------------------------------------------------------- sessions
 
     /// SessionStart: registers project + session, consumes the pending handoff (superseding
@@ -1246,6 +1251,9 @@ mod tests {
         assert_eq!(status.pages, 3);
         assert_eq!(status.index_docs, 3);
         assert_eq!(status.projects, 1);
+        let projects = store.list_projects().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].id, pid);
 
         // reopening keeps everything; a deleted index is rebuilt from the wiki
         drop(store);

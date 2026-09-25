@@ -143,6 +143,21 @@ pub fn get_project(conn: &Connection, id: &str) -> anyhow::Result<Option<Project
         .optional()?)
 }
 
+/// All projects, ordered by id.
+pub fn list_projects(conn: &Connection) -> anyhow::Result<Vec<ProjectRow>> {
+    let mut stmt =
+        conn.prepare("SELECT id, name, root_path, remote_url FROM projects ORDER BY id")?;
+    let rows = stmt.query_map([], |r| {
+        Ok(ProjectRow {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            root_path: r.get(2)?,
+            remote_url: r.get(3)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 const SESSION_COLS: &str = "id, project_id, agent, cwd, source, started_at, ended_at, status";
 
 fn session_from_row(r: &Row<'_>) -> rusqlite::Result<Session> {

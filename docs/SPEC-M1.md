@@ -427,12 +427,29 @@ GET  /api/v1/pages/*path                     → {path, frontmatter, body}
 PUT  /api/v1/pages                           {title, content, project?, scope?, tags?, path?} → {path}
 GET  /api/v1/handoffs/pending?project=&accept=bool&session= → {handoff?}
 POST /api/v1/handoffs                        {project, session?, summary, next_steps, open_questions, decisions} → {id}
-GET  /api/v1/status                          → {data_dir, projects, pages, sessions, observations, index_docs}
+GET  /api/v1/status                          → {data_dir, projects, pages, sessions, observations, handoffs, index_docs, git_enabled}
+POST /api/v1/reindex                         → {docs}
 POST /mcp                                    MCP streamable HTTP (rmcp)
 ```
 
-Errors: `{error: "<message>"}` with 400/401/404/500. Unknown session on
-`observations` → 404 (hook then silently drops).
+`/api/v1/health` is the only route reachable without the bearer token; `/mcp`
+requires it too (Claude Code sends it via `--header`). An empty token disables
+auth entirely; `kioku serve` refuses that on a non-loopback bind.
+`POST /api/v1/reindex` exists because a CLI on a client machine has no local
+data dir, so `kioku search` / `status` / `reindex` all go through HTTP.
+`finalize` accepts an empty body. `handoffs/pending` returns `{handoff: null}`
+when there is none. `search`: an explicit `scope` wins; without one, a given
+`project` means scope `project`, otherwise `all`; `scope=project` without a
+project → 400; `limit` defaults to 10 and is clamped to 1..=100.
+
+Errors: `{error: "<message>"}` with 400/401/404/500 (core `NotFound` → 404,
+`InvalidInput` and malformed JSON / query strings → 400, anything else → 500).
+Unknown session on `observations` → 404 (hook then silently drops). An unknown
+project on `PUT /pages` or `POST /handoffs` → 404 whose message lists the
+known project ids.
+
+rmcp's `Host`-header allowlist is disabled for `/mcp` (a home server is reached
+by names we cannot know in advance; the bearer token is the guard).
 
 ## 10. MCP tools (rmcp `#[tool_router]`)
 
@@ -441,12 +458,17 @@ model reads, so write them carefully (Japanese + English one-liner each).
 
 | tool | input | output |
 |------|-------|--------|
-| `kioku_query` | `{query, project?, scope?: "project"\|"global"\|"all" (default all), limit? (default 8)}` | text: numbered hits `path — title (score) [global]` + snippet |
+| `kioku_query` | `{query, project?, scope?: "project"\|"global"\|"all" (default: project if `project` is given, else all), limit? (default 8)}` | text: numbered hits `path — title (score) [global]` + snippet, or `no hits` |
 | `kioku_read` | `{path}` | text: frontmatter summary + body |
 | `kioku_write_page` | `{title, content, project?, scope?, tags?, path?}` | text: `wrote <path>` |
 | `kioku_handoff_write` | §7.5 | text: `handoff recorded for <project>` |
-| `kioku_handoff_pending` | `{project, accept?: false}` | text: handoff or `none` |
-| `kioku_status` | `{}` | text: counts + data dir |
+| `kioku_handoff_pending` | `{project, accept?: false}` | text: one header line (id, source, dates) + handoff, or `none` |
+| `kioku_status` | `{}` | text: counts + data dir + known project ids |
+
+Tool failures are returned as tool results with `isError: true` and the error
+text. An unknown project in `kioku_write_page` / `kioku_handoff_write` stays a
+not-found error, but its text lists the known project ids so the agent can
+retry with a valid one.
 
 Server info `instructions` (returned on initialize): one paragraph telling
 the agent to query before exploring and to write a handoff before stopping.

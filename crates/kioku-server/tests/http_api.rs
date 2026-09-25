@@ -1,0 +1,498 @@
+//! Integration tests for the §9 HTTP API over a real socket.
+
+mod common;
+
+use common::{PROJECT, TOKEN, spawn, start_body};
+use reqwest::Method;
+use serde_json::json;
+
+#[tokio::test]
+async fn health_is_public() {
+    let srv = spawn().await;
+    let resp = srv
+        .http
+        .get(srv.url("/api/v1/health"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["version"], kioku_core::VERSION);
+}
+
+#[tokio::test]
+async fn everything_else_requires_the_token() {
+    let srv = spawn().await;
+    let routes = [
+        (Method::POST, "/api/v1/sessions/start"),
+        (Method::GET, "/api/v1/sessions/abc"),
+        (Method::POST, "/api/v1/sessions/abc/finalize"),
+        (Method::POST, "/api/v1/observations"),
+        (
+            Method::GET,
+            "/api/v1/search?q=%E5%BC%95%E3%81%8D%E7%B6%99%E3%81%8E",
+        ),
+        (Method::GET, "/api/v1/pages/_global/x.md"),
+        (Method::PUT, "/api/v1/pages"),
+        (Method::GET, "/api/v1/handoffs/pending?project=p"),
+        (Method::POST, "/api/v1/handoffs"),
+        (Method::GET, "/api/v1/status"),
+        (Method::POST, "/api/v1/reindex"),
+        (Method::POST, "/mcp"),
+        (Method::GET, "/mcp"),
+        (Method::GET, "/api/v1/nonexistent"),
+    ];
+    for (method, path) in routes {
+        for auth in [None, Some("Bearer wrong-token"), Some("Basic dGVzdA==")] {
+            let mut req = srv
+                .http
+                .request(method.clone(), srv.url(path))
+                .header("content-type", "application/json")
+                .body("{}");
+            if let Some(a) = auth {
+                req = req.header("authorization", a);
+            }
+            let resp = req.send().await.unwrap();
+            assert_eq!(resp.status(), 401, "{method} {path} auth={auth:?}");
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert!(body["error"].as_str().unwrap().contains("unauthorized"));
+        }
+    }
+    // with the token the same route works
+    let (status, _) = srv.get("/api/v1/status").await;
+    assert_eq!(status, 200);
+    let resp = srv
+        .http
+        .get(srv.url("/api/v1/status"))
+        .header("authorization", format!("bearer {TOKEN}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn session_lifecycle_round_trip() {
+    let srv = spawn().await;
+    let sid = "0c2f1a2b-1111-2222-3333-444455556666";
+
+    let (status, start) = srv.post("/api/v1/sessions/start", start_body(sid)).await;
+    assert_eq!(status, 200, "{start}");
+    assert_eq!(start["project_id"], PROJECT);
+    assert!(start["pending_handoff"].is_null());
+    assert!(start["state_excerpt"].is_null());
+    assert_eq!(start["recent_sessions"], json!([]));
+
+    let observations = [
+        json!({"session_id": sid, "kind": "prompt", "payload": {"prompt": "引き継ぎ書の自動生成を実装して"}}),
+        json!({"session_id": sid, "kind": "tool_use", "ts": "2026-09-25T02:15:00Z", "payload": {
+            "tool_name": "Edit",
+            "tool_input": {"file_path": "/home/u/kioku/src/handoff.rs"},
+            "tool_response": {}
+        }}),
+        json!({"session_id": sid, "kind": "tool_use", "payload": {
+            "tool_name": "Bash",
+            "tool_input": {"command": "cargo test -p kioku-core"},
+            "tool_response": {"stdout": "ok"}
+        }}),
+    ];
+    for (i, obs) in observations.into_iter().enumerate() {
+        let (status, body) = srv.post("/api/v1/observations", obs).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["seq"], i as i64 + 1);
+    }
+
+    // unknown session → 404, bad kind → 400, malformed JSON → 400
+    let (status, body) = srv
+        .post(
+            "/api/v1/observations",
+            json!({"session_id": "nope", "kind": "prompt", "payload": {}}),
+        )
+        .await;
+    assert_eq!(status, 404);
+    assert!(body["error"].as_str().unwrap().contains("nope"));
+    let (status, body) = srv
+        .post(
+            "/api/v1/observations",
+            json!({"session_id": sid, "kind": "bogus", "payload": {}}),
+        )
+        .await;
+    assert_eq!(status, 400);
+    assert!(body["error"].is_string());
+    let resp = srv
+        .http
+        .post(srv.url("/api/v1/observations"))
+        .bearer_auth(TOKEN)
+        .header("content-type", "application/json")
+        .body("{not json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let (status, info) = srv.get(&format!("/api/v1/sessions/{sid}")).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        info,
+        json!({
+            "project_id": PROJECT,
+            "status": "open",
+            "counts": {"prompts": 1, "tool_uses": 2},
+            "has_agent_handoff": false
+        })
+    );
+    let (status, _) = srv.get("/api/v1/sessions/unknown-session").await;
+    assert_eq!(status, 404);
+
+    // finalize: with a body, then again without one (idempotent)
+    let (status, fin) = srv
+        .post(
+            &format!("/api/v1/sessions/{sid}/finalize"),
+            json!({"reason": "stop"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{fin}");
+    assert_eq!(fin["substantive"], true);
+    let page_path = fin["session_page"].as_str().unwrap().to_string();
+    assert!(page_path.starts_with(&format!("{PROJECT}/sessions/")));
+    assert!(page_path.ends_with("-0c2f1a2b.md"));
+    let handoff_id = fin["handoff_id"].as_str().unwrap().to_string();
+    let resp = srv
+        .http
+        .post(srv.url(&format!("/api/v1/sessions/{sid}/finalize")))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let again: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(again, fin);
+    let (status, _) = srv
+        .post("/api/v1/sessions/unknown-session/finalize", json!({}))
+        .await;
+    assert_eq!(status, 404);
+
+    // pending handoff: peek does not consume
+    for _ in 0..2 {
+        let (status, body) = srv
+            .get(&format!("/api/v1/handoffs/pending?project={PROJECT}"))
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["handoff"]["id"], handoff_id.as_str());
+        assert_eq!(body["handoff"]["source"], "rules");
+        assert!(body["handoff"]["accepted_at"].is_null());
+        assert!(
+            body["handoff"]["content_md"]
+                .as_str()
+                .unwrap()
+                .contains("最後の指示: 引き継ぎ書の自動生成を実装して")
+        );
+    }
+
+    // the session page is searchable with a Japanese query
+    let (status, body) = srv
+        .get(&format!(
+            "/api/v1/search?q={}&project={PROJECT}",
+            enc("引き継ぎ書の自動生成")
+        ))
+        .await;
+    assert_eq!(status, 200);
+    let hits = body["hits"].as_array().unwrap();
+    assert!(
+        hits.iter().any(|h| h["path"] == page_path.as_str()),
+        "{body}"
+    );
+    let hit = hits
+        .iter()
+        .find(|h| h["path"] == page_path.as_str())
+        .unwrap();
+    assert_eq!(hit["kind"], "session");
+    assert_eq!(hit["global"], false);
+    assert!(hit["score"].as_f64().unwrap() > 0.0);
+
+    // the session page itself
+    let (status, page) = srv.get(&format!("/api/v1/pages/{page_path}")).await;
+    assert_eq!(status, 200);
+    assert_eq!(page["path"], page_path.as_str());
+    assert_eq!(page["frontmatter"]["kind"], "session");
+    assert_eq!(page["frontmatter"]["session"], sid);
+    assert!(page["body"].as_str().unwrap().contains("src/handoff.rs"));
+    let (status, state) = srv.get(&format!("/api/v1/pages/{PROJECT}/STATE.md")).await;
+    assert_eq!(status, 200);
+    assert_eq!(state["frontmatter"]["kind"], "state");
+
+    // the next session consumes the handoff and sees STATE + recent sessions
+    let (status, next) = srv
+        .post("/api/v1/sessions/start", start_body("next-session"))
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(next["pending_handoff"]["id"], handoff_id.as_str());
+    assert_eq!(next["pending_handoff"]["accepted_by"], "next-session");
+    assert!(
+        next["state_excerpt"]
+            .as_str()
+            .unwrap()
+            .starts_with("## 最新の引き継ぎ")
+    );
+    assert_eq!(next["recent_sessions"][0]["path"], page_path.as_str());
+    let (_, body) = srv
+        .get(&format!("/api/v1/handoffs/pending?project={PROJECT}"))
+        .await;
+    assert!(body["handoff"].is_null());
+
+    // invalid start request → 400
+    let (status, _) = srv
+        .post("/api/v1/sessions/start", start_body("../escape"))
+        .await;
+    assert_eq!(status, 400);
+}
+
+#[tokio::test]
+async fn agent_handoff_write_and_accept() {
+    let srv = spawn().await;
+    srv.post("/api/v1/sessions/start", start_body("s-agent"))
+        .await;
+    let (status, body) = srv
+        .post(
+            "/api/v1/handoffs",
+            json!({
+                "project": PROJECT,
+                "summary": "HTTP API を実装した",
+                "next_steps": ["MCP のテストを書く"],
+                "open_questions": [],
+                "decisions": ["rmcp を使う"]
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let id = body["id"].as_str().unwrap().to_string();
+    let (_, info) = srv.get("/api/v1/sessions/s-agent").await;
+    assert_eq!(info["has_agent_handoff"], true);
+
+    let (status, body) = srv
+        .get(&format!(
+            "/api/v1/handoffs/pending?project={PROJECT}&accept=true&session=s-next"
+        ))
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["handoff"]["id"], id.as_str());
+    assert_eq!(body["handoff"]["source"], "agent");
+    assert_eq!(body["handoff"]["accepted_by"], "s-next");
+    assert!(
+        body["handoff"]["content_md"]
+            .as_str()
+            .unwrap()
+            .contains("### 要約\nHTTP API を実装した")
+    );
+    let (_, body) = srv
+        .get(&format!("/api/v1/handoffs/pending?project={PROJECT}"))
+        .await;
+    assert!(body["handoff"].is_null());
+
+    // unknown project → 404 listing the known ids; empty summary → 400
+    let (status, body) = srv
+        .post(
+            "/api/v1/handoffs",
+            json!({"project": "nope-00000000", "summary": "x"}),
+        )
+        .await;
+    assert_eq!(status, 404);
+    let msg = body["error"].as_str().unwrap();
+    assert!(
+        msg.contains("nope-00000000") && msg.contains(PROJECT),
+        "{msg}"
+    );
+    let (status, _) = srv
+        .post(
+            "/api/v1/handoffs",
+            json!({"project": PROJECT, "summary": " "}),
+        )
+        .await;
+    assert_eq!(status, 400);
+    // missing required query parameter → 400
+    let (status, _) = srv.get("/api/v1/handoffs/pending").await;
+    assert_eq!(status, 400);
+}
+
+#[tokio::test]
+async fn pages_put_get_and_search() {
+    let srv = spawn().await;
+    srv.post("/api/v1/sessions/start", start_body("s-pages"))
+        .await;
+
+    let (status, body) = srv
+        .send(
+            Method::PUT,
+            "/api/v1/pages",
+            json!({
+                "title": "自宅サーバーの構成",
+                "content": "k3sクラスタにWireGuardで自宅サーバーを参加させた",
+                "scope": "global",
+                "tags": ["infra"]
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let global_path = body["path"].as_str().unwrap().to_string();
+    assert!(global_path.starts_with("_global/page-"));
+
+    let (status, body) = srv
+        .send(
+            Method::PUT,
+            "/api/v1/pages",
+            json!({
+                "title": "Design Notes",
+                "content": "引き継ぎ書を毎回作るのが手間なので自動化したい",
+                "project": PROJECT
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["path"], format!("{PROJECT}/pages/design-notes.md"));
+
+    let (status, page) = srv
+        .get(&format!("/api/v1/pages/{PROJECT}/pages/design-notes.md"))
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(page["frontmatter"]["title"], "Design Notes");
+    assert_eq!(page["frontmatter"]["scope"], "project");
+    assert_eq!(page["frontmatter"]["project"], PROJECT);
+    assert_eq!(
+        page["body"],
+        "引き継ぎ書を毎回作るのが手間なので自動化したい\n"
+    );
+    let (status, page) = srv.get(&format!("/api/v1/pages/{global_path}")).await;
+    assert_eq!(status, 200);
+    assert_eq!(page["frontmatter"]["tags"], json!(["infra"]));
+
+    // replace keeps the path
+    let (status, body) = srv
+        .send(
+            Method::PUT,
+            "/api/v1/pages",
+            json!({"title": "Design Notes", "content": "更新した本文", "project": PROJECT}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["path"], format!("{PROJECT}/pages/design-notes.md"));
+
+    // Japanese search, scoped
+    let (_, body) = srv
+        .get(&format!("/api/v1/search?q={}", enc("自宅サーバー")))
+        .await;
+    assert_eq!(body["hits"][0]["path"], global_path.as_str());
+    assert_eq!(body["hits"][0]["global"], true);
+    let snippet = body["hits"][0]["snippet"].as_str().unwrap();
+    assert!(
+        snippet.contains('【') && snippet.contains("サーバー"),
+        "{snippet}"
+    );
+    let (_, body) = srv
+        .get(&format!(
+            "/api/v1/search?q={}&scope=project&project={PROJECT}",
+            enc("更新")
+        ))
+        .await;
+    assert_eq!(
+        body["hits"][0]["path"],
+        format!("{PROJECT}/pages/design-notes.md")
+    );
+    let (_, body) = srv
+        .get(&format!("/api/v1/search?q={}&scope=global", enc("更新")))
+        .await;
+    assert_eq!(body["hits"], json!([]));
+    let (_, body) = srv.get("/api/v1/search?q=Postgres&limit=5").await;
+    assert_eq!(body["hits"], json!([]));
+    let (status, _) = srv.get("/api/v1/search?q=x&scope=project").await;
+    assert_eq!(status, 400);
+    let (status, _) = srv.get("/api/v1/search?q=x&scope=bogus").await;
+    assert_eq!(status, 400);
+    let (status, _) = srv.get("/api/v1/search").await;
+    assert_eq!(status, 400);
+
+    // errors
+    let (status, body) = srv
+        .send(
+            Method::PUT,
+            "/api/v1/pages",
+            json!({"title": "x", "content": "y", "project": "unknown-proj"}),
+        )
+        .await;
+    assert_eq!(status, 404);
+    assert!(body["error"].as_str().unwrap().contains(PROJECT));
+    let (status, _) = srv
+        .send(
+            Method::PUT,
+            "/api/v1/pages",
+            json!({"title": "x", "content": "y", "path": "../escape.md"}),
+        )
+        .await;
+    assert_eq!(status, 400);
+    let (status, _) = srv
+        .send(
+            Method::PUT,
+            "/api/v1/pages",
+            json!({"title": "  ", "content": "y"}),
+        )
+        .await;
+    assert_eq!(status, 400);
+    let (status, body) = srv.get("/api/v1/pages/_global/missing.md").await;
+    assert_eq!(status, 404);
+    assert!(body["error"].as_str().unwrap().contains("not found"));
+}
+
+#[tokio::test]
+async fn reindex_and_status() {
+    let srv = spawn().await;
+    let (status, body) = srv.get("/api/v1/status").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["pages"], 0);
+    assert_eq!(body["index_docs"], 0);
+    assert_eq!(
+        body["data_dir"],
+        srv.dir.path().display().to_string().as_str()
+    );
+    for key in ["projects", "sessions", "observations", "handoffs"] {
+        assert_eq!(body[key], 0, "{key}");
+    }
+
+    // a hand-written page is invisible until reindex
+    std::fs::create_dir_all(srv.dir.path().join("wiki/_global")).unwrap();
+    std::fs::write(
+        srv.dir.path().join("wiki/_global/manual.md"),
+        "# 手書きメモ\nFlutterでコードチャートのアプリを作っている\n",
+    )
+    .unwrap();
+    let (_, body) = srv
+        .get(&format!("/api/v1/search?q={}", enc("アプリ")))
+        .await;
+    assert_eq!(body["hits"], json!([]));
+
+    let (status, body) = srv.post("/api/v1/reindex", json!({})).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, json!({"docs": 1}));
+
+    let (_, body) = srv
+        .get(&format!("/api/v1/search?q={}", enc("アプリ")))
+        .await;
+    assert_eq!(body["hits"][0]["path"], "_global/manual.md");
+    assert_eq!(body["hits"][0]["title"], "手書きメモ");
+    let (_, body) = srv.get("/api/v1/status").await;
+    assert_eq!(body["pages"], 1);
+    assert_eq!(body["index_docs"], 1);
+    assert_eq!(srv.store.status().unwrap().index_docs, 1);
+}
+
+/// Percent-encodes a query-string value.
+fn enc(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
