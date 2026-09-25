@@ -1,0 +1,20 @@
+# Example: KIOKU_AUTH_TOKEN=$(openssl rand -hex 32) docker compose up -d
+# Keep the token in a .env file next to this file (not in git) for restarts.
+# Put a TLS-terminating reverse proxy (Caddy, Cloudflare Tunnel, …) or a
+# WireGuard network in front before exposing the port beyond your LAN.
+services:
+  kioku:
+    build: .
+    image: kioku:latest
+    restart: unless-stopped
+    environment:
+      KIOKU_AUTH_TOKEN: ${KIOKU_AUTH_TOKEN:?set KIOKU_AUTH_TOKEN}
+      # KIOKU_PORT: "7391"
+      # RUST_LOG: info
+    ports:
+      - "7391:7391"          # use "127.0.0.1:7391:7391" when a reverse proxy runs on the same host
+    volumes:
+      - kioku-data:/data
+
+volumes:
+  kioku-data:

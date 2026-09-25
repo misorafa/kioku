@@ -1,0 +1,8 @@
+target/
+.git/
+.github/
+Dockerfile
+.dockerignore
+docker-compose.yml
+**/*.rs.bk
+.DS_Store

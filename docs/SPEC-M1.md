@@ -79,6 +79,11 @@ both sections with a freshly generated 32-byte hex token (never replacing an
 existing one), creates the data dir via core, and prints next steps.
 `KIOKU_STOP_NUDGE=0` disables the Stop nudge.
 
+`config.toml` is optional for the server: `kioku serve` without one runs on
+defaults + env and creates the data dir (wiki repo, db, index) on first start
+(`Store::open`), so `KIOKU_DATA_DIR=/data KIOKU_BIND=0.0.0.0
+KIOKU_AUTH_TOKEN=… kioku serve` is enough — this is how the Docker image runs.
+
 ## 4. Project identity
 
 `kioku-core::project::identify(cwd) -> ProjectIdentity { id, name, root, remote }`
@@ -560,4 +565,6 @@ Stop nudge (2).
   Claude Code payload fixtures; installer merge idempotency on a temp
   settings.json.
 - Step 4 — verification by the planner: full e2e run, README (ja/en),
-  Dockerfile (multi-stage, distroless or debian-slim, arm64+amd64 later).
+  Dockerfile (multi-stage, debian-slim runtime with `git`, non-root, `VOLUME
+  /data`, entrypoint `kioku serve`; arm64+amd64 images later),
+  docker-compose example, CI + release workflows.
