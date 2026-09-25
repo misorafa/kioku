@@ -83,12 +83,17 @@ Priority:
 2. Git: `git -C <cwd> rev-parse --show-toplevel`; `name` = basename of root;
    `remote` = `git remote get-url origin` normalized (strip `.git`, strip
    credentials, `git@host:a/b` → `host/a/b`, lowercase host).
-   `id` = `<slug(name)>-<first 8 hex of sha256(remote)>` when a remote exists,
-   else `<slug(name)>-<first 8 hex of sha256(canonical root path)>`.
+   `id` = `<slug(repo)>-<first 8 hex of sha256(remote)>` when a remote exists
+   (`repo` = last path segment of the normalized remote, so clones in
+   differently named directories still agree), else
+   `<slug(name)>-<first 8 hex of sha256(canonical root path)>`.
+   Normalization also strips the scheme and port, so `git@host:a/b.git` and
+   `https://user@host/a/b` both become `host/a/b`.
 3. No git: `name` = basename of cwd, `id` as in 2 using the canonical path.
 
 `slug()` keeps `[a-z0-9-]`, lowercases, collapses runs of `-`; Japanese names
-are transliterated NOT — non-ASCII is dropped; if the slug is empty use `proj`.
+are transliterated NOT — non-ASCII is dropped; other ASCII characters become
+`-`; if the slug is empty use `proj`.
 The remote-based id makes the same repo cloned on two machines map to the same
 memory. Document this in the README later.
 
@@ -134,8 +139,12 @@ Frontmatter is parsed with `serde_yaml_ng`; unknown keys are preserved on
 rewrite (keep a `BTreeMap<String, Value>` for extras).
 
 `kioku_write_page` path rules: `scope=global` → `_global/<slug(title)>.md`;
-else `<project_id>/pages/<slug(title)>.md`; caller may pass an explicit
-relative `path` inside its scope. Writing an existing path replaces the body,
+else `<project_id>/pages/<slug(title)>.md`. For page file names, a title
+containing non-ASCII gets `-<6 hex of sha256(title)>` appended (or becomes
+`page-<6 hex>` when nothing ASCII is left) so Japanese titles do not collide.
+Caller may pass an explicit relative `path` inside its scope; for project
+scope it is confined to `<project_id>/pages/` (STATE.md and session pages are
+not writable through this path). Writing an existing path replaces the body,
 keeps `created`, bumps `updated`. Reject paths containing `..` or absolute.
 
 ### 6.2 tantivy schema
@@ -147,7 +156,7 @@ keeps `created`, bumps `updated`. Reject paths containing `..` or absolute.
 | scope       | STRING | indexed                                  |
 | kind        | STRING | indexed, stored                          |
 | title       | TEXT   | tokenizer `ja`, stored, positions        |
-| body        | TEXT   | tokenizer `ja`, stored (for snippets)    |
+| body        | TEXT   | tokenizer `ja`, stored (for snippets), positions |
 | tags        | TEXT   | tokenizer `raw` per tag, stored          |
 | updated     | DATE   | fast, stored                             |
 
@@ -171,6 +180,12 @@ write (M1 scale is thousands of pages; keep it simple).
 - Query parsing: tantivy `QueryParser` over `title` (boost 2.0) and `body`,
   default conjunction OFF (OR semantics; BM25 ranks). Escape/handle parser
   errors by falling back to a term-by-term OR query of the tokenized input.
+  Note: `QueryParser` turns an unspaced Japanese word that tokenizes into
+  several tokens into a *phrase* query, so a natural-language query without
+  explicit syntax (quotes, `field:`, `+`/`-`, AND/OR/NOT, parentheses) goes
+  straight to the term-by-term OR query (title ×2, body, plus exact tag
+  match); single-hiragana and punctuation tokens are dropped from it unless
+  nothing else is left.
 - `Hit { path, title, kind, snippet, score, updated, global }`. Snippet via
   `tantivy::snippet::SnippetGenerator` on `body`, max 200 chars, `<b>`
   removed (plain text with `【】` around highlighted terms).
@@ -215,6 +230,11 @@ SessionEnd hook ─► POST /api/v1/sessions/{id}/finalize (idempotent)
    (`source = rules`, content = digest "Handoff" section).
 5. Rewrite `<project>/STATE.md` (§7.4), index, commit.
 6. Mark session finalized.
+
+Claude Code fires Stop after every turn, so finalize runs many times per
+session: a `prompt`/`tool_use` observation on a finalized session reopens it,
+and the next finalize rewrites the same session page, refreshes the session's
+pending rules handoff in place (no pile-up), and rewrites STATE.md.
 
 Handoffs are single-use per project: `sessions/start` returns the newest
 unaccepted handoff for the project and marks it accepted by the new session;

@@ -1,0 +1,13 @@
+[package]
+name = "kioku-cli"
+description = "the kioku command-line binary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "kioku"
+path = "src/main.rs"
+
+[dependencies]
