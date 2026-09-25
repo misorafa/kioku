@@ -17,9 +17,15 @@ pub const TOOL_RESPONSE_MAX: usize = 2000;
 /// Max serialized chars kept for `tool_input`.
 pub const TOOL_INPUT_MAX: usize = 4000;
 
+/// Secret-looking key names (substring, case-insensitive) shared by the text and JSON-key rules.
+const SECRET_WORD: &str = r"(secret|token|passw(?:or)?d|api[_-]?key|access[_-]?key|private[_-]?key|credential|authorization)";
+
 struct Patterns {
     whole: Vec<Regex>,
+    unterminated_key: Regex,
+    url_userinfo: Regex,
     key_value: Regex,
+    flag_value: Regex,
     secret_key: Regex,
 }
 
@@ -30,29 +36,94 @@ fn patterns() -> &'static Patterns {
             r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
             r"AKIA[0-9A-Z]{16}",
             r"sk-[A-Za-z0-9_-]{16,}",
-            r"ghp_[A-Za-z0-9]{36}",
-            r"gho_[A-Za-z0-9]{36}",
+            r"sk_(?:live|test)_[A-Za-z0-9]{10,}",
+            r"github_pat_[A-Za-z0-9_]{20,}",
+            r"gh[opusr]_[A-Za-z0-9]{36}",
             r"xox[bap]-[A-Za-z0-9-]{10,}",
+            r"AIza[0-9A-Za-z_-]{35}",
+            r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
         ]
         .iter()
         .map(|p| Regex::new(p).expect("valid secret regex"))
         .collect();
+        // Quoted values (also JSON-escaped `\"…\"`) are one unit; otherwise up to whitespace.
+        let value = r#"(?P<value>\\?"[^"\n]*"|\\?'[^'\n]*'|(?:(?:bearer|basic|token)\s+)?\S+)"#;
         Patterns {
             whole,
-            key_value: Regex::new(
-                r"(?i)(?P<key>authorization|api[_-]?key|secret|password|token)(?P<sep>\s*[:=]\s*)(?P<value>(?:(?:bearer|basic|token)\s+)?\S+)",
-            )
-            .expect("valid key/value regex"),
-            secret_key: Regex::new(r"(?i)^(authorization|api[_-]?key|secret|password|token)$")
+            unterminated_key: Regex::new(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*")
                 .expect("valid key regex"),
+            url_userinfo: Regex::new(
+                r"(?i)(?P<pre>[a-z][a-z0-9+.-]*://[^/\s:@]+:)(?P<value>[^@\s]+)@",
+            )
+            .expect("valid url regex"),
+            key_value: Regex::new(&format!(
+                r#"(?i)(?P<key>[\w.-]*{SECRET_WORD}[\w.-]*)(?P<sep>\\?["']?\s*[:=]\s*){value}"#
+            ))
+            .expect("valid key/value regex"),
+            flag_value: Regex::new(&format!(
+                r#"(?i)(?P<key>--(?:password|token|api-key))(?P<sep>\s+){value}"#
+            ))
+            .expect("valid flag regex"),
+            secret_key: Regex::new(&format!("(?i){SECRET_WORD}")).expect("valid key regex"),
         }
     })
 }
 
-/// Redacts secrets in free text (tokens, private keys, `password=…`-style values).
+/// True for key names that contain a secret word but name something harmless
+/// (`max_tokens`, `input_tokens`, `tokenizer`): those are counts/config, not credentials.
+fn benign_key(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    let k = k.trim_matches(|c: char| c == '"' || c == '\'' || c == '\\');
+    k.ends_with("tokens") || k.contains("tokenizer")
+}
+
+/// Replaces the `value` group of every match with `[REDACTED]`, keeping quotes around
+/// quoted values; leaves already-redacted values alone (idempotent).
+fn redact_values(re: &Regex, text: &str) -> String {
+    if !re.is_match(text) {
+        return text.to_string();
+    }
+    re.replace_all(text, |c: &regex::Captures| {
+        let whole = c.get(0).map_or("", |m| m.as_str()).to_string();
+        if c.name("key").is_some_and(|k| benign_key(k.as_str())) {
+            return whole;
+        }
+        let Some(value) = c.name("value") else {
+            return whole;
+        };
+        let v = value.as_str();
+        let (open, close): (&str, &str) =
+            if v.len() >= 4 && v.starts_with("\\\"") && v.ends_with("\\\"") {
+                ("\\\"", "\\\"")
+            } else if v.len() >= 3 && v.starts_with("\\\"") && v.ends_with('"') {
+                ("\\\"", "\"")
+            } else if v.len() >= 2 && v.starts_with('"') && v.ends_with('"') {
+                ("\"", "\"")
+            } else if v.len() >= 2 && v.starts_with('\'') && v.ends_with('\'') {
+                ("'", "'")
+            } else {
+                ("", "")
+            };
+        let inner = v
+            .strip_prefix(open)
+            .and_then(|x| x.strip_suffix(close))
+            .unwrap_or(v);
+        if inner == REDACTED {
+            return whole;
+        }
+        let m = c.get(0).expect("whole match");
+        let prefix = &text[m.start()..value.start()];
+        let suffix = &text[value.end()..m.end()];
+        format!("{prefix}{open}{REDACTED}{close}{suffix}")
+    })
+    .into_owned()
+}
+
+/// Redacts secrets in free text (tokens, private keys, URL passwords, `password=…`-style
+/// values and `--password <v>` flags).
 ///
 /// For `authorization: Bearer <token>` the scheme word is swallowed with the value so the
-/// token itself does not survive.
+/// token itself does not survive; quoted values are redacted as one unit.
 pub fn redact(text: &str) -> String {
     let p = patterns();
     let mut out = text.to_string();
@@ -61,18 +132,12 @@ pub fn redact(text: &str) -> String {
             out = re.replace_all(&out, REDACTED).into_owned();
         }
     }
-    if p.key_value.is_match(&out) {
-        out = p
-            .key_value
-            .replace_all(&out, |c: &regex::Captures| {
-                if &c["value"] == REDACTED {
-                    c[0].to_string()
-                } else {
-                    format!("{}{}{REDACTED}", &c["key"], &c["sep"])
-                }
-            })
-            .into_owned();
+    if p.unterminated_key.is_match(&out) {
+        out = p.unterminated_key.replace_all(&out, REDACTED).into_owned();
     }
+    out = redact_values(&p.url_userinfo, &out);
+    out = redact_values(&p.key_value, &out);
+    out = redact_values(&p.flag_value, &out);
     out
 }
 
@@ -85,7 +150,10 @@ pub fn redact_value(value: &Value) -> Value {
         Value::Object(map) => Value::Object(
             map.iter()
                 .map(|(k, v)| {
-                    let v = if p.secret_key.is_match(k) && (v.is_string() || v.is_number()) {
+                    let v = if p.secret_key.is_match(k)
+                        && !benign_key(k)
+                        && (v.is_string() || v.is_number())
+                    {
                         Value::String(REDACTED.to_string())
                     } else {
                         redact_value(v)
@@ -264,6 +332,111 @@ mod tests {
         assert_eq!(redact(&once), once);
         // plain prose untouched
         assert_eq!(redact("トークンの設計について"), "トークンの設計について");
+    }
+
+    #[test]
+    fn key_value_variants_from_review() {
+        let cases = [
+            (r#"{"password": "hunter2"}"#, "hunter2"),
+            (r#""access_token": "ya29.a0AfH6SMBx""#, "ya29.a0AfH6SMBx"),
+            (
+                "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG",
+                "wJalrXUtnFEMI",
+            ),
+            (
+                "STRIPE_SECRET_KEY=sk_live_abcdef1234567",
+                "sk_live_abcdef1234567",
+            ),
+            ("mysql --password hunter3 -u root", "hunter3"),
+            ("cli --token 'abc def' x", "abc def"),
+            ("cli --api-key=zzz999", "zzz999"),
+            (r#"password = "correct horse battery staple""#, "horse"),
+            (r#"echo "{\"password\": \"s3cr3t pw\"}""#, "s3cr3t"),
+            ("db.credentials: topsecretvalue", "topsecretvalue"),
+            ("private_key='-abc-'", "-abc-"),
+        ];
+        for (input, secret) in cases {
+            redacted_all(input, secret);
+            let once = redact(input);
+            assert_eq!(redact(&once), once, "idempotent: {input}");
+        }
+        assert_eq!(
+            redact(r#"{"password": "hunter2"}"#),
+            r#"{"password": "[REDACTED]"}"#
+        );
+        assert_eq!(
+            redact(r#"password = "correct horse battery staple" rest"#),
+            r#"password = "[REDACTED]" rest"#
+        );
+        assert_eq!(redact("--password hunter3 -v"), "--password [REDACTED] -v");
+    }
+
+    #[test]
+    fn new_token_patterns() {
+        let cases = [
+            format!("github_pat_{}", "A1b2_".repeat(10)),
+            format!("ghs_{}", "a1B2".repeat(9)),
+            format!("ghu_{}", "a1B2".repeat(9)),
+            format!("ghr_{}", "a1B2".repeat(9)),
+            "sk_test_abcdefghij12".to_string(),
+            format!("AIza{}", "Sy0_-abcdefghijklmnopqrstuvwxyz0123"),
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+                .to_string(),
+        ];
+        for t in &cases {
+            redacted_all(&format!("value {t} end"), t);
+        }
+    }
+
+    #[test]
+    fn url_userinfo_password_only() {
+        assert_eq!(
+            redact("psql postgres://app:pa55w0rd@db.local:5432/x"),
+            "psql postgres://app:[REDACTED]@db.local:5432/x"
+        );
+        assert_eq!(
+            redact("git clone https://user:tok3n@github.com/a/b"),
+            "git clone https://user:[REDACTED]@github.com/a/b"
+        );
+        let url = "https://example.com:8080/path";
+        assert_eq!(redact(url), url);
+        let once = redact("redis://u:p@h");
+        assert_eq!(redact(&once), once);
+    }
+
+    #[test]
+    fn unterminated_private_key() {
+        let out = redact("key:\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk\nAAAA");
+        assert_eq!(out, format!("key:\n{REDACTED}"));
+    }
+
+    #[test]
+    fn prose_and_harmless_keys_survive() {
+        for s in [
+            r#"git commit -m "fix token parsing""#,
+            "the password reset flow is broken",
+            "トークンの設計について",
+            "file_path=/src/main.rs",
+        ] {
+            assert_eq!(redact(s), s);
+        }
+        let v = json!({
+            "file_path": "/a/tokenizer.rs",
+            "is_error": false,
+            "command": "git commit -m \"fix token parsing\"",
+            "max_tokens": 1024,
+            "session_token": "abc",
+            "X-Api-Key": "k",
+            "AWS_SECRET_ACCESS_KEY": "v",
+        });
+        let out = redact_value(&v);
+        assert_eq!(out["file_path"], "/a/tokenizer.rs");
+        assert_eq!(out["is_error"], false);
+        assert_eq!(out["command"], "git commit -m \"fix token parsing\"");
+        assert_eq!(out["max_tokens"], 1024);
+        assert_eq!(out["session_token"], REDACTED);
+        assert_eq!(out["X-Api-Key"], REDACTED);
+        assert_eq!(out["AWS_SECRET_ACCESS_KEY"], REDACTED);
     }
 
     #[test]

@@ -273,15 +273,23 @@ becomes `proj`). Use `.kioku.toml` to merge or rename projects.
 - `config.toml` holds the token in plain text; `chmod 600` it.
 - **Sanitizer** — hook payloads are redacted on the client before they are
   sent (and again by the server):
-  - AWS access key ids (`AKIA…`), `sk-…` keys, GitHub `ghp_…` / `gho_…`
-    tokens, Slack `xoxb-` / `xoxa-` / `xoxp-` tokens, PEM private key blocks;
-  - the value in `authorization|api_key|api-key|apikey|secret|password|token`
-    followed by `:` or `=` (including `Bearer …`), and JSON values under keys
-    with those names;
+  - AWS access key ids (`AKIA…`), `sk-…` keys, Stripe `sk_live_…` /
+    `sk_test_…` keys, GitHub `ghp_` / `gho_` / `ghu_` / `ghs_` / `ghr_` and
+    `github_pat_…` tokens, Slack `xoxb-` / `xoxa-` / `xoxp-` tokens, Google
+    `AIza…` keys, JWT-shaped strings (`eyJ….….…`), PEM private key blocks
+    (to the end of the text when the `END` line is missing);
+  - the password in URLs (`postgres://user:[REDACTED]@host`);
+  - the whole value after any key *containing* `secret`, `token`,
+    `password`/`passwd`, `api_key`, `access_key`, `private_key`, `credential`
+    or `authorization` followed by `:` or `=` (`AWS_SECRET_ACCESS_KEY=…`,
+    `"access_token": "…"`, `password = "several words"`; quoted values are
+    one unit, `Bearer …` included), the value after `--password`, `--token`,
+    `--api-key`, and JSON values under keys containing those words (except
+    counts such as `max_tokens`);
   - `tool_input` is truncated to 4 000 chars and `tool_response` to 2 000.
-- **Not redacted**: anything that does not match those shapes — e.g. Google
-  `AIza…` keys, Stripe `sk_live_…` keys, JWTs, passwords inside URLs
-  (`postgres://user:pass@…`), personal data. Prompts, commands, file paths and
+- **Not redacted**: anything that does not match those shapes — e.g. a
+  password passed as `-p secret`, bare high-entropy strings, personal data.
+  Prompts, commands, file paths and
   the (truncated) output of `Read`/`Bash`/edit tools reach the server and end
   up in `raw/`, SQLite and, in digested form, the git history of `wiki/`.
   Transcripts are not uploaded.

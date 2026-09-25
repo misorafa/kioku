@@ -387,10 +387,23 @@ Claude Code stdin fields: `session_id`, `transcript_path`, `cwd`,
 
 Apply to `prompt`, `tool_input`, `tool_response` text (serialized):
 - Replace matches of these with `[REDACTED]`: `AKIA[0-9A-Z]{16}`,
-  `sk-[A-Za-z0-9_-]{16,}`, `ghp_[A-Za-z0-9]{36}`, `gho_…`, `xox[bap]-…`,
-  `-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----`,
-  `(?i)(authorization|api[_-]?key|secret|password|token)\s*[:=]\s*\S+`
-  (redact only the value).
+  `sk-[A-Za-z0-9_-]{16,}`, `sk_(live|test)_[A-Za-z0-9]{10,}`,
+  `github_pat_[A-Za-z0-9_]{20,}`, `gh[opusr]_[A-Za-z0-9]{36}`, `xox[bap]-…`,
+  `AIza[0-9A-Za-z_-]{35}`, JWT-shaped
+  `eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}`,
+  `-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----`
+  (and, when the END line is missing, from BEGIN to the end of the text).
+- Redact only the value (quotes kept, idempotent) for:
+  - URL userinfo: `[a-z][a-z0-9+.-]*://[^/\s:]+:(<password>)@`;
+  - key/value: `(?i)[\w.-]*(secret|token|passw(or)?d|api[_-]?key|access[_-]?key|private[_-]?key|credential|authorization)[\w.-]*`
+    then optional closing quote, `\s*[:=]\s*`, then the value: a quoted
+    `"…"` / `'…'` (also JSON-escaped `\"…\"`) as one unit, else an optional
+    `Bearer|Basic|token ` scheme word plus the next non-whitespace run;
+  - flags: `--password|--token|--api-key <value>`.
+- JSON object values (string/number) under a key matching the same word list
+  (substring, case-insensitive) become `[REDACTED]`. Keys ending in `tokens`
+  or containing `tokenizer` (`max_tokens`, `input_tokens`) are counts, not
+  secrets, and are exempt from both key rules.
 - Truncate `tool_response` to 2 000 chars, `tool_input` to 4 000 chars.
 - Unit-test every pattern.
 

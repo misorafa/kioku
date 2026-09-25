@@ -255,13 +255,19 @@ slug 部分では非 ASCII 文字が落とされます（日本語だけの名�
   してあるため、トークンが唯一の防御です。既定のバインドは `127.0.0.1` です。
 - `config.toml` にはトークンが平文で入っています。`chmod 600` してください。
 - **サニタイザ** — フックのペイロードは送信前にクライアントで（サーバーでも再度）伏せ字にされます:
-  - AWS アクセスキー ID（`AKIA…`）、`sk-…` 形式のキー、GitHub の `ghp_…` / `gho_…` トークン、
-    Slack の `xoxb-` / `xoxa-` / `xoxp-` トークン、PEM 形式の秘密鍵ブロック
-  - `authorization|api_key|api-key|apikey|secret|password|token` に `:` か `=` が続く場合の値
-    （`Bearer …` を含む）と、その名前のキーを持つ JSON の値
+  - AWS アクセスキー ID（`AKIA…`）、`sk-…` 形式のキー、Stripe の `sk_live_…` / `sk_test_…` キー、
+    GitHub の `ghp_` / `gho_` / `ghu_` / `ghs_` / `ghr_` / `github_pat_…` トークン、
+    Slack の `xoxb-` / `xoxa-` / `xoxp-` トークン、Google の `AIza…` キー、JWT 形式の文字列
+    （`eyJ….….…`）、PEM 形式の秘密鍵ブロック（`END` 行が無い場合はテキストの末尾まで）
+  - URL 内のパスワード（`postgres://user:[REDACTED]@host`）
+  - `secret`、`token`、`password`/`passwd`、`api_key`、`access_key`、`private_key`、`credential`、
+    `authorization` を*含む*キーに `:` か `=` が続く場合の値全体（`AWS_SECRET_ACCESS_KEY=…`、
+    `"access_token": "…"`、`password = "複数の 単語"`。引用符で囲まれた値はひとまとまり、`Bearer …` も含む）、
+    `--password` / `--token` / `--api-key` の後ろの値、およびそれらの語を含む名前のキーを持つ JSON の値
+    （`max_tokens` のような件数は除く）
   - `tool_input` は 4 000 文字、`tool_response` は 2 000 文字に切り詰め
-- **伏せ字にならないもの**: 上記の形に一致しないもの全般 — 例: Google の `AIza…` キー、
-  Stripe の `sk_live_…` キー、JWT、URL 内のパスワード（`postgres://user:pass@…`）、個人情報。
+- **伏せ字にならないもの**: 上記の形に一致しないもの全般 — 例: `-p secret` のように渡したパスワード、
+  単独の高エントロピー文字列、個人情報。
   プロンプト、コマンド、ファイルパス、`Read`/`Bash`/編集系ツールの（切り詰められた）出力はサーバーに届き、
   `raw/`、SQLite、そして要約された形で `wiki/` の git 履歴に残ります。トランスクリプトは送信しません。
 - **フックは fail-open**: ネットワークやサーバーのエラー時、フックは `logs/hook.log` に 1 行記録し、
