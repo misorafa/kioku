@@ -1,0 +1,316 @@
+//! `kioku update` (M2 §13.3): download the release asset for the target this binary was
+//! built for, verify its SHA-256 exactly like install.sh, replace the running binary
+//! atomically and restart the kioku service when one is installed.
+
+use std::path::Path;
+use std::process::Command;
+use std::time::Duration;
+
+use anyhow::{Context, bail};
+use sha2::{Digest, Sha256};
+
+use crate::setup::{KIOKU_REPO, SetupEnv, VERSION, install_sh_url};
+
+/// Target triple this binary was built for (`build.rs`); a musl build updates to musl.
+pub const TARGET: &str = env!("KIOKU_TARGET");
+
+/// The tag in a `…/releases/tag/<tag>` URL (where GitHub's `releases/latest` lands).
+pub fn tag_from_release_url(url: &str) -> Option<String> {
+    let url = url.split(['?', '#']).next()?.trim_end_matches('/');
+    let (_, tag) = url.rsplit_once("/releases/tag/")?;
+    (!tag.is_empty() && !tag.contains('/')).then(|| tag.to_string())
+}
+
+/// The checksum for `asset` in `SHA256SUMS` / `<asset>.sha256` text (`<hex>  [*]<file>`).
+pub fn checksum_for(sums: &str, asset: &str) -> Option<String> {
+    sums.lines().find_map(|l| {
+        let mut it = l.split_whitespace();
+        let (hex, file) = (it.next()?, it.next()?);
+        (file.trim_start_matches('*') == asset).then(|| hex.to_ascii_lowercase())
+    })
+}
+
+/// True when release `tag` (`vX.Y.Z`) is newer than `current` (`X.Y.Z`).
+pub fn is_newer(tag: &str, current: &str) -> bool {
+    let parse = |v: &str| -> Vec<u64> {
+        let v = v.trim_start_matches('v');
+        let core = v.split(['-', '+']).next().unwrap_or(v);
+        core.split('.').map(|p| p.parse().unwrap_or(0)).collect()
+    };
+    parse(tag) > parse(current)
+}
+
+fn get(http: &reqwest::blocking::Client, url: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    let resp = http.get(url).send().with_context(|| format!("GET {url}"))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let resp = resp
+        .error_for_status()
+        .with_context(|| format!("GET {url}"))?;
+    Ok(Some(resp.bytes()?.to_vec()))
+}
+
+/// `kioku update [--version <tag>] [--check]`; returns the exit code (10 = `--check` found
+/// a newer release).
+pub fn run_update(version: Option<String>, check: bool) -> anyhow::Result<i32> {
+    let repo = std::env::var("KIOKU_REPO").unwrap_or_else(|_| KIOKU_REPO.to_string());
+    let base = std::env::var("KIOKU_DOWNLOAD_BASE")
+        .unwrap_or_else(|_| format!("https://github.com/{repo}/releases"));
+    let base = base.trim_end_matches('/');
+    let http = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .user_agent(format!("kioku/{VERSION}"))
+        .build()?;
+    let tag = match version {
+        Some(v) if v.starts_with('v') => v,
+        Some(v) => format!("v{v}"),
+        None => {
+            let resp = http.head(format!("{base}/latest")).send()?;
+            tag_from_release_url(resp.url().as_str())
+                .with_context(|| format!("no published release found at {base}"))?
+        }
+    };
+    if check {
+        println!("current: v{VERSION}\nlatest:  {tag} ({TARGET})");
+        return Ok(if is_newer(&tag, VERSION) { 10 } else { 0 });
+    }
+    if tag.trim_start_matches('v') == VERSION {
+        println!("kioku v{VERSION} is up to date");
+        return Ok(0);
+    }
+    let exe = std::env::current_exe().context("locating the kioku binary")?;
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    let dir = exe.parent().context("binary has no parent directory")?;
+    let new = dir.join(format!(".kioku.new.{}", std::process::id()));
+    if std::fs::write(&new, b"").is_err() {
+        bail!(
+            "{} is not writable; re-run the installer instead (never with sudo):\n  curl -fsSL {} | sh -s -- --version {tag} --no-setup",
+            dir.display(),
+            install_sh_url()
+        );
+    }
+    let work = dir.join(format!(".kioku-update.{}", std::process::id()));
+    let result = replace(&http, base, &tag, &exe, &new, &work);
+    let _ = std::fs::remove_file(&new);
+    let _ = std::fs::remove_dir_all(&work);
+    let installed = result?;
+    println!("kioku: updated v{VERSION} -> {tag} ({installed})");
+    restart_service(&exe);
+    Ok(0)
+}
+
+/// Downloads, verifies, extracts and renames the new binary over `exe`.
+fn replace(
+    http: &reqwest::blocking::Client,
+    base: &str,
+    tag: &str,
+    exe: &Path,
+    new: &Path,
+    work: &Path,
+) -> anyhow::Result<String> {
+    let asset = format!("kioku-{tag}-{TARGET}.tar.gz");
+    let url = format!("{base}/download/{tag}/{asset}");
+    let bytes = get(http, &url)?.with_context(|| format!("release {tag} has no {asset}"))?;
+    let expected = [
+        format!("{base}/download/{tag}/SHA256SUMS"),
+        format!("{url}.sha256"),
+    ]
+    .iter()
+    .find_map(|u| {
+        let text = String::from_utf8(get(http, u).ok()??).ok()?;
+        checksum_for(&text, &asset)
+    })
+    .with_context(|| {
+        format!("no checksum for {asset}; refusing to install an unverified binary")
+    })?;
+    let actual = format!("{:x}", Sha256::digest(&bytes));
+    if actual != expected {
+        bail!(
+            "checksum mismatch for {asset} (expected {expected}, got {actual}); nothing was changed"
+        );
+    }
+    std::fs::create_dir_all(work)?;
+    let tarball = work.join(&asset);
+    std::fs::write(&tarball, &bytes)?;
+    let status = Command::new("tar")
+        .arg("-xzf")
+        .arg(&tarball)
+        .arg("-C")
+        .arg(work)
+        .status()
+        .context("running tar")?;
+    if !status.success() {
+        bail!("tar could not extract {asset}");
+    }
+    let bin = work.join(format!("kioku-{tag}-{TARGET}")).join("kioku");
+    std::fs::copy(&bin, new).with_context(|| format!("{asset} has no kioku binary"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(new, std::fs::Permissions::from_mode(0o755))?;
+    }
+    let out = Command::new(new).arg("--version").output()?;
+    if !out.status.success() {
+        bail!(
+            "the new binary does not run here: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    // Same directory: atomic; a running `kioku serve` keeps the old inode until restarted.
+    std::fs::rename(new, exe).with_context(|| format!("replacing {}", exe.display()))?;
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Restarts the kioku service if one is installed (hooks need nothing: same path).
+fn restart_service(exe: &Path) {
+    let Ok(env) = SetupEnv::from_process(exe.display().to_string()) else {
+        return;
+    };
+    let Ok(cfg) = kioku_core::Config::load_from_dir(&env.config_dir(), &env.vars) else {
+        return;
+    };
+    let manager = env.service_manager(&cfg.data_dir);
+    if !manager.is_installed() {
+        return;
+    }
+    match manager.stop().and_then(|_| manager.start()) {
+        Ok(_) => println!("kioku: restarted the service ({})", manager.describe()),
+        Err(err) => eprintln!(
+            "kioku: warning: restart the service yourself (`kioku service start`): {err:#}"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_url_checksums_and_versions() {
+        let u = "https://github.com/misorafa/kioku/releases/tag/v0.2.0";
+        assert_eq!(tag_from_release_url(u).as_deref(), Some("v0.2.0"));
+        assert_eq!(
+            tag_from_release_url(&format!("{u}/?x=1")).as_deref(),
+            Some("v0.2.0")
+        );
+        assert_eq!(
+            tag_from_release_url("https://github.com/misorafa/kioku/releases"),
+            None
+        );
+        let sums = "AB12  kioku-v0.2.0-x86_64-unknown-linux-musl.tar.gz\n\
+                    cd34 *kioku-v0.2.0-aarch64-apple-darwin.tar.gz\n";
+        assert_eq!(
+            checksum_for(sums, "kioku-v0.2.0-x86_64-unknown-linux-musl.tar.gz").as_deref(),
+            Some("ab12")
+        );
+        assert_eq!(
+            checksum_for(sums, "kioku-v0.2.0-aarch64-apple-darwin.tar.gz").as_deref(),
+            Some("cd34")
+        );
+        assert_eq!(
+            checksum_for(sums, "kioku-v0.2.0-x86_64-apple-darwin.tar.gz"),
+            None
+        );
+        assert!(is_newer("v0.2.0", "0.1.9"));
+        assert!(is_newer("v0.10.0", "0.9.0"));
+        assert!(!is_newer("v0.1.0", "0.1.0"));
+        assert!(!is_newer("v0.1.0-rc1", "0.1.0"));
+        assert!(TARGET.contains('-'));
+    }
+
+    /// Serves `files` (path → body) on an ephemeral port; unknown paths are 404.
+    fn serve(files: Vec<(String, Vec<u8>)>) -> String {
+        use axum::http::{StatusCode, Uri};
+        let files = std::sync::Arc::new(files);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let app = axum::Router::new().fallback(move |uri: Uri| {
+                    let files = files.clone();
+                    async move {
+                        match files.iter().find(|(p, _)| p == uri.path()) {
+                            Some((_, body)) => (StatusCode::OK, body.clone()),
+                            None => (StatusCode::NOT_FOUND, Vec::new()),
+                        }
+                    }
+                });
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                tx.send(listener.local_addr().unwrap()).unwrap();
+                axum::serve(listener, app).await.unwrap();
+            });
+        });
+        format!("http://{}/releases", rx.recv().unwrap())
+    }
+
+    #[test]
+    fn replace_verifies_the_checksum_before_touching_the_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let name = format!("kioku-v9.9.9-{TARGET}");
+        std::fs::create_dir(tmp.path().join(&name)).unwrap();
+        std::fs::write(
+            tmp.path().join(&name).join("kioku"),
+            "#!/bin/sh\necho 'kioku 9.9.9'\n",
+        )
+        .unwrap();
+        let tarball = tmp.path().join(format!("{name}.tar.gz"));
+        let ok = Command::new("tar")
+            .arg("-czf")
+            .arg(&tarball)
+            .arg("-C")
+            .arg(tmp.path())
+            .arg(&name)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        let bytes = std::fs::read(&tarball).unwrap();
+        let asset = format!("/releases/download/v9.9.9/{name}.tar.gz");
+        let good = format!("{:x}  {name}.tar.gz\n", Sha256::digest(&bytes));
+        let bad = format!("{}  {name}.tar.gz\n", "0".repeat(64));
+        let sums = "/releases/download/v9.9.9/SHA256SUMS".to_string();
+        let http = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        let bin_dir = tmp.path().join("bin dir");
+        std::fs::create_dir(&bin_dir).unwrap();
+        let exe = bin_dir.join("kioku");
+        let run = |base: &str| {
+            std::fs::write(&exe, "old").unwrap();
+            let r = replace(
+                &http,
+                base,
+                "v9.9.9",
+                &exe,
+                &bin_dir.join(".kioku.new.1"),
+                &bin_dir.join(".kioku-update.1"),
+            );
+            let _ = std::fs::remove_dir_all(bin_dir.join(".kioku-update.1"));
+            (r, std::fs::read_to_string(&exe).unwrap())
+        };
+
+        let (r, content) = run(&serve(vec![
+            (asset.clone(), bytes.clone()),
+            (sums.clone(), bad.into()),
+        ]));
+        assert!(format!("{:#}", r.unwrap_err()).contains("checksum mismatch"));
+        assert_eq!(content, "old");
+
+        let (r, content) = run(&serve(vec![(asset.clone(), bytes.clone())]));
+        assert!(format!("{:#}", r.unwrap_err()).contains("no checksum"));
+        assert_eq!(content, "old");
+
+        // Pre-SHA256SUMS releases: `<asset>.sha256`.
+        let (r, content) = run(&serve(vec![
+            (asset.clone(), bytes),
+            (format!("{asset}.sha256"), good.into()),
+        ]));
+        assert_eq!(r.unwrap(), "kioku 9.9.9");
+        assert!(content.contains("kioku 9.9.9"));
+        assert!(!bin_dir.join(".kioku.new.1").exists());
+    }
+}

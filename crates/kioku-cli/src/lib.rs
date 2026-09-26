@@ -1,7 +1,7 @@
 //! kioku-cli: the `kioku` binary as a library — clap commands, fail-open hook handlers
 //! for Claude Code, Codex, Cursor and Gemini CLI (M1 §8, M2 §3–§6), the per-agent
 //! installers (M1 §8.5, M2 §8), HTTP-client commands (§11) and machine setup (M2 §10–§12):
-//! `serve --log-file`, `service`, `setup` and `doctor`.
+//! `serve --log-file`, `service`, `setup` and `doctor`, plus `update` (§13.3).
 //!
 //! Hooks and `search` / `status` / `reindex` talk to the server over HTTP using the
 //! `[client]` config; only `init`, `setup` and `serve` touch the data directory.
@@ -21,6 +21,7 @@ pub mod logfile;
 pub mod render;
 pub mod service;
 pub mod setup;
+pub mod update;
 
 pub use context::{SESSION_START_CAP, StartContext, render_session_start};
 pub use event::{ALL_AGENTS, ALL_EVENTS, Agent, HookEnv, HookEvent, HookEventKind, parse_event};

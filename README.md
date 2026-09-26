@@ -2,7 +2,7 @@
 
 [日本語](README.ja.md) | English
 
-**Status: M1 — early, expect rough edges.**
+**Status: M2 — early, expect rough edges.**
 
 kioku is a self-hosted memory server shared by all your AI coding agents on all
 your machines. It is a single Rust binary. Everything it remembers is plain
@@ -74,40 +74,200 @@ SessionEnd        finalize (idempotent)
   consumes the newest pending handoff (older pending ones are marked
   superseded). `kioku_handoff_pending` with `accept=false` only peeks.
 
-## Quickstart (one machine)
+## Install
 
-Requirements: Rust 1.91+ to build (`rustup update` if older), `git` (optional; without it the wiki is not
-versioned). The build downloads the IPADIC dictionary, so it needs network
-access. Prebuilt binaries for Linux (x86_64, aarch64) and macOS (arm64,
-x86_64) are attached to tagged GitHub releases.
+One line, no sudo (macOS and Linux, x86_64 and arm64):
 
 ```sh
-cargo install --locked --path crates/kioku-cli   # installs `kioku`
-
-kioku init                    # ~/.kioku: config.toml with a new token, wiki git repo, db, index
-kioku serve                   # keep it running (127.0.0.1:7391)
-kioku install claude-code     # in another terminal: hooks + MCP registration
+curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh
 ```
 
-`kioku install claude-code` merges hook entries into `~/.claude/settings.json`
-(`--project` uses `./.claude/settings.json`; a `settings.json.kioku-bak` backup
-is made before the first change) and registers the MCP server by setting
-`mcpServers.kioku` in `~/.claude.json` to `{"type": "http", "url":
-"http://127.0.0.1:7391/mcp", "headers": {"Authorization": "Bearer <token>"}}`
-(everything else in the file is kept; `.claude.json.kioku-bak` is made once).
-It does not run `claude mcp add`, so the token never appears on a command
-line. If `~/.claude.json` cannot be parsed, it is left alone and the snippet is
-printed for you to add. Restart Claude Code afterwards. `kioku uninstall
-claude-code` removes exactly what it added.
+`install.sh` downloads the release binary for your machine (Linux: the static
+musl build first, then the glibc one), verifies it against the release's
+`SHA256SUMS` (it refuses to install anything it cannot verify), installs it to
+`~/.local/bin/kioku` (atomic rename) and runs `kioku setup` (next section). If
+`~/.local/bin` is not on your `PATH` it prints the line to add for your shell
+(zsh / bash / fish); it never edits your shell files. Options:
 
-Try it:
+| option | env | default | |
+|--------|-----|---------|-|
+| `--version <tag>` | `KIOKU_VERSION` | `latest` | release to install |
+| `--install-dir <dir>` | `KIOKU_INSTALL_DIR` | `~/.local/bin` | destination |
+| `--repo <owner/name>` | `KIOKU_REPO` | `misorafa/kioku` | GitHub repository |
+| `--from-source` | | | build with cargo instead of downloading |
+| `--no-setup` | | | install the binary only |
 
-1. Open Claude Code in a git repository and give it a task. `kioku project id`
-   prints the project id kioku uses for that directory.
+Every other argument (and everything after `--`) is passed to `kioku setup`:
+`curl -fsSL …/install.sh | sh -s -- --version v0.2.0 --no-setup`. It refuses to
+run as root unless `--install-dir` is given (kioku is a per-user install).
+Without a prebuilt binary for your platform it builds from source, which needs
+Rust 1.91+ (`rustup update` if older) and `git`; the first build takes several
+minutes (it downloads the IPADIC dictionary). By hand:
+`cargo install --locked --git https://github.com/misorafa/kioku kioku-cli`, or
+`cargo install --locked --path crates/kioku-cli` in a checkout. `git` is
+optional at runtime (without it the wiki is not versioned).
+
+**Other machines** (laptop, desktop) talk to one server. On the server,
+`kioku setup --print-client-command` prints the exact command, token included:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh -s -- --client-only http://<server>:7391 <token>
+```
+
+Update later with `kioku update` (same download and checksum verification;
+replaces the binary in place and restarts the service; `kioku update --check`
+exits 10 when a newer release exists), or by re-running the one-liner.
+
+## `kioku setup`
+
+```
+kioku setup [--client-only <url> <token>] [--no-service] [--no-agents] [--agents a,b]
+            [--bind <addr>] [--no-instructions] [--dry-run] [--print-client-command]
+```
+
+One idempotent, non-interactive step (safe under `curl … | sh`; run it again
+any time):
+
+1. **config** — creates `~/.kioku/config.toml` with a new token (like `kioku
+   init`), or keeps the existing one (the token is never replaced).
+   `--bind 0.0.0.0` for a server other machines connect to. With
+   `--client-only`, the URL and token are checked against the server *before*
+   anything is written, and only a `[client]` section is written.
+2. **service** — installs the background service (`kioku service install`,
+   below) and waits for the server to answer. If a kioku server already answers
+   on the port (e.g. Docker), no service is installed. `--no-service` skips it.
+3. **auth** — checks the token with an authenticated request.
+4. **agents** — installs hooks + MCP for every agent it detects (`~/.claude`,
+   `~/.codex` or `$CODEX_HOME`, `~/.cursor`, `~/.gemini`); `--agents` limits
+   the set, `--no-agents` skips it, `--no-instructions` skips the instruction
+   snippets.
+5. **summary** — one line per step (`ok`, `--` skipped, `!!` warning, `xx`
+   failed); exit 1 if a step failed.
+
+`--dry-run` prints the plan and writes nothing. Restart running agents
+afterwards so they load the new hooks and MCP server.
+
+## `kioku doctor`
+
+```sh
+kioku doctor                  # [ OK ] / [WARN] / [FAIL] per check, with a `fix:` hint
+kioku doctor --agent codex    # one agent only (even if it is not detected)
+kioku doctor --json           # {"checks":[{id, status, message, fix?}]}
+```
+
+Checks the binary and `PATH`, `config.toml` (and its 0600 mode), the data dir,
+`git`, the server (reachable, same version), the token, the index version, MCP,
+the service, and for every detected agent: hooks present and pointing at an
+existing binary, the MCP entry's URL and token (compared, never printed),
+agent-specific switches, and the instruction snippet. Also flags recent hook
+errors in `hook.log` and an enabled payload dump. Exit 1 if any check fails.
+
+## `kioku service`
+
+```sh
+kioku service install      # write the definition, enable, start (idempotent)
+kioku service status       # installed? active? pid; server health
+kioku service start|stop
+kioku service logs [-f] [-n 200]   # tail ~/.kioku/logs/serve.log
+kioku service uninstall
+```
+
+A user-level service running `kioku serve --log-file ~/.kioku/logs/serve.log`,
+no sudo: on macOS the LaunchAgent
+`~/Library/LaunchAgents/dev.kioku.serve.plist` (launchd), on Linux the
+`systemd --user` unit `~/.config/systemd/user/kioku.service`. On Linux it
+enables lingering (`loginctl enable-linger`) so the server keeps running
+after you log out; if that is not allowed it prints the command to run
+yourself. Without launchd or a working `systemctl --user` (WSL without systemd,
+containers) it prints how to run `kioku serve` yourself (or use Docker) and
+`setup` continues with a warning. Client-only machines have no service.
+
+## Agents
+
+`kioku setup` installs every detected agent; `kioku install <agent>` installs
+one (`claude-code`, `codex`, `cursor`, `gemini-cli`, or `all`), and `kioku
+uninstall <agent>` removes exactly what kioku added. Common to all:
+
+- hooks run `<absolute path of kioku> hook <event> --agent <agent>`, so they
+  work regardless of `PATH` (install kioku in a stable place such as
+  `~/.local/bin`, not `target/`); they are fail-open (see Security notes);
+- entries are merged: other hooks and servers in the same files are kept, a
+  second run changes nothing, and each existing file is backed up once to
+  `<file>.kioku-bak` before kioku first changes it; a file that is not valid
+  JSON is left untouched and the snippet to add is printed;
+- `--project` writes hooks (and instructions) into the current repository
+  instead; the MCP entry, which holds the token, always stays in your user
+  config, never in a repository. Project hook files contain a machine-specific
+  path — do not commit them;
+- `--dry-run` shows what would change.
+
+### Claude Code
+
+| what | where |
+|------|-------|
+| hooks (SessionStart, UserPromptSubmit, PostToolUse, PreCompact, Stop, SessionEnd) | `~/.claude/settings.json` (`--project`: `./.claude/settings.json`) |
+| MCP | `mcpServers.kioku` in `~/.claude.json`: `{"type": "http", "url": "http://127.0.0.1:7391/mcp", "headers": {"Authorization": "Bearer <token>"}}` |
+| instructions | none by default (the hooks inject context); `--instructions` adds a block to `~/.claude/CLAUDE.md` |
+
+kioku does not run `claude mcp add`, so the token never appears on a command
+line.
+
+### Codex CLI
+
+| what | where |
+|------|-------|
+| hooks | `~/.codex/hooks.json` (`$CODEX_HOME`; `--project`: `<repo>/.codex/hooks.json`) |
+| MCP | a managed block `[mcp_servers.kioku]` (url + `Authorization` header) in `~/.codex/config.toml`; bytes outside the block are never changed |
+| instructions | a delimited kioku block in `~/.codex/AGENTS.md` (`--project`: `<repo>/AGENTS.md`) |
+
+**Trust step:** Codex runs a new or changed hook only after you trust it.
+Open Codex once and run `/hooks`, then trust kioku's hooks (setup and doctor
+remind you). kioku never writes trust state for you; the path stays the same
+across `kioku update`, so this is needed again only if the binary moves. Until
+then the AGENTS.md block tells Codex to use the kioku MCP tools. Hooks are on
+by default in current Codex; for an older build that still needs the feature
+flag, `kioku install codex --enable-hooks-feature` adds `hooks = true` under
+`[features]`.
+
+### Cursor
+
+| what | where |
+|------|-------|
+| hooks | `~/.cursor/hooks.json` (`--project`: `<repo>/.cursor/hooks.json`) — used by the editor and the `agent` CLI |
+| MCP | `mcpServers.kioku` in `~/.cursor/mcp.json` |
+| instructions | with `--project` only: `<repo>/.cursor/rules/kioku.mdc` (Cursor has no user-level rules file) |
+
+**Duplicate hooks:** Cursor also runs Claude Code's hooks from
+`~/.claude/settings.json` ("Include Third-Party Plugins, Skills, and Other
+Configs", on by default). When kioku's native Cursor hooks are installed, the
+imported Claude Code invocations recognise that they run inside Cursor and do
+nothing, so nothing is recorded twice; without native hooks they are handled
+as Cursor events. Install both (setup does) and let `kioku doctor` confirm
+(`agent.cursor.duplicate`). Because Cursor's sessionStart context is not
+always delivered, kioku also adds its context on the first tool use of each
+session (`[client] cursor_late_context = false` turns that off).
+
+### Gemini CLI
+
+| what | where |
+|------|-------|
+| hooks (named `kioku-*`) | `hooks` in `~/.gemini/settings.json` (`--project`: `<repo>/.gemini/settings.json`) |
+| MCP | `mcpServers.kioku` in `~/.gemini/settings.json` (`--trust-mcp` adds `"trust": true`) |
+| instructions | a delimited kioku block in `~/.gemini/GEMINI.md` (`--project`: `<repo>/GEMINI.md`) |
+
+Hooks must not be disabled (`hooksConfig.enabled: false`, or a `kioku-*` name
+in `hooksConfig.disabled`); doctor checks both. Project hooks show Gemini's
+one-time warning before they first run.
+
+## Try it
+
+1. Open any of these agents in a git repository and give it a task. `kioku
+   project id` prints the project id kioku uses for that directory.
 2. When it finishes a turn after using a few tools (since its last handoff),
    the Stop nudge asks it to call `kioku_handoff_write`.
-3. Start a new session in the same repository (or `/clear`): the handoff is
-   injected at SessionStart.
+3. Start a new session in the same repository (or `/clear`) — in the same or
+   another agent, on this or another machine: the handoff is injected at
+   SessionStart.
 4. Search from the terminal:
 
 ```sh
@@ -116,26 +276,14 @@ kioku search --project <id> --limit 5 設計 判断
 kioku status
 ```
 
-## Home server setup
+## Home server
 
-Run one server for all your machines.
-
-On the server:
-
-```sh
-kioku init
-kioku serve --bind 0.0.0.0     # or [server] bind = "0.0.0.0" in config.toml, or KIOKU_BIND
-```
-
-On every other machine (laptop, desktop):
-
-```sh
-kioku init --client-only https://kioku.example.com <auth_token from the server's config.toml>
-kioku install claude-code
-```
-
-`--client-only` writes only a `[client]` section and checks the URL and token
-with an authenticated request.
+Run one server for all your machines. On a fresh server,
+`curl -fsSL …/install.sh | sh -s -- --bind 0.0.0.0` writes `[server] bind =
+"0.0.0.0"` into the new `config.toml` (an existing config is kept: edit `bind`
+there, then `kioku service stop && kioku service start`). Then run
+`kioku setup --print-client-command` and the printed command on every other
+machine.
 
 Hooks never send requests to a server on this machine or a private network
 through an `HTTP(S)_PROXY` from the environment (loopback, 10/8, 172.16/12,
@@ -174,7 +322,9 @@ docker run -d --name kioku -p 7391:7391 \
 The image runs `kioku serve` as a non-root user (uid 10001) with
 `KIOKU_DATA_DIR=/data` and `KIOKU_BIND=0.0.0.0`. No `config.toml` is needed:
 with `KIOKU_AUTH_TOKEN` set, the data directory is created on first start. Keep
-the token — clients need it for `kioku init --client-only`. A bind-mounted host
+the token — clients need it for `install.sh … --client-only <url> <token>` (or
+`kioku setup --client-only`). On the Docker host itself, `kioku setup` sees the
+running server and does not install a service. A bind-mounted host
 directory must be writable by uid 10001. Extra arguments go to `kioku serve`
 (e.g. `--port 8000`), and `docker exec kioku kioku status` works inside the
 container.
@@ -332,9 +482,11 @@ self-hosted server shared by every machine. On the roadmap: whole-life ingest
 
 ## Roadmap
 
-- **M1** (this release): server, Markdown/git store, Japanese search, MCP
-  tools, Claude Code hooks and handoffs, rule-based summaries.
-- **M2**: web UI + other agents' installers.
+- **M1**: server, Markdown/git store, Japanese search, MCP tools, Claude Code
+  hooks and handoffs, rule-based summaries.
+- **M2** (this release): Codex CLI, Cursor and Gemini CLI; `install.sh`,
+  `kioku setup` / `doctor` / `service` / `update`.
+- **Later**: web UI.
 - **M3**: embeddings + bi-temporal facts.
 - **M4**: ingest adapters.
 - **M5**: eval harness.

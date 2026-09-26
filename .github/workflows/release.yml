@@ -20,6 +20,18 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             cross: true
+          # Static musl binaries run on any distro (the gnu builds need ubuntu-latest's
+          # glibc, which e.g. Ubuntu 22.04 servers lack); install.sh tries musl first.
+          # UNVERIFIED in CI (SPEC-M2 §13.1 / §18 #12): whether rusqlite `bundled` and
+          # lindera `embed-ipadic` build cleanly for musl under `cross`. If these two jobs
+          # fail: delete them and pin the two gnu jobs above to `os: ubuntu-22.04` instead
+          # (install.sh then falls back from the missing musl asset to gnu by itself).
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
           - target: aarch64-apple-darwin
             os: macos-latest
           - target: x86_64-apple-darwin
@@ -70,6 +82,12 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: SHA256SUMS
+        # One file with every asset's checksum; install.sh verifies against it (and falls
+        # back to <asset>.sha256 for releases that predate it).
+        run: |
+          cd dist && cat *.sha256 | sort -k2 > SHA256SUMS
+          cat SHA256SUMS
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}

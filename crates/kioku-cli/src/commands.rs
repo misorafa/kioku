@@ -110,6 +110,10 @@ pub fn run(cli: Cli) -> i32 {
         Command::Project {
             command: ProjectCommand::Id { path },
         } => project_id(path),
+        Command::Update { version, check } => match crate::update::run_update(version, check) {
+            Ok(code) => return code,
+            Err(err) => Err(err),
+        },
         Command::Reindex => reindex(),
         Command::Status => status(),
     };

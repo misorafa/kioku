@@ -60,6 +60,6 @@ the spec in the same change and say so in the commit message.
 ```
 crates/kioku-core     store, index, project identity, observations, handoffs, summary rules
 crates/kioku-server   axum HTTP API + MCP (rmcp) — no business logic here
-crates/kioku-cli      the `kioku` binary: serve / init / hook / install / setup / service / doctor / search / status
+crates/kioku-cli      the `kioku` binary: serve / init / hook / install / setup / service / doctor / update / search / status
 docs/                 SPEC-M1.md and later specs; ADRs in docs/adr/
 ```

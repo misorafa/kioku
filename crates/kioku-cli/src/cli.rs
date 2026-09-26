@@ -160,6 +160,15 @@ pub enum Command {
         #[command(subcommand)]
         command: ProjectCommand,
     },
+    /// Replace this binary with a release (SHA-256 verified) and restart the service.
+    Update {
+        /// Release tag to install (default: the latest release).
+        #[arg(long)]
+        version: Option<String>,
+        /// Only compare with the latest release; exit 10 when an update is available.
+        #[arg(long)]
+        check: bool,
+    },
     /// Rebuild the search index from the wiki (via the server).
     Reindex,
     /// Show server status and counts.
@@ -399,6 +408,17 @@ mod tests {
         ));
         assert!(p(&["doctor", "--agent", "all"]).is_err());
         assert!(p(&["project", "id", "/tmp"]).is_ok());
+        assert!(matches!(
+            p(&["update", "--version", "v0.2.0"]).unwrap().command,
+            Command::Update { version: Some(v), check: false } if v == "v0.2.0"
+        ));
+        assert!(matches!(
+            p(&["update", "--check"]).unwrap().command,
+            Command::Update {
+                version: None,
+                check: true
+            }
+        ));
         assert!(p(&["reindex"]).is_ok());
         assert!(p(&["status"]).is_ok());
     }

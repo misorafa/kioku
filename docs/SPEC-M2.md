@@ -1122,8 +1122,8 @@ Behaviour:
 
 1. `set -eu`; wrap the body in a `main` function called on the last line (safe
    against truncated downloads). Never calls `sudo`. Refuses to run as root
-   unless `--install-dir` is given explicitly (a root install would put the
-   service and config in root's home).
+   unless `--install-dir` (or `KIOKU_INSTALL_DIR`) is given explicitly (a root
+   install would put the service and config in root's home).
 2. Needs `curl` or `wget`, `tar`, and `sha256sum` or `shasum -a 256`; missing
    → clear error.
 3. Target: `uname -s` → `Linux` | `Darwin` (else → source fallback, or
@@ -1141,10 +1141,12 @@ Behaviour:
    404 for this target → next candidate target → source fallback. Verify the
    checksum line for the asset name; mismatch or no checksum file → abort
    (never install unverified).
-6. Extract; copy `kioku` to `<dir>/.kioku.new.$$`, `chmod 755`, `mv` over
-   `<dir>/kioku` (atomic on one filesystem; a running service keeps the old
-   inode). Run `<dir>/kioku --version`; if it fails (e.g. glibc too old) try the
-   next target, then source fallback.
+6. Extract; copy `kioku` to `<dir>/.kioku.new.$$`, `chmod 755`, run
+   `<dir>/.kioku.new.$$ --version`; if it fails (e.g. glibc too old) remove it
+   and try the next target, then source fallback. Only a binary that runs is
+   `mv`ed over `<dir>/kioku` (atomic on one filesystem; a running service keeps
+   the old inode). Step 5 change: the M2 draft renamed first and checked after,
+   which could replace a working binary with one that does not run.
 7. Source fallback: needs `cargo` ≥ 1.91 (`cargo --version`) and `git`;
    otherwise print rustup instructions and exit 1. Inside a kioku checkout
    (`./Cargo.toml` with `kioku-cli`) → `cargo build --release --locked -p
@@ -1162,6 +1164,9 @@ curl carry no quarantine attribute, so Gatekeeper does not block the binary
 (re-check if a notarization requirement ever applies).
 
 ### 13.3 `kioku update` (optional in M2)
+
+Implemented in Step 5 (`crates/kioku-cli/src/update.rs`; honours `KIOKU_REPO`
+and `KIOKU_DOWNLOAD_BASE` like install.sh).
 
 `kioku update [--version <tag>] [--check]`: same resolution/verification as
 install.sh, implemented in Rust (`reqwest` + `sha2`; extraction by shelling out
@@ -1186,7 +1191,7 @@ kioku uninstall claude-code|codex|cursor|gemini-cli|all [--project] [--dry-run]
 kioku hook <event> [--agent claude-code|codex|cursor|gemini-cli]
 kioku hook-dump extract <agent> <event> [--out <dir>]
 kioku serve [--bind] [--port] [--log-file <path>]
-kioku update [--version <tag>] [--check]          (optional)
+kioku update [--version <tag>] [--check]
 ```
 
 New `[client]` keys: `hook_dump = false`, `cursor_late_context = true`.
@@ -1282,7 +1287,11 @@ systemctl.
     (Linux x86_64/aarch64 → musl then gnu, Darwin arm64/x86_64, FreeBSD →
     source fallback message); PATH hint printed when the dir is not on PATH;
     passthrough args reach `kioku setup` (fixture binary is a shell script that
-    echoes its argv).
+    echoes its argv). Step 5: `scripts/test-install.sh`; the fixture server is a
+    `python3` `http.server` subclass that also answers `releases/latest` with the
+    GitHub-style redirect; a fake `id` and `cargo` on PATH cover the root refusal
+    and the source fallback; `KIOKU_TEST_REAL_BIN=<path>` adds a run of the real
+    binary's `setup --dry-run`. CI runs it under dash and macOS sh.
 
 ## 17. Step plan (one agent run per step)
 
