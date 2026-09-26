@@ -34,6 +34,55 @@ pub enum Command {
         /// Port to listen on (overrides [server] port / KIOKU_PORT).
         #[arg(long)]
         port: Option<u16>,
+        /// Write the log to this file (rotated at 10 MiB, keeps .1-.3) instead of stderr.
+        #[arg(long)]
+        log_file: Option<std::path::PathBuf>,
+    },
+    /// Set up this machine in one idempotent step: config, background service, hooks + MCP
+    /// for every detected agent, summary.
+    Setup {
+        /// Client-only machine: talk to the server at URL with TOKEN (checked before anything
+        /// is written).
+        #[arg(long, num_args = 2, value_names = ["URL", "TOKEN"])]
+        client_only: Option<Vec<String>>,
+        /// Do not install the background service.
+        #[arg(long)]
+        no_service: bool,
+        /// Do not install hooks / MCP for any agent.
+        #[arg(long)]
+        no_agents: bool,
+        /// Only these agents (comma-separated).
+        #[arg(long, value_enum, value_delimiter = ',')]
+        agents: Vec<Agent>,
+        /// `[server] bind` for a new config (e.g. 0.0.0.0 on a home server).
+        #[arg(long, conflicts_with = "client_only")]
+        bind: Option<String>,
+        /// Do not write the instruction snippets (AGENTS.md, GEMINI.md).
+        #[arg(long)]
+        no_instructions: bool,
+        /// Print the plan; write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Also print the command for other machines (`curl -fsSL
+        /// https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh -s --
+        /// --client-only <url> <token>`); it contains the token.
+        #[arg(long)]
+        print_client_command: bool,
+    },
+    /// Manage the user-level background service (launchd / systemd --user) running `kioku serve`.
+    Service {
+        /// Subcommand.
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
+    /// Check this machine's kioku setup (config, server, service, every agent's hooks and MCP).
+    Doctor {
+        /// Machine-readable output: {"checks":[{id, status, message, fix?}]}.
+        #[arg(long)]
+        json: bool,
+        /// Only check this agent (other agents are skipped).
+        #[arg(long, value_enum)]
+        agent: Option<Agent>,
     },
     /// Search the wiki through the server.
     Search {
@@ -143,6 +192,30 @@ impl InstallTarget {
             InstallTarget::All => None,
         }
     }
+}
+
+/// `kioku service …`.
+#[derive(Debug, Subcommand)]
+pub enum ServiceCommand {
+    /// Write the definition, enable and start it (idempotent).
+    Install,
+    /// Stop, disable and remove the definition.
+    Uninstall,
+    /// Start the installed service.
+    Start,
+    /// Stop the service.
+    Stop,
+    /// Installed? active? pid; server health.
+    Status,
+    /// Print the end of serve.log.
+    Logs {
+        /// Keep printing new lines.
+        #[arg(short = 'f', long)]
+        follow: bool,
+        /// Number of lines.
+        #[arg(short = 'n', long, default_value_t = 200)]
+        lines: usize,
+    },
 }
 
 /// `kioku hook-dump …`.
@@ -267,6 +340,64 @@ mod tests {
             }
         ));
         assert!(p(&["serve", "--bind", "0.0.0.0", "--port", "9000"]).is_ok());
+        assert!(matches!(
+            p(&["serve", "--log-file", "/tmp/s.log"]).unwrap().command,
+            Command::Serve {
+                log_file: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            p(&["setup", "--client-only", "http://h:7391", "tok", "--agents", "codex,cursor", "--no-instructions", "--dry-run", "--print-client-command"]).unwrap().command,
+            Command::Setup { client_only: Some(v), agents, no_instructions: true, dry_run: true, print_client_command: true, .. }
+                if v == ["http://h:7391", "tok"] && agents == [Agent::Codex, Agent::Cursor]
+        ));
+        assert!(matches!(
+            p(&["setup", "--no-service", "--no-agents", "--bind", "0.0.0.0"]).unwrap().command,
+            Command::Setup { no_service: true, no_agents: true, bind: Some(b), .. } if b == "0.0.0.0"
+        ));
+        assert!(
+            p(&[
+                "setup",
+                "--client-only",
+                "http://h:7391",
+                "tok",
+                "--bind",
+                "0.0.0.0"
+            ])
+            .is_err()
+        );
+        for sub in ["install", "uninstall", "start", "stop", "status", "logs"] {
+            assert!(p(&["service", sub]).is_ok(), "{sub}");
+        }
+        assert!(matches!(
+            p(&["service", "logs", "-f", "-n", "50"]).unwrap().command,
+            Command::Service {
+                command: ServiceCommand::Logs {
+                    follow: true,
+                    lines: 50
+                }
+            }
+        ));
+        assert!(matches!(
+            p(&["service", "logs"]).unwrap().command,
+            Command::Service {
+                command: ServiceCommand::Logs {
+                    follow: false,
+                    lines: 200
+                }
+            }
+        ));
+        assert!(matches!(
+            p(&["doctor", "--json", "--agent", "gemini-cli"])
+                .unwrap()
+                .command,
+            Command::Doctor {
+                json: true,
+                agent: Some(Agent::GeminiCli)
+            }
+        ));
+        assert!(p(&["doctor", "--agent", "all"]).is_err());
         assert!(p(&["project", "id", "/tmp"]).is_ok());
         assert!(p(&["reindex"]).is_ok());
         assert!(p(&["status"]).is_ok());

@@ -849,7 +849,7 @@ this needed tests only.)
 
 New flag: tracing output goes to `<path>` with size rotation (10 MiB, keep
 `.1`–`.3`), implemented as a small `io::Write` behind `parking_lot::Mutex` (no
-new crate). Without the flag, stderr as in M1. Service definitions always pass
+new crate; `kioku_cli::logfile`, file created 0600, no ANSI colours). Without the flag, stderr as in M1. Service definitions always pass
 `--log-file <data_dir>/logs/serve.log`; stdout/stderr of the process go to
 `<data_dir>/logs/serve.stderr.log` (panics, pre-logging failures).
 
@@ -912,6 +912,12 @@ All paths in definitions are absolute (no `~`, no `$HOME`); `<bin>` as in §8.1.
 Note: `stop` via `bootout` also unloads; `start` bootstraps again. A stopped
 LaunchAgent comes back at next login (RunAtLoad) unless uninstalled.
 
+Idempotency (Step 4): `service install` rewrites the definition only when its
+bytes differ (new file 0644, no backup — kioku owns it) and runs the
+bootout → bootstrap → enable sequence only when it rewrote the plist or
+`launchctl print` says the job is not loaded; otherwise it runs nothing but the
+`id -u` / `print` queries. `start` = the same sequence on an installed plist.
+
 ### 10.4 Linux: systemd user unit (no sudo)
 
 `$XDG_CONFIG_HOME/systemd/user/kioku.service` (default
@@ -935,9 +941,15 @@ RestartSec=5
 WantedBy=default.target
 ```
 
-Paths with spaces are quoted per systemd rules. Commands: `systemctl --user
+Paths with spaces are quoted per systemd rules (`ExecStart=` arguments with
+whitespace, quotes, `\` or `;` in double quotes; `Environment=` quoted as a whole
+assignment; `%` → `%%` everywhere, `$` → `$$` in `ExecStart=`). Commands: `systemctl --user
 daemon-reload`; `enable --now kioku.service`; `restart`; `stop`; `disable
---now`; status = `systemctl --user is-active kioku.service` + health check.
+--now`; status = `systemctl --user is-active kioku.service` (+ `show -p MainPID
+--value`) + health check. `service install` (Step 4): unit bytes unchanged and
+active → only `is-active` + the linger query run; changed → `daemon-reload`,
+`enable --now`, and `restart` if it was active before; unchanged but inactive →
+`enable --now`.
 
 **Linger**: a user unit stops at logout unless lingering is enabled. `service
 install` runs `loginctl enable-linger` (no sudo; polkit usually allows it for
@@ -967,7 +979,9 @@ Non-interactive (safe under `curl … | sh`); every step idempotent. Order:
 1. **Binary** — resolve `<bin>` (§8.1), warn if unstable location.
 2. **Config** — `--client-only`: same as `kioku init --client-only` (writes
    `[client]`, verifies with `GET /api/v1/status`; failure → exit 1 before
-   touching agents). Otherwise: if `config.toml` is missing → `kioku init`
+   touching agents). Step 4: the check runs **before** the write, so a wrong
+   token never replaces a working config (nothing at all is written on failure);
+   its result is the `auth` line, and step 4 is not repeated. Otherwise: if `config.toml` is missing → `kioku init`
    (with `--bind` written to `[server] bind` when given); if present → keep
    (token never replaced); if it has only `[client]` → treat as client-only.
 3. **Service** (full mode, unless `--no-service`) — if `GET <server_url>/api/v1/health`
@@ -982,19 +996,24 @@ Non-interactive (safe under `curl … | sh`); every step idempotent. Order:
    hooks fail open).
 
 `--dry-run` prints the plan (files that would change, commands that would run)
-and writes nothing. `--print-client-command` additionally prints the laptop
-command **including the token** (off by default):
-`curl -fsSL <install.sh url> | sh -s -- --client-only http://<host>:7391 <token>`
-(host = first non-loopback address when `bind` is `0.0.0.0`).
+and writes nothing (it still does read-only health / status requests; the auth
+line is `--` when config.toml does not exist yet). `--print-client-command`
+additionally prints the laptop command **including the token** (off by default):
+`curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh -s -- --client-only http://<host>:7391 <token>`
+(host = first non-loopback address when `bind` is `0.0.0.0`; with a loopback
+bind the same address plus a note to set `bind = "0.0.0.0"`; on a client-only
+machine its own `server_url`).
 
 Summary format (ASCII only, one line per step; `ok` / `--` skipped / `!!`
-warning / `xx` failed):
+warning / `xx` failed; `  <mark>  <step padded to 11> <text>`; the M2 draft's
+example used `—`, replaced by `at` to stay ASCII, and gained the `auth` line):
 
 ```
 kioku setup (v0.2.0)
   ok  binary      /Users/me/.local/bin/kioku
   ok  config      /Users/me/.kioku/config.toml (existing, token kept)
-  ok  service     launchd dev.kioku.serve running — http://127.0.0.1:7391 (v0.2.0)
+  ok  service     launchd dev.kioku.serve running at http://127.0.0.1:7391 (v0.2.0)
+  ok  auth        token accepted by http://127.0.0.1:7391
   ok  claude-code hooks ~/.claude/settings.json (6), MCP ~/.claude.json
   ok  codex       hooks ~/.codex/hooks.json (6), MCP ~/.codex/config.toml, AGENTS.md
   !!  codex       open Codex and run /hooks once to trust kioku's hooks
@@ -1003,6 +1022,17 @@ kioku setup (v0.2.0)
 Restart running agents so they pick up the new hooks and MCP server.
 Check any time with: kioku doctor
 ```
+
+Agent lines are the same whether the run installed or found everything in
+place, so a second run prints the same summary (only the config line changes
+from `(created, …)` to `(existing, token kept)`) and writes no file. The Codex
+trust line is shown unless `[hooks.state]` records a trusted hash for a key
+mentioning kioku (same heuristic as doctor). Installer `warning:` lines and
+unparseable MCP files become `!!` lines; the snippet (which holds the token) is
+left to `kioku install <agent>`. `--dry-run` prefixes agent lines with
+`would change:` (or appends `(unchanged)`) and indents the installer's plan
+under each line; the service line lists the file write and commands.
+`--client-only` summary order: binary, config, auth, service (`--`), agents.
 
 ## 12. `kioku doctor`
 
@@ -1013,6 +1043,14 @@ kioku doctor [--json] [--agent <name>]
 Each check prints `[ OK ]`, `[WARN]` or `[FAIL]` + one line (+ a `fix:` hint).
 Exit 0 if no FAIL, 1 otherwise. `--json` → `{"checks":[{id, status:"ok"|"warn"|"fail", message, fix?}]}`.
 Never prints the token. Runs with a 3 s per-request timeout.
+Text form (Step 4): `[ OK ] <id>: <message>`, then `       fix: <hint>`, then one
+count line. `auth`, `index` and `mcp` run only when the config is usable and
+`server` found kioku (otherwise they would repeat the same failure); `index` and
+`mcp` also need `auth` to pass. A detected agent with no kioku hooks at all is
+`agent.<name>.hooks` WARN ("not installed"); its missing MCP entry is FAIL per
+the table. `agent.cursor.duplicate` is always `[ OK ]` (the no-native-hooks case
+is its info line). `--agent <name>` checks that agent even when not detected and
+skips the others.
 
 | id | check | OK | WARN | FAIL |
 |----|-------|----|------|------|
@@ -1063,7 +1101,7 @@ Required changes (Step 5):
 ### 13.2 `install.sh` (POSIX sh, repo root, served from the raw GitHub URL)
 
 ```
-curl -fsSL https://raw.githubusercontent.com/<owner>/kioku/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh
 curl -fsSL …/install.sh | sh -s -- --version v0.2.0 --no-setup
 curl -fsSL …/install.sh | sh -s -- --client-only http://home.lan:7391 <token>
 ```
@@ -1074,7 +1112,7 @@ Options / env (flag wins over env):
 |------|-----|---------|---------|
 | `--version <tag>` | `KIOKU_VERSION` | `latest` | release tag to install |
 | `--install-dir <dir>` | `KIOKU_INSTALL_DIR` | `$HOME/.local/bin` | destination |
-| `--repo <owner/name>` | `KIOKU_REPO` | the project repo (constant at the top of the script; the repo slug is not decided yet — no git remote exists) | GitHub repository |
+| `--repo <owner/name>` | `KIOKU_REPO` | `misorafa/kioku` (constant at the top of the script; `kioku_cli::setup::KIOKU_REPO` in Rust) | GitHub repository |
 | `--from-source` | — | off | skip binaries, build with cargo |
 | `--no-setup` | — | off | install only |
 | everything after `--` or unknown `--client-only …` etc. | — | — | passed to `kioku setup` |
@@ -1280,4 +1318,4 @@ systemctl.
 | 10 | Gemini `run_shell_command` `tool_response` text | §6.3 | digest uses command + `error` only |
 | 11 | Gemini / Cursor tolerance of empty stdout (kioku prints `{}` anyway) | §3.6 | always print valid JSON |
 | 12 | musl cross-build of rusqlite(bundled)+lindera | §13.1 | pin gnu builds to ubuntu-22.04 |
-| 13 | GitHub repo slug for install.sh / update (no git remote configured yet) | §13.2 | `KIOKU_REPO` / `--repo` |
+| 13 | ~~GitHub repo slug~~ — resolved in Step 4: `misorafa/kioku` | §13.2 | `KIOKU_REPO` / `--repo` still override it |

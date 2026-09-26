@@ -194,7 +194,7 @@ fn roundtrip(agent: Agent, project: bool) {
     assert!(r.changed, "{agent:?}: {:?}", r.lines);
     let v = read_json(&hooks);
     let ours = our_commands(&v);
-    let expected_keys: Vec<String> = specs(agent, BIN).into_iter().map(|s| s.key).collect();
+    let expected_keys: Vec<String> = hook_specs(agent, BIN).into_iter().map(|s| s.key).collect();
     assert_eq!(ours.len(), expected_keys.len(), "{agent:?} {ours:?}");
     for cmds in ours.values() {
         assert_eq!(cmds.len(), 1);
@@ -453,7 +453,7 @@ fn exact_hook_shapes_on_an_empty_home() {
 #[test]
 fn registered_timeouts_match_the_hook_deadlines() {
     for agent in ALL_AGENTS {
-        for spec in specs(agent, BIN) {
+        for spec in hook_specs(agent, BIN) {
             let handlers: Vec<Value> = match spec.entry.get("hooks") {
                 Some(Value::Array(h)) => h.clone(),
                 _ => vec![spec.entry.clone()],

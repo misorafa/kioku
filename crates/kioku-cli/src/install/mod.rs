@@ -361,6 +361,12 @@ pub fn rewrite_text(path: &Path, text: &str) -> anyhow::Result<()> {
     write_text_inner(path, true, text, false, false).map(|_| ())
 }
 
+/// Writes a file kioku owns entirely (a service definition): temp file + rename, no backup,
+/// a new file 0644, an existing one keeps its mode.
+pub fn write_definition_file(path: &Path, existed: bool, text: &str) -> anyhow::Result<()> {
+    write_text_inner(path, existed, text, false, false).map(|_| ())
+}
+
 /// True when a JSON value holds nothing but what kioku may leave behind (`{}`, or an empty
 /// `mcpServers` object).
 pub fn is_blank_json(v: &Value) -> bool {

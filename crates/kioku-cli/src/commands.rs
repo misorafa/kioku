@@ -1,6 +1,7 @@
 //! Implementations of the commands: the `hook` entry point (config / stdin / dump
 //! plumbing around the handlers), init, serve, search, status, reindex, project id,
-//! install / uninstall and `hook-dump extract`.
+//! install / uninstall, `hook-dump extract`, and the machine-setup commands `setup`,
+//! `service` and `doctor` (M2 §10–§12).
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -13,7 +14,9 @@ use kioku_core::util::home_dir;
 use kioku_core::{Config, Hit, StatusReport, Store, identify};
 use serde_json::Value;
 
-use crate::cli::{Cli, Command, HookDumpCommand, InstallTarget, ProjectCommand, ScopeArg};
+use crate::cli::{
+    Cli, Command, HookDumpCommand, InstallTarget, ProjectCommand, ScopeArg, ServiceCommand,
+};
 use crate::client::{ApiClient, COMMAND_TIMEOUT};
 use crate::dump;
 use crate::event::{Agent, HookEnv, HookEventKind};
@@ -36,7 +39,38 @@ pub fn run(cli: Cli) -> i32 {
             Some(_) => Err(anyhow::anyhow!("--client-only takes <url> <token>")),
             None => init(),
         },
-        Command::Serve { bind, port } => serve(bind, port),
+        Command::Serve {
+            bind,
+            port,
+            log_file,
+        } => serve(bind, port, log_file),
+        Command::Setup {
+            client_only,
+            no_service,
+            no_agents,
+            agents,
+            bind,
+            no_instructions,
+            dry_run,
+            print_client_command,
+        } => {
+            let opts = crate::setup::SetupOptions {
+                client_only: client_only.and_then(|v| match v.as_slice() {
+                    [url, token] => Some((url.clone(), token.clone())),
+                    _ => None,
+                }),
+                no_service,
+                no_agents,
+                agents,
+                bind,
+                no_instructions,
+                dry_run,
+                print_client_command,
+            };
+            return setup(&opts);
+        }
+        Command::Service { command } => service(command),
+        Command::Doctor { json, agent } => return doctor(json, agent),
         Command::Search {
             query,
             project,
@@ -218,7 +252,7 @@ fn init_client_only(url: &str, token: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn serve(bind: Option<String>, port: Option<u16>) -> anyhow::Result<()> {
+fn serve(bind: Option<String>, port: Option<u16>, log_file: Option<PathBuf>) -> anyhow::Result<()> {
     let mut cfg = Config::load()?;
     if let Some(bind) = bind {
         cfg.server.bind = bind;
@@ -237,7 +271,7 @@ fn serve(bind: Option<String>, port: Option<u16>) -> anyhow::Result<()> {
             cfg.config_file.display()
         );
     }
-    init_tracing();
+    init_tracing(log_file.as_deref())?;
     let (bind, port) = (cfg.server.bind.clone(), cfg.server.port);
     let data_dir = cfg.data_dir.clone();
     let store = Arc::new(Store::open(cfg).context("opening the data directory")?);
@@ -255,14 +289,28 @@ fn serve(bind: Option<String>, port: Option<u16>) -> anyhow::Result<()> {
     runtime.block_on(kioku_server::serve(store, bind, port))
 }
 
-fn init_tracing() {
+fn init_tracing(log_file: Option<&std::path::Path>) -> anyhow::Result<()> {
     use tracing_subscriber::EnvFilter;
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,tantivy=warn"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .try_init();
+    match log_file {
+        Some(path) => {
+            let writer = crate::logfile::RotatingFile::open(path)
+                .with_context(|| format!("opening log file {}", path.display()))?;
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .try_init();
+        }
+        None => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .try_init();
+        }
+    }
+    Ok(())
 }
 
 fn command_client() -> anyhow::Result<(Config, ApiClient)> {
@@ -363,6 +411,133 @@ fn current_binary() -> anyhow::Result<String> {
     let exe = std::env::current_exe().context("locating the kioku binary")?;
     let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
     Ok(exe.display().to_string())
+}
+
+/// `kioku setup` (M2 §11); returns the exit code.
+fn setup(opts: &crate::setup::SetupOptions) -> i32 {
+    let env = match current_binary().and_then(crate::setup::SetupEnv::from_process) {
+        Ok(e) => e,
+        Err(err) => {
+            eprintln!("kioku: error: {err:#}");
+            return 1;
+        }
+    };
+    let report = crate::setup::run_setup(opts, &env);
+    print!("{}", report.render());
+    report.exit_code()
+}
+
+/// `kioku doctor [--json] [--agent <name>]` (M2 §12); returns the exit code.
+fn doctor(json: bool, agent: Option<Agent>) -> i32 {
+    let bin = match current_binary() {
+        Ok(b) => b,
+        Err(err) => {
+            eprintln!("kioku: error: {err:#}");
+            return 1;
+        }
+    };
+    let env = crate::doctor::DoctorEnv::from_process(bin);
+    let checks = crate::doctor::run_doctor(&env, agent);
+    if json {
+        let v = crate::doctor::render_json(&checks);
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+    } else {
+        print!("{}", crate::doctor::render_text(&checks));
+    }
+    crate::doctor::exit_code(&checks)
+}
+
+/// `kioku service …` (M2 §10.2). Refuses on a client-only machine.
+fn service(command: ServiceCommand) -> anyhow::Result<()> {
+    use crate::service::{Health, Platform, probe_health};
+    let env = crate::setup::SetupEnv::from_process(current_binary()?)?;
+    let config_path = env.config_dir().join(kioku_core::config::CONFIG_FILE);
+    let cfg = Config::load_from_dir(&env.config_dir(), &env.vars)?;
+    let server_section = std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|t| toml::from_str::<toml::Table>(&t).ok())
+        .map(|t| t.contains_key("server"));
+    if server_section == Some(false) {
+        anyhow::bail!(
+            "this machine is configured as a client only (no [server] section in {}); the service runs on the server machine",
+            config_path.display()
+        );
+    }
+    let manager = env.service_manager(&cfg.data_dir);
+    let print = |act: crate::service::ServiceAction| {
+        for l in act.lines {
+            println!("{l}");
+        }
+    };
+    match command {
+        ServiceCommand::Install | ServiceCommand::Start => {
+            let has_token = cfg
+                .server
+                .auth_token
+                .as_deref()
+                .is_some_and(|t| !t.trim().is_empty());
+            if server_section.is_none() || !has_token {
+                anyhow::bail!(
+                    "no server config with an auth token at {}: run `kioku setup` (or `kioku init`) first",
+                    config_path.display()
+                );
+            }
+            if let Some(w) = unstable_binary_warning(&env.bin) {
+                println!("{w}");
+            }
+            let act = if matches!(command, ServiceCommand::Install) {
+                manager.install()?
+            } else {
+                manager.start()?
+            };
+            print(act);
+        }
+        ServiceCommand::Uninstall => print(manager.uninstall()?),
+        ServiceCommand::Stop => print(manager.stop()?),
+        ServiceCommand::Status => {
+            if let Platform::Unsupported(why) = &manager.platform {
+                println!("service : none ({why})");
+            } else {
+                let st = manager.state();
+                let def = manager.definition_path().unwrap_or_default();
+                println!(
+                    "service : {} ({})",
+                    manager.describe(),
+                    if st.installed {
+                        format!("installed: {}", def.display())
+                    } else {
+                        "not installed".to_string()
+                    }
+                );
+                let pid = st.pid.map(|p| format!(", pid {p}")).unwrap_or_default();
+                println!(
+                    "state   : {}",
+                    if st.active {
+                        format!("active{pid}")
+                    } else {
+                        "not active".to_string()
+                    }
+                );
+                if let Some(l) = st.linger {
+                    println!(
+                        "linger  : {}",
+                        if l { "on" } else { "off (stops at logout)" }
+                    );
+                }
+            }
+            let url = &cfg.client.server_url;
+            match probe_health(&cfg.client, Duration::from_secs(3)) {
+                Health::Kioku { version } => println!("health  : ok - {url} (v{version})"),
+                Health::Foreign(why) => println!("health  : not kioku - {url}: {why}"),
+                Health::Down(why) => println!("health  : unreachable - {url}: {why}"),
+            }
+            println!("log     : {}", manager.spec.log_file().display());
+        }
+        ServiceCommand::Logs { follow, lines } => {
+            crate::service::tail_log(&manager.spec.log_file(), lines, follow)?;
+        }
+    }
+    Ok(())
 }
 
 fn print_report(r: &AgentReport, indent: &str) {

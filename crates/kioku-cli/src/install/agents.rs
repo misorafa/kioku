@@ -216,7 +216,7 @@ fn gemini_context_file(ctx: &InstallCtx, project: bool) -> String {
 
 /// Instruction files of an agent: where `install` writes (first) and every file `uninstall`
 /// cleans. Cursor has no user-level rule file (User Rules are UI-only).
-fn instruction_files(agent: Agent, ctx: &InstallCtx, project: bool) -> Vec<PathBuf> {
+pub fn instruction_files(agent: Agent, ctx: &InstallCtx, project: bool) -> Vec<PathBuf> {
     match (agent, project) {
         (Agent::ClaudeCode, false) => vec![ctx.home.join(".claude").join("CLAUDE.md")],
         (Agent::ClaudeCode, true) => vec![ctx.cwd.join("CLAUDE.md")],
@@ -251,7 +251,8 @@ fn instruction_files(agent: Agent, ctx: &InstallCtx, project: bool) -> Vec<PathB
     }
 }
 
-fn wants_instructions(agent: Agent, opts: &InstallOptions) -> bool {
+/// True when `install` writes the instruction snippet for `agent` with these options (M2 §7).
+pub fn wants_instructions(agent: Agent, opts: &InstallOptions) -> bool {
     match opts.instructions {
         Instructions::Skip => false,
         Instructions::Force => true,
@@ -388,7 +389,8 @@ pub fn gemini_specs(bin: &str) -> Vec<HookSpec> {
         .collect()
 }
 
-fn specs(agent: Agent, bin: &str) -> Vec<HookSpec> {
+/// The hook registrations `install` writes for `agent` (one per native event key).
+pub fn hook_specs(agent: Agent, bin: &str) -> Vec<HookSpec> {
     match agent {
         Agent::ClaudeCode => claude_specs(bin),
         Agent::Codex => codex_specs(bin),
@@ -397,16 +399,17 @@ fn specs(agent: Agent, bin: &str) -> Vec<HookSpec> {
     }
 }
 
-fn is_flat(agent: Agent) -> bool {
+/// True for Cursor's flat hook format (no matcher groups).
+pub fn is_flat(agent: Agent) -> bool {
     agent == Agent::Cursor
 }
 
 /// Our hooks merged into `settings` in the agent's format.
 pub fn merge_agent_hooks(agent: Agent, settings: &Value, bin: &str) -> anyhow::Result<Value> {
     if is_flat(agent) {
-        merge_flat(settings, &specs(agent, bin))
+        merge_flat(settings, &hook_specs(agent, bin))
     } else {
-        merge_nested(settings, &specs(agent, bin))
+        merge_nested(settings, &hook_specs(agent, bin))
     }
 }
 
