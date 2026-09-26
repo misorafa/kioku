@@ -95,7 +95,8 @@ curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh
 `curl -fsSL …/install.sh | sh -s -- --version v0.2.0 --no-setup`。kioku はユーザー単位のインストールなので、
 `--install-dir` を指定しない限り root では実行を拒否します。このプラットフォーム用のビルド済みバイナリが
 無い場合はソースからビルドします。これには Rust 1.91 以上（古い場合は `rustup update`）と `git` が必要で、
-初回のビルドには数分かかります（IPADIC 辞書をダウンロードするため）。手動なら
+初回のビルドには数分かかります（IPADIC 辞書をダウンロードするため）。GitHub に到達できない場合
+（ネットワークや HTTP のエラー）はソースビルドに切り替えず、エラーで終了します。手動なら
 `cargo install --locked --git https://github.com/misorafa/kioku kioku-cli`、チェックアウト内なら
 `cargo install --locked --path crates/kioku-cli` です。実行時の `git` は任意です（無い場合 wiki は
 バージョン管理されません）。
@@ -108,8 +109,10 @@ curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh
 ```
 
 あとからの更新は `kioku update`（同じダウンロードとチェックサム検証。バイナリをその場で置き換え、
-サービスを再起動します。`kioku update --check` は新しいリリースがあれば終了コード 10 で終わります）、
-または 1 行のコマンドをもう一度実行します。
+サービスを再起動します。動いているものより新しいリリースだけをインストールし、`--version <tag>` なら
+古いものも含めて任意のタグを入れられます。`kioku update --check` は新しいリリースがあれば終了コード 10
+で終わります）、または 1 行のコマンドをもう一度実行します（古いバージョンのまま動いているサービスは、
+次の `kioku setup` が再起動します）。
 
 ## `kioku setup`
 
@@ -126,7 +129,9 @@ kioku setup [--client-only <url> <token>] [--no-service] [--no-agents] [--agents
    `[client]` セクションだけを書きます。
 2. **service** — バックグラウンドサービスをインストールし（`kioku service install`、後述）、サーバーが
    応答するまで待ちます。そのポートですでに kioku サーバーが応答している場合（Docker など）は
-   サービスをインストールしません。`--no-service` で省略します。
+   サービスをインストールしません。インストール済みのサービスがこのバイナリと違うバージョンで応答した
+   場合（バイナリを置き換えた直後など）は再起動します: `restarted (v<old> -> v<new>)`。
+   `--no-service` で省略します。
 3. **auth** — 認証付きのリクエストでトークンを確認します。
 4. **agents** — 検出したすべてのエージェント（`~/.claude`、`~/.codex` または `$CODEX_HOME`、
    `~/.cursor`、`~/.gemini`）にフック + MCP をインストールします。`--agents` で対象を絞り、
@@ -156,7 +161,7 @@ kioku doctor --json           # {"checks":[{id, status, message, fix?}]}
 ```sh
 kioku service install      # 定義を書き、有効化して起動（冪等）
 kioku service status       # インストール済み? 動作中? pid、サーバーの health
-kioku service start|stop
+kioku service start|stop    # start は動作中の launchd ジョブを再起動（kickstart -k）
 kioku service logs [-f] [-n 200]   # ~/.kioku/logs/serve.log の末尾
 kioku service uninstall
 ```
@@ -168,6 +173,9 @@ macOS では LaunchAgent `~/Library/LaunchAgents/dev.kioku.serve.plist`（launch
 自分で実行するコマンドを表示します。launchd も動作する `systemctl --user` も無い環境（systemd の無い
 WSL、コンテナ）では、`kioku serve` を自分で動かす方法（または Docker）を表示し、`setup` は警告付きで
 続行します。クライアント専用のマシンにサービスはありません。
+サービスはクラッシュ後には再起動しますが、正常終了後には再起動せず、クラッシュの繰り返しは抑制されます
+（launchd: 起動間隔 10 秒、systemd: 60 秒に 5 回まで）。`serve.log` は 10 MiB でローテートします
+（`.1`〜`.3` を保持）。
 
 ## エージェント
 
@@ -181,9 +189,13 @@ WSL、コンテナ）では、`kioku serve` を自分で動かす方法（また
 - エントリはマージされます。同じファイル内のほかのフックやサーバーはそのまま残り、2 回目の実行では
   何も変わらず、既存のファイルは kioku が最初に変更する前に 1 回だけ `<file>.kioku-bak` にバックアップ
   されます。正しい JSON でないファイルは触らずに、追加すべき設定断片を表示します;
+- シンボリックリンクの設定ファイル（dotfiles リポジトリなど）はリンク越しに編集します。リンクは残り、
+  リンク先が更新されます（バックアップはリンク先の隣）。ほかのユーザーが読めるファイルに kioku が
+  トークンを追加するときは、モードを 0600 にしてその旨を表示します;
 - `--project` はフック（と指示）を現在のリポジトリに書きます。トークンを含む MCP エントリは常に
   ユーザー設定に置かれ、リポジトリには決して入りません。プロジェクトのフックファイルにはマシン固有の
-  パスが入るので、コミットしないでください;
+  パスが入るので、コミットしないでください。プロジェクトのディレクトリがホームディレクトリそのもの
+  の場合、`--project` は実行を拒否します;
 - `--dry-run` は変更内容を表示します。
 
 ### Claude Code
@@ -201,7 +213,7 @@ kioku は `claude mcp add` を実行しないので、トークンがコマン�
 | 内容 | 場所 |
 |------|------|
 | フック | `~/.codex/hooks.json`（`$CODEX_HOME`。`--project`: `<repo>/.codex/hooks.json`） |
-| MCP | `~/.codex/config.toml` 内の管理ブロック `[mcp_servers.kioku]`（url + `Authorization` ヘッダー）。ブロック外のバイトは決して変更しません |
+| MCP | `~/.codex/config.toml` 内の管理ブロック `[mcp_servers.kioku]`（url + `Authorization` ヘッダー）。ブロック外のバイトは決して変更せず、Codex があとからブロック内に追加したテーブル（プロジェクトやフックの信頼）はブロックの外へ移し、決して消しません |
 | 指示 | `~/.codex/AGENTS.md` の区切られた kioku ブロック（`--project`: `<repo>/AGENTS.md`） |
 
 **信頼の手順:** Codex は、新しいフックや変更されたフックを、信頼されるまで実行しません。Codex を一度
@@ -225,8 +237,8 @@ kioku は `claude mcp add` を実行しないので、トークンがコマン�
 認識して何もしないので、二重に記録されることはありません。ネイティブのフックが無い場合は Cursor の
 イベントとして処理されます。両方をインストールし（setup はそうします）、`kioku doctor` で確認して
 ください（`agent.cursor.duplicate`）。Cursor の sessionStart のコンテキストは常に届くとは限らないため、
-kioku は各セッションの最初のツール使用時にもコンテキストを追加します（`[client] cursor_late_context =
-false` で無効）。
+kioku は各セッションの最初のツール使用時（`postToolUse`。ファイル編集と失敗したツールでは渡せません）
+にもコンテキストを追加します（`[client] cursor_late_context = false` で無効）。
 
 ### Gemini CLI
 
@@ -238,7 +250,8 @@ false` で無効）。
 
 フックが無効になっていないこと（`hooksConfig.enabled: false`、または `hooksConfig.disabled` に
 `kioku-*` の名前がある）が必要です。doctor が両方を確認します。プロジェクトのフックは、初回の実行前に
-Gemini の警告が一度表示されます。
+Gemini の警告が一度表示されます。`context.fileName` で Gemini が `AGENTS.md`（Codex と共有）を読む
+場合、片方をアンインストールしても、もう片方がインストールされている間は kioku のブロックを残します。
 
 ## 試してみる
 
@@ -408,6 +421,9 @@ slug 部分では非 ASCII 文字が落とされます（日本語だけの名�
   `kioku serve` は起動しません。`GET /api/v1/health` 以外のすべてのルートで
   `Authorization: Bearer <token>` が必要です。`/mcp` も同様で、Host ヘッダの許可リストは無効に
   してあるため、トークンが唯一の防御です。既定のバインドは `127.0.0.1` です。
+- トークンを含むエージェントのファイル（`~/.claude.json`、`~/.codex/config.toml`、`~/.cursor/mcp.json`、
+  `~/.gemini/settings.json`）は 0600 で作成します。ほかのユーザーが読める既存のファイルに kioku が
+  トークンを追加するときは 0600 にします（1 行で報告し、トークン自体は表示しません）。
 - `config.toml` にはトークンが平文で入っています。kioku はこれをモード 0600 で書き、データディレクトリ・
   `raw/`・`logs/` を 0700 で作成します（unix）。
 - **サニタイザ** — フックのペイロードは送信前にクライアントで（サーバーでも再度）伏せ字にされます:

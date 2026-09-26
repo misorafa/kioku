@@ -134,7 +134,9 @@ cwd (first non-empty, absolute path wins):
 
 1. payload `cwd` (Claude, Codex, Gemini always; Cursor only on some events);
 2. `workspace_roots[0]` (Cursor; a multi-root workspace uses the first root —
-   documented limitation);
+   documented limitation). **For Cursor steps 1 and 2 are swapped**: the
+   workspace root wins over a payload `cwd`, which can be a subdirectory (or
+   the hook's own `~/.cursor`) and would resolve to a different project;
 3. environment: `CURSOR_PROJECT_DIR`, `GEMINI_PROJECT_DIR`, `GEMINI_CWD`,
    `CLAUDE_PROJECT_DIR` (the one(s) belonging to the agent, then the Claude alias;
    Codex documents none, so it goes straight to step 4); `C:\…` counts as absolute;
@@ -190,7 +192,10 @@ and `render(agent, event, result) -> HookOutcome {stdout, stderr, exit_code}`:
 | gemini-cli | stdout `{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":t}}` | stdout `{"hookSpecificOutput":{"hookEventName":"BeforeAgent","additionalContext":t}}` | — | stdout `{"decision":"deny","reason":m}`, exit 0 (G2: AfterAgent deny → reason sent as a new prompt; exit 0 + JSON is the "preferred" path, G1) | stdout `{}`, exit 0 (G1: stdout must be JSON only) |
 
 Errors stay fail-open (M1 §8.1): render `Silent` for the agent (Gemini/Cursor
-still print `{}`) and exit 0. Nudge only on Cursor `stop` with `status ==
+still print `{}`) and exit 0. The process environment is read with
+`std::env::vars_os()` (a non-UTF-8 name is skipped, a non-UTF-8 value converted
+lossily — `kioku_core::util::env_vars`), so an odd environment can never panic
+a hook (`std::env::vars()` would, exit 101 with a panic on stderr). Nudge only on Cursor `stop` with `status ==
 "completed"` (aborted/error stops finalize without a nudge); a stop payload
 without `status` (Claude-shaped, §3.7) counts as completed. JSON replies are
 one object followed by `\n`.
@@ -208,8 +213,12 @@ Third-Party Plugins, Skills, and Other Configs" is on — **on by default** (U2)
 A machine with kioku installed for Claude Code would therefore run
 `kioku hook … --agent claude-code` inside Cursor too.
 
-Rule: `--agent claude-code` with a payload containing `cursor_version`, or with
-`CURSOR_VERSION` in the environment, is a Cursor invocation:
+Rule: `--agent claude-code` with a payload that carries a Cursor field —
+`cursor_version`, `conversation_id`, `workspace_roots`, or a camelCase
+`hook_event_name` (Cursor's `postToolUse`; Claude's are PascalCase) — is a
+Cursor invocation. The payload alone decides: `CURSOR_VERSION` in the
+environment is **never** sufficient (Claude Code started from Cursor's
+integrated terminal inherits it and must stay Claude Code):
 
 - if a kioku entry exists in `~/.cursor/hooks.json` or in
   `<workspace_roots[0]>/.cursor/hooks.json` → `Silent` (the native Cursor hook
@@ -220,6 +229,8 @@ Rule: `--agent claude-code` with a payload containing `cursor_version`, or with
 Which payload Cursor sends to an imported Claude hook (native Cursor fields or
 Claude-shaped) is **UNVERIFIED — check with a captured payload**; the Cursor
 parser must accept both `session_id`/`cwd` and `conversation_id`/`workspace_roots`.
+A purely Claude-shaped payload from Cursor is handled as Claude Code (it is
+indistinguishable from one).
 
 ### 3.8 `KIOKU_HOOK_DUMP` (payload capture)
 
@@ -434,6 +445,16 @@ kioku edits `config.toml` only through the delimited managed block above:
    URL, else abort without writing. Write via temp file + rename; keep the mode
    of an existing file, 0600 for a new one; backup `config.toml.kioku-bak` once.
 
+Codex itself edits `config.toml` with `toml_edit`, which appends new tables
+(`[projects."<path>"] trust_level`, `[hooks.state.*] trusted_hash`) **before the
+document's trailing comment** — our end marker — i.e. inside the block when the
+block is last. So before every install / uninstall the block is normalized:
+only `[mcp_servers.kioku]` (and sub-tables) and a `[features]` table holding
+nothing but `hooks = true` are kioku's; every other table inside the markers is
+moved verbatim to just after the end marker (after one blank line), and key
+lines before the block's first header move to just before the begin marker.
+Nothing another writer put there is ever deleted.
+
 Uninstall removes the block (and the one blank line before it). Bytes outside
 the block are never changed. (`toml_edit` would be the alternative; not added.)
 A begin marker without an end marker → file untouched, snippet printed. A file
@@ -577,8 +598,12 @@ also loads `mcpServers.kioku` from `~/.claude.json` (duplicate server) is
 
 ### 5.6 Late context (Cursor only)
 
-Because sessionStart context is unreliable, the first `post-tool-use` of each
-Cursor session delivers the kioku block through `additional_context`:
+Because sessionStart context is unreliable, the first native `postToolUse` of
+each Cursor session delivers the kioku block through `additional_context`
+(`afterFileEdit` and `postToolUseFailure` also run `post-tool-use` but cannot
+carry it: they are recorded, and the marker stays unconsumed for the next
+`postToolUse`; a Claude-shaped PostToolUse from imported hooks qualifies unless
+it is an edit or a failure):
 
 - marker `<data_dir>/state/cursor-ctx/<session_id>` (data dir chosen like the
   log dir in M1 §8.1: `~/.kioku` on a client-only machine), created with `create_new` (O_EXCL); if it
@@ -768,13 +793,21 @@ Size < 1 KiB.
   comments; kioku does not rewrite them).
 - Backup `<file>.kioku-bak` before the first modification of an existing file,
   never overwritten. Write via temp file + rename; keep existing mode; new files
-  that hold the token 0600, others 0644. Parent dirs created as needed.
+  that hold the token 0600, others 0644. Parent dirs created as needed. A
+  symlinked file (a dotfiles repository) is resolved first (`canonicalize`), so
+  the link stays and its target is updated in place; the backup sits next to
+  the target. A write that **adds** a bearer token (more `Bearer ` occurrences
+  than before) to an existing group/world-readable file sets it to 0600 and
+  prints one line saying so (never the token).
 - **The token is never written inside a repository**: `--project` affects hooks
   and instructions only; MCP is always registered at user level. Print what
   changed, never the token.
 - Project root for `--project` = `git rev-parse --show-toplevel` from cwd, else
   cwd (Claude keeps M1's cwd). Print a note that project hook files contain an
   absolute, machine-specific binary path and should not be committed.
+  `install --project` refuses (error, nothing written) when that directory is
+  the home directory itself (e.g. run from `~`, or `~` is a dotfiles git repo):
+  the "project" files would be the user-level ones.
 - Uninstall removes exactly our hook entries (empty event lists/objects left by
   that are removed), our MCP entry (Codex: the managed block) and our
   instruction block / `.mdc`. Foreign content stays. Like install, `uninstall
@@ -782,7 +815,10 @@ Size < 1 KiB.
   Uninstall never writes a backup: install backed up every pre-existing file
   before its first change, so a file without `<file>.kioku-bak` is one kioku
   created — such a file is deleted when nothing but `{}` / an empty
-  `mcpServers` / blank text is left (Step 3).
+  `mcpServers` / blank text is left (Step 3). An instruction file that another
+  agent also uses (Gemini's `context.fileName` = `AGENTS.md` makes Gemini and
+  Codex share `<root>/AGENTS.md`) keeps its block while that other agent's hook
+  file still holds kioku hooks; the last one uninstalled removes it.
 - Claude Code's `settings.json` follows the same mode rule (new file 0644; M1
   created it 0600 — it holds no token).
 
@@ -858,7 +894,7 @@ new crate; `kioku_cli::logfile`, file created 0600, no ANSI colours). Without th
 ```
 kioku service install     # write definition, enable, start; idempotent (rewrite+restart only if content changed)
 kioku service uninstall   # stop, disable, remove definition
-kioku service start|stop  # start / stop
+kioku service start|stop  # start (launchd: a loaded job is restarted with kickstart -k) / stop
 kioku service status      # installed?  loaded/active?  pid;  GET /api/v1/health result
 kioku service logs [-f] [-n 200]   # tail serve.log (implemented in Rust, both platforms)
 ```
@@ -890,7 +926,10 @@ All paths in definitions are absolute (no `~`, no `$HOME`); `<bin>` as in §8.1.
   </dict>
   <key>WorkingDirectory</key><string>/Users/me/.kioku</string>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key><false/>
+  </dict>
   <key>ThrottleInterval</key><integer>10</integer>
   <key>ProcessType</key><string>Background</string>
   <key>StandardOutPath</key><string>/Users/me/.kioku/logs/serve.stderr.log</string>
@@ -904,10 +943,17 @@ All paths in definitions are absolute (no `~`, no `$HOME`); `<bin>` as in §8.1.
 
 | action | command |
 |--------|---------|
-| install/start | `launchctl bootout gui/<uid>/dev.kioku.serve` (ignore failure) → `launchctl bootstrap gui/<uid> <plist>` → `launchctl enable gui/<uid>/dev.kioku.serve` |
-| restart | `launchctl kickstart -k gui/<uid>/dev.kioku.serve` |
+| install (not loaded) / start (not loaded) | `launchctl bootstrap gui/<uid> <plist>` → `launchctl enable gui/<uid>/dev.kioku.serve` |
+| install (plist changed while loaded) | `launchctl bootout gui/<uid>/dev.kioku.serve` → `bootstrap` → `enable` (a changed plist is only read at bootstrap) |
+| restart; start while loaded; `kioku update`; setup on a version mismatch | `launchctl kickstart -k gui/<uid>/dev.kioku.serve` |
 | stop / uninstall | `launchctl bootout gui/<uid>/dev.kioku.serve` (+ delete plist) |
 | status | `launchctl print gui/<uid>/dev.kioku.serve` exit code = loaded; running = health check (the `print` text format is not a stable API — do not parse beyond `pid = N`, optional) |
+
+`bootout` returns before launchd has torn the job down, so a `bootstrap` right
+after it can fail (`Bootstrap failed: 5: Input/output error`): every bootstrap
+is retried up to 5 times, 500 ms apart. `KeepAlive` = `SuccessfulExit: false`
+restarts the server after a crash but not after a clean exit (e.g. a config
+error it reported), and `ThrottleInterval` 10 s bounds a crash loop.
 
 Note: `stop` via `bootout` also unloads; `start` bootstraps again. A stopped
 LaunchAgent comes back at next login (RunAtLoad) unless uninstalled.
@@ -915,8 +961,8 @@ LaunchAgent comes back at next login (RunAtLoad) unless uninstalled.
 Idempotency (Step 4): `service install` rewrites the definition only when its
 bytes differ (new file 0644, no backup — kioku owns it) and runs the
 bootout → bootstrap → enable sequence only when it rewrote the plist or
-`launchctl print` says the job is not loaded; otherwise it runs nothing but the
-`id -u` / `print` queries. `start` = the same sequence on an installed plist.
+`launchctl print` says the job is not loaded (the `bootout` only when it was
+loaded); otherwise it runs nothing but the `id -u` / `print` queries.
 
 ### 10.4 Linux: systemd user unit (no sudo)
 
@@ -927,6 +973,8 @@ bootout → bootstrap → enable sequence only when it rewrote the plist or
 [Unit]
 Description=kioku shared memory server for AI coding agents
 After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -949,7 +997,8 @@ daemon-reload`; `enable --now kioku.service`; `restart`; `stop`; `disable
 --value`) + health check. `service install` (Step 4): unit bytes unchanged and
 active → only `is-active` + the linger query run; changed → `daemon-reload`,
 `enable --now`, and `restart` if it was active before; unchanged but inactive →
-`enable --now`.
+`enable --now`. `StartLimitIntervalSec=60` / `StartLimitBurst=5` stop a crash
+loop (5 restarts within 60 s) instead of restarting forever.
 
 **Linger**: a user unit stops at logout unless lingering is enabled. `service
 install` runs `loginctl enable-linger` (no sudo; polkit usually allows it for
@@ -988,7 +1037,12 @@ Non-interactive (safe under `curl … | sh`); every step idempotent. Order:
    already answers and no kioku service is installed → "server already running
    (Docker/k3s?), not installing a service". If something non-kioku owns the
    port → fail. Else `service install`, then poll health every 200 ms for up to
-   15 s. Fallback platform (§10.5) → warning, continue.
+   15 s. When the installed service answers but its health `version` differs
+   from this binary's (the binary was replaced, e.g. by install.sh), it is
+   restarted (`launchctl kickstart -k` / `systemctl --user restart`) and health
+   is polled again until it reports this version; the line then reads
+   `… running at <url>, restarted (v<old> -> v<new>)` (still another version
+   after the restart → `!!`). Fallback platform (§10.5) → warning, continue.
 4. **Auth check** — `GET /api/v1/status` with the token (401 → fail).
 5. **Agents** (unless `--no-agents`) — `install all` semantics (§8.3).
 6. **Summary** and exit code: 0 when steps 2–5 succeeded (warnings allowed),
@@ -1133,8 +1187,11 @@ Behaviour:
    `<arch>-unknown-linux-musl`, then `<arch>-unknown-linux-gnu`.
 4. Tag: `latest` → follow `https://github.com/<repo>/releases/latest` and take
    the tag from the final URL (`…/releases/tag/<tag>`; no API call, no rate
-   limit). No release (404, or the redirect lands on `/releases`) → source
-   fallback.
+   limit). No release (the lookup succeeds but the redirect does not land on
+   `/releases/tag/`, e.g. on `/releases`) → source fallback. A failed lookup
+   (curl/wget error: unreachable host, DNS, TLS, any HTTP error such as a 500
+   from an outage or proxy) is **not** "no release": exit 1 with a network
+   error (with `--from-source` only a warning; the default branch is built).
 5. Download into `mktemp -d` (removed by `trap`):
    `…/releases/download/<tag>/kioku-<tag>-<target>.tar.gz` and `SHA256SUMS`
    (fallback: `<asset>.sha256` for releases that predate `SHA256SUMS`). Asset
@@ -1146,7 +1203,11 @@ Behaviour:
    and try the next target, then source fallback. Only a binary that runs is
    `mv`ed over `<dir>/kioku` (atomic on one filesystem; a running service keeps
    the old inode). Step 5 change: the M2 draft renamed first and checked after,
-   which could replace a working binary with one that does not run.
+   which could replace a working binary with one that does not run. These steps
+   run inside `if try_target …`, where `set -e` is off, so every command there
+   (`mkdir`, `cp`, `chmod`, checksum, `mv`, …) is checked explicitly and dies
+   with a message; a directory at `<dir>/kioku` is refused (`mv` would move
+   the binary into it).
 7. Source fallback: needs `cargo` ≥ 1.91 (`cargo --version`) and `git`;
    otherwise print rustup instructions and exit 1. Inside a kioku checkout
    (`./Cargo.toml` with `kioku-cli`) → `cargo build --release --locked -p
@@ -1173,8 +1234,11 @@ install.sh, implemented in Rust (`reqwest` + `sha2`; extraction by shelling out
 to `tar`, as with `git`). The target triple is baked in at build time
 (`build.rs` → `KIOKU_TARGET`), so a musl build updates to musl. Replace
 `current_exe()` atomically (temp file in the same dir + rename); then, if a
-kioku service is installed, restart it; hook commands need no change (same
-path). `--check` prints current vs latest and exits 0/10 (10 = update
+kioku service is installed, restart it (`launchctl kickstart -k` / `systemctl
+--user restart`); hook commands need no change (same path). Without
+`--version` only a strictly newer release (semver compare of `X.Y.Z`) is
+installed, otherwise "already up to date" — `latest` never downgrades a newer
+local build. `--version <tag>` installs any other tag, including an older one. `--check` prints current vs latest and exits 0/10 (10 = update
 available). If `current_exe()` is not writable (e.g. under `/usr/local/bin`
 installed by root) → print the install.sh command instead; never sudo.
 
@@ -1227,8 +1291,8 @@ systemctl.
      session_end.
    At least one prompt fixture per agent is Japanese.
 2. **Parsers** — per fixture: agent label, session id (Cursor fallback order),
-   cwd resolution (payload → workspace_roots → env → never process cwd for
-   Cursor), `stop_hook_active` (Cursor `loop_count`), tool normalization table
+   cwd resolution (payload → workspace_roots → env; Cursor: workspace_roots
+   first; never process cwd for Cursor), `stop_hook_active` (Cursor `loop_count`), tool normalization table
    §3.5 (apply_patch paths extracted before truncation, from a > 4 000-char
    patch), `tool_output` string parsed, `is_error` set.
 3. **Renderers** — golden `HookOutcome` for every cell of §3.6; Gemini outputs
@@ -1239,9 +1303,13 @@ systemctl.
    (codex exit 2; cursor followup JSON; gemini deny JSON) → handoff write →
    stop finalizes; implicit start on an unknown session (observation 404 →
    start → retry; prompt event returns the block); Cursor late context appears
-   exactly once per session (marker), and not when disabled; Cursor sniff:
-   Claude-format invocation with Cursor payload is Silent when native Cursor
-   hooks exist, re-dispatched otherwise; SessionEnd deadline cap for Codex.
+   exactly once per session (marker), only on native `postToolUse`
+   (`afterFileEdit` / `postToolUseFailure` leave the marker), and not when
+   disabled; Cursor sniff: Claude-format invocation with Cursor payload is
+   Silent when native Cursor hooks exist, re-dispatched otherwise; a
+   Claude-shaped payload with `CURSOR_VERSION` in the env stays Claude Code;
+   SessionEnd deadline cap for Codex; the real binary run with a non-UTF-8
+   environment variable (name and value) exits 0 with JSON-only Gemini stdout.
 5. **Hook dump** — writes one line per invocation incl. outcome, env filtered
    (no `KIOKU_AUTH_TOKEN`), mode 0600, rotation at 5 MiB, dump failure never
    changes the outcome; `hook-dump extract` round-trip.
@@ -1255,7 +1323,14 @@ systemctl.
    outside the block identical; replace block; foreign `[mcp_servers.kioku]`
    untouched + warning; inline `mcp_servers.kioku = {…}` detected as foreign;
    unparseable file untouched; result re-parses; uninstall restores the
-   original bytes exactly (modulo the backup).
+   original bytes exactly (modulo the backup); tables Codex (toml_edit) appended
+   inside the block (`[projects."…"]`, `[hooks.state.x]`) survive
+   install → install → uninstall.
+   Symlinked config files are updated through the link (link kept); adding the
+   token to a 0644 file makes it 0600 with one report line; `--project` from
+   the home directory is refused; a shared `AGENTS.md` (Codex + Gemini via
+   `context.fileName`) keeps its block until the last of the two is
+   uninstalled.
    Instructions: block insert/replace/remove in an existing AGENTS.md /
    GEMINI.md; `.override.md` preference; `context.fileName` honoured; `.mdc`
    frontmatter exact.
@@ -1265,12 +1340,15 @@ systemctl.
    it; all paths absolute; XML escaping; systemd quoting; command lists for
    install/start/stop/status generated through a recording runner (a struct
    with a `dry_run` flag that records argv instead of executing — not a
-   trait); `service install` twice → second is a no-op; on macOS CI,
-   `plutil -lint` the rendered plist.
+   trait); `service install` twice → second is a no-op; launchd start/restart of
+   a loaded job = `kickstart -k`; a failing `bootstrap` after `bootout` is
+   retried (5 attempts); on macOS CI, `plutil -lint` the rendered plist.
 8. **Setup** — `--dry-run` on a temp HOME writes nothing; full run against a
    test server with `--no-service` installs agents and prints the summary;
    `--client-only` with a wrong token fails before touching agents; existing
-   config token is kept.
+   config token is kept; an installed, healthy service reporting another
+   version is restarted once and the line reads `restarted (v<old> -> v<new>)`.
+   `kioku update` without `--version` never installs an older or equal release.
 9. **Doctor** — temp HOME: no config → FAIL `config`, exit 1; config + test
    server + all agents installed → all OK/expected WARN (codex trust), exit 0;
    moved binary → FAIL `agent.*.hooks`; token mismatch in an MCP entry → WARN,
@@ -1291,7 +1369,9 @@ systemctl.
     `python3` `http.server` subclass that also answers `releases/latest` with the
     GitHub-style redirect; a fake `id` and `cargo` on PATH cover the root refusal
     and the source fallback; `KIOKU_TEST_REAL_BIN=<path>` adds a run of the real
-    binary's `setup --dry-run`. CI runs it under dash and macOS sh.
+    binary's `setup --dry-run`. CI runs it under dash and macOS sh. A 500 on
+    `releases/latest` and an unreachable host exit 1 with a network error and
+    no source fallback (curl and wget); a directory at `<dir>/kioku` aborts.
 
 ## 17. Step plan (one agent run per step)
 

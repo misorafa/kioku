@@ -102,7 +102,9 @@ Every other argument (and everything after `--`) is passed to `kioku setup`:
 run as root unless `--install-dir` is given (kioku is a per-user install).
 Without a prebuilt binary for your platform it builds from source, which needs
 Rust 1.91+ (`rustup update` if older) and `git`; the first build takes several
-minutes (it downloads the IPADIC dictionary). By hand:
+minutes (it downloads the IPADIC dictionary). If GitHub cannot be reached
+(network or HTTP error) it stops with an error instead of falling back to a
+source build. By hand:
 `cargo install --locked --git https://github.com/misorafa/kioku kioku-cli`, or
 `cargo install --locked --path crates/kioku-cli` in a checkout. `git` is
 optional at runtime (without it the wiki is not versioned).
@@ -115,8 +117,11 @@ curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh
 ```
 
 Update later with `kioku update` (same download and checksum verification;
-replaces the binary in place and restarts the service; `kioku update --check`
-exits 10 when a newer release exists), or by re-running the one-liner.
+replaces the binary in place and restarts the service; it only installs a
+release newer than the running one — `--version <tag>` installs any tag,
+including an older one; `kioku update --check` exits 10 when a newer release
+exists), or by re-running the one-liner (the next `kioku setup` restarts a
+service still running the old version).
 
 ## `kioku setup`
 
@@ -135,7 +140,10 @@ any time):
    anything is written, and only a `[client]` section is written.
 2. **service** — installs the background service (`kioku service install`,
    below) and waits for the server to answer. If a kioku server already answers
-   on the port (e.g. Docker), no service is installed. `--no-service` skips it.
+   on the port (e.g. Docker), no service is installed. If the installed service
+   answers with another version than this binary (you just replaced the
+   binary), it is restarted: `restarted (v<old> -> v<new>)`. `--no-service`
+   skips it.
 3. **auth** — checks the token with an authenticated request.
 4. **agents** — installs hooks + MCP for every agent it detects (`~/.claude`,
    `~/.codex` or `$CODEX_HOME`, `~/.cursor`, `~/.gemini`); `--agents` limits
@@ -167,7 +175,7 @@ errors in `hook.log` and an enabled payload dump. Exit 1 if any check fails.
 ```sh
 kioku service install      # write the definition, enable, start (idempotent)
 kioku service status       # installed? active? pid; server health
-kioku service start|stop
+kioku service start|stop    # start restarts a running launchd job (kickstart -k)
 kioku service logs [-f] [-n 200]   # tail ~/.kioku/logs/serve.log
 kioku service uninstall
 ```
@@ -181,6 +189,9 @@ after you log out; if that is not allowed it prints the command to run
 yourself. Without launchd or a working `systemctl --user` (WSL without systemd,
 containers) it prints how to run `kioku serve` yourself (or use Docker) and
 `setup` continues with a warning. Client-only machines have no service.
+The service is restarted after a crash but not after a clean exit, and a
+crash loop is throttled (launchd: 10 s between starts; systemd: at most 5
+starts per 60 s). `serve.log` rotates at 10 MiB (`.1`–`.3` kept).
 
 ## Agents
 
@@ -195,10 +206,15 @@ uninstall <agent>` removes exactly what kioku added. Common to all:
   second run changes nothing, and each existing file is backed up once to
   `<file>.kioku-bak` before kioku first changes it; a file that is not valid
   JSON is left untouched and the snippet to add is printed;
+- a config file that is a symlink (e.g. into a dotfiles repository) is edited
+  through the link: the link stays, its target is updated (backup next to
+  the target). When kioku adds the token to a file others can read, it sets
+  the file to 0600 and says so;
 - `--project` writes hooks (and instructions) into the current repository
   instead; the MCP entry, which holds the token, always stays in your user
   config, never in a repository. Project hook files contain a machine-specific
-  path — do not commit them;
+  path — do not commit them. `--project` refuses to run when the project
+  directory is your home directory;
 - `--dry-run` shows what would change.
 
 ### Claude Code
@@ -217,7 +233,7 @@ line.
 | what | where |
 |------|-------|
 | hooks | `~/.codex/hooks.json` (`$CODEX_HOME`; `--project`: `<repo>/.codex/hooks.json`) |
-| MCP | a managed block `[mcp_servers.kioku]` (url + `Authorization` header) in `~/.codex/config.toml`; bytes outside the block are never changed |
+| MCP | a managed block `[mcp_servers.kioku]` (url + `Authorization` header) in `~/.codex/config.toml`; bytes outside the block are never changed, and tables Codex itself later adds inside it (project trust, hook trust) are moved out of it, never deleted |
 | instructions | a delimited kioku block in `~/.codex/AGENTS.md` (`--project`: `<repo>/AGENTS.md`) |
 
 **Trust step:** Codex runs a new or changed hook only after you trust it.
@@ -245,7 +261,8 @@ nothing, so nothing is recorded twice; without native hooks they are handled
 as Cursor events. Install both (setup does) and let `kioku doctor` confirm
 (`agent.cursor.duplicate`). Because Cursor's sessionStart context is not
 always delivered, kioku also adds its context on the first tool use of each
-session (`[client] cursor_late_context = false` turns that off).
+session (`postToolUse`; file edits and failed tools cannot carry it;
+`[client] cursor_late_context = false` turns that off).
 
 ### Gemini CLI
 
@@ -257,7 +274,9 @@ session (`[client] cursor_late_context = false` turns that off).
 
 Hooks must not be disabled (`hooksConfig.enabled: false`, or a `kioku-*` name
 in `hooksConfig.disabled`); doctor checks both. Project hooks show Gemini's
-one-time warning before they first run.
+one-time warning before they first run. If `context.fileName` makes Gemini
+read `AGENTS.md` (shared with Codex), uninstalling one of the two keeps the
+kioku block while the other is still installed.
 
 ## Try it
 
@@ -442,6 +461,10 @@ becomes `proj`). Use `.kioku.toml` to merge or rename projects.
   requires `Authorization: Bearer <token>`, including `/mcp`, whose Host-header
   allowlist is disabled so the token is the guard. The default bind is
   `127.0.0.1`.
+- Agent files that hold the token (`~/.claude.json`, `~/.codex/config.toml`,
+  `~/.cursor/mcp.json`, `~/.gemini/settings.json`) are created 0600; an
+  existing one that others could read is set to 0600 when kioku adds the token
+  (reported in one line; the token itself is never printed).
 - `config.toml` holds the token in plain text; kioku writes it with mode 0600
   and creates the data dir, `raw/` and `logs/` as 0700 (unix).
 - **Sanitizer** — hook payloads are redacted on the client before they are
