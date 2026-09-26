@@ -40,6 +40,17 @@ pub fn is_newer(tag: &str, current: &str) -> bool {
     parse(tag) > parse(current)
 }
 
+/// Whether `kioku update` installs release `tag` over `current`: a tag given with
+/// `--version` (`explicit`) is installed unless it is the running version (downgrades
+/// allowed); the latest release only when it is strictly newer (M2 §13.3).
+pub fn should_install(tag: &str, current: &str, explicit: bool) -> bool {
+    if explicit {
+        tag.trim_start_matches('v') != current
+    } else {
+        is_newer(tag, current)
+    }
+}
+
 fn get(http: &reqwest::blocking::Client, url: &str) -> anyhow::Result<Option<Vec<u8>>> {
     let resp = http.get(url).send().with_context(|| format!("GET {url}"))?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -62,6 +73,7 @@ pub fn run_update(version: Option<String>, check: bool) -> anyhow::Result<i32> {
         .timeout(Duration::from_secs(300))
         .user_agent(format!("kioku/{VERSION}"))
         .build()?;
+    let explicit = version.is_some();
     let tag = match version {
         Some(v) if v.starts_with('v') => v,
         Some(v) => format!("v{v}"),
@@ -75,8 +87,12 @@ pub fn run_update(version: Option<String>, check: bool) -> anyhow::Result<i32> {
         println!("current: v{VERSION}\nlatest:  {tag} ({TARGET})");
         return Ok(if is_newer(&tag, VERSION) { 10 } else { 0 });
     }
-    if tag.trim_start_matches('v') == VERSION {
-        println!("kioku v{VERSION} is up to date");
+    if !should_install(&tag, VERSION, explicit) {
+        if explicit {
+            println!("kioku v{VERSION} is already installed");
+        } else {
+            println!("kioku v{VERSION} is already up to date (latest release: {tag})");
+        }
         return Ok(0);
     }
     let exe = std::env::current_exe().context("locating the kioku binary")?;
@@ -174,7 +190,7 @@ fn restart_service(exe: &Path) {
     if !manager.is_installed() {
         return;
     }
-    match manager.stop().and_then(|_| manager.start()) {
+    match manager.restart() {
         Ok(_) => println!("kioku: restarted the service ({})", manager.describe()),
         Err(err) => eprintln!(
             "kioku: warning: restart the service yourself (`kioku service start`): {err:#}"
@@ -217,6 +233,22 @@ mod tests {
         assert!(!is_newer("v0.1.0", "0.1.0"));
         assert!(!is_newer("v0.1.0-rc1", "0.1.0"));
         assert!(TARGET.contains('-'));
+    }
+
+    #[test]
+    fn update_without_version_never_downgrades() {
+        // Latest release: strictly newer only.
+        assert!(should_install("v0.3.0", "0.2.0", false));
+        assert!(!should_install("v0.2.0", "0.2.0", false));
+        assert!(
+            !should_install("v0.1.9", "0.2.0", false),
+            "an older `latest` (e.g. a dev build ahead of the last release) is not installed"
+        );
+        assert!(!should_install("v0.2.0-rc1", "0.2.0", false));
+        // --version: any other tag, including a downgrade.
+        assert!(should_install("v0.1.9", "0.2.0", true));
+        assert!(should_install("v0.3.0", "0.2.0", true));
+        assert!(!should_install("v0.2.0", "0.2.0", true));
     }
 
     /// Serves `files` (path → body) on an ephemeral port; unknown paths are 404.

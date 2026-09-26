@@ -31,6 +31,11 @@ pub const SERVICE_RUST_LOG: &str = "info,tantivy=warn";
 pub const SERVE_LOG: &str = "serve.log";
 /// stdout/stderr of the service process (panics, pre-logging failures).
 pub const SERVE_STDERR_LOG: &str = "serve.stderr.log";
+/// `launchctl bootstrap` attempts after a `bootout` (launchd tears the old job down
+/// asynchronously, so an immediate bootstrap can fail with an I/O error).
+pub const BOOTSTRAP_ATTEMPTS: usize = 5;
+/// Pause between two `launchctl bootstrap` attempts.
+pub const BOOTSTRAP_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 // ---------------------------------------------------------------------------------------
 // Definitions (pure rendering)
@@ -99,7 +104,10 @@ pub fn render_plist(spec: &ServiceSpec) -> String {
   </dict>
   <key>WorkingDirectory</key>{data}
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key><false/>
+  </dict>
   <key>ThrottleInterval</key><integer>10</integer>
   <key>ProcessType</key><string>Background</string>
   <key>StandardOutPath</key>{stderr}
@@ -178,6 +186,8 @@ pub fn render_unit(spec: &ServiceSpec) -> String {
         "[Unit]
 Description=kioku shared memory server for AI coding agents
 After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -634,7 +644,7 @@ impl ServiceManager {
         match self.platform {
             Platform::Launchd => {
                 let svc = format!("gui/<uid>/{LAUNCHD_LABEL}");
-                out.push(format!("launchctl bootout {svc}"));
+                out.push(format!("launchctl bootout {svc} (if loaded)"));
                 out.push(format!("launchctl bootstrap gui/<uid> {}", path.display()));
                 out.push(format!("launchctl enable {svc}"));
             }
@@ -664,18 +674,17 @@ impl ServiceManager {
                     act.lines.push(format!("wrote {}", path.display()));
                 }
                 if written || !loaded {
-                    let _ = self.runner.run(&["launchctl", "bootout", &svc]);
-                    let out = self.runner.run(&[
-                        "launchctl",
-                        "bootstrap",
-                        &format!("gui/{uid}"),
-                        &path.display().to_string(),
-                    ]);
-                    if !out.success {
-                        anyhow::bail!("launchctl bootstrap failed: {}", out.stderr.trim());
+                    // A changed plist is only read at bootstrap: unload the old job first.
+                    if loaded {
+                        let _ = self.runner.run(&["launchctl", "bootout", &svc]);
                     }
+                    self.launchd_bootstrap(&uid, &path)?;
                     let _ = self.runner.run(&["launchctl", "enable", &svc]);
-                    act.lines.push(format!("loaded and started {svc}"));
+                    act.lines.push(if loaded {
+                        format!("reloaded and restarted {svc}")
+                    } else {
+                        format!("loaded and started {svc}")
+                    });
                     act.changed = true;
                 }
                 act.changed |= written;
@@ -776,36 +785,93 @@ impl ServiceManager {
         Ok(act)
     }
 
-    /// Starts an installed service.
+    /// `launchctl bootstrap gui/<uid> <plist>`, retried up to [`BOOTSTRAP_ATTEMPTS`] times
+    /// [`BOOTSTRAP_RETRY_DELAY`] apart (no sleeping with a recording runner).
+    fn launchd_bootstrap(&self, uid: &str, path: &Path) -> anyhow::Result<()> {
+        let domain = format!("gui/{uid}");
+        let plist = path.display().to_string();
+        let mut last = CmdOutput::default();
+        for attempt in 0..BOOTSTRAP_ATTEMPTS {
+            if attempt > 0 && !self.runner.is_recording() {
+                std::thread::sleep(BOOTSTRAP_RETRY_DELAY);
+            }
+            last = self
+                .runner
+                .run(&["launchctl", "bootstrap", &domain, &plist]);
+            if last.success {
+                return Ok(());
+            }
+        }
+        anyhow::bail!(
+            "launchctl bootstrap failed ({BOOTSTRAP_ATTEMPTS} attempts): {}",
+            last.stderr.trim()
+        )
+    }
+
+    /// launchd: `kickstart -k` a loaded job (kills and restarts it in place), bootstraps an
+    /// unloaded one. Returns true when the job was already loaded.
+    fn launchd_start_or_restart(&self) -> anyhow::Result<bool> {
+        let uid = self.uid()?;
+        let svc = format!("gui/{uid}/{LAUNCHD_LABEL}");
+        if self.runner.run(&["launchctl", "print", &svc]).success {
+            let out = self.runner.run(&["launchctl", "kickstart", "-k", &svc]);
+            if !out.success {
+                anyhow::bail!("launchctl kickstart -k {svc} failed: {}", out.stderr.trim());
+            }
+            return Ok(true);
+        }
+        let path = self.definition_path().unwrap_or_default();
+        self.launchd_bootstrap(&uid, &path)?;
+        let _ = self.runner.run(&["launchctl", "enable", &svc]);
+        Ok(false)
+    }
+
+    /// Starts an installed service (launchd: a loaded job is restarted with `kickstart -k`).
     pub fn start(&self) -> anyhow::Result<ServiceAction> {
         self.require_installed()?;
-        match self.platform {
+        let verb = match self.platform {
             Platform::Launchd => {
-                let uid = self.uid()?;
-                let svc = format!("gui/{uid}/{LAUNCHD_LABEL}");
-                let path = self.definition_path().unwrap_or_default();
-                let _ = self.runner.run(&["launchctl", "bootout", &svc]);
-                let out = self.runner.run(&[
-                    "launchctl",
-                    "bootstrap",
-                    &format!("gui/{uid}"),
-                    &path.display().to_string(),
-                ]);
-                if !out.success {
-                    anyhow::bail!("launchctl bootstrap failed: {}", out.stderr.trim());
+                if self.launchd_start_or_restart()? {
+                    "restarted"
+                } else {
+                    "started"
                 }
-                let _ = self.runner.run(&["launchctl", "enable", &svc]);
             }
             _ => {
                 let out = self.systemctl(&["start", SYSTEMD_UNIT]);
                 if !out.success {
                     anyhow::bail!("systemctl --user start failed: {}", out.stderr.trim());
                 }
+                "started"
+            }
+        };
+        Ok(ServiceAction {
+            changed: true,
+            lines: vec![format!("{verb} {}", self.describe())],
+        })
+    }
+
+    /// Restarts an installed service so it runs the current binary: `launchctl kickstart -k`
+    /// (bootstrap when not loaded) / `systemctl --user restart`.
+    pub fn restart(&self) -> anyhow::Result<ServiceAction> {
+        self.require_installed()?;
+        match self.platform {
+            Platform::Launchd => {
+                self.launchd_start_or_restart()?;
+            }
+            _ => {
+                let out = self.systemctl(&["restart", SYSTEMD_UNIT]);
+                if !out.success {
+                    anyhow::bail!(
+                        "systemctl --user restart {SYSTEMD_UNIT} failed: {}",
+                        out.stderr.trim()
+                    );
+                }
             }
         }
         Ok(ServiceAction {
             changed: true,
-            lines: vec![format!("started {}", self.describe())],
+            lines: vec![format!("restarted {}", self.describe())],
         })
     }
 

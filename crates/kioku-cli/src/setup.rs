@@ -82,7 +82,7 @@ impl SetupEnv {
     /// The real process environment.
     pub fn from_process(bin: String) -> anyhow::Result<SetupEnv> {
         Ok(SetupEnv {
-            vars: std::env::vars().collect(),
+            vars: kioku_core::util::env_vars(),
             home: kioku_core::util::home_dir(),
             cwd: std::env::current_dir()?,
             bin,
@@ -609,16 +609,88 @@ fn service_step(opts: &SetupOptions, env: &SetupEnv, cfg: &Config, r: &mut Setup
             return;
         }
     };
+    let mut version = wait_for_health(env, &cfg.client, |_| true);
+    // A healthy service still running an older (or other) binary — typically after the
+    // binary was replaced — is restarted so it serves this version.
+    if let Some(old) = version.clone().filter(|v| v != VERSION) {
+        if let Err(e) = manager.restart() {
+            r.push(
+                Mark::Fail,
+                "service",
+                format!(
+                    "{} runs v{old}, not v{VERSION}, and the restart failed: {e:#}",
+                    manager.describe()
+                ),
+            );
+            return;
+        }
+        version = wait_for_health(env, &cfg.client, |v| v == VERSION);
+        match version.as_deref() {
+            Some(new) if new == VERSION => r.push(
+                Mark::Ok,
+                "service",
+                format!(
+                    "{} running at {url}, restarted (v{old} -> v{new})",
+                    manager.describe()
+                ),
+            ),
+            Some(other) => r.push(
+                Mark::Warn,
+                "service",
+                format!(
+                    "{} restarted but still reports v{other} (this binary is v{VERSION}); check the binary path in {}",
+                    manager.describe(),
+                    manager.definition_path().unwrap_or_default().display()
+                ),
+            ),
+            None => r.push(
+                Mark::Fail,
+                "service",
+                format!(
+                    "{} restarted, but {url} did not answer within {} s; see `kioku service logs`",
+                    manager.describe(),
+                    env.poll_timeout.as_secs()
+                ),
+            ),
+        }
+    } else {
+        push_health_line(&manager, &url, env, version, r);
+    }
+    for note in act.lines.iter().filter(|l| l.starts_with("note: ")) {
+        r.push(Mark::Warn, "service", note.trim_start_matches("note: "));
+    }
+}
+
+/// Polls `GET /health` until it reports a kioku server whose version satisfies `accept`
+/// (or `poll_timeout` passes); returns the last version seen.
+fn wait_for_health(
+    env: &SetupEnv,
+    client: &ClientConfig,
+    accept: impl Fn(&str) -> bool,
+) -> Option<String> {
     let deadline = Instant::now() + env.poll_timeout;
-    let version = loop {
-        if let Health::Kioku { version } = probe_health(&cfg.client, env.request_timeout) {
-            break Some(version);
+    let mut seen = None;
+    loop {
+        if let Health::Kioku { version } = probe_health(client, env.request_timeout) {
+            if accept(&version) {
+                return Some(version);
+            }
+            seen = Some(version);
         }
         if Instant::now() >= deadline {
-            break None;
+            return seen;
         }
         std::thread::sleep(env.poll_interval);
-    };
+    }
+}
+
+fn push_health_line(
+    manager: &ServiceManager,
+    url: &str,
+    env: &SetupEnv,
+    version: Option<String>,
+    r: &mut SetupReport,
+) {
     match version {
         Some(v) => r.push(
             Mark::Ok,
@@ -634,9 +706,6 @@ fn service_step(opts: &SetupOptions, env: &SetupEnv, cfg: &Config, r: &mut Setup
                 env.poll_timeout.as_secs()
             ),
         ),
-    }
-    for note in act.lines.iter().filter(|l| l.starts_with("note: ")) {
-        r.push(Mark::Warn, "service", note.trim_start_matches("note: "));
     }
 }
 
@@ -887,5 +956,112 @@ Check any time with: kioku doctor
         );
         assert_eq!(tilde(Path::new("/etc/x"), home), "/etc/x");
         assert!(install_sh_url().starts_with("https://raw.githubusercontent.com/misorafa/kioku/"));
+    }
+
+    /// A fake kioku health endpoint reporting `0.0.1` until `restarted` is set, then VERSION.
+    fn fake_health(restarted: std::sync::Arc<std::sync::atomic::AtomicBool>) -> String {
+        use std::sync::atomic::Ordering;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let app = axum::Router::new().route(
+                    "/api/v1/health",
+                    axum::routing::get(move || {
+                        let v = if restarted.load(Ordering::SeqCst) {
+                            VERSION
+                        } else {
+                            "0.0.1"
+                        };
+                        async move { axum::Json(serde_json::json!({"ok": true, "version": v})) }
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                tx.send(listener.local_addr().unwrap()).unwrap();
+                axum::serve(listener, app).await.unwrap();
+            });
+        });
+        format!("http://{}", rx.recv().unwrap())
+    }
+
+    #[test]
+    fn a_healthy_service_on_another_version_is_restarted() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let home = tempfile::tempdir().unwrap();
+        let restarted = Arc::new(AtomicBool::new(false));
+        let url = fake_health(restarted.clone());
+        let flag = restarted.clone();
+        let runner = Runner::recording(move |argv| match argv.join(" ").as_str() {
+            "systemctl --user restart kioku.service" => {
+                flag.store(true, Ordering::SeqCst);
+                crate::service::CmdOutput::ok("")
+            }
+            "loginctl show-user me -p Linger" => crate::service::CmdOutput::ok("Linger=yes\n"),
+            _ => crate::service::CmdOutput::ok(""),
+        });
+        let env = SetupEnv {
+            vars: [("USER".to_string(), "me".to_string())].into(),
+            home: home.path().to_path_buf(),
+            cwd: home.path().to_path_buf(),
+            bin: home.path().join("bin/kioku").display().to_string(),
+            runner: runner.clone(),
+            platform: Some(Platform::Systemd),
+            request_timeout: Duration::from_secs(3),
+            poll_interval: Duration::from_millis(20),
+            poll_timeout: Duration::from_secs(5),
+        };
+        let mut cfg = Config::for_data_dir(&home.path().join(".kioku"));
+        cfg.client.server_url = url.clone();
+        // Installed, active and unchanged: install() itself does nothing.
+        let manager = env.service_manager(&cfg.data_dir);
+        let unit = manager.definition_path().unwrap();
+        std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+        std::fs::write(&unit, manager.render().unwrap()).unwrap();
+
+        let mut r = SetupReport {
+            lines: Vec::new(),
+            footer: Vec::new(),
+        };
+        service_step(&SetupOptions::default(), &env, &cfg, &mut r);
+        assert_eq!(
+            r.summary_lines(),
+            [format!(
+                "  ok  service     systemd kioku.service running at {url}, restarted (v0.0.1 -> v{VERSION})"
+            )]
+        );
+        assert!(restarted.load(Ordering::SeqCst));
+        let calls: Vec<String> = runner.calls().iter().map(|c| c.join(" ")).collect();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c.as_str() == "systemctl --user restart kioku.service")
+                .count(),
+            1,
+            "{calls:?}"
+        );
+
+        // Same version: no restart.
+        runner.clear_calls();
+        let mut r = SetupReport {
+            lines: Vec::new(),
+            footer: Vec::new(),
+        };
+        service_step(&SetupOptions::default(), &env, &cfg, &mut r);
+        assert_eq!(
+            r.summary_lines(),
+            [format!(
+                "  ok  service     systemd kioku.service running at {url} (v{VERSION})"
+            )]
+        );
+        assert!(
+            runner
+                .calls()
+                .iter()
+                .all(|c| c.join(" ") != "systemctl --user restart kioku.service")
+        );
     }
 }

@@ -33,7 +33,10 @@ const SPEC_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
   </dict>
   <key>WorkingDirectory</key><string>/Users/me/.kioku</string>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key><false/>
+  </dict>
   <key>ThrottleInterval</key><integer>10</integer>
   <key>ProcessType</key><string>Background</string>
   <key>StandardOutPath</key><string>/Users/me/.kioku/logs/serve.stderr.log</string>
@@ -45,6 +48,8 @@ const SPEC_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 const SPEC_UNIT: &str = "[Unit]
 Description=kioku shared memory server for AI coding agents
 After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -77,6 +82,8 @@ fn golden_definitions_for_a_home_with_a_space() {
         "[Unit]
 Description=kioku shared memory server for AI coding agents
 After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -339,7 +346,6 @@ fn launchd_commands() {
         [
             "id -u".to_string(),
             "launchctl print gui/501/dev.kioku.serve".into(),
-            "launchctl bootout gui/501/dev.kioku.serve".into(),
             format!("launchctl bootstrap gui/501 {}", plist.display()),
             "launchctl enable gui/501/dev.kioku.serve".into(),
         ]
@@ -360,14 +366,133 @@ fn launchd_commands() {
     assert_eq!(st.pid, Some(777));
     assert_eq!(st.linger, None);
 
+    // start / restart of a loaded job: kickstart -k, no bootout/bootstrap race.
+    for act in [m.start().unwrap(), m.restart().unwrap()] {
+        assert!(act.lines[0].starts_with("restarted"), "{:?}", act.lines);
+    }
+    runner.clear_calls();
+    m.restart().unwrap();
+    assert_eq!(
+        argv(&runner.calls()),
+        [
+            "id -u",
+            "launchctl print gui/501/dev.kioku.serve",
+            "launchctl kickstart -k gui/501/dev.kioku.serve"
+        ]
+    );
+
+    // A changed plist while loaded: bootout, then bootstrap (the new plist is read only then).
+    runner.clear_calls();
+    let mut moved = m.clone();
+    moved.spec.bin = "/usr/local/bin/kioku".into();
+    let act = moved.install().unwrap();
+    assert!(act.changed);
+    assert_eq!(
+        argv(&runner.calls()),
+        [
+            "id -u".to_string(),
+            "launchctl print gui/501/dev.kioku.serve".into(),
+            "launchctl bootout gui/501/dev.kioku.serve".into(),
+            format!("launchctl bootstrap gui/501 {}", plist.display()),
+            "launchctl enable gui/501/dev.kioku.serve".into(),
+        ]
+    );
+
     runner.clear_calls();
     m.stop().unwrap();
     assert_eq!(
         argv(&runner.calls()),
         ["id -u", "launchctl bootout gui/501/dev.kioku.serve"]
     );
+    // start of an unloaded job bootstraps it.
+    runner.clear_calls();
+    assert!(m.start().unwrap().lines[0].starts_with("started"));
+    assert!(
+        argv(&runner.calls())
+            .iter()
+            .any(|c| c.starts_with("launchctl bootstrap gui/501"))
+    );
     m.uninstall().unwrap();
     assert!(!plist.exists());
+}
+
+#[test]
+fn launchd_bootstrap_is_retried_after_bootout() {
+    let home = tempfile::tempdir().unwrap();
+    let failures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let loaded = Arc::new(AtomicBool::new(true));
+    let (f, l) = (failures.clone(), loaded.clone());
+    let runner = Runner::recording(move |argv| match argv.join(" ").as_str() {
+        "id -u" => CmdOutput::ok("501\n"),
+        "launchctl print gui/501/dev.kioku.serve" => {
+            if l.load(Ordering::SeqCst) {
+                CmdOutput::ok("pid = 1\n")
+            } else {
+                CmdOutput::fail("Could not find service")
+            }
+        }
+        "launchctl bootout gui/501/dev.kioku.serve" => {
+            l.store(false, Ordering::SeqCst);
+            CmdOutput::ok("")
+        }
+        s if s.starts_with("launchctl bootstrap") => {
+            // The old job is still being torn down for the first two attempts.
+            if f.fetch_add(1, Ordering::SeqCst) < 2 {
+                CmdOutput::fail("Bootstrap failed: 5: Input/output error")
+            } else {
+                l.store(true, Ordering::SeqCst);
+                CmdOutput::ok("")
+            }
+        }
+        _ => CmdOutput::ok(""),
+    });
+    let m = manager(home.path(), Platform::Launchd, runner.clone());
+    // Loaded with an outdated plist (none on disk yet) → bootout + retried bootstrap.
+    assert!(m.install().unwrap().changed);
+    let bootstraps = runner
+        .calls()
+        .iter()
+        .filter(|c| c[1] == "bootstrap")
+        .count();
+    assert_eq!(bootstraps, 3);
+
+    // Five failures in a row give up with launchctl's message.
+    failures.store(0, Ordering::SeqCst);
+    let always_fail = Runner::recording(|argv| match argv.join(" ").as_str() {
+        "id -u" => CmdOutput::ok("501\n"),
+        "launchctl print gui/501/dev.kioku.serve" => CmdOutput::fail("Could not find service"),
+        s if s.starts_with("launchctl bootstrap") => CmdOutput::fail("Input/output error"),
+        _ => CmdOutput::ok(""),
+    });
+    let m = manager(home.path(), Platform::Launchd, always_fail.clone());
+    let err = format!("{:#}", m.start().unwrap_err());
+    assert!(
+        err.contains("5 attempts") && err.contains("Input/output error"),
+        "{err}"
+    );
+    assert_eq!(
+        always_fail
+            .calls()
+            .iter()
+            .filter(|c| c[1] == "bootstrap")
+            .count(),
+        BOOTSTRAP_ATTEMPTS
+    );
+}
+
+#[test]
+fn systemd_restart_uses_systemctl_restart() {
+    let home = tempfile::tempdir().unwrap();
+    let (runner, _) = fake_systemd();
+    let m = manager(home.path(), Platform::Systemd, runner.clone());
+    assert!(m.restart().is_err(), "restart needs an installed service");
+    m.install().unwrap();
+    runner.clear_calls();
+    m.restart().unwrap();
+    assert_eq!(
+        argv(&runner.calls()),
+        ["systemctl --user restart kioku.service"]
+    );
 }
 
 #[test]
