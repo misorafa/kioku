@@ -73,12 +73,15 @@ fetch() {
     fi
 }
 
-# Final URL after redirects (empty on error).
+# Final URL after redirects; non-zero on a network or HTTP error (nothing printed then).
 final_url() {
     if [ "$DL" = curl ]; then
-        curl -fsSLI -o /dev/null -w '%{url_effective}' --connect-timeout 20 "$1" 2>/dev/null || true
+        FU_URL=$(curl -fsSLI -o /dev/null -w '%{url_effective}' --retry 2 --connect-timeout 20 "$1" 2>/dev/null) ||
+            return 1
+        printf '%s' "$FU_URL"
     else
-        FU_LOC=$(wget -S --spider -q "$1" 2>&1 | sed -n 's/^ *[Ll]ocation: *//p' | tail -n 1 | tr -d '\r') || true
+        wget -S --spider -q "$1" >"$TMP/wget-headers" 2>&1 || return 1
+        FU_LOC=$(sed -n 's/^ *[Ll]ocation: *//p' "$TMP/wget-headers" | tail -n 1 | tr -d '\r')
         if [ -n "$FU_LOC" ]; then printf '%s' "$FU_LOC"; else printf '%s' "$1"; fi
     fi
 }
@@ -91,13 +94,16 @@ sha256_of() {
     fi
 }
 
-# Sets TAG from VERSION (resolving `latest`); empty TAG = no release.
+# Sets TAG from VERSION (resolving `latest`); empty TAG = no release published (the
+# redirect does not land on /releases/tag/<tag>). Returns 1 when the lookup itself failed
+# (network or HTTP error) — that is never mistaken for "no release".
 resolve_tag() {
+    TAG=""
     if [ "$VERSION" != latest ]; then
         TAG=$VERSION
         return 0
     fi
-    RT_URL=$(final_url "$BASE/latest")
+    RT_URL=$(final_url "$BASE/latest") || return 1
     RT_URL=${RT_URL%%\?*}
     RT_URL=${RT_URL%/}
     case "$RT_URL" in
@@ -157,10 +163,11 @@ expected_sum() {
 # install_binary <path>: copy next to the destination, check that it runs, rename over it.
 # Returns 1 (and removes the copy) when the binary does not run on this machine.
 install_binary() {
+    # Called from `if try_target …`, where `set -e` is off: every step is checked.
     mkdir -p "$DIR" || die "cannot create $DIR"
     IB_NEW="$DIR/.kioku.new.$$"
     cp "$1" "$IB_NEW" || die "cannot write to $DIR"
-    chmod 755 "$IB_NEW"
+    chmod 755 "$IB_NEW" || { rm -f "$IB_NEW"; die "cannot make $IB_NEW executable"; }
     if ! IB_VER=$("$IB_NEW" --version 2>&1); then
         rm -f "$IB_NEW"
         warn "the binary does not run here: $(printf '%s' "$IB_VER" | head -n 1)"
@@ -168,7 +175,12 @@ install_binary() {
     fi
     # Same directory = same filesystem: the rename is atomic, and a running
     # `kioku serve` keeps the old inode until it restarts.
-    mv -f "$IB_NEW" "$DIR/kioku"
+    # (A directory in the way would swallow the file: `mv` moves into it.)
+    if [ -d "$DIR/kioku" ]; then
+        rm -f "$IB_NEW"
+        die "$DIR/kioku is a directory; move it away and re-run"
+    fi
+    mv -f "$IB_NEW" "$DIR/kioku" || { rm -f "$IB_NEW"; die "cannot replace $DIR/kioku"; }
     say "installed $IB_VER to $DIR/kioku"
     return 0
 }
@@ -182,14 +194,15 @@ try_target() {
         return 1
     fi
     expected_sum "$TT_ASSET"
-    TT_ACTUAL=$(sha256_of "$TMP/$TT_ASSET")
+    TT_ACTUAL=$(sha256_of "$TMP/$TT_ASSET") || die "cannot compute the SHA-256 of $TT_ASSET"
+    [ -n "$TT_ACTUAL" ] || die "cannot compute the SHA-256 of $TT_ASSET"
     if [ "$TT_ACTUAL" != "$EXPECTED" ]; then
         rm -f "$TMP/$TT_ASSET"
         die "checksum mismatch for $TT_ASSET (expected $EXPECTED, got $TT_ACTUAL); nothing was installed"
     fi
     say "checksum ok ($TT_ACTUAL)"
-    rm -rf "$TMP/x"
-    mkdir "$TMP/x"
+    rm -rf "$TMP/x" || die "cannot clean $TMP/x"
+    mkdir "$TMP/x" || die "cannot create $TMP/x"
     tar -xzf "$TMP/$TT_ASSET" -C "$TMP/x" || die "cannot extract $TT_ASSET"
     TT_BIN="$TMP/x/kioku-$TAG-$1/kioku"
     [ -f "$TT_BIN" ] || TT_BIN="$TMP/x/kioku"
@@ -336,9 +349,10 @@ main() {
         have tar || die "tar is required"
         have sha256sum || have shasum || die "sha256sum or shasum is required to verify the download"
         detect_targets
-        resolve_tag
+        resolve_tag ||
+            die "could not look up the latest release at $BASE/latest (network or HTTP error); check the connection and retry, or pass --version <tag>"
         if [ -z "$TAG" ]; then
-            say "no published release found for $REPO (or GitHub is unreachable)"
+            say "no published release found for $REPO"
         elif [ -n "$TARGETS" ]; then
             say "installing kioku $TAG"
             for t in $TARGETS; do
@@ -352,7 +366,8 @@ main() {
             say "no usable prebuilt binary; falling back to --from-source"
         fi
     elif [ -n "$DL" ]; then
-        resolve_tag
+        # Building from source: an unreachable release index only means "no --tag".
+        resolve_tag || warn "could not look up the latest release (network or HTTP error); building the default branch"
     elif [ "$VERSION" != latest ]; then
         TAG=$VERSION
     fi

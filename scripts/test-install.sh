@@ -124,6 +124,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def route(self):
         path = self.path.split("?")[0]
+        if path.startswith("/broken/"):
+            # A server error (GitHub outage, captive portal, proxy): not "no release".
+            self.send_response(500)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return True
         if path.endswith("/releases/latest"):
             prefix = path[: -len("/releases/latest")]
             # /empty/...: a repository without releases (GitHub redirects to /releases).
@@ -263,6 +269,13 @@ newhome
 T_PATH="$H/.local/bin:$FAKEBIN:$PATH0" inst Linux x86_64 --no-setup --version v9.9.9
 check "no PATH hint when the dir is on PATH" eval '[ "$RC" = 0 ] && lacks "not on your PATH"'
 
+newhome
+mkdir -p "$H/.local/bin/kioku"
+inst Linux x86_64 --no-setup --version v9.9.9
+check "a failing final step inside try_target aborts (exit 1), no temp file left" \
+    eval '[ "$RC" = 1 ] && has "is a directory" && lacks "installed kioku" &&
+        [ -z "$(find "$H/.local/bin" -name ".kioku.new.*")" ]'
+
 # ---------------------------------------------------------------- checksums
 
 newhome
@@ -309,6 +322,19 @@ newhome
 T_BASE="http://127.0.0.1:$PORT/empty/releases" T_PATH="$FAKEBIN:$FAKECARGO:$PATH0" inst Linux x86_64 --no-setup
 check "no release published -> source fallback without --tag" \
     eval '[ "$RC" = 0 ] && has "no published release" && ! grep -F -- "--tag" "$CARGO_LOG" >/dev/null && installed_is 0.0.0-source'
+
+newhome
+: >"$CARGO_LOG"
+T_BASE="http://127.0.0.1:$PORT/broken/releases" T_PATH="$FAKEBIN:$FAKECARGO:$PATH0" inst Linux x86_64 --no-setup
+check "HTTP 500 on releases/latest -> network error, exit 1, no source fallback" \
+    eval '[ "$RC" = 1 ] && has "network or HTTP error" && lacks "falling back" && [ ! -s "$CARGO_LOG" ] && nothing_installed'
+
+newhome
+: >"$CARGO_LOG"
+DEAD_PORT=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+T_BASE="http://127.0.0.1:$DEAD_PORT/releases" T_PATH="$FAKEBIN:$FAKECARGO:$PATH0" inst Linux x86_64 --no-setup
+check "unreachable host -> network error, exit 1, no source fallback" \
+    eval '[ "$RC" = 1 ] && has "network or HTTP error" && [ ! -s "$CARGO_LOG" ] && nothing_installed'
 
 newhome
 : >"$CARGO_LOG"
@@ -365,6 +391,10 @@ if command -v wget >/dev/null 2>&1; then
     newhome
     T_PATH="$FAKEBIN:$NOCURL" inst Linux x86_64 --no-setup
     check "wget only: latest + download + verify" eval '[ "$RC" = 0 ] && installed_is "9.9.9 (x86_64-unknown-linux-musl)"'
+    newhome
+    T_BASE="http://127.0.0.1:$PORT/broken/releases" T_PATH="$FAKEBIN:$NOCURL" inst Linux x86_64 --no-setup
+    check "wget only: HTTP 500 -> network error, exit 1" \
+        eval '[ "$RC" = 1 ] && has "network or HTTP error" && nothing_installed'
 else
     echo "skip wget-only (no wget)"
 fi
