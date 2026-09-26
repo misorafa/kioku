@@ -127,14 +127,17 @@ pub fn run(cli: Cli) -> i32 {
 }
 
 fn env_map() -> HashMap<String, String> {
-    std::env::vars().collect()
+    kioku_core::util::env_vars()
 }
 
 /// `kioku hook <event> --agent <a>`: stdin → server → stdout/stderr/exit code. Always
 /// fail-open; with `KIOKU_HOOK_DUMP` the invocation is also captured (M2 §3.8).
 fn hook(event: HookEventKind, agent: Agent) -> i32 {
     let env = HookEnv::from_process();
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let argv: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
     let mut stdin = String::new();
     let stdin_err = std::io::stdin().read_to_string(&mut stdin).err();
     let outcome = match Config::load() {

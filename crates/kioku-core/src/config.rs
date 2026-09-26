@@ -118,7 +118,7 @@ impl Config {
 
     /// Loads config using the real process environment.
     pub fn load() -> Result<Config> {
-        let env: HashMap<String, String> = std::env::vars().collect();
+        let env: HashMap<String, String> = util::env_vars();
         Config::load_with_env(&env)
     }
 

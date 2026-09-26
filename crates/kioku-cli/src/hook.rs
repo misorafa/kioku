@@ -101,7 +101,7 @@ pub fn run_hook_with_env(
         serde_json::from_str(stdin_json.trim()).context("hook stdin is not JSON");
     if agent == Agent::ClaudeCode
         && let Ok(raw) = &raw
-        && is_cursor_invocation(raw, env)
+        && is_cursor_invocation(raw)
     {
         if cursor_native_hooks_installed(raw, env) {
             // The native Cursor hook handles this event; avoid double capture (§3.7).
@@ -124,10 +124,39 @@ pub fn run_hook_with_env(
     }
 }
 
-/// True when a `--agent claude-code` invocation actually runs inside Cursor (§3.7):
-/// the payload has `cursor_version` or the environment `CURSOR_VERSION`.
-pub fn is_cursor_invocation(raw: &Value, env: &HookEnv) -> bool {
-    raw.get("cursor_version").is_some_and(|v| !v.is_null()) || env.var("CURSOR_VERSION").is_some()
+/// True when a `--agent claude-code` invocation actually runs inside Cursor (§3.7), decided
+/// by the payload alone: `cursor_version`, `conversation_id`, `workspace_roots` or a
+/// camelCase `hook_event_name` (Claude's are PascalCase). `CURSOR_VERSION` in the
+/// environment is never enough — it leaks into Claude Code started from Cursor's terminal.
+pub fn is_cursor_invocation(raw: &Value) -> bool {
+    let present = |k: &str| raw.get(k).is_some_and(|v| !v.is_null());
+    present("cursor_version")
+        || present("conversation_id")
+        || present("workspace_roots")
+        || raw
+            .get("hook_event_name")
+            .and_then(Value::as_str)
+            .and_then(|n| n.chars().next())
+            .is_some_and(|c| c.is_ascii_lowercase())
+}
+
+/// True when a Cursor post-tool event can carry `additional_context`: only Cursor's native
+/// `postToolUse` (or a Claude-shaped PostToolUse from imported hooks) — never `afterFileEdit`
+/// or `postToolUseFailure` (M2 §5.6).
+pub fn cursor_accepts_late_context(ev: &HookEvent) -> bool {
+    match ev.native_event.as_str() {
+        "postToolUse" => true,
+        "" | "PostToolUse" => {
+            ev.native_tool.as_deref() != Some("afterFileEdit")
+                && ev
+                    .tool_response
+                    .as_ref()
+                    .and_then(|r| r.get("is_error"))
+                    .and_then(Value::as_bool)
+                    != Some(true)
+        }
+        _ => false,
+    }
 }
 
 /// Cursor `hooks.json` files that would hold native kioku hooks: `~/.cursor/hooks.json` and
@@ -285,7 +314,9 @@ impl Handler<'_> {
                 Ok(implicit_block.map_or(HookResult::Silent, HookResult::Context))
             }
             HookEventKind::PostToolUse
-                if self.agent == Agent::Cursor && self.cfg.client.cursor_late_context =>
+                if self.agent == Agent::Cursor
+                    && self.cfg.client.cursor_late_context
+                    && cursor_accepts_late_context(self.ev) =>
             {
                 self.cursor_late_context()
             }
@@ -739,6 +770,48 @@ mod tests {
     }
 
     #[test]
+    fn cursor_version_env_alone_does_not_make_a_claude_payload_cursor() {
+        let data = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let cfg = cfg_unreachable(data.path());
+        let mut env = env_home(home.path());
+        env.vars.insert("CURSOR_VERSION".into(), "3.1.0".into());
+        // Claude Code started from Cursor's integrated terminal inherits CURSOR_VERSION.
+        let stdin = json!({
+            "session_id": "claude-in-cursor-terminal",
+            "transcript_path": "/tmp/t.jsonl",
+            "cwd": home.path().display().to_string(),
+            "hook_event_name": "Stop",
+            "stop_hook_active": false,
+        })
+        .to_string();
+        let out = run_hook_with_env(HookEventKind::Stop, Agent::ClaudeCode, &stdin, &cfg, &env);
+        // Claude Code's fail-open rendering (empty stdout), not Cursor's `{}`.
+        assert_eq!(out, HookOutcome::ok());
+    }
+
+    #[test]
+    fn cursor_late_context_only_on_native_post_tool_use() {
+        let env = HookEnv::default();
+        let parse = |rel: &str| {
+            let raw: Value = serde_json::from_str(&fixture_text(rel)).unwrap();
+            crate::event::parse_value(Agent::Cursor, HookEventKind::PostToolUse, raw, &env).unwrap()
+        };
+        assert!(cursor_accepts_late_context(&parse(
+            "cursor/post_tool_use_shell.docs.json"
+        )));
+        assert!(cursor_accepts_late_context(&parse(
+            "cursor/post_tool_use_read.docs.json"
+        )));
+        assert!(!cursor_accepts_late_context(&parse(
+            "cursor/after_file_edit.docs.json"
+        )));
+        assert!(!cursor_accepts_late_context(&parse(
+            "cursor/post_tool_use_failure.docs.json"
+        )));
+    }
+
+    #[test]
     fn cursor_sniff_is_silent_when_native_hooks_exist() {
         let data = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
@@ -746,13 +819,19 @@ mod tests {
         let stdin = fixture_text("cursor/claude_import_stop.docs.json");
         let raw: Value = serde_json::from_str(&stdin).unwrap();
         let env = env_home(home.path());
-        assert!(is_cursor_invocation(&raw, &env));
-        assert!(!is_cursor_invocation(&json!({"session_id": "s"}), &env));
-        let mut with_var = env.clone();
-        with_var
-            .vars
-            .insert("CURSOR_VERSION".into(), "3.1.0".into());
-        assert!(is_cursor_invocation(&json!({"session_id": "s"}), &with_var));
+        assert!(is_cursor_invocation(&raw));
+        assert!(!is_cursor_invocation(&json!({"session_id": "s"})));
+        for cursor in [
+            json!({"conversation_id": "c"}),
+            json!({"session_id": "s", "workspace_roots": ["/w"]}),
+            json!({"session_id": "s", "hook_event_name": "postToolUse"}),
+            json!({"session_id": "s", "cursor_version": "3.1.0"}),
+        ] {
+            assert!(is_cursor_invocation(&cursor), "{cursor}");
+        }
+        assert!(!is_cursor_invocation(
+            &json!({"session_id": "s", "hook_event_name": "PostToolUse", "cursor_version": null})
+        ));
 
         // No native hooks: re-dispatched to the Cursor parser/renderer (fail-open `{}` here,
         // the server is unreachable) and the failure is logged.
@@ -846,10 +925,13 @@ mod tests {
             (Agent::Codex, HookEventKind::Stop, ""),
             (Agent::ClaudeCode, HookEventKind::Stop, ""),
         ] {
-            for stdin in [
-                "garbage",
-                r#"{"session_id":"s","conversation_id":"s","cwd":"/w"}"#,
-            ] {
+            // (`conversation_id` would make a claude-code invocation a Cursor one, §3.7.)
+            let shaped = if agent == Agent::ClaudeCode {
+                r#"{"session_id":"s","cwd":"/w"}"#
+            } else {
+                r#"{"session_id":"s","conversation_id":"s","cwd":"/w"}"#
+            };
+            for stdin in ["garbage", shaped] {
                 let out = run_hook_with_env(event, agent, stdin, &cfg, &env);
                 assert_eq!(out.stdout, want, "{agent:?} {event:?} {stdin}");
                 assert_eq!(out.exit_code, 0);

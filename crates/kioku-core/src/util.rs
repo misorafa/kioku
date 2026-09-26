@@ -159,6 +159,22 @@ pub fn expand_tilde(p: &str) -> std::path::PathBuf {
     }
 }
 
+/// The process environment as UTF-8 strings without ever panicking: a variable whose name
+/// is not UTF-8 is skipped, a non-UTF-8 value is converted lossily (`std::env::vars()` would
+/// panic on either).
+pub fn env_vars() -> std::collections::HashMap<String, String> {
+    env_vars_from(std::env::vars_os())
+}
+
+/// [`env_vars`] over any `(name, value)` pairs (tests).
+pub fn env_vars_from(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> std::collections::HashMap<String, String> {
+    vars.into_iter()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.to_string_lossy().into_owned())))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

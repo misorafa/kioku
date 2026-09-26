@@ -606,8 +606,9 @@ fn agent_lifecycle(agent: Agent) {
             HookEventKind::PostToolUse,
             &p(name, extra),
         );
-        if agent == Agent::Cursor && i == 0 {
-            // Cursor late context: the block again, via postToolUse additional_context
+        if agent == Agent::Cursor && i == 1 {
+            // Cursor late context: the block again, via postToolUse additional_context — on
+            // the first native postToolUse (the afterFileEdit before it cannot carry it)
             let late = context_of(agent, &out).expect("cursor late context");
             assert!(
                 late.starts_with("<kioku>\nproject: e2e (id: e2e-proj)"),
@@ -846,6 +847,26 @@ fn cursor_late_context_once_per_session_and_toggle() {
             HookEventKind::SessionStart,
             &fixture_payload(a, "session_start", sid, cwd),
         );
+        // afterFileEdit / postToolUseFailure cannot carry additional_context: recorded, but
+        // the once-per-session marker stays unconsumed for the next real postToolUse.
+        for name in ["after_file_edit", "post_tool_use_failure"] {
+            let out = run(
+                &cfg,
+                &env,
+                a,
+                HookEventKind::PostToolUse,
+                &fixture_payload(a, name, sid, cwd),
+            );
+            assert_silent(a, HookEventKind::PostToolUse, &out);
+            assert!(
+                !client_dir
+                    .path()
+                    .join("state/cursor-ctx")
+                    .join(sid)
+                    .exists(),
+                "{sid}: {name} consumed the marker"
+            );
+        }
         let first = run(&cfg, &env, a, HookEventKind::PostToolUse, &tool(sid));
         assert!(context_of(a, &first).is_some(), "{sid}: first tool use");
         for _ in 0..2 {
@@ -910,7 +931,8 @@ fn cursor_sniff_in_claude_hooks() {
     );
     let block = context_of(Agent::Cursor, &out).expect("re-dispatched to the Cursor renderer");
     assert!(block.contains("session: sniff-1  ←"));
-    // Claude-shaped payload + CURSOR_VERSION in the environment works the same way.
+    // A Claude-shaped payload is Claude Code even with CURSOR_VERSION in the environment
+    // (Claude Code started from Cursor's terminal inherits it): the env alone never decides.
     let mut cursor_env = env.clone();
     cursor_env
         .vars
@@ -926,7 +948,7 @@ fn cursor_sniff_in_claude_hooks() {
         HookEventKind::UserPromptSubmit,
         &prompt,
     );
-    assert_silent(Agent::Cursor, HookEventKind::UserPromptSubmit, &out);
+    assert_silent(Agent::ClaudeCode, HookEventKind::UserPromptSubmit, &out);
     assert_eq!(
         api_get(&server.base, "sessions/sniff-1")["counts"]["prompts"],
         1
@@ -1009,4 +1031,61 @@ fn codex_session_end_deadline_is_capped() {
     );
     let log = std::fs::read_to_string(client_dir.path().join("logs/hook.log")).unwrap();
     assert!(log.contains("session-end session=slow error: "), "{log}");
+}
+
+/// A non-UTF-8 environment (variable value and name) must never panic the hook binary:
+/// Gemini still gets JSON-only stdout and exit 0 (regression: `std::env::vars()` panicked).
+#[cfg(unix)]
+#[test]
+fn hook_binary_survives_a_non_utf8_environment() {
+    use std::ffi::OsStr;
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+    use std::process::{Command, Stdio};
+
+    let server = start_server();
+    let home = tempfile::tempdir().unwrap();
+    let project = project_dir();
+    let payload = fixture_payload(
+        Agent::GeminiCli,
+        "session_start",
+        "sess-non-utf8",
+        project.path(),
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kioku"))
+        .args(["hook", "session-start", "--agent", "gemini-cli"])
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", home.path())
+        .env("KIOKU_DATA_DIR", home.path().join(".kioku"))
+        .env("KIOKU_SERVER_URL", &server.base)
+        .env("KIOKU_AUTH_TOKEN", TOKEN)
+        .env("KIOKU_WEIRD", OsStr::from_bytes(b"caf\xe9 \xff"))
+        .env(OsStr::from_bytes(b"BAD_\xffNAME"), "x")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.to_string().as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout={stdout} stderr={stderr}"
+    );
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    let v: Value = serde_json::from_str(&stdout).expect("stdout is exactly one JSON object");
+    let ctx = v
+        .pointer("/hookSpecificOutput/additionalContext")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(ctx.contains(PROJECT), "{stdout}");
 }

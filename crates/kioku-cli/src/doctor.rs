@@ -103,7 +103,7 @@ impl DoctorEnv {
     /// The real process environment.
     pub fn from_process(bin: String) -> DoctorEnv {
         DoctorEnv {
-            vars: std::env::vars().collect(),
+            vars: kioku_core::util::env_vars(),
             home: kioku_core::util::home_dir(),
             bin,
             runner: Runner::real(),

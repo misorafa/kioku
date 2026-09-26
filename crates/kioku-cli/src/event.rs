@@ -144,7 +144,7 @@ impl HookEnv {
     /// The real process environment, home directory and cwd.
     pub fn from_process() -> HookEnv {
         HookEnv {
-            vars: std::env::vars().collect(),
+            vars: kioku_core::util::env_vars(),
             home: kioku_core::util::home_dir_opt(),
             cwd: std::env::current_dir().ok(),
         }
@@ -458,12 +458,19 @@ fn common(
     })
 }
 
-/// cwd per M2 §3.4 steps 1–3: payload `cwd`, `workspace_roots[0]`, then the agent's
+/// cwd per M2 §3.4 steps 1–3: payload `cwd`, `workspace_roots[0]` (Cursor: the root first —
+/// its payload `cwd` can be a subdirectory or the hook's own `~/.cursor`), then the agent's
 /// project-dir variables — the first non-empty absolute path. Empty when none qualifies
 /// (the handler decides about the process cwd, which Cursor never uses).
 fn resolve_cwd(agent: Agent, raw: &Value, roots: &[String], env: &HookEnv) -> String {
     let payload = text(raw, "cwd");
-    let candidates = payload.into_iter().chain(roots.first().cloned()).chain(
+    let root = roots.first().cloned();
+    let (first, second) = if agent == Agent::Cursor {
+        (root, payload)
+    } else {
+        (payload, root)
+    };
+    let candidates = first.into_iter().chain(second).chain(
         agent
             .project_dir_env()
             .iter()

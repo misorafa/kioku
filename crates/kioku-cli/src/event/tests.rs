@@ -482,7 +482,8 @@ fn cursor_session_id_and_cwd_resolution() {
         )
         .is_err()
     );
-    // payload cwd → workspace_roots[0] → CURSOR_PROJECT_DIR → CLAUDE_PROJECT_DIR; never the process cwd
+    // workspace_roots[0] → payload cwd → CURSOR_PROJECT_DIR → CLAUDE_PROJECT_DIR; never the
+    // process cwd. The root wins over a payload cwd (a subdirectory, or the hook's ~/.cursor).
     let env = env_of(&[
         ("CURSOR_PROJECT_DIR", "/env/cursor"),
         ("CLAUDE_PROJECT_DIR", "/env/claude"),
@@ -490,9 +491,33 @@ fn cursor_session_id_and_cwd_resolution() {
     let cwd = |raw: Value, env: &HookEnv| parse_value(Agent::Cursor, k, raw, env).unwrap().cwd;
     assert_eq!(
         cwd(
-            json!({"conversation_id": "c", "cwd": "/p", "workspace_roots": ["/r1", "/r2"]}),
+            json!({"conversation_id": "c", "cwd": "/r1/crates/sub", "workspace_roots": ["/r1", "/r2"]}),
             &env
         ),
+        "/r1"
+    );
+    assert_eq!(
+        cwd(
+            json!({"conversation_id": "c", "cwd": "/p", "workspace_roots": ["rel"]}),
+            &env
+        ),
+        "/p",
+        "a payload cwd still beats a non-absolute root"
+    );
+    assert_eq!(
+        cwd(json!({"conversation_id": "c", "cwd": "/p"}), &env),
+        "/p"
+    );
+    // Other agents keep payload cwd first.
+    assert_eq!(
+        parse_value(
+            Agent::ClaudeCode,
+            k,
+            json!({"session_id": "s", "cwd": "/p", "workspace_roots": ["/r1"]}),
+            &env
+        )
+        .unwrap()
+        .cwd,
         "/p"
     );
     assert_eq!(
