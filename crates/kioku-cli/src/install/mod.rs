@@ -307,6 +307,45 @@ pub struct SettingsChange {
     pub backup: Option<PathBuf>,
     /// Hook entries removed (uninstall).
     pub removed: usize,
+    /// True when this write added the token and tightened the file to 0600.
+    pub made_private: bool,
+}
+
+/// What one [`write_text`] did besides writing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Written {
+    /// Backup written by this call (only before the first modification).
+    pub backup: Option<PathBuf>,
+    /// True when the write added a bearer token to an existing file that others could read,
+    /// and its mode was set to 0600 (unix).
+    pub made_private: bool,
+}
+
+/// The one line reported when [`Written::made_private`] is set.
+pub fn made_private_note(path: &Path) -> String {
+    format!(
+        "{} now holds the kioku token: its permissions were set to 0600",
+        path.display()
+    )
+}
+
+/// The file a write to `path` really changes: a symlink (e.g. into a dotfiles repository)
+/// is followed so the target is updated in place instead of being replaced by a regular file.
+pub fn resolve_target(path: &Path) -> PathBuf {
+    let is_link = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+    if !is_link {
+        return path.to_path_buf();
+    }
+    std::fs::canonicalize(path).unwrap_or_else(|_| {
+        // Dangling link: write where it points (relative to the link's directory).
+        match std::fs::read_link(path) {
+            Ok(target) if target.is_absolute() => target,
+            Ok(target) => path
+                .parent()
+                .map_or_else(|| target.clone(), |p| p.join(&target)),
+            Err(_) => path.to_path_buf(),
+        }
+    })
 }
 
 /// Reads a JSON file: `None` when missing, `{}` when empty, an error when not valid JSON.
@@ -337,21 +376,18 @@ fn write_settings(
     existed: bool,
     value: &Value,
     secret: bool,
-) -> anyhow::Result<Option<PathBuf>> {
+) -> anyhow::Result<Written> {
     let text = serde_json::to_string_pretty(value).context("serializing settings")? + "\n";
     write_text(path, existed, &text, secret)
 }
 
 /// Writes `text` to `path`, backing the file up once first (only if it existed; an existing
-/// backup is never overwritten). The write goes through a temp file + rename that keeps the
-/// original's permissions; a new file is 0600 when it holds the token (`secret`), else 0644.
-/// Parent directories are created as needed. Returns the backup written by this call.
-pub fn write_text(
-    path: &Path,
-    existed: bool,
-    text: &str,
-    secret: bool,
-) -> anyhow::Result<Option<PathBuf>> {
+/// backup is never overwritten). A symlinked `path` is followed ([`resolve_target`]). The
+/// write goes through a temp file + rename that keeps the original's permissions — except
+/// that a write adding a bearer token (`secret`) to a group/world-readable file makes it
+/// 0600; a new file is 0600 when it holds the token, else 0644. Parent directories are
+/// created as needed.
+pub fn write_text(path: &Path, existed: bool, text: &str, secret: bool) -> anyhow::Result<Written> {
     write_text_inner(path, existed, text, secret, true)
 }
 
@@ -379,7 +415,7 @@ pub fn is_blank_json(v: &Value) -> bool {
 /// Writes a JSON file after removing our entries: without a backup, and a file kioku created
 /// (no `.kioku-bak`) that is now blank is deleted instead. Returns true when deleted.
 pub fn rewrite_json_after_removal(path: &Path, after: &Value) -> anyhow::Result<bool> {
-    if is_blank_json(after) && !backup_path(path).exists() {
+    if is_blank_json(after) && !backup_path(&resolve_target(path)).exists() {
         std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
         return Ok(true);
     }
@@ -394,8 +430,15 @@ fn write_text_inner(
     text: &str,
     secret: bool,
     make_backup: bool,
-) -> anyhow::Result<Option<PathBuf>> {
+) -> anyhow::Result<Written> {
+    let target = resolve_target(path);
+    let path = target.as_path();
     let mut backup = None;
+    let adds_token = secret
+        && existed
+        && std::fs::read_to_string(path)
+            .is_ok_and(|old| text.matches("Bearer ").count() > old.matches("Bearer ").count());
+    let mut made_private = false;
     let bak = backup_path(path);
     if make_backup && existed && !bak.exists() {
         std::fs::copy(path, &bak).with_context(|| format!("backing up to {}", bak.display()))?;
@@ -413,7 +456,17 @@ fn write_text_inner(
     kioku_core::util::write_private_file(&tmp, text)
         .with_context(|| format!("writing {}", tmp.display()))?;
     if existed && let Ok(meta) = std::fs::metadata(path) {
-        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+        #[allow(unused_mut)]
+        let mut perms = meta.permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if adds_token && perms.mode() & 0o077 != 0 {
+                perms.set_mode(0o600);
+                made_private = true;
+            }
+        }
+        let _ = std::fs::set_permissions(&tmp, perms);
     } else if !secret {
         #[cfg(unix)]
         {
@@ -422,7 +475,11 @@ fn write_text_inner(
         }
     }
     std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))?;
-    Ok(backup)
+    let _ = adds_token;
+    Ok(Written {
+        backup,
+        made_private,
+    })
 }
 
 /// Installs our hooks into the settings file at `path` using `bin` as the kioku binary.
@@ -433,7 +490,7 @@ pub fn install_settings(path: &Path, bin: &str) -> anyhow::Result<SettingsChange
     let after = merge_hooks(&before, bin)?;
     let changed = !existed || after != before;
     let backup = if changed {
-        write_settings(path, existed, &after, false)?
+        write_settings(path, existed, &after, false)?.backup
     } else {
         None
     };
@@ -442,6 +499,7 @@ pub fn install_settings(path: &Path, bin: &str) -> anyhow::Result<SettingsChange
         changed,
         backup,
         removed: 0,
+        made_private: false,
     })
 }
 
@@ -453,11 +511,12 @@ pub fn uninstall_settings(path: &Path) -> anyhow::Result<SettingsChange> {
             changed: false,
             backup: None,
             removed: 0,
+            made_private: false,
         });
     };
     let (after, removed) = remove_hooks(&before)?;
     let backup = if removed > 0 {
-        write_settings(path, true, &after, false)?
+        write_settings(path, true, &after, false)?.backup
     } else {
         None
     };
@@ -466,6 +525,7 @@ pub fn uninstall_settings(path: &Path) -> anyhow::Result<SettingsChange> {
         changed: removed > 0,
         backup,
         removed,
+        made_private: false,
     })
 }
 
@@ -590,13 +650,16 @@ pub fn register_mcp_entry(path: &Path, entry: &Value, agent: &str, dry_run: bool
         };
     }
     match write_settings(path, existed, &after, true) {
-        Ok(backup) => {
+        Ok(written) => {
             let mut msg = format!(
                 "MCP server `{MCP_NAME}` registered in {} (user scope): {url}",
                 path.display()
             );
-            if let Some(b) = backup {
+            if let Some(b) = written.backup {
                 msg.push_str(&format!("\n  backup: {}", b.display()));
+            }
+            if written.made_private {
+                msg.push_str(&format!("\n  {}", made_private_note(path)));
             }
             msg.push_str(&format!("\n  restart {agent} to pick it up"));
             McpChange {
@@ -902,6 +965,113 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             r#"{"mcpServers": []}"#
+        );
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adding_the_token_to_a_readable_file_makes_it_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude.json");
+        std::fs::write(&path, r#"{"numStartups": 1}"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let msg = register_mcp(&path, &mcp_cfg());
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(
+            msg.matches("permissions were set to 0600").count(),
+            1,
+            "{msg}"
+        );
+        assert!(!msg.contains("Bearer abc"), "{msg}");
+
+        // The token is already there (a URL change only): the user's mode is kept, no note.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let mut moved = mcp_cfg();
+        moved.server_url = "https://kioku.lan".into();
+        let msg = register_mcp(&path, &moved);
+        assert!(!msg.contains("0600"), "{msg}");
+        assert_eq!(mode(&path), 0o640);
+
+        // No token: nothing secret is added, the mode stays.
+        let plain = dir.path().join("plain.json");
+        std::fs::write(&plain, "{}").unwrap();
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut cfg = mcp_cfg();
+        cfg.auth_token = None;
+        let msg = register_mcp(&plain, &cfg);
+        assert!(!msg.contains("0600"), "{msg}");
+        assert_eq!(mode(&plain), 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_config_is_updated_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let dotfiles = dir.path().join("dotfiles");
+        std::fs::create_dir(&dotfiles).unwrap();
+        let real = dotfiles.join("claude.json");
+        let original = r#"{"numStartups": 1}"#;
+        std::fs::write(&real, original).unwrap();
+        let link = dir.path().join(".claude.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        register_mcp(&link, &mcp_cfg());
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link is kept, not replaced by a regular file"
+        );
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&real).unwrap()).unwrap();
+        assert_eq!(v["mcpServers"]["kioku"]["url"], "http://home:7391/mcp");
+        assert_eq!(
+            std::fs::read_to_string(dotfiles.join("claude.json.kioku-bak")).unwrap(),
+            original
+        );
+        assert!(!dir.path().join(".claude.json.kioku-bak").exists());
+        // Relative link (as dotfile managers create them) and uninstall through it.
+        let rel = dir.path().join("rel.json");
+        std::os::unix::fs::symlink("dotfiles/claude.json", &rel).unwrap();
+        assert!(unregister_mcp(&rel).contains("removed"));
+        assert!(
+            std::fs::symlink_metadata(&rel)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&real).unwrap()).unwrap();
+        assert!(v["mcpServers"].get("kioku").is_none(), "{v}");
+        assert_eq!(v["numStartups"], 1);
+
+        // Codex config.toml and a Markdown block through a link, too.
+        let real_toml = dotfiles.join("config.toml");
+        std::fs::write(&real_toml, "model = \"o3\"\n").unwrap();
+        let toml_link = dir.path().join("config.toml");
+        std::os::unix::fs::symlink(&real_toml, &toml_link).unwrap();
+        block::install_codex_config(&toml_link, "http://h/mcp", Some("t"), false, false).unwrap();
+        assert!(
+            std::fs::read_to_string(&real_toml)
+                .unwrap()
+                .contains("[mcp_servers.kioku]")
+        );
+        block::uninstall_codex_config(&toml_link, false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&real_toml).unwrap(),
+            "model = \"o3\"\n"
+        );
+        assert!(
+            std::fs::symlink_metadata(&toml_link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
     }
 

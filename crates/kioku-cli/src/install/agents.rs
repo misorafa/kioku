@@ -14,10 +14,10 @@ use serde_json::{Map, Value, json};
 
 use super::block::{self, FileOutcome};
 use super::{
-    HookSpec, McpChange, SettingsChange, agent_hook_command, claude_specs, mcp_server_entry,
-    mcp_url, merge_flat, merge_mcp_entry, merge_nested, read_settings, register_mcp_entry,
-    remove_flat, remove_hooks, remove_mcp_server, rewrite_json_after_removal, unregister_mcp_entry,
-    write_settings,
+    HookSpec, McpChange, SettingsChange, Written, agent_hook_command, claude_specs,
+    mcp_server_entry, mcp_url, merge_flat, merge_mcp_entry, merge_nested, read_settings,
+    register_mcp_entry, remove_flat, remove_hooks, remove_mcp_server, rewrite_json_after_removal,
+    unregister_mcp_entry, write_settings,
 };
 use crate::event::{ALL_AGENTS, ALL_EVENTS, Agent, HookEventKind, registered_timeout_ms};
 
@@ -57,6 +57,36 @@ impl InstallCtx {
     /// Project root for `--project`: git top level of the cwd, else the cwd (M2 §8.1).
     pub fn project_root(&self) -> PathBuf {
         kioku_core::project::git_toplevel(&self.cwd).unwrap_or_else(|| self.cwd.clone())
+    }
+
+    /// The directory `--project` writes into for `agent` (Claude Code: the cwd, M1; the
+    /// others: [`InstallCtx::project_root`]).
+    pub fn project_dir(&self, agent: Agent) -> PathBuf {
+        if agent == Agent::ClaudeCode {
+            self.cwd.clone()
+        } else {
+            self.project_root()
+        }
+    }
+
+    /// Error when `--project` would write into the home directory itself (the project files
+    /// would then be the user-level ones, e.g. `~/.cursor/hooks.json`, or a dotfiles repo
+    /// rooted at `~`).
+    pub fn check_project_dir(&self, agent: Agent) -> anyhow::Result<()> {
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let dir = self.project_dir(agent);
+        if canon(&dir) == canon(&self.home) {
+            anyhow::bail!(
+                "--project resolves to your home directory ({}){}; run it inside a project directory, or drop --project for the user-level install",
+                dir.display(),
+                if dir != self.cwd {
+                    " because it is the git top level"
+                } else {
+                    ""
+                }
+            );
+        }
+        Ok(())
     }
 
     fn token(&self) -> Option<String> {
@@ -497,16 +527,17 @@ fn install_hook_file(
             .map_err(manual)?;
     }
     let changed = !existed || after != before;
-    let backup = if changed && !dry_run {
+    let written = if changed && !dry_run {
         write_settings(path, existed, &after, mcp_entry.is_some())?
     } else {
-        None
+        Written::default()
     };
     Ok(SettingsChange {
         path: path.to_path_buf(),
         changed,
-        backup,
+        backup: written.backup,
         removed: 0,
+        made_private: written.made_private,
     })
 }
 
@@ -520,6 +551,9 @@ fn report_hooks(r: &mut AgentReport, c: &SettingsChange, dry_run: bool, what: &s
     r.push(format!("{what}: {} ({verb})", c.path.display()));
     if let Some(b) = &c.backup {
         r.push(format!("  backup of the original: {}", b.display()));
+    }
+    if c.made_private {
+        r.push(format!("  {}", super::made_private_note(&c.path)));
     }
 }
 
@@ -581,6 +615,9 @@ pub fn install_agent(
 ) -> anyhow::Result<AgentReport> {
     let mut r = AgentReport::new(agent);
     let dry = opts.dry_run;
+    if opts.project {
+        ctx.check_project_dir(agent)?;
+    }
     if agent == Agent::GeminiCli && ctx.bin.contains('$') {
         anyhow::bail!(
             "the kioku binary path {} contains `$`, which Gemini CLI expands in settings.json; install kioku to a path without `$`",
@@ -712,6 +749,22 @@ pub fn uninstall_agent(
         _ => r.mcp(unregister_mcp_entry(&mcp_path(agent, ctx), dry_run)),
     }
     for path in instruction_files(agent, ctx, project) {
+        // Gemini's `context.fileName` can point at the same file another agent uses (e.g.
+        // AGENTS.md with Codex): keep the shared block while that agent is still installed.
+        if let Some(other) = ALL_AGENTS.into_iter().find(|&o| {
+            o != agent
+                && instruction_files(o, ctx, project).contains(&path)
+                && agent_hooks_installed(o, ctx, project)
+        }) {
+            if block::read_text(&path)?.is_some_and(|t| t.contains(block::MD_MARKERS.end)) {
+                r.push(format!(
+                    "instructions: {} kept ({} still uses it)",
+                    path.display(),
+                    other.as_str()
+                ));
+            }
+            continue;
+        }
         let outcome = if agent == Agent::Cursor {
             match block::read_text(&path)? {
                 Some(t) if block::is_our_mdc(&t) => {
@@ -731,6 +784,15 @@ pub fn uninstall_agent(
         }
     }
     Ok(r)
+}
+
+/// True when `agent`'s hook file (user or project level) holds kioku hook entries.
+pub fn agent_hooks_installed(agent: Agent, ctx: &InstallCtx, project: bool) -> bool {
+    read_settings(&hooks_path(agent, ctx, project))
+        .ok()
+        .flatten()
+        .and_then(|v| remove_agent_hooks(agent, &v).ok())
+        .is_some_and(|(_, n)| n > 0)
 }
 
 /// Notes printed after installing an agent (Codex trust, project hook files).

@@ -168,7 +168,7 @@ pub fn save_text(
 /// Writes `after` after a removal: a file left blank that kioku created (no `.kioku-bak`,
 /// which is written before the first change of a pre-existing file) is deleted instead.
 pub fn save_after_removal(path: &Path, after: &str, dry_run: bool) -> anyhow::Result<FileOutcome> {
-    if after.trim().is_empty() && !backup_path(path).exists() {
+    if after.trim().is_empty() && !backup_path(&super::resolve_target(path)).exists() {
         if !dry_run {
             std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
         }
@@ -271,6 +271,129 @@ pub fn codex_block(url: &str, token: Option<&str>, enable_hooks: bool) -> String
     wrap(&body, TOML_MARKERS)
 }
 
+/// Which part of a Codex managed block a line belongs to (see [`normalize_codex_blocks`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Segment {
+    /// Before the first table header inside the block.
+    Prefix,
+    /// `[mcp_servers.kioku]` (or a sub-table of it): kioku's own.
+    Ours,
+    /// A `[features]` table inside the block: ours when it holds only `hooks = true`.
+    Features,
+    /// Any other table: written by someone else (toml_edit appends new tables before the
+    /// document's trailing comment, i.e. before our end marker).
+    Foreign,
+}
+
+/// Dotted name of a `[table]` / `[[array]]` header line (quotes and spaces removed; good
+/// enough to recognise our two tables), or `None` for any other line.
+fn header_name(line: &str) -> Option<String> {
+    let t = line.trim();
+    if !t.starts_with('[') {
+        return None;
+    }
+    let array = t.starts_with("[[");
+    let inner = t.trim_start_matches('[');
+    let end = inner.find(']')?;
+    let name: String = inner[..end]
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '\t' | '"' | '\''))
+        .collect();
+    Some(if array { format!("[[{name}") } else { name })
+}
+
+/// True for a key line of our `[features]` table (`hooks = true`, any spacing / comment).
+fn is_hooks_true(line: &str) -> bool {
+    let bare = line.split('#').next().unwrap_or_default();
+    let compact: String = bare.chars().filter(|c| !c.is_whitespace()).collect();
+    compact == "hooks=true"
+}
+
+/// `text` with every Codex managed block reduced to kioku's own content (M2 §4.6):
+/// tables inside the markers that kioku did not write — Codex's `toml_edit` writer appends new
+/// tables (`[projects."…"]`, `[hooks.state.…]`) before the trailing end-marker comment — are
+/// moved, verbatim, to just after the end marker; key lines before the block's first table
+/// header (they belong to the table above the block) move to just before the begin marker.
+/// Text without such lines is returned unchanged.
+pub fn normalize_codex_blocks(text: &str) -> anyhow::Result<String> {
+    let ranges = block_ranges(text, TOML_MARKERS)?;
+    if ranges.is_empty() {
+        return Ok(text.to_string());
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut pos = 0;
+    for (start, end) in ranges {
+        out.push_str(&text[pos..start]);
+        pos = end;
+        let lines: Vec<&str> = text[start..end].split_inclusive('\n').collect();
+        let (begin, rest) = lines.split_first().expect("a block has a begin line");
+        let (end_line, inner) = rest.split_last().expect("a block has an end line");
+        let mut prefix = String::new();
+        let mut ours = String::new();
+        let mut salvaged = String::new();
+        let mut segment = Segment::Prefix;
+        let mut features: Vec<&str> = Vec::new();
+        let flush_features =
+            |features: &mut Vec<&str>, ours: &mut String, salvaged: &mut String| {
+                if features.is_empty() {
+                    return;
+                }
+                let only_hooks = features[1..].iter().all(|l| {
+                    let t = l.trim();
+                    t.is_empty() || t.starts_with('#') || is_hooks_true(t)
+                });
+                let target = if only_hooks { ours } else { salvaged };
+                for l in features.drain(..) {
+                    target.push_str(l);
+                }
+            };
+        for &line in inner {
+            if let Some(name) = header_name(line) {
+                flush_features(&mut features, &mut ours, &mut salvaged);
+                segment = if name == "mcp_servers.kioku" || name.starts_with("mcp_servers.kioku.") {
+                    Segment::Ours
+                } else if name == "features" {
+                    Segment::Features
+                } else {
+                    Segment::Foreign
+                };
+            }
+            let trimmed = line.trim();
+            match segment {
+                Segment::Prefix => {
+                    if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                        prefix.push_str(line);
+                    }
+                }
+                Segment::Ours => ours.push_str(line),
+                Segment::Features => features.push(line),
+                Segment::Foreign => salvaged.push_str(line),
+            }
+        }
+        flush_features(&mut features, &mut ours, &mut salvaged);
+        if !prefix.is_empty() {
+            out.push_str(&prefix);
+            if !prefix.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        out.push_str(begin);
+        out.push_str(&ours);
+        out.push_str(end_line);
+        let salvaged = salvaged.trim_end_matches(['\n', '\r']);
+        if !salvaged.is_empty() {
+            if !end_line.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push('\n');
+            out.push_str(salvaged);
+            out.push('\n');
+        }
+    }
+    out.push_str(&text[pos..]);
+    Ok(out)
+}
+
 fn parse_toml(text: &str) -> anyhow::Result<toml::Table> {
     toml::from_str::<toml::Table>(text).map_err(|e| anyhow::anyhow!("{e}"))
 }
@@ -360,6 +483,19 @@ pub fn install_codex_config(
         }
     };
     notes.extend(codex_feature_warnings(&parsed));
+    // Tables another writer put inside our block move out of it first (M2 §4.6).
+    let normalized = match normalize_codex_blocks(text) {
+        Ok(n) => n,
+        Err(e) => {
+            let block = codex_block(url, token, enable_hooks_feature);
+            return Ok(manual(
+                format!("{}: {e:#}; not touching it", path.display()),
+                notes,
+                &block,
+            ));
+        }
+    };
+    let text = normalized.as_str();
     let ranges = match block_ranges(text, TOML_MARKERS) {
         Ok(r) => r,
         Err(e) => {
@@ -424,8 +560,19 @@ pub fn install_codex_config(
             &block,
         ));
     }
-    let outcome = save_text(path, before.as_deref(), &after, true, dry_run)?;
-    Ok(CodexConfigChange { outcome, notes })
+    if before.as_deref() == Some(after.as_str()) {
+        return Ok(CodexConfigChange {
+            outcome: FileOutcome::Unchanged,
+            notes,
+        });
+    }
+    if !dry_run && write_text(path, before.is_some(), &after, true)?.made_private {
+        notes.push(super::made_private_note(path));
+    }
+    Ok(CodexConfigChange {
+        outcome: FileOutcome::Written,
+        notes,
+    })
 }
 
 /// Removes the managed block from the Codex `config.toml` at `path` (bytes outside it kept).
@@ -433,7 +580,8 @@ pub fn uninstall_codex_config(path: &Path, dry_run: bool) -> anyhow::Result<File
     let Some(before) = read_text(path)? else {
         return Ok(FileOutcome::Unchanged);
     };
-    let (after, found) = remove_blocks(&before, TOML_MARKERS)
+    let (after, found) = normalize_codex_blocks(&before)
+        .and_then(|n| remove_blocks(&n, TOML_MARKERS))
         .with_context(|| format!("{}: not touching it", path.display()))?;
     if !found {
         return Ok(FileOutcome::Unchanged);
@@ -562,6 +710,28 @@ mod tests {
         assert!(!fresh.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn toml_adding_the_token_makes_a_readable_config_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "model = \"o3\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let r = install_codex_config(&path, URL, Some("tok"), false, false).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(r.notes.len(), 1, "{:?}", r.notes);
+        assert!(r.notes[0].contains("0600") && !r.notes[0].contains("tok\""));
+        // Without a token nothing is tightened.
+        std::fs::write(&path, "model = \"o3\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let r = install_codex_config(&path, URL, None, false, false).unwrap();
+        assert!(r.notes.is_empty());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+    }
+
     #[test]
     fn toml_foreign_unparseable_and_inline_are_left_alone() {
         let dir = tempfile::tempdir().unwrap();
@@ -629,6 +799,87 @@ mod tests {
         assert!(text.starts_with(foreign));
         assert_eq!(text.matches("[features]").count(), 1);
         assert!(parse_toml(&text).is_ok());
+    }
+
+    /// Codex's toml_edit writer appends new tables before the document's trailing comment —
+    /// our end marker — so they land inside the block. They must survive every rewrite.
+    #[test]
+    fn toml_tables_codex_appended_inside_the_block_survive_install_and_uninstall() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let foreign_tail = "[projects.\"/Users/me/src/app\"]\ntrust_level = \"trusted\"\n\n[hooks.state.x]\ntrusted_hash = \"sha256:abc\"\n";
+        for original in ["", "model = \"o3\"\n"] {
+            std::fs::write(&path, original).unwrap();
+            let _ = std::fs::remove_file(backup_path(&path));
+            install_codex_config(&path, URL, Some("tok"), true, false).unwrap();
+            let installed = std::fs::read_to_string(&path).unwrap();
+            // Simulate Codex (toml_edit) adding trust tables at the end of the document.
+            let cut = installed.rfind(TOML_MARKERS.end).unwrap();
+            let edited = format!("{}\n{foreign_tail}{}", &installed[..cut], &installed[cut..]);
+            let t = parse_toml(&edited).unwrap();
+            assert!(table_get(&t, &["projects", "/Users/me/src/app"]).is_some());
+            std::fs::write(&path, &edited).unwrap();
+
+            // install → install → uninstall: the foreign tables are kept every time.
+            let r = install_codex_config(&path, URL, Some("tok"), false, false).unwrap();
+            assert_eq!(r.outcome, FileOutcome::Written, "{original:?}");
+            let once = std::fs::read_to_string(&path).unwrap();
+            let block_end = once.find(TOML_MARKERS.end).unwrap();
+            assert!(
+                once[block_end..].contains(foreign_tail),
+                "moved after the block: {once}"
+            );
+            let t = parse_toml(&once).unwrap();
+            assert_eq!(
+                table_get(&t, &["projects", "/Users/me/src/app", "trust_level"])
+                    .unwrap()
+                    .as_str(),
+                Some("trusted")
+            );
+            assert_eq!(
+                table_get(&t, &["hooks", "state", "x", "trusted_hash"])
+                    .unwrap()
+                    .as_str(),
+                Some("sha256:abc")
+            );
+            assert_eq!(
+                table_get(&t, &["features", "hooks"]).unwrap().as_bool(),
+                Some(true),
+                "our sticky [features] stays ours"
+            );
+            let r = install_codex_config(&path, URL, Some("tok"), false, false).unwrap();
+            assert_eq!(r.outcome, FileOutcome::Unchanged);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), once);
+
+            uninstall_codex_config(&path, false).unwrap();
+            let left = std::fs::read_to_string(&path).unwrap();
+            assert!(!left.contains("kioku"), "{left}");
+            assert!(left.contains(foreign_tail), "{left}");
+            assert!(left.starts_with(original));
+            let t = parse_toml(&left).unwrap();
+            assert!(table_get(&t, &["hooks", "state", "x", "trusted_hash"]).is_some());
+            assert!(t.get("features").is_none());
+        }
+    }
+
+    #[test]
+    fn normalize_moves_foreign_features_and_prefix_keys_out_of_the_block() {
+        let text = format!(
+            "[tui]\n{}\nnotifications = true\n[mcp_servers.kioku]\nurl = \"x\"\n[features]\nhooks = true\nweb_search = true\n{}\n",
+            TOML_MARKERS.begin, TOML_MARKERS.end
+        );
+        let n = normalize_codex_blocks(&text).unwrap();
+        assert_eq!(
+            n,
+            format!(
+                "[tui]\nnotifications = true\n{}\n[mcp_servers.kioku]\nurl = \"x\"\n{}\n\n[features]\nhooks = true\nweb_search = true\n",
+                TOML_MARKERS.begin, TOML_MARKERS.end
+            )
+        );
+        assert_eq!(parse_toml(&n).unwrap(), parse_toml(&text).unwrap());
+        // A clean block is left byte-identical.
+        let clean = codex_block(URL, None, true);
+        assert_eq!(normalize_codex_blocks(&clean).unwrap(), clean);
     }
 
     #[test]

@@ -791,3 +791,62 @@ fn notes_and_binary_warning() {
     assert!(unstable_binary_warning("/tmp/x/kioku").is_some());
     assert!(unstable_binary_warning("/home/me/.local/bin/kioku").is_none());
 }
+
+#[test]
+fn project_install_refuses_the_home_directory() {
+    let home = tempfile::tempdir().unwrap();
+    let c = ctx(home.path(), home.path(), BIN);
+    for agent in ALL_AGENTS {
+        let err = format!("{:#}", install_agent(agent, &c, &opts(true)).unwrap_err());
+        assert!(err.contains("home directory"), "{agent:?}: {err}");
+    }
+    assert!(snapshot(home.path()).is_empty(), "nothing written");
+    // A subdirectory (no git) is fine; the user-level install from ~ is too.
+    let sub = home.path().join("src/app");
+    std::fs::create_dir_all(&sub).unwrap();
+    install_agent(Agent::Cursor, &ctx(home.path(), &sub, BIN), &opts(true)).unwrap();
+    assert!(sub.join(".cursor/hooks.json").exists());
+    install_agent(Agent::Cursor, &c, &opts(false)).unwrap();
+}
+
+#[test]
+fn a_shared_agents_md_block_stays_while_another_agent_uses_it() {
+    let home = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let c = ctx(home.path(), proj.path(), BIN);
+    // Gemini reads AGENTS.md in this project — the same file as Codex.
+    write_json(
+        &proj.path().join(".gemini/settings.json"),
+        &json!({"context": {"fileName": "AGENTS.md"}}),
+    );
+    let agents_md = proj.path().join("AGENTS.md");
+    write(&agents_md, "# Rules\n");
+    install_agent(Agent::Codex, &c, &opts(true)).unwrap();
+    install_agent(Agent::GeminiCli, &c, &opts(true)).unwrap();
+    let text = std::fs::read_to_string(&agents_md).unwrap();
+    assert_eq!(text.matches(MD_MARKERS.begin).count(), 1, "{text}");
+
+    // Uninstalling Codex keeps the block Gemini still reads…
+    let r = uninstall_agent(Agent::Codex, &c, true, false).unwrap();
+    assert!(
+        r.lines
+            .iter()
+            .any(|l| l.contains("kept (gemini-cli still uses it)")),
+        "{:?}",
+        r.lines
+    );
+    assert!(
+        std::fs::read_to_string(&agents_md)
+            .unwrap()
+            .contains(MD_MARKERS.begin)
+    );
+    // …and uninstalling Gemini (the last user) removes it.
+    uninstall_agent(Agent::GeminiCli, &c, true, false).unwrap();
+    assert_eq!(std::fs::read_to_string(&agents_md).unwrap(), "# Rules\n");
+
+    // The other order, via uninstall all: the block goes as well.
+    install_agent(Agent::Codex, &c, &opts(true)).unwrap();
+    install_agent(Agent::GeminiCli, &c, &opts(true)).unwrap();
+    uninstall_all(&c, true, false);
+    assert_eq!(std::fs::read_to_string(&agents_md).unwrap(), "# Rules\n");
+}
