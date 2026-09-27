@@ -6,6 +6,7 @@
 //! home, binary, command runner), so tests run the whole flow on a temp HOME against an
 //! in-process server without touching the real environment, launchctl or systemctl.
 
+use anyhow::Context;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -301,7 +302,9 @@ pub fn run_setup(opts: &SetupOptions, env: &SetupEnv) -> SetupReport {
     };
 
     // 3. Service
-    if state.client_only {
+    if state.client_only && state.retired_server {
+        retire_service_step(opts, env, &state.cfg, &mut r);
+    } else if state.client_only {
         r.push(
             Mark::Skip,
             "service",
@@ -351,6 +354,32 @@ struct ConfigState {
     client_only: bool,
     /// config.toml exists (false only in a dry run that would create it).
     exists: bool,
+    /// `--client-only` dropped this machine's own `[server]` (it had been a server).
+    retired_server: bool,
+}
+
+/// Backup of a former server machine's config.toml, next to it (SPEC-M2 §11 step 2).
+pub const SERVER_CONFIG_BACKUP: &str = "config.toml.server-bak";
+
+/// Copies config.toml (it holds the server token) to `backup`, 0600.
+fn backup_config(config_path: &Path, backup: &Path) -> anyhow::Result<()> {
+    let old = std::fs::read_to_string(config_path)
+        .with_context(|| format!("reading {}", config_path.display()))?;
+    kioku_core::util::write_private_file(backup, &old)
+        .with_context(|| format!("writing {}", backup.display()))
+}
+
+/// True when `url` is this machine's own server: a loopback host on `[server] port`.
+fn points_at_own_server(url: &str, cfg: &Config) -> bool {
+    let Ok(u) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let host = u.host_str().unwrap_or_default().trim_matches(['[', ']']);
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    loopback && u.port_or_known_default() == Some(cfg.server.port)
 }
 
 fn config_step(
@@ -392,6 +421,11 @@ fn config_step(
             );
             return None;
         }
+        // A former server machine switching to another server: retire its [server].
+        let retire_server = config_path.exists()
+            && has_server_section(config_path)
+            && !points_at_own_server(url, &cfg);
+        let backup = config_dir.join(SERVER_CONFIG_BACKUP);
         if opts.dry_run {
             r.push(
                 Mark::Ok,
@@ -401,8 +435,23 @@ fn config_step(
                     config_path.display()
                 ),
             );
+            if retire_server {
+                r.push(
+                    Mark::Ok,
+                    "config",
+                    format!("would drop [server] (backup: {})", backup.display()),
+                );
+            }
         } else {
-            match Config::write_client_only(config_path, url, token) {
+            let written = if retire_server {
+                backup_config(config_path, &backup).and_then(|()| {
+                    Config::write_client_only_dropping_server(config_path, url, token)
+                        .map_err(anyhow::Error::from)
+                })
+            } else {
+                Config::write_client_only(config_path, url, token).map_err(anyhow::Error::from)
+            };
+            match written {
                 Ok(written) => {
                     cfg.client = written.client;
                     r.push(
@@ -410,6 +459,16 @@ fn config_step(
                         "config",
                         format!("{} (client-only -> {url})", config_path.display()),
                     );
+                    if retire_server {
+                        r.push(
+                            Mark::Ok,
+                            "config",
+                            format!(
+                                "dropped this machine's [server] (backup: {})",
+                                backup.display()
+                            ),
+                        );
+                    }
                 }
                 Err(e) => {
                     r.push(Mark::Fail, "config", format!("{e:#}"));
@@ -422,6 +481,7 @@ fn config_step(
             cfg,
             client_only: true,
             exists: !opts.dry_run,
+            retired_server: retire_server,
         });
     }
 
@@ -453,6 +513,7 @@ fn config_step(
                 cfg,
                 client_only: false,
                 exists: false,
+                retired_server: false,
             });
         }
         return match kioku_core::init(&mut cfg) {
@@ -471,6 +532,7 @@ fn config_step(
                     cfg,
                     client_only: false,
                     exists: true,
+                    retired_server: false,
                 })
             }
             Err(e) => {
@@ -501,6 +563,7 @@ fn config_step(
             cfg,
             client_only: true,
             exists: true,
+            retired_server: false,
         });
     }
     let has_token = cfg
@@ -553,7 +616,52 @@ fn config_step(
         cfg,
         client_only: false,
         exists: true,
+        retired_server: false,
     })
+}
+
+/// A former server machine that became a client: its own kioku service would keep serving
+/// stale data (and make doctor treat the machine as a server) — remove it; data stays.
+fn retire_service_step(opts: &SetupOptions, env: &SetupEnv, cfg: &Config, r: &mut SetupReport) {
+    let manager = env.service_manager(&cfg.data_dir);
+    let server = &cfg.client.server_url;
+    if !manager.is_installed() {
+        r.push(
+            Mark::Skip,
+            "service",
+            format!("client-only machine (server at {server})"),
+        );
+        return;
+    }
+    if opts.dry_run {
+        r.push(
+            Mark::Ok,
+            "service",
+            format!(
+                "would remove this machine's {} (now a client of {server})",
+                manager.describe()
+            ),
+        );
+        return;
+    }
+    match manager.uninstall() {
+        Ok(_) => r.push(
+            Mark::Ok,
+            "service",
+            format!(
+                "removed this machine's {} (now a client of {server}; data in {} kept)",
+                manager.describe(),
+                cfg.data_dir.display()
+            ),
+        ),
+        Err(e) => r.push(
+            Mark::Warn,
+            "service",
+            format!(
+                "could not remove this machine's kioku service: {e:#}; run kioku service uninstall"
+            ),
+        ),
+    }
 }
 
 fn service_step(opts: &SetupOptions, env: &SetupEnv, cfg: &Config, r: &mut SetupReport) {

@@ -1079,6 +1079,19 @@ Non-interactive (safe under `curl … | sh`); every step idempotent. Order:
    its result is the `auth` line, and step 4 is not repeated. Otherwise: if `config.toml` is missing → `kioku init`
    (with `--bind` written to `[server] bind` when given); if present → keep
    (token never replaced); if it has only `[client]` → treat as client-only.
+   **Former server machine** (added 2026-09-28): `--client-only <url>` on a
+   config.toml that has a `[server]` section, where `<url>` is not this
+   machine's own server (a loopback host on `[server] port`):
+   - the file is copied to `config.toml.server-bak` (0600);
+   - config.toml is rewritten with `[client]` only;
+   - the summary adds `config  dropped this machine's [server] (backup: …)`;
+   - step 3 removes this machine's installed kioku service
+     (`service  removed this machine's <service> (now a client of <url>; data
+     in <dir> kept)`).
+
+   A leftover `[server]` made doctor treat the client as a server machine,
+   and a leftover service kept serving stale data. The data dir is never
+   touched. Found when moving a Mac's kioku to a Mac mini.
 3. **Service** (full mode, unless `--no-service`) — if `GET <server_url>/api/v1/health`
    already answers and no kioku service is installed → "server already running
    (Docker/k3s?), not installing a service". If something non-kioku owns the

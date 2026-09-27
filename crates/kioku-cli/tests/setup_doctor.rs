@@ -388,6 +388,75 @@ fn fake_systemd_with_server(home: PathBuf, port: u16) -> Runner {
     })
 }
 
+/// A former server machine joining another server: its [server] is dropped (backup kept),
+/// its own service removed, its data left alone (SPEC-M2 §11 step 2).
+#[test]
+fn setup_client_only_retires_a_former_server() {
+    let (base, _server) = test_server();
+    let (home, bin) = home_with_agents(false);
+    let kioku = home.path().join(".kioku");
+    std::fs::create_dir_all(kioku.join("wiki")).unwrap();
+    std::fs::write(kioku.join("wiki/page.md"), "# 以前の記憶\n").unwrap();
+    let own_port = free_port();
+    let config = kioku.join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[server]\nbind = \"127.0.0.1\"\nport = {own_port}\nauth_token = \"old-server-token-0123456789\"\n\n[client]\nserver_url = \"http://127.0.0.1:{own_port}\"\nauth_token = \"old-server-token-0123456789\"\n"
+        ),
+    )
+    .unwrap();
+    let unit = home.path().join(".config/systemd/user/kioku.service");
+    std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    std::fs::write(&unit, "[Unit]\n").unwrap();
+    let runner = Runner::recording(|_| CmdOutput::ok(""));
+    let env = setup_env(home.path(), &bin, HashMap::new(), runner.clone());
+
+    let r = run_setup(
+        &SetupOptions {
+            client_only: Some((base.clone(), TOKEN.into())),
+            no_agents: true,
+            ..SetupOptions::default()
+        },
+        &env,
+    );
+    assert_eq!(r.exit_code(), 0, "{}", r.render());
+    let backup = kioku.join("config.toml.server-bak");
+    let lines = r.summary_lines();
+    assert!(
+        lines.contains(&format!(
+            "  ok  config      dropped this machine's [server] (backup: {})",
+            backup.display()
+        )),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with(
+            "  ok  service     removed this machine's systemd kioku.service (now a client of"
+        )),
+        "{lines:?}"
+    );
+    let text = std::fs::read_to_string(&config).unwrap();
+    assert!(!text.contains("[server]") && text.contains(&base), "{text}");
+    assert!(
+        std::fs::read_to_string(&backup)
+            .unwrap()
+            .contains("old-server-token")
+    );
+    assert!(!unit.exists(), "service definition removed");
+    assert_eq!(
+        std::fs::read_to_string(kioku.join("wiki/page.md")).unwrap(),
+        "# 以前の記憶\n",
+        "data kept"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+}
+
 #[test]
 fn setup_installs_the_service_and_polls_health() {
     let (home, bin) = home_with_agents(false);

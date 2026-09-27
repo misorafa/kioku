@@ -215,6 +215,24 @@ impl Config {
         Ok(config)
     }
 
+    /// Writes a client-only config.toml pointing at `server_url`, dropping any `[server]`
+    /// section: the machine becomes a client of another server (SPEC-M2 §11 step 2).
+    pub fn write_client_only_dropping_server(
+        path: &Path,
+        server_url: &str,
+        token: &str,
+    ) -> Result<Config> {
+        let mut config = Config::load_file(path)?;
+        config.client.server_url = server_url.to_string();
+        config.client.auth_token = Some(token.to_string());
+        let text = toml::to_string_pretty(&ClientOnlyFile {
+            client: &config.client,
+        })
+        .context("serializing client config")?;
+        write_file(path, &text)?;
+        Ok(config)
+    }
+
     /// True when `server.bind` is a loopback address.
     pub fn is_loopback_bind(&self) -> bool {
         let b = self.server.bind.trim();
