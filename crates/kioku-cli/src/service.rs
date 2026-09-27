@@ -809,16 +809,26 @@ impl ServiceManager {
     }
 
     /// launchd: `kickstart -k` a loaded job (kills and restarts it in place), bootstraps an
-    /// unloaded one. Returns true when the job was already loaded.
+    /// unloaded one. Returns true when the job was already loaded. A job still being torn
+    /// down by a just-issued `bootout` (`service stop` then `start`) still answers `print`
+    /// but refuses `kickstart`: it is bootstrapped again instead (with the retries).
     fn launchd_start_or_restart(&self) -> anyhow::Result<bool> {
         let uid = self.uid()?;
         let svc = format!("gui/{uid}/{LAUNCHD_LABEL}");
         if self.runner.run(&["launchctl", "print", &svc]).success {
             let out = self.runner.run(&["launchctl", "kickstart", "-k", &svc]);
-            if !out.success {
-                anyhow::bail!("launchctl kickstart -k {svc} failed: {}", out.stderr.trim());
+            if out.success {
+                return Ok(true);
             }
-            return Ok(true);
+            let path = self.definition_path().unwrap_or_default();
+            self.launchd_bootstrap(&uid, &path).with_context(|| {
+                format!(
+                    "launchctl kickstart -k {svc} failed ({})",
+                    out.stderr.trim()
+                )
+            })?;
+            let _ = self.runner.run(&["launchctl", "enable", &svc]);
+            return Ok(false);
         }
         let path = self.definition_path().unwrap_or_default();
         self.launchd_bootstrap(&uid, &path)?;

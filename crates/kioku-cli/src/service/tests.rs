@@ -381,6 +381,33 @@ fn launchd_commands() {
         ]
     );
 
+    // Regression: `stop` then `start` — the job is still torn down (print answers, kickstart
+    // fails with an empty message): fall back to bootstrap instead of failing.
+    let tearing = Runner::recording(|argv| {
+        let cmd = argv.join(" ");
+        if cmd == "id -u" {
+            CmdOutput::ok("501\n")
+        } else if cmd.starts_with("launchctl kickstart") {
+            CmdOutput::default()
+        } else {
+            CmdOutput::ok("")
+        }
+    });
+    let mut t = m.clone();
+    t.runner = tearing.clone();
+    let act = t.start().unwrap();
+    assert!(act.lines[0].starts_with("started"), "{:?}", act.lines);
+    assert_eq!(
+        argv(&tearing.calls()),
+        [
+            "id -u".to_string(),
+            "launchctl print gui/501/dev.kioku.serve".into(),
+            "launchctl kickstart -k gui/501/dev.kioku.serve".into(),
+            format!("launchctl bootstrap gui/501 {}", plist.display()),
+            "launchctl enable gui/501/dev.kioku.serve".into(),
+        ]
+    );
+
     // A changed plist while loaded: bootout, then bootstrap (the new plist is read only then).
     runner.clear_calls();
     let mut moved = m.clone();
