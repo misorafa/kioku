@@ -231,8 +231,12 @@ No enablement or trust check (none exists in agy).
 
 1. ~~Transcript format / timing~~ — resolved by A7 (§3.5).
 2. `executionNum` scope (§3.7). The A7 run never reached Stop: `agy -p` hit a
-   permission check on its first write and ended without a Stop event —
-   capture Stop from an interactive `agy` session.
+   permission check on its first write and ended without a Stop event. An
+   interactive agy 1.2.12 session (2026-09-27, 46 tool uses) then showed the
+   whole loop working — the `continue` nudge reached the model, it called
+   `kioku_handoff_write`, and the next Stop finalized the session (our marker
+   guard) — but hook_dump was off, so the Stop payload itself is still
+   uncaptured.
 3. Whether SessionStart output can inject context (not needed: the
    PreInvocation `ephemeralMessage` reached the model in A7 — it shows up in
    the transcript as an `EPHEMERAL_MESSAGE` step and the model acted on it).
