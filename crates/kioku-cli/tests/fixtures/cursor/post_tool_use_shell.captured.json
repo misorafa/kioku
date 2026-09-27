@@ -1,0 +1,23 @@
+{
+  "conversation_id": "30a74989-858a-4c1f-b8b8-53e227d502d1",
+  "generation_id": "30a74989-858a-4c1f-b8b8-53e227d502d1",
+  "model": "default",
+  "tool_name": "Shell",
+  "tool_input": {
+    "command": "mkdir -p notes && printf 'kioku probe\\n' > hello.txt && printf '%s\\n' '- [ ] 次にやること: なし' > notes/todo.md && ls -la hello.txt notes/todo.md && cat hello.txt notes/todo.md",
+    "cwd": "",
+    "timeout": 30000
+  },
+  "tool_output": "{\"output\":\"-rw-r--r--@ 1 me  staff  12 Sep 27 19:46 hello.txt\\n-rw-r--r--@ 1 me  staff  33 Sep 27 19:46 notes/todo.md\\nkioku probe\\n- [ ] 次にやること: なし\\n\",\"exitCode\":0}",
+  "duration": 1002.269,
+  "tool_use_id": "9cbab02c-cd55-41a8-99ce-b7f3fa618a3e",
+  "cwd": "",
+  "session_id": "30a74989-858a-4c1f-b8b8-53e227d502d1",
+  "hook_event_name": "postToolUse",
+  "cursor_version": "2026.09.26-dd393fe",
+  "workspace_roots": [
+    "/Users/me/src/kioku"
+  ],
+  "user_email": "me@example.com",
+  "transcript_path": "/Users/me/.cursor/projects/Users-me-src-kioku/agent-transcripts/30a74989-858a-4c1f-b8b8-53e227d502d1/30a74989-858a-4c1f-b8b8-53e227d502d1.jsonl"
+}

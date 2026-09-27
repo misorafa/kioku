@@ -1,0 +1,14 @@
+{
+  "conversation_id": "30a74989-858a-4c1f-b8b8-53e227d502d1",
+  "generation_id": "30a74989-858a-4c1f-b8b8-53e227d502d1",
+  "model": "default",
+  "is_background_agent": false,
+  "session_id": "30a74989-858a-4c1f-b8b8-53e227d502d1",
+  "hook_event_name": "sessionStart",
+  "cursor_version": "2026.09.26-dd393fe",
+  "workspace_roots": [
+    "/Users/me/src/kioku"
+  ],
+  "user_email": "me@example.com",
+  "transcript_path": null
+}

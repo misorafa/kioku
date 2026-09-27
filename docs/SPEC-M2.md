@@ -1407,13 +1407,13 @@ systemctl.
 | 2 | Codex hook trust key format / hash input in `[hooks.state]` | §4.1, §12 | doctor always WARNs "confirm /hooks" |
 | 3 | ~~Codex `tool_response` shape for Bash~~ — resolved: a plain string (stdout); `apply_patch` still UNVERIFIED. Captured extras per event: `model`, `permission_mode` (all), `turn_id` (all but SessionStart/End), `last_assistant_message` (Stop), `source: "resume"` on SessionStart. Fixtures: `tests/fixtures/codex/*.captured.json` | §4.3 | normalizer accepts any JSON |
 | 4 | Cursor hook default timeout ("platform default") | §5.2 | kioku sets explicit timeouts |
-| 5 | Cursor: are common fields (`conversation_id`, `workspace_roots`) on every event; is `cwd` present beyond pre/postToolUse | §5.3 | resolution order §3.4 |
+| 5 | ~~Cursor common fields / `cwd`~~ — resolved 2026-09-27 (`cursor-agent -p` 2026.09.26): `conversation_id`, `session_id` (same value), `workspace_roots`, `cursor_version`, `user_email`, `model`, `generation_id` on sessionStart, postToolUse and sessionEnd; `cwd` only on postToolUse and there **empty** (`""`, also `tool_input.cwd`), so the root-first order of §3.4 is required; `transcript_path` is null on sessionStart; env adds `CURSOR_TRANSCRIPT_PATH`. That headless run fired **no** beforeSubmitPrompt or stop — sessionEnd (`reason`/`final_status: "completed"`) finalizes. Fixtures: `tests/fixtures/cursor/*.captured.json` | §5.3 | resolution order §3.4 |
 | 6 | Cursor `Read` tool `tool_input` key for the path | §3.5 | tries `file_path`/`path`/`target_file`/`filePath` |
 | 7 | Cursor sessionStart `additional_context` reaching the model (reported broken, U9) | §5.4 | late context §5.6 |
 | 8 | Cursor `loop_count` scope (per turn vs per conversation) | §5.4 | at most one nudge per conversation if cumulative |
-| 9 | Payload Cursor sends to imported Claude Code hooks; whether it also imports `~/.claude.json` MCP servers | §3.7, §5.5 | sniff accepts both shapes; duplicate MCP tolerated |
+| 9 | ~~Payload Cursor sends to imported Claude Code hooks~~ — resolved: the native Cursor payload (camelCase `hook_event_name`, `conversation_id`), so the §3.7 sniff fires and, with native hooks installed, the Claude-side run is silent (verified live). MCP import from `~/.claude.json` still UNVERIFIED | §3.7, §5.5 | sniff accepts both shapes; duplicate MCP tolerated |
 | 10 | Gemini `run_shell_command` `tool_response` text | §6.3 | digest uses command + `error` only |
-| 11 | Gemini / Cursor tolerance of empty stdout (kioku prints `{}` anyway) | §3.6 | always print valid JSON |
+| 11 | Gemini / Cursor tolerance of empty stdout (kioku prints `{}` anyway) — Cursor: resolved, the imported Claude hooks print nothing and the run completes normally; Gemini moot for personal accounts (SPEC-M2.1) | §3.6 | always print valid JSON |
 | 12 | musl cross-build of rusqlite(bundled)+lindera | §13.1 | pin gnu builds to ubuntu-22.04 |
 | 13 | ~~GitHub repo slug~~ — resolved in Step 4: `misorafa/kioku` | §13.2 | `KIOKU_REPO` / `--repo` still override it |
 | 14 | ~~Does `KIOKU_HOOK_DUMP` reach Codex hooks?~~ — resolved: no. Codex passes only a core env (`CODEX_MANAGED_BY_NPM`, `CODEX_MANAGED_PACKAGE_ROOT` were the only extras seen), so the env switch never arrives; use `[client] hook_dump = true` (`scripts/probe-agents.sh` does this) | §3.8 | config key |

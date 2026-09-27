@@ -833,3 +833,34 @@ fn antigravity_ids_and_cwd_fallbacks() {
     );
     assert!(parse_event_env(Agent::Antigravity, Stop, "{}", &HookEnv::default()).is_err());
 }
+
+/// Real Cursor CLI payloads (2026.09.26, `cursor-agent -p`): `cwd` is present but empty on
+/// postToolUse (top level and in `tool_input`), so the workspace root decides; `tool_output`
+/// is a JSON string; Claude-Code-imported hooks get the same native payload (SPEC-M2 §18 5, 9).
+#[test]
+fn cursor_captured_payloads() {
+    use HookEventKind::*;
+    let dir = format!("{}/tests/fixtures/cursor", env!("CARGO_MANIFEST_DIR"));
+    let read = |name: &str| std::fs::read_to_string(format!("{dir}/{name}.captured.json")).unwrap();
+    let tool = read("post_tool_use_shell");
+    let ev = parse_event(Agent::Cursor, PostToolUse, &tool).unwrap();
+    assert_eq!(ev.raw["cwd"], "");
+    assert_eq!(ev.cwd, ROOT);
+    assert_eq!(ev.tool_name.as_deref(), Some("Bash"));
+    assert_eq!(ev.tool_response.as_ref().unwrap()["exitCode"], 0);
+    assert!(
+        ev.tool_response.as_ref().unwrap()["output"]
+            .as_str()
+            .unwrap()
+            .contains("次にやること")
+    );
+    for name in ["session_start", "post_tool_use_shell", "session_end"] {
+        let raw: Value = serde_json::from_str(&read(name)).unwrap();
+        assert!(raw["conversation_id"].is_string(), "{name}");
+        assert!(raw["workspace_roots"].is_array(), "{name}");
+        assert!(
+            crate::hook::is_cursor_invocation(&raw),
+            "{name}: sniffed as Cursor"
+        );
+    }
+}
