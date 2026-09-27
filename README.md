@@ -123,6 +123,12 @@ including an older one; `kioku update --check` exits 10 when a newer release
 exists), or by re-running the one-liner (the next `kioku setup` restarts a
 service still running the old version).
 
+On macOS, never overwrite the installed binary with `cp` onto the existing file:
+the kernel caches the old code signature and kills the new binary (SIGKILL,
+"zsh: killed"). Remove it first — `rm ~/.cargo/bin/kioku && cp target/release/kioku ~/.cargo/bin/` —
+then `kioku service stop && kioku service start`. `kioku update` and
+`cargo install` already replace the file this way.
+
 ## `kioku setup`
 
 ```

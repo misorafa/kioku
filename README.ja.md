@@ -114,6 +114,11 @@ curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh
 で終わります）、または 1 行のコマンドをもう一度実行します（古いバージョンのまま動いているサービスは、
 次の `kioku setup` が再起動します）。
 
+macOS では、インストール済みのバイナリに `cp` で上書きしないでください。カーネルが古いコード署名を
+キャッシュしているため、新しいバイナリが SIGKILL で落ちます（"zsh: killed"）。先に消してからコピーし
+（`rm ~/.cargo/bin/kioku && cp target/release/kioku ~/.cargo/bin/`）、`kioku service stop && kioku service start`
+で再起動します。`kioku update` と `cargo install` は最初からこの方法で置き換えます。
+
 ## `kioku setup`
 
 ```
