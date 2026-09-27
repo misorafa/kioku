@@ -114,7 +114,7 @@ rm -f "$REL"/v9.9.5/*.sha256
 # ---------------------------------------------------------------- server
 
 cat >"$WORK/server.py" <<'EOF'
-import functools, http.server, os, sys
+import functools, http.server, os, socketserver, sys
 
 root, portfile = sys.argv[1], sys.argv[2]
 
@@ -157,7 +157,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if not self.route():
             super().do_HEAD()
 
-srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Handler, directory=root))
+class Server(http.server.ThreadingHTTPServer):
+    # HTTPServer.server_bind calls socket.getfqdn(), a reverse DNS lookup that takes
+    # ~35 s on macOS (and CI's macOS runners): skip it, the name is never used.
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "127.0.0.1"
+        self.server_port = self.server_address[1]
+
+srv = Server(("127.0.0.1", 0), functools.partial(Handler, directory=root))
 with open(portfile + ".tmp", "w") as f:
     f.write(str(srv.server_address[1]))
 os.rename(portfile + ".tmp", portfile)
@@ -211,7 +219,7 @@ newhome() {
 }
 
 # inst <uname_s> <uname_m> [install.sh args…] -> OUT, RC (runs in $H with HOME=$H).
-# Knobs: T_PATH, T_BASE, T_SHELL, FAKE_UID.
+# Knobs: T_PATH, T_BASE, T_SHELL, FAKE_UID, FAKE_CARGO_VERSION (cleared after each call).
 inst() {
     i_s=$1
     i_m=$2
@@ -220,6 +228,9 @@ inst() {
     OUT=$(cd "$H" && env HOME="$H" SHELL="${T_SHELL:-/bin/zsh}" PATH="${T_PATH:-$FAKEBIN:$PATH0}" \
         FAKE_UID="${FAKE_UID:-1000}" KIOKU_DOWNLOAD_BASE="${T_BASE:-$BASE}" \
         KIOKU_UNAME_S="$i_s" KIOKU_UNAME_M="$i_m" "$TEST_SH" "$ROOT/install.sh" "$@" 2>&1) || RC=$?
+    # `KNOB=x inst …` is scoped to the call in dash, but bash in POSIX mode (macOS /bin/sh)
+    # keeps the assignment afterwards: clear the knobs so they never leak into later tests.
+    unset T_PATH T_BASE T_SHELL FAKE_UID FAKE_CARGO_VERSION
 }
 BIN() { printf '%s' "$H/.local/bin/kioku"; }
 installed_is() { [ -x "$(BIN)" ] && "$(BIN)" --version | grep -F -- "$1" >/dev/null; }
@@ -388,6 +399,8 @@ if command -v wget >/dev/null 2>&1; then
             [ "$b" = curl ] || [ -e "$NOCURL/$b" ] || ln -s "$f" "$NOCURL/$b"
         done
     done
+    # wget may live outside those dirs (Homebrew on Apple silicon: /opt/homebrew/bin).
+    [ -e "$NOCURL/wget" ] || ln -s "$(command -v wget)" "$NOCURL/wget"
     newhome
     T_PATH="$FAKEBIN:$NOCURL" inst Linux x86_64 --no-setup
     check "wget only: latest + download + verify" eval '[ "$RC" = 0 ] && installed_is "9.9.9 (x86_64-unknown-linux-musl)"'
