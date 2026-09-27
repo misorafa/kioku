@@ -314,6 +314,14 @@ impl Handler<'_> {
     /// prompt / tool_use / compact observation, with implicit start on an unknown session.
     fn record(&self) -> anyhow::Result<HookResult> {
         let implicit_block = self.post_observation(self.ev)?;
+        if self.agent == Agent::Antigravity
+            && self.ev.event == HookEventKind::PostToolUse
+            && let Some(d) = marker_dir(self.agent, self.cfg, self.env)
+        {
+            // This agy fires tool events: stop estimating tool rounds (M2.1 §3.7).
+            let _ = kioku_core::util::create_private_dir(&d);
+            let _ = std::fs::write(d.join(tools_marker_name(&self.ev.session_id)), "");
+        }
         match self.ev.event {
             HookEventKind::UserPromptSubmit => {
                 // Claude / Codex / Gemini show it now; Cursor renders `{"continue":true}`
@@ -388,7 +396,10 @@ impl Handler<'_> {
             .get("invocationNum")
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        if round > 0 {
+        let real_tools = dir
+            .as_ref()
+            .is_some_and(|d| d.join(tools_marker_name(&self.ev.session_id)).exists());
+        if round > 0 && !real_tools {
             let mut ev = self.ev.clone();
             ev.event = HookEventKind::PostToolUse;
             ev.tool_name = Some(ANTIGRAVITY_TOOL_ROUND.to_string());
@@ -579,6 +590,26 @@ fn ctx_marker_name(agent: Agent, session_id: &str) -> String {
     }
 }
 
+/// `<id>.tools`: this conversation has sent a real PostToolUse (agy ≥ 1.2.12).
+fn tools_marker_name(session_id: &str) -> String {
+    format!("{}.tools", marker_name(session_id))
+}
+
+/// The user's text of an agy USER_INPUT step: the `<USER_REQUEST>` element when present
+/// (agy appends `<ADDITIONAL_METADATA>` etc. after it), else the whole content.
+pub fn user_request(content: &str) -> String {
+    const OPEN: &str = "<USER_REQUEST>";
+    const CLOSE: &str = "</USER_REQUEST>";
+    match content.find(OPEN) {
+        Some(start) => {
+            let rest = &content[start + OPEN.len()..];
+            let body = rest.find(CLOSE).map_or(rest, |end| &rest[..end]);
+            body.trim().to_string()
+        }
+        None => content.to_string(),
+    }
+}
+
 /// Tool name recorded for an Antigravity model call after the first of a turn (M2.1 §3.7).
 pub const ANTIGRAVITY_TOOL_ROUND: &str = "tool_round";
 
@@ -612,7 +643,7 @@ pub fn last_user_input(path: &Path) -> Option<(String, u64)> {
             None => None,
         };
         if let Some(t) = text {
-            found = Some((t, end));
+            found = Some((user_request(&t), end));
         }
     }
     found
@@ -963,6 +994,22 @@ mod tests {
         let filler = format!("{model}\n").repeat(TRANSCRIPT_TAIL_BYTES as usize / model.len() + 1);
         std::fs::write(&big, format!("{first}\n{filler}")).unwrap();
         assert_eq!(last_user_input(&big), None);
+    }
+
+    #[test]
+    fn user_request_is_cut_out_of_the_captured_transcript() {
+        let path = std::path::PathBuf::from(format!(
+            "{}/tests/fixtures/antigravity/transcript.captured.jsonl",
+            env!("CARGO_MANIFEST_DIR")
+        ));
+        let (text, _) = last_user_input(&path).unwrap();
+        assert!(
+            text.starts_with("このリポジトリ直下に hello.txt を作って"),
+            "{text}"
+        );
+        assert!(text.ends_with("終了してください。"), "{text}");
+        assert_eq!(user_request("素のテキスト"), "素のテキスト");
+        assert_eq!(user_request("<USER_REQUEST>\n途中で切れた"), "途中で切れた");
     }
 
     fn fixture_text(rel: &str) -> String {

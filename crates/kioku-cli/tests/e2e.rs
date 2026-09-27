@@ -807,7 +807,8 @@ fn antigravity_lifecycle() {
     // 2. First model call: the prompt comes from the transcript, the block via injectSteps.
     transcript_step(
         &transcript,
-        json!({"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "引き継ぎを読んで続きをやって"}),
+        json!({"type": "USER_INPUT", "source": "USER_EXPLICIT",
+               "content": "<USER_REQUEST>\n引き継ぎを読んで続きをやって\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-09-27T19:52:14+09:00.\n</ADDITIONAL_METADATA>"}),
     );
     let block = context_of(a, &invoke(0)).expect("late context on the first model call");
     assert!(
@@ -855,6 +856,23 @@ fn antigravity_lifecycle() {
     assert_silent(a, HookEventKind::UserPromptSubmit, &invoke(0));
     assert_silent(a, HookEventKind::UserPromptSubmit, &invoke(0));
     assert_eq!(info()["counts"]["prompts"], 2);
+
+    // agy ≥ 1.2.12 fires PostToolUse: from then on real tool uses count, not rounds.
+    let tool = with(
+        fixture_payload(a, "post_tool_use", sid, cwd),
+        json!({ "transcriptPath": tr }),
+    );
+    assert_silent(
+        a,
+        HookEventKind::PostToolUse,
+        &run(&cfg, &env, a, HookEventKind::PostToolUse, &tool),
+    );
+    assert_silent(a, HookEventKind::UserPromptSubmit, &invoke(1));
+    let i = info();
+    assert_eq!(
+        i["counts"]["tool_uses"], 4,
+        "one PostToolUse, no extra round: {i}"
+    );
 
     // 6. A conversation SessionStart never announced: the first model call starts it.
     let out = run(

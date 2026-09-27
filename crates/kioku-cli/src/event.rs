@@ -405,9 +405,34 @@ pub fn parse_antigravity(
 ) -> anyhow::Result<HookEvent> {
     let mut ev = common(Agent::Antigravity, event, raw, env, &["conversationId"])?;
     if let Some(call) = ev.raw.get("toolCall").cloned() {
-        ev.tool_name = text(&call, "name");
-        ev.native_tool = ev.tool_name.clone();
-        ev.tool_input = call.get("args").cloned();
+        let native = text(&call, "name");
+        let args = call.get("args").cloned();
+        let arg = |key: &str| args.as_ref().and_then(|a| text(a, key));
+        // M2.1 §3.3: `view_file` is verified (agy 1.2.12); the others follow the same
+        // argument naming and are UNVERIFIED — unknown tools keep their name and input.
+        let (name, input) = match native.as_deref() {
+            Some("view_file") => (
+                "Read",
+                arg("AbsolutePath").map(|p| json!({ "file_path": p })),
+            ),
+            Some("write_to_file") => (
+                "Write",
+                arg("TargetFile").map(|p| json!({ "file_path": p })),
+            ),
+            Some("replace_file_content" | "multi_replace_file_content") => {
+                ("Edit", arg("TargetFile").map(|p| json!({ "file_path": p })))
+            }
+            Some("run_command") => ("Bash", arg("CommandLine").map(|c| json!({ "command": c }))),
+            _ => ("", None),
+        };
+        if name.is_empty() || input.is_none() {
+            ev.tool_name = native.clone();
+            ev.tool_input = args;
+        } else {
+            ev.tool_name = Some(name.to_string());
+            ev.tool_input = input;
+        }
+        ev.native_tool = native;
     }
     if event == HookEventKind::PostToolUse {
         ev.tool_response = Some(match text(&ev.raw, "error") {

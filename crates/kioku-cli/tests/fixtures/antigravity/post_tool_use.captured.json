@@ -1,0 +1,19 @@
+{
+  "artifactDirectoryPath": "/Users/me/.gemini/antigravity-cli/brain/67bebad1-47ef-4464-804c-96b971a54e37",
+  "conversationId": "67bebad1-47ef-4464-804c-96b971a54e37",
+  "error": "",
+  "modelName": "gemini-3.8-flash-high",
+  "stepIdx": 3,
+  "toolCall": {
+    "args": {
+      "AbsolutePath": "/Users/me/.gemini/antigravity-cli/mcp/kioku/kioku_handoff_write.json",
+      "toolAction": "Viewing schema",
+      "toolSummary": "View kioku_handoff_write schema"
+    },
+    "name": "view_file"
+  },
+  "transcriptPath": "/Users/me/.gemini/antigravity-cli/brain/67bebad1-47ef-4464-804c-96b971a54e37/.system_generated/logs/transcript_full.jsonl",
+  "workspacePaths": [
+    "/Users/me/src/kioku"
+  ]
+}

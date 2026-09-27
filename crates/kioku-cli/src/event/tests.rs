@@ -796,9 +796,42 @@ fn antigravity_fixtures() {
         assert!(!ev.stop_hook_active);
     }
     let ev = antigravity_fixture(PostToolUse, "post_tool_use", &env);
-    assert_eq!(ev.tool_name.as_deref(), Some("run_command"));
+    assert_eq!(ev.tool_name.as_deref(), Some("Bash"));
     assert_eq!(ev.native_tool.as_deref(), Some("run_command"));
-    assert_eq!(ev.tool_input, Some(json!({"CommandLine": "cargo test"})));
+    assert_eq!(ev.tool_input, Some(json!({"command": "cargo test"})));
+    assert_eq!(ev.tool_response, Some(json!({})));
+}
+
+/// Real agy 1.2.12 payloads (SPEC-M2.1 §7): PostToolUse fires, `view_file` → Read.
+#[test]
+fn antigravity_captured_payloads() {
+    use HookEventKind::*;
+    let dir = format!("{}/tests/fixtures/antigravity", env!("CARGO_MANIFEST_DIR"));
+    let read = |name: &str| std::fs::read_to_string(format!("{dir}/{name}.captured.json")).unwrap();
+    for (kind, name) in [
+        (SessionStart, "session_start"),
+        (UserPromptSubmit, "pre_invocation"),
+        (PostToolUse, "post_tool_use"),
+    ] {
+        let ev = parse_event(Agent::Antigravity, kind, &read(name)).unwrap();
+        assert_eq!(ev.session_id, "67bebad1-47ef-4464-804c-96b971a54e37");
+        assert_eq!(ev.cwd, ROOT, "{name}");
+        assert!(
+            ev.raw["transcriptPath"]
+                .as_str()
+                .unwrap()
+                .ends_with("transcript_full.jsonl")
+        );
+    }
+    let ev = parse_event(Agent::Antigravity, PostToolUse, &read("post_tool_use")).unwrap();
+    assert_eq!(ev.tool_name.as_deref(), Some("Read"));
+    assert_eq!(ev.native_tool.as_deref(), Some("view_file"));
+    assert_eq!(
+        ev.tool_input,
+        Some(
+            json!({"file_path": "/Users/me/.gemini/antigravity-cli/mcp/kioku/kioku_handoff_write.json"})
+        )
+    );
     assert_eq!(ev.tool_response, Some(json!({})));
 }
 

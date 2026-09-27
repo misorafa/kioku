@@ -25,6 +25,7 @@ state under `~/.gemini`).
 | A4 | Rules doc | https://antigravity.google/docs/rules/ |
 | A5 | Live capture of agy 1.2.7 (macOS arm64, 2026-09-20): COMPATIBILITY.md + fixtures | https://github.com/automatis-tools/agents-can-communicate PR #181 (`packages/adapter-antigravity/`), issue #177 |
 | A6 | claude-mem migration (settings.json hooks ignored; transcript format) | https://github.com/thedotmack/claude-mem/issues/4057, /issues/4196 |
+| A7 | **Our own capture**, agy 1.2.12 (macOS arm64, 2026-09-27, `scripts/probe-agents.sh antigravity`) | `crates/kioku-cli/tests/fixtures/antigravity/*.captured.json(l)` |
 
 A2 and A5 disagree; **A5 (a real capture) wins**. Everything marked
 UNVERIFIED must be checked with `sh scripts/probe-agents.sh antigravity`.
@@ -39,14 +40,14 @@ UNVERIFIED must be checked with `sh scripts/probe-agents.sh antigravity`.
 
 agy 1.2.7 loads exactly SessionStart, PreInvocation, PostInvocation and Stop
 (A5); SessionEnd, PreToolUse, PostToolUse and Gemini names are silently
-dropped. A2 documents Pre/PostToolUse, so kioku registers PostToolUse too
-(dropped today, picked up if a later build fires it).
+dropped. A2 documents Pre/PostToolUse, so kioku registers PostToolUse too —
+and **agy 1.2.12 does fire it** (A7).
 
 | neutral | Antigravity | notes |
 |---|---|---|
 | `session-start` | SessionStart | fires once per conversation (A5) |
 | `user-prompt-submit` | PreInvocation | fires **once per model call** (a turn with two tool rounds fires three times, `invocationNum` 0,1,2); there is no prompt field — see §3.5 |
-| `post-tool-use` | PostToolUse (`matcher: "*"`) | documented (A2), not fired by 1.2.7 |
+| `post-tool-use` | PostToolUse (`matcher: "*"`) | fired by 1.2.12 (A7), not by 1.2.7 (A5) |
 | `stop` | Stop | end of every execution (turn) |
 | `pre-compact` | — | none |
 | `session-end` | — | none; Stop finalizes per turn (M2 behaviour) |
@@ -63,7 +64,7 @@ prompt field** (A5):
  "artifactDirectoryPath":"…","modelName":"gemini-3.8-flash-high"}
 // PreInvocation / PostInvocation: + "invocationNum":0, "initialNumSteps":0
 // Stop: + "executionNum":0, "terminationReason":"NO_TOOL_CALL", "error":"", "fullyIdle":true
-// PostToolUse (A2 only, UNVERIFIED): + "toolCall":{"name":…,"args":{…}}, "stepIdx":3, "error":""
+// PostToolUse (A7): + "toolCall":{"name":"view_file","args":{"AbsolutePath":…,"toolAction":…,"toolSummary":…}}, "stepIdx":3, "error":""
 ```
 
 - Session id: `conversationId`, then env `ANTIGRAVITY_CONVERSATION_ID` (the
@@ -76,9 +77,20 @@ prompt field** (A5):
   repository). Otherwise the event is dropped and logged, as for Cursor.
   `workspacePaths` is `[]` for `agy -p` without `--add-dir` (A5): those runs
   are not recorded — documented limitation.
-- Tool events: `toolCall.name` is kept as the tool name, `toolCall.args` as the
-  input, a non-empty `error` → `{is_error: true, error}`. Native tool names are
-  UNVERIFIED, so there is no normalization table yet.
+- `transcriptPath` names `…/logs/transcript_full.jsonl` in 1.2.12 (A7;
+  `transcript.jsonl` next to it has the same steps).
+- Tool events: a non-empty `error` → `{is_error: true, error}`; `toolCall.name`
+  is normalized like M2 §3.5, the native name kept as `native_tool`:
+
+  | native | → | input |
+  |---|---|---|
+  | `view_file` (verified, A7) | `Read` | `{file_path: args.AbsolutePath}` |
+  | `write_to_file` | `Write` | `{file_path: args.TargetFile}` |
+  | `replace_file_content`, `multi_replace_file_content` | `Edit` | `{file_path: args.TargetFile}` |
+  | `run_command` | `Bash` | `{command: args.CommandLine}` |
+
+  All but `view_file` are UNVERIFIED (same argument style as the verified
+  one); any other tool, or a missing argument, keeps the native name and args.
 
 ### 3.4 Output (A2, A5)
 
@@ -94,7 +106,11 @@ stdout is always exactly one JSON object and the exit code is always 0.
 
 PreInvocation has no prompt, so kioku reads it from `transcriptPath` (A6):
 JSONL, one step per line; a user prompt is a line with `"type":"USER_INPUT"`
-and the text in `content` (a string; `content.text` accepted too). On every
+and the text in `content` (a string; `content.text` accepted too). Verified
+(A7): `content` wraps the text as `<USER_REQUEST>\n…\n</USER_REQUEST>`
+followed by `<ADDITIONAL_METADATA>` / `<USER_SETTINGS_CHANGE>` elements; kioku
+records only the `<USER_REQUEST>` body (the whole content when the tag is
+absent). The first PreInvocation (`invocationNum` 0) already sees the line. On every
 PreInvocation kioku reads at most the last 256 KiB, takes the **last**
 USER_INPUT line, and records it as a prompt observation only if its end offset
 is past the offset stored in `<kioku dir>/state/antigravity/<id>.prompt` (then
@@ -119,8 +135,9 @@ The Stop nudge (M1 §7.1) needs ≥ 3 tool uses since the last handoff, and agy
 previous model call ran tools, so kioku records it as one tool use named
 `tool_round` (`native_tool: "PreInvocation"`, input `{invocationNum}`). It
 counts toward the threshold and the session's tool total; the digest lists no
-files or commands for it. If a later agy fires PostToolUse, both are counted —
-acceptable, revisit then.
+files or commands for it. Once a conversation sends a real PostToolUse (agy
+1.2.12 does, A7) kioku writes `<kioku dir>/state/antigravity/<id>.tools` and
+stops recording rounds for it, so tools are not counted twice.
 
 
 `executionNum` is 1 after a continue, but whether it counts per turn or per
@@ -212,9 +229,15 @@ No enablement or trust check (none exists in agy).
 
 ## 7. UNVERIFIED (resolve with a real capture)
 
-1. Transcript line format for USER_INPUT (§3.5), and whether the prompt is in
-   the transcript before the first PreInvocation.
-2. `executionNum` scope (§3.7).
-3. Whether SessionStart output can inject context.
-4. PostToolUse payload and native tool names (§3.3).
+1. ~~Transcript format / timing~~ — resolved by A7 (§3.5).
+2. `executionNum` scope (§3.7). The A7 run never reached Stop: `agy -p` hit a
+   permission check on its first write and ended without a Stop event —
+   capture Stop from an interactive `agy` session.
+3. Whether SessionStart output can inject context (not needed: the
+   PreInvocation `ephemeralMessage` reached the model in A7 — it shows up in
+   the transcript as an `EPHEMERAL_MESSAGE` step and the model acted on it).
+4. PostToolUse: payload verified (A7); tool names other than `view_file`.
 5. Whether empty stdout / non-zero exit codes are tolerated (kioku avoids both).
+6. An execution that ends in an error fires no Stop, and agy has no
+   SessionEnd: such a session stays open until the next Stop of the same
+   conversation.
