@@ -1,0 +1,4 @@
+# kioku project identity for this repository (README: プロジェクトの識別).
+# Pinned to the id it had before the GitHub remote existed, so earlier memory stays attached.
+project = "ai-agents-shared-memory-02036d30"
+name = "kioku"
