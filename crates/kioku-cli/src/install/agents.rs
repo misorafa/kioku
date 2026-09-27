@@ -102,7 +102,7 @@ impl InstallCtx {
 /// Instruction snippet choice (`--instructions` / `--no-instructions`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Instructions {
-    /// The agent's default (Codex, Gemini CLI: yes; Cursor: `--project` only; Claude: no).
+    /// The agent's default (Codex, Gemini CLI, Antigravity: yes; Cursor: `--project` only; Claude: no).
     #[default]
     Default,
     /// `--no-instructions`.
@@ -186,6 +186,8 @@ pub fn hooks_path(agent: Agent, ctx: &InstallCtx, project: bool) -> PathBuf {
         (Agent::Cursor, true) => ctx.project_root().join(".cursor").join("hooks.json"),
         (Agent::GeminiCli, false) => gemini_user_settings(ctx),
         (Agent::GeminiCli, true) => ctx.project_root().join(".gemini").join("settings.json"),
+        (Agent::Antigravity, false) => antigravity_config_dir(ctx).join("hooks.json"),
+        (Agent::Antigravity, true) => ctx.project_root().join(".agents").join("hooks.json"),
     }
 }
 
@@ -196,21 +198,38 @@ pub fn mcp_path(agent: Agent, ctx: &InstallCtx) -> PathBuf {
         Agent::Codex => ctx.codex_home.join("config.toml"),
         Agent::Cursor => ctx.home.join(".cursor").join("mcp.json"),
         Agent::GeminiCli => gemini_user_settings(ctx),
+        Agent::Antigravity => antigravity_config_dir(ctx).join("mcp_config.json"),
     }
+}
+
+/// `~/.gemini/config`: Antigravity CLI's user hooks, MCP servers and rules (M2.1 §4).
+fn antigravity_config_dir(ctx: &InstallCtx) -> PathBuf {
+    ctx.home.join(".gemini").join("config")
 }
 
 fn gemini_user_settings(ctx: &InstallCtx) -> PathBuf {
     ctx.home.join(".gemini").join("settings.json")
 }
 
-/// Directory whose existence means the agent is installed on this machine (M2 §8.3).
-pub fn detection_dir(agent: Agent, ctx: &InstallCtx) -> PathBuf {
+/// Paths whose existence means the agent is installed on this machine (M2 §8.3, M2.1 §4.4);
+/// the first is the one named when none exists. `~/.gemini` itself is shared by Gemini CLI
+/// and Antigravity, so neither uses it.
+pub fn detection_paths(agent: Agent, ctx: &InstallCtx) -> Vec<PathBuf> {
     match agent {
-        Agent::ClaudeCode => ctx.home.join(".claude"),
-        Agent::Codex => ctx.codex_home.clone(),
-        Agent::Cursor => ctx.home.join(".cursor"),
-        Agent::GeminiCli => ctx.home.join(".gemini"),
+        Agent::ClaudeCode => vec![ctx.home.join(".claude")],
+        Agent::Codex => vec![ctx.codex_home.clone()],
+        Agent::Cursor => vec![ctx.home.join(".cursor")],
+        Agent::GeminiCli => vec![ctx.home.join(".gemini").join("tmp")],
+        Agent::Antigravity => vec![
+            ctx.home.join(".gemini").join("antigravity-cli"),
+            ctx.home.join(".local").join("bin").join("agy"),
+        ],
     }
+}
+
+/// True when the agent is installed on this machine (any [`detection_paths`] entry exists).
+pub fn is_detected(agent: Agent, ctx: &InstallCtx) -> bool {
+    detection_paths(agent, ctx).iter().any(|p| p.exists())
 }
 
 /// Gemini's context file name: `context.fileName` (string or array) when it does not include
@@ -278,6 +297,9 @@ pub fn instruction_files(agent: Agent, ctx: &InstallCtx, project: bool) -> Vec<P
             ]
         }
         (Agent::GeminiCli, true) => vec![ctx.project_root().join(gemini_context_file(ctx, true))],
+        // Global rules (M2.1 §4.3): the same file as Gemini CLI's default — shared-file rule.
+        (Agent::Antigravity, false) => vec![ctx.home.join(".gemini").join("GEMINI.md")],
+        (Agent::Antigravity, true) => vec![ctx.project_root().join("AGENTS.md")],
     }
 }
 
@@ -289,7 +311,7 @@ pub fn wants_instructions(agent: Agent, opts: &InstallOptions) -> bool {
         Instructions::Default => match agent {
             Agent::ClaudeCode => false,
             Agent::Cursor => opts.project,
-            Agent::Codex | Agent::GeminiCli => true,
+            Agent::Codex | Agent::GeminiCli | Agent::Antigravity => true,
         },
     }
 }
@@ -419,6 +441,100 @@ pub fn gemini_specs(bin: &str) -> Vec<HookSpec> {
         .collect()
 }
 
+/// Antigravity CLI hook group kioku owns in `hooks.json` (M2.1 §4.1).
+pub const ANTIGRAVITY_GROUP: &str = "kioku";
+
+/// Antigravity CLI events (M2.1 §3.2): native key, neutral event, tool matcher (tool events
+/// take a `{matcher, hooks}` group, lifecycle events a bare handler).
+pub const ANTIGRAVITY_EVENTS: [(&str, HookEventKind, Option<&str>); 4] = [
+    ("SessionStart", HookEventKind::SessionStart, None),
+    ("PreInvocation", HookEventKind::UserPromptSubmit, None),
+    ("PostToolUse", HookEventKind::PostToolUse, Some("*")),
+    ("Stop", HookEventKind::Stop, None),
+];
+
+/// Antigravity CLI handlers of the `kioku` group (M2.1 §4.1); timeouts in seconds.
+pub fn antigravity_specs(bin: &str) -> Vec<HookSpec> {
+    let a = Agent::Antigravity;
+    ANTIGRAVITY_EVENTS
+        .iter()
+        .map(|&(key, event, matcher)| {
+            let handler = json!({
+                "type": "command",
+                "command": agent_hook_command(a, bin, event),
+                "timeout": secs(a, event),
+            });
+            let entry = match matcher {
+                Some(m) => json!({ "matcher": m, "hooks": [handler] }),
+                None => handler,
+            };
+            HookSpec {
+                key: key.to_string(),
+                entry,
+            }
+        })
+        .collect()
+}
+
+/// Antigravity format: `settings` with the `kioku` group replaced by ours (in place when it
+/// exists); foreign groups are untouched.
+fn merge_group(settings: &Value, specs: &[HookSpec]) -> anyhow::Result<Value> {
+    let mut out = settings.clone();
+    let root = out
+        .as_object_mut()
+        .context("the hook file is not a JSON object")?;
+    let group: Map<String, Value> = specs
+        .iter()
+        .map(|s| (s.key.clone(), json!([s.entry])))
+        .collect();
+    root.insert(ANTIGRAVITY_GROUP.into(), Value::Object(group));
+    Ok(out)
+}
+
+/// Antigravity format: `settings` without the `kioku` group and the number of kioku handlers
+/// it held (at least 1 when the group existed).
+fn remove_group(settings: &Value) -> anyhow::Result<(Value, usize)> {
+    let mut out = settings.clone();
+    let root = out
+        .as_object_mut()
+        .context("the hook file is not a JSON object")?;
+    let Some(group) = root.shift_remove(ANTIGRAVITY_GROUP) else {
+        return Ok((settings.clone(), 0));
+    };
+    let handlers = group
+        .as_object()
+        .map(|g| g.keys().map(|k| hook_commands(&group, k).len()).sum())
+        .unwrap_or(0);
+    Ok((out, handlers.max(1)))
+}
+
+/// kioku hook commands registered under event `key` of a hook map (`hooks` object, or an
+/// Antigravity group): bare handlers and handlers inside `{matcher, hooks}` groups alike.
+pub fn hook_commands(map: &Value, key: &str) -> Vec<String> {
+    let Some(list) = map.get(key).and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    list.iter()
+        .flat_map(|item| match item.get("hooks").and_then(Value::as_array) {
+            Some(inner) => inner.iter().collect::<Vec<_>>(),
+            None => vec![item],
+        })
+        .filter_map(|h| h.get("command").and_then(Value::as_str))
+        .filter(|c| crate::install::is_kioku_command(c))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The object holding an agent's event lists: `hooks`, or Antigravity's `kioku` group.
+pub fn hooks_map(agent: Agent, settings: &Value) -> Option<&Value> {
+    let key = if agent == Agent::Antigravity {
+        ANTIGRAVITY_GROUP
+    } else {
+        "hooks"
+    };
+    settings.get(key)
+}
+
 /// The hook registrations `install` writes for `agent` (one per native event key).
 pub fn hook_specs(agent: Agent, bin: &str) -> Vec<HookSpec> {
     match agent {
@@ -426,6 +542,7 @@ pub fn hook_specs(agent: Agent, bin: &str) -> Vec<HookSpec> {
         Agent::Codex => codex_specs(bin),
         Agent::Cursor => cursor_specs(bin),
         Agent::GeminiCli => gemini_specs(bin),
+        Agent::Antigravity => antigravity_specs(bin),
     }
 }
 
@@ -436,7 +553,9 @@ pub fn is_flat(agent: Agent) -> bool {
 
 /// Our hooks merged into `settings` in the agent's format.
 pub fn merge_agent_hooks(agent: Agent, settings: &Value, bin: &str) -> anyhow::Result<Value> {
-    if is_flat(agent) {
+    if agent == Agent::Antigravity {
+        merge_group(settings, &hook_specs(agent, bin))
+    } else if is_flat(agent) {
         merge_flat(settings, &hook_specs(agent, bin))
     } else {
         merge_nested(settings, &hook_specs(agent, bin))
@@ -445,7 +564,9 @@ pub fn merge_agent_hooks(agent: Agent, settings: &Value, bin: &str) -> anyhow::R
 
 /// `settings` without our hooks, in the agent's format, and the number removed.
 pub fn remove_agent_hooks(agent: Agent, settings: &Value) -> anyhow::Result<(Value, usize)> {
-    if is_flat(agent) {
+    if agent == Agent::Antigravity {
+        remove_group(settings)
+    } else if is_flat(agent) {
         remove_flat(settings)
     } else {
         remove_hooks(settings)
@@ -470,6 +591,16 @@ fn bearer(ctx: &InstallCtx) -> Option<Value> {
 /// Cursor `mcpServers.kioku` (M2 §5.5): `{url, headers}`, no `type`.
 pub fn cursor_mcp_entry(ctx: &InstallCtx) -> Value {
     let mut v = json!({ "url": mcp_url(&ctx.client) });
+    if let Some(h) = bearer(ctx) {
+        v["headers"] = h;
+    }
+    v
+}
+
+/// Antigravity CLI `mcpServers.kioku` (M2.1 §4.2): `{serverUrl, headers}` — agy rejects
+/// `url` / `httpUrl`.
+pub fn antigravity_mcp_entry(ctx: &InstallCtx) -> Value {
+    let mut v = json!({ "serverUrl": mcp_url(&ctx.client) });
     if let Some(h) = bearer(ctx) {
         v["headers"] = h;
     }
@@ -665,6 +796,14 @@ pub fn install_agent(
             ));
         }
         Agent::GeminiCli => {}
+        Agent::Antigravity => {
+            r.mcp(register_mcp_entry(
+                &mcp_path(agent, ctx),
+                &antigravity_mcp_entry(ctx),
+                "Antigravity CLI",
+                dry,
+            ));
+        }
         Agent::Codex => {
             let path = mcp_path(agent, ctx);
             let token = ctx.token();
@@ -864,9 +1003,8 @@ pub fn install_all(
         .iter()
         .filter(|a| only.is_empty() || only.contains(a))
         .map(|&agent| {
-            let dir = detection_dir(agent, ctx);
-            let status = if !dir.is_dir() {
-                AllStatus::NotDetected(dir)
+            let status = if !is_detected(agent, ctx) {
+                AllStatus::NotDetected(detection_paths(agent, ctx).swap_remove(0))
             } else {
                 match install_agent(agent, ctx, opts) {
                     Ok(r) if r.changed => AllStatus::Changed(r),

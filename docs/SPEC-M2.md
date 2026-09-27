@@ -637,6 +637,11 @@ duplicate text when Codex's `--project` snippet is there too).
 
 ## 6. Gemini CLI
 
+> **2026-09-27:** Google retired Gemini CLI for personal accounts on
+> 2026-06-18; its successor Antigravity CLI is specified in `SPEC-M2.1.md`,
+> which also moves Gemini CLI detection from `~/.gemini` to `~/.gemini/tmp`
+> (§8.3). This section still applies to Gemini CLI itself.
+
 ### 6.1 Files and enablement (verified, G1/G5)
 
 - Settings layers: `.gemini/settings.json` (project), `~/.gemini/settings.json`

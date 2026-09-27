@@ -413,7 +413,10 @@ fn fixture_payload(agent: Agent, name: &str, sid: &str, cwd: &Path) -> Value {
     );
     let mut v: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let c = cwd.display().to_string();
-    if agent == Agent::Cursor {
+    if agent == Agent::Antigravity {
+        v["conversationId"] = json!(sid);
+        v["workspacePaths"] = json!([c]);
+    } else if agent == Agent::Cursor {
         v["conversation_id"] = json!(sid);
         if v.get("session_id").is_some() {
             v["session_id"] = json!(sid);
@@ -465,6 +468,12 @@ fn context_of(agent: Agent, out: &HookOutcome) -> Option<String> {
                 .and_then(Value::as_str)
                 .map(str::to_string)
         }
+        Agent::Antigravity => {
+            let v: Value = serde_json::from_str(&out.stdout).expect("antigravity stdout is JSON");
+            v.pointer("/injectSteps/0/ephemeralMessage")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        }
     }
 }
 
@@ -490,6 +499,13 @@ fn nudge_of(agent: Agent, out: &HookOutcome) -> String {
             assert_eq!(v["decision"], "deny", "{v}");
             v["reason"].as_str().unwrap().to_string()
         }
+        Agent::Antigravity => {
+            assert_eq!(out.exit_code, 0);
+            assert!(out.stderr.is_empty());
+            let v: Value = serde_json::from_str(&out.stdout).unwrap();
+            assert_eq!(v["decision"], "continue", "{v}");
+            v["reason"].as_str().unwrap().to_string()
+        }
     }
 }
 
@@ -498,7 +514,7 @@ fn assert_silent(agent: Agent, event: HookEventKind, out: &HookOutcome) {
     let want = match agent {
         Agent::ClaudeCode | Agent::Codex => "",
         Agent::Cursor if event == HookEventKind::UserPromptSubmit => "{\"continue\":true}\n",
-        Agent::Cursor | Agent::GeminiCli => "{}\n",
+        Agent::Cursor | Agent::GeminiCli | Agent::Antigravity => "{}\n",
     };
     assert_eq!(out.stdout, want, "{agent:?} {event:?}");
     assert!(out.stderr.is_empty(), "{out:?}");
@@ -545,7 +561,8 @@ fn turn_fixtures(agent: Agent, cwd: &Path) -> (&'static str, Vec<(&'static str, 
                 ),
             ],
         ),
-        Agent::ClaudeCode => unreachable!(),
+        // Antigravity has its own lifecycle test (no prompt or tool events).
+        Agent::ClaudeCode | Agent::Antigravity => unreachable!(),
     }
 }
 
@@ -696,7 +713,7 @@ fn agent_lifecycle(agent: Agent) {
             assert!(body.contains("src/lib.rs"), "{body}");
             assert!(body.contains("cargo build"), "{body}");
         }
-        Agent::ClaudeCode => {}
+        Agent::ClaudeCode | Agent::Antigravity => {}
     }
     // session end is silent too
     let end = fixture_payload(agent, "session_end", &sid, cwd);
@@ -733,6 +750,145 @@ fn cursor_lifecycle() {
 #[test]
 fn gemini_lifecycle() {
     agent_lifecycle(Agent::GeminiCli);
+}
+
+/// Appends one JSONL step to an Antigravity transcript.
+fn transcript_step(path: &Path, step: Value) {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    writeln!(f, "{step}").unwrap();
+}
+
+#[test]
+fn antigravity_lifecycle() {
+    let server = start_server();
+    let client_dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let proj = project_dir();
+    let cwd = proj.path();
+    let cfg = client_config(client_dir.path(), &server.base, TOKEN, &[]);
+    let env = agent_env(home.path());
+    let a = Agent::Antigravity;
+    let sid = "agy-conv-1";
+    let transcript = home.path().join("transcript.jsonl");
+    let tr = transcript.display().to_string();
+    let p = |name: &str, extra: Value| {
+        with(
+            fixture_payload(a, name, sid, cwd),
+            with(json!({ "transcriptPath": tr }), extra),
+        )
+    };
+    let invoke = |n: u64| {
+        run(
+            &cfg,
+            &env,
+            a,
+            HookEventKind::UserPromptSubmit,
+            &p("pre_invocation", json!({ "invocationNum": n })),
+        )
+    };
+    let info = || api_get(&server.base, &format!("sessions/{sid}"));
+
+    // 1. SessionStart starts the session; its reply carries no context (M2.1 §3.4).
+    let out = run(
+        &cfg,
+        &env,
+        a,
+        HookEventKind::SessionStart,
+        &p("session_start", json!({})),
+    );
+    assert_silent(a, HookEventKind::SessionStart, &out);
+    assert_eq!(info()["status"], "open");
+
+    // 2. First model call: the prompt comes from the transcript, the block via injectSteps.
+    transcript_step(
+        &transcript,
+        json!({"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "引き継ぎを読んで続きをやって"}),
+    );
+    let block = context_of(a, &invoke(0)).expect("late context on the first model call");
+    assert!(
+        block.starts_with("<kioku>\nproject: e2e (id: e2e-proj)"),
+        "{block}"
+    );
+    assert!(block.contains(&format!("session: {sid}  ←")), "{block}");
+    // 3. Tool rounds: later model calls are silent, record no prompt again, count a round each.
+    transcript_step(
+        &transcript,
+        json!({"type": "PLANNER_RESPONSE", "source": "MODEL", "content": "テストを実行します"}),
+    );
+    for n in 1..=3 {
+        assert_silent(a, HookEventKind::UserPromptSubmit, &invoke(n));
+    }
+    let i = info();
+    assert_eq!(i["counts"]["prompts"], 1, "{i}");
+    assert_eq!(i["counts"]["tool_uses"], 3, "{i}");
+
+    // 4. Stop → continue nudge; the next Stop (our marker) finalizes without a second one.
+    let stop = p("stop", json!({}));
+    let nudge = nudge_of(a, &run(&cfg, &env, a, HookEventKind::Stop, &stop));
+    assert!(
+        nudge.contains(&format!(
+            "kioku_handoff_write（project=e2e-proj, session={sid}）"
+        )),
+        "{nudge}"
+    );
+    assert_eq!(info()["status"], "open");
+    let out = run(
+        &cfg,
+        &env,
+        a,
+        HookEventKind::Stop,
+        &with(stop.clone(), json!({"executionNum": 1})),
+    );
+    assert_silent(a, HookEventKind::Stop, &out);
+    assert_eq!(info()["status"], "finalized");
+
+    // 5. A new prompt in the same conversation is recorded once more.
+    transcript_step(
+        &transcript,
+        json!({"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": {"text": "テストも追加して"}}),
+    );
+    assert_silent(a, HookEventKind::UserPromptSubmit, &invoke(0));
+    assert_silent(a, HookEventKind::UserPromptSubmit, &invoke(0));
+    assert_eq!(info()["counts"]["prompts"], 2);
+
+    // 6. A conversation SessionStart never announced: the first model call starts it.
+    let out = run(
+        &cfg,
+        &env,
+        a,
+        HookEventKind::UserPromptSubmit,
+        &with(
+            fixture_payload(a, "pre_invocation", "agy-conv-2", cwd),
+            json!({ "transcriptPath": tr }),
+        ),
+    );
+    let block = context_of(a, &out).expect("implicit start block");
+    assert!(block.contains("session: agy-conv-2  ←"), "{block}");
+    assert_eq!(
+        api_get(&server.base, "sessions/agy-conv-2")["counts"]["prompts"],
+        1
+    );
+
+    // 7. No workspacePaths and the hook running in ~/.gemini/config: dropped, not misfiled.
+    let gemini_cfg = home.path().join(".gemini").join("config");
+    let env_cfg = HookEnv {
+        cwd: Some(gemini_cfg),
+        ..env.clone()
+    };
+    let orphan = with(
+        fixture_payload(a, "session_start", "agy-conv-3", cwd),
+        json!({ "workspacePaths": [] }),
+    );
+    let out = run(&cfg, &env_cfg, a, HookEventKind::SessionStart, &orphan);
+    assert_silent(a, HookEventKind::SessionStart, &out);
+    let log = std::fs::read_to_string(client_dir.path().join("logs/hook.log")).unwrap();
+    assert!(log.contains("empty workspacePaths: dropped"), "{log}");
+    assert_eq!(log.lines().count(), 1, "{log}");
 }
 
 #[test]

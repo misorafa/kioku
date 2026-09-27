@@ -1,0 +1,11 @@
+{
+    "conversationId": "0b1f7c2e-5d3a-4e8b-9c61-2f4a8d7e1b90",
+    "workspacePaths": [
+        "/Users/me/src/kioku"
+    ],
+    "transcriptPath": "/Users/me/.gemini/antigravity-cli/brain/0b1f7c2e-5d3a-4e8b-9c61-2f4a8d7e1b90/.system_generated/logs/transcript.jsonl",
+    "artifactDirectoryPath": "/Users/me/.gemini/antigravity-cli/brain/0b1f7c2e-5d3a-4e8b-9c61-2f4a8d7e1b90",
+    "modelName": "gemini-3.8-flash-high",
+    "invocationNum": 0,
+    "initialNumSteps": 0
+}

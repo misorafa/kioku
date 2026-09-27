@@ -1,7 +1,7 @@
-//! Per-agent output rendering (M2 §3.6): handlers return a neutral [`HookResult`];
+//! Per-agent output rendering (M2 §3.6, M2.1 §3.4): handlers return a neutral [`HookResult`];
 //! [`render`] turns it into what the agent expects on stdout / stderr / exit code.
 //!
-//! Invariants (tested): Gemini and Cursor stdout is always exactly one JSON object; Codex
+//! Invariants (tested): Gemini, Antigravity and Cursor stdout is always exactly one JSON object; Codex
 //! never prints plain text on a Stop that exits 0; Cursor never exits 2.
 
 use serde_json::{Value, json};
@@ -65,6 +65,17 @@ pub fn render(agent: Agent, event: HookEventKind, result: HookResult) -> HookOut
                 (UserPromptSubmit, HookResult::Context(t)) => json!({
                     "hookSpecificOutput": { "hookEventName": "BeforeAgent", "additionalContext": t }
                 }),
+                _ => json!({}),
+            };
+            json_outcome(body)
+        }
+        Agent::Antigravity => {
+            let body = match (event, result) {
+                (Stop, HookResult::Nudge(m)) => json!({ "decision": "continue", "reason": m }),
+                // PreInvocation (M2.1 §3.4); SessionStart context is undocumented → `{}`.
+                (UserPromptSubmit, HookResult::Context(t)) => {
+                    json!({ "injectSteps": [{ "ephemeralMessage": t }] })
+                }
                 _ => json!({}),
             };
             json_outcome(body)
@@ -203,13 +214,39 @@ mod tests {
     }
 
     #[test]
+    fn golden_antigravity() {
+        let a = Agent::Antigravity;
+        assert_eq!(
+            render(a, UserPromptSubmit, ctx()),
+            out(
+                "{\"injectSteps\":[{\"ephemeralMessage\":\"<kioku>\\n引き継ぎ\\n</kioku>\\n\"}]}\n",
+                "",
+                0
+            )
+        );
+        assert_eq!(
+            render(a, Stop, nudge()),
+            out(
+                "{\"decision\":\"continue\",\"reason\":\"kioku: 引き継ぎを書いて\"}\n",
+                "",
+                0
+            )
+        );
+        // SessionStart cannot carry context (undocumented); the block goes out on PreInvocation.
+        assert_eq!(render(a, SessionStart, ctx()), out("{}\n", "", 0));
+        for e in ALL_EVENTS {
+            assert_eq!(render(a, e, HookResult::Silent), out("{}\n", "", 0));
+        }
+    }
+
+    #[test]
     fn invariants_over_every_cell() {
         for a in ALL_AGENTS {
             for e in ALL_EVENTS {
                 for r in [HookResult::Silent, ctx(), nudge()] {
                     let o = render(a, e, r.clone());
                     match a {
-                        Agent::Cursor | Agent::GeminiCli => {
+                        Agent::Cursor | Agent::GeminiCli | Agent::Antigravity => {
                             let v: Value = serde_json::from_str(&o.stdout)
                                 .unwrap_or_else(|_| panic!("{a:?} {e:?} {r:?}: {}", o.stdout));
                             assert!(v.is_object());

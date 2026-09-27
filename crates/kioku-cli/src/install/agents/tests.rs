@@ -76,10 +76,10 @@ fn mode(path: &Path) -> u32 {
     std::fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
 
-/// All hook commands of ours in a hook file, per event key.
-fn our_commands(v: &Value) -> BTreeMap<String, Vec<String>> {
+/// All hook commands of ours in an agent's hook file, per event key.
+fn our_commands(agent: Agent, v: &Value) -> BTreeMap<String, Vec<String>> {
     let mut out = BTreeMap::new();
-    let Some(hooks) = v.get("hooks").and_then(Value::as_object) else {
+    let Some(hooks) = hooks_map(agent, v).and_then(Value::as_object) else {
         return out;
     };
     for (key, list) in hooks {
@@ -163,6 +163,20 @@ fn seed_foreign(agent: Agent, c: &InstallCtx, project: bool) {
                 write_json(&hooks, &v);
             }
         }
+        Agent::Antigravity => {
+            // Another tool's named group (Orca's, as seen on a real machine).
+            write_json(
+                &hooks,
+                &json!({"orca-status": {
+                    "Stop": [{"type": "command", "command": "./audit.sh", "timeout": 10}],
+                    "PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "guard.sh"}]}]
+                }}),
+            );
+            write_json(
+                &mcp_path(agent, c),
+                &json!({"mcpServers": {"github": {"serverUrl": "https://api.githubcopilot.com/mcp/"}}}),
+            );
+        }
     }
     for path in instruction_files(agent, c, project).into_iter().take(1) {
         if path.extension().is_none_or(|e| e != "mdc") {
@@ -193,7 +207,7 @@ fn roundtrip(agent: Agent, project: bool) {
     let r = install_agent(agent, &c, &o).unwrap();
     assert!(r.changed, "{agent:?}: {:?}", r.lines);
     let v = read_json(&hooks);
-    let ours = our_commands(&v);
+    let ours = our_commands(agent, &v);
     let expected_keys: Vec<String> = hook_specs(agent, BIN).into_iter().map(|s| s.key).collect();
     assert_eq!(ours.len(), expected_keys.len(), "{agent:?} {ours:?}");
     for cmds in ours.values() {
@@ -270,7 +284,7 @@ fn roundtrip(agent: Agent, project: bool) {
             .iter()
             .all(|l| !l.contains("backup of the original"))
     );
-    let ours = our_commands(&read_json(&hooks));
+    let ours = our_commands(agent, &read_json(&hooks));
     assert_eq!(ours.len(), expected_keys.len());
     for cmds in ours.values() {
         assert_eq!(cmds.len(), 1);
@@ -650,7 +664,13 @@ fn invalid_json_is_untouched_and_the_snippet_reported() {
 #[test]
 fn dry_run_writes_nothing() {
     let home = tempfile::tempdir().unwrap();
-    for d in [".claude", ".codex", ".cursor", ".gemini"] {
+    for d in [
+        ".claude",
+        ".codex",
+        ".cursor",
+        ".gemini/tmp",
+        ".gemini/antigravity-cli",
+    ] {
         std::fs::create_dir_all(home.path().join(d)).unwrap();
     }
     let c = ctx(home.path(), home.path(), BIN);
@@ -677,10 +697,10 @@ fn dry_run_writes_nothing() {
 
 #[test]
 fn install_all_detects_agents_by_directory() {
-    // Only ~/.codex and ~/.gemini exist → exactly those are installed.
+    // Only ~/.codex and Gemini CLI's ~/.gemini/tmp exist → exactly those are installed.
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join(".codex")).unwrap();
-    std::fs::create_dir_all(home.path().join(".gemini")).unwrap();
+    std::fs::create_dir_all(home.path().join(".gemini/tmp")).unwrap();
     let c = ctx(home.path(), home.path(), BIN);
     let results = install_all(&c, &opts(false), &[]);
     let summary: Vec<(Agent, &str)> = results
@@ -704,6 +724,7 @@ fn install_all_detects_agents_by_directory() {
             (Agent::Codex, "installed"),
             (Agent::Cursor, "skipped"),
             (Agent::GeminiCli, "installed"),
+            (Agent::Antigravity, "skipped"),
         ]
     );
     assert!(!home.path().join(".claude").exists());
@@ -733,9 +754,15 @@ fn install_all_detects_agents_by_directory() {
     );
     assert!(snapshot(empty.path()).is_empty());
 
-    // All four present.
+    // All five present.
     let full = tempfile::tempdir().unwrap();
-    for d in [".claude", ".codex", ".cursor", ".gemini"] {
+    for d in [
+        ".claude",
+        ".codex",
+        ".cursor",
+        ".gemini/tmp",
+        ".gemini/antigravity-cli",
+    ] {
         std::fs::create_dir_all(full.path().join(d)).unwrap();
     }
     let cf = ctx(full.path(), full.path(), BIN);
@@ -757,11 +784,82 @@ fn install_all_detects_agents_by_directory() {
 }
 
 #[test]
+fn gemini_and_antigravity_are_told_apart() {
+    // The Antigravity desktop app alone (`~/.gemini/antigravity`, a GEMINI.md): neither CLI.
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".gemini/antigravity")).unwrap();
+    write(&home.path().join(".gemini/GEMINI.md"), "# rules\n");
+    let c = ctx(home.path(), home.path(), BIN);
+    assert!(!is_detected(Agent::GeminiCli, &c));
+    assert!(!is_detected(Agent::Antigravity, &c));
+    // `agy` installed by its script but never run yet.
+    write(&home.path().join(".local/bin/agy"), "");
+    assert!(is_detected(Agent::Antigravity, &c));
+    assert!(!is_detected(Agent::GeminiCli, &c));
+    // Gemini CLI has been used (its chat store).
+    std::fs::create_dir_all(home.path().join(".gemini/tmp")).unwrap();
+    assert!(is_detected(Agent::GeminiCli, &c));
+}
+
+#[test]
+fn antigravity_user_and_project() {
+    roundtrip(Agent::Antigravity, false);
+    roundtrip(Agent::Antigravity, true);
+}
+
+#[test]
+fn antigravity_exact_group_next_to_a_foreign_one() {
+    let home = tempfile::tempdir().unwrap();
+    let c = ctx(home.path(), home.path(), BIN);
+    let hooks = home.path().join(".gemini/config/hooks.json");
+    let orca = json!({"PreInvocation": [{"type": "command", "command": "orca.sh", "timeout": 10}]});
+    write_json(&hooks, &json!({ "orca-status": orca }));
+    install_agent(Agent::Antigravity, &c, &opts(false)).unwrap();
+    let cmd = |e: &str| format!("{BIN} hook {e} --agent antigravity");
+    let v = read_json(&hooks);
+    // Only named groups at the top level: agy drops the whole file otherwise (M2.1 §4.1).
+    assert_eq!(
+        v.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["orca-status", "kioku"]
+    );
+    assert_eq!(v["orca-status"], orca);
+    assert_eq!(
+        v["kioku"],
+        json!({
+            "SessionStart": [{"type": "command", "command": cmd("session-start"), "timeout": 10}],
+            "PreInvocation": [{"type": "command", "command": cmd("user-prompt-submit"), "timeout": 5}],
+            "PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": cmd("post-tool-use"), "timeout": 5}]}],
+            "Stop": [{"type": "command", "command": cmd("stop"), "timeout": 10}]
+        })
+    );
+    let mcp = home.path().join(".gemini/config/mcp_config.json");
+    assert_eq!(
+        read_json(&mcp),
+        json!({"mcpServers": {"kioku": {"serverUrl": "http://127.0.0.1:7391/mcp",
+            "headers": {"Authorization": format!("Bearer {TOKEN}")}}}})
+    );
+    #[cfg(unix)]
+    assert_eq!(mode(&mcp), 0o600);
+    // The legacy desktop-app MCP file is never touched.
+    assert!(
+        !home
+            .path()
+            .join(".gemini/antigravity/mcp_config.json")
+            .exists()
+    );
+    let t = std::fs::read_to_string(home.path().join(".gemini/GEMINI.md")).unwrap();
+    assert!(t.contains("kioku_handoff_write"), "{t}");
+
+    uninstall_agent(Agent::Antigravity, &c, false, false).unwrap();
+    assert_eq!(read_json(&hooks), json!({ "orca-status": orca }));
+}
+
+#[test]
 fn install_all_continues_past_a_failing_agent() {
     let home = tempfile::tempdir().unwrap();
     let c = ctx(home.path(), home.path(), BIN);
     write(&home.path().join(".codex/hooks.json"), "not json");
-    std::fs::create_dir_all(home.path().join(".gemini")).unwrap();
+    std::fs::create_dir_all(home.path().join(".gemini/tmp")).unwrap();
     let results = install_all(&c, &opts(false), &[]);
     let codex = &results.iter().find(|(a, _)| *a == Agent::Codex).unwrap().1;
     assert!(matches!(codex, AllStatus::Error(e) if e.contains("not valid JSON")));

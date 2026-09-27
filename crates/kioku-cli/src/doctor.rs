@@ -18,11 +18,11 @@ use crate::client::{ApiClient, http_status, is_local_url};
 use crate::dump::{dump_enabled, dump_path};
 use crate::event::{ALL_AGENTS, Agent, HookEnv};
 use crate::install::agents::{
-    GEMINI_EVENTS, InstallCtx, InstallOptions, detection_dir, hook_specs, hooks_path,
-    instruction_files, is_flat, mcp_path, unstable_binary_warning, wants_instructions,
+    GEMINI_EVENTS, InstallCtx, InstallOptions, hook_commands, hook_specs, hooks_map, hooks_path,
+    instruction_files, is_detected, mcp_path, unstable_binary_warning, wants_instructions,
 };
 use crate::install::block::{self, MD_MARKERS};
-use crate::install::{is_kioku_command, mcp_url, read_settings};
+use crate::install::{mcp_url, read_settings};
 use crate::service::{Health, Platform, Runner, probe_health};
 use crate::setup::{VERSION, codex_trust_recorded};
 
@@ -227,7 +227,7 @@ pub fn run_doctor(env: &DoctorEnv, only: Option<Agent>) -> Vec<Check> {
         None => ALL_AGENTS
             .iter()
             .copied()
-            .filter(|a| detection_dir(*a, &ctx).is_dir())
+            .filter(|a| is_detected(*a, &ctx))
             .collect(),
     };
     for agent in &agents {
@@ -733,28 +733,10 @@ fn service_check(env: &DoctorEnv, cfg: &Config, health: &Health) -> Check {
 // ---------------------------------------------------------------------------------------
 
 /// Our hook commands under one event key (nested or flat format).
-fn our_commands_at(settings: &Value, key: &str, flat: bool) -> Vec<String> {
-    let Some(list) = settings
-        .get("hooks")
-        .and_then(|h| h.get(key))
-        .and_then(Value::as_array)
-    else {
-        return Vec::new();
-    };
-    let handlers: Vec<&Value> = if flat {
-        list.iter().collect()
-    } else {
-        list.iter()
-            .filter_map(|g| g.get("hooks").and_then(Value::as_array))
-            .flatten()
-            .collect()
-    };
-    handlers
-        .into_iter()
-        .filter_map(|h| h.get("command").and_then(Value::as_str))
-        .filter(|c| is_kioku_command(c))
-        .map(str::to_string)
-        .collect()
+fn our_commands_at(agent: Agent, settings: &Value, key: &str) -> Vec<String> {
+    hooks_map(agent, settings)
+        .map(|m| hook_commands(m, key))
+        .unwrap_or_default()
 }
 
 /// The binary part of a hook command (`"/a b/kioku" hook stop` → `/a b/kioku`).
@@ -808,21 +790,18 @@ fn hooks_check(agent: Agent, ctx: &InstallCtx) -> Check {
             return check(&id, Status::Warn, format!("{e:#}"), fix);
         }
     };
-    let flat = is_flat(agent);
     let specs = hook_specs(agent, &ctx.bin);
     let mut missing = Vec::new();
     let mut bins = Vec::new();
     for spec in &specs {
-        let expected = if flat {
-            spec.entry.get("command").and_then(Value::as_str)
-        } else {
-            spec.entry["hooks"][0]
-                .get("command")
-                .and_then(Value::as_str)
-        }
-        .map(command_suffix)
-        .unwrap_or_default();
-        let found: Vec<String> = our_commands_at(&settings, &spec.key, flat)
+        let expected = spec
+            .entry
+            .get("command")
+            .or_else(|| spec.entry["hooks"][0].get("command"))
+            .and_then(Value::as_str)
+            .map(command_suffix)
+            .unwrap_or_default();
+        let found: Vec<String> = our_commands_at(agent, &settings, &spec.key)
             .into_iter()
             .filter(|c| command_suffix(c) == expected)
             .collect();
@@ -908,10 +887,10 @@ fn mcp_entry(agent: Agent, path: &Path) -> anyhow::Result<Option<(String, Option
     let Some(e) = v.get("mcpServers").and_then(|m| m.get("kioku")) else {
         return Ok(None);
     };
-    let url_key = if agent == Agent::GeminiCli {
-        "httpUrl"
-    } else {
-        "url"
+    let url_key = match agent {
+        Agent::GeminiCli => "httpUrl",
+        Agent::Antigravity => "serverUrl",
+        _ => "url",
     };
     let url = e.get(url_key).and_then(Value::as_str).unwrap_or_default();
     let auth = e
@@ -1098,17 +1077,18 @@ fn cursor_duplicate_check(ctx: &InstallCtx) -> Option<Check> {
         .flatten()?;
     let claude_installed = crate::event::ALL_EVENTS
         .iter()
-        .any(|e| !our_commands_at(&claude, e.claude_code_name(), false).is_empty());
-    if !claude_installed || !detection_dir(Agent::Cursor, ctx).is_dir() {
+        .any(|e| !our_commands_at(Agent::ClaudeCode, &claude, e.claude_code_name()).is_empty());
+    if !claude_installed || !is_detected(Agent::Cursor, ctx) {
         return None;
     }
     let native = read_settings(&hooks_path(Agent::Cursor, ctx, false))
         .ok()
         .flatten()
         .is_some_and(|v| {
-            v.get("hooks")
-                .and_then(Value::as_object)
-                .is_some_and(|h| h.keys().any(|k| !our_commands_at(&v, k, true).is_empty()))
+            v.get("hooks").and_then(Value::as_object).is_some_and(|h| {
+                h.keys()
+                    .any(|k| !our_commands_at(Agent::Cursor, &v, k).is_empty())
+            })
         });
     Some(if native {
         check(

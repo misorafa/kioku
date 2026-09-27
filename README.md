@@ -202,7 +202,7 @@ starts per 60 s). `serve.log` rotates at 10 MiB (`.1`–`.3` kept).
 ## Agents
 
 `kioku setup` installs every detected agent; `kioku install <agent>` installs
-one (`claude-code`, `codex`, `cursor`, `gemini-cli`, or `all`), and `kioku
+one (`claude-code`, `codex`, `cursor`, `gemini-cli`, `antigravity`, or `all`), and `kioku
 uninstall <agent>` removes exactly what kioku added. Common to all:
 
 - hooks run `<absolute path of kioku> hook <event> --agent <agent>`, so they
@@ -272,6 +272,11 @@ session (`postToolUse`; file edits and failed tools cannot carry it;
 
 ### Gemini CLI
 
+Google retired Gemini CLI for personal accounts on 2026-06-18 (it still serves
+Code Assist Standard/Enterprise and paid API keys); its successor is
+Antigravity CLI, below. Gemini CLI is detected by `~/.gemini/tmp`, not by
+`~/.gemini`, which Antigravity creates too.
+
 | what | where |
 |------|-------|
 | hooks (named `kioku-*`) | `hooks` in `~/.gemini/settings.json` (`--project`: `<repo>/.gemini/settings.json`) |
@@ -283,6 +288,26 @@ in `hooksConfig.disabled`); doctor checks both. Project hooks show Gemini's
 one-time warning before they first run. If `context.fileName` makes Gemini
 read `AGENTS.md` (shared with Codex), uninstalling one of the two keeps the
 kioku block while the other is still installed.
+
+### Antigravity CLI
+
+`agy` (detected by `~/.gemini/antigravity-cli` or `~/.local/bin/agy`; the
+desktop app alone does not count). Details and sources: `docs/SPEC-M2.1.md`.
+
+| what | where |
+|------|-------|
+| hooks (the named group `kioku`) | `~/.gemini/config/hooks.json` (`--project`: `<repo>/.agents/hooks.json`) |
+| MCP | `mcpServers.kioku` with `serverUrl` in `~/.gemini/config/mcp_config.json` |
+| instructions | a delimited kioku block in `~/.gemini/GEMINI.md` (`--project`: `<repo>/AGENTS.md`) |
+
+agy loads only SessionStart, PreInvocation, PostInvocation and Stop, and its
+payloads carry neither the prompt nor a cwd. So kioku reads each new prompt
+from the conversation transcript, delivers the handoff on the first model
+call of a conversation (`injectSteps`), counts later model calls of a turn as
+tool rounds for the Stop nudge, and takes the project from `workspacePaths`.
+`agy -p` without `--add-dir` sends no workspace, so such runs are not recorded.
+Other tools' groups in `hooks.json` are kept; check what agy loaded with
+`agy -p "/hooks" --output-format json`.
 
 ## Try it
 

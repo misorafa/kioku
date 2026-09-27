@@ -730,7 +730,7 @@ fn every_agent_rejects_garbage_without_panicking() {
             let ev = parse_event(
                 agent,
                 kind,
-                r#"{"session_id":"s","conversation_id":"s","tool_name":7,"tool_input":"str","tool_output":null,
+                r#"{"session_id":"s","conversation_id":"s","conversationId":"s","tool_name":7,"tool_input":"str","tool_output":null,
                    "workspace_roots":[1,""],"loop_count":-1,"stop_hook_active":"yes","edits":{}}"#,
             )
             .unwrap();
@@ -765,4 +765,71 @@ fn agent_labels_match_value_enum() {
         assert_eq!(Agent::from_str(agent.as_str(), false).unwrap(), agent);
     }
     assert_eq!(Agent::GeminiCli.as_str(), "gemini-cli");
+}
+
+fn antigravity_fixture(kind: HookEventKind, name: &str, env: &HookEnv) -> HookEvent {
+    let path = format!(
+        "{}/tests/fixtures/antigravity/{name}.docs.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let text = std::fs::read_to_string(&path).unwrap();
+    parse_event_env(Agent::Antigravity, kind, &text, env).unwrap()
+}
+
+#[test]
+fn antigravity_fixtures() {
+    use HookEventKind::*;
+    let env = HookEnv::default();
+    for (kind, name) in [
+        (SessionStart, "session_start"),
+        (UserPromptSubmit, "pre_invocation"),
+        (Stop, "stop"),
+        (PostToolUse, "post_tool_use"),
+    ] {
+        let ev = antigravity_fixture(kind, name, &env);
+        assert_eq!(ev.agent, "antigravity");
+        assert_eq!(ev.session_id, "0b1f7c2e-5d3a-4e8b-9c61-2f4a8d7e1b90");
+        assert_eq!(ev.cwd, "/Users/me/src/kioku", "{name}");
+        assert_eq!(ev.workspace_roots, ["/Users/me/src/kioku"]);
+        // No prompt field: PreInvocation prompts come from the transcript (M2.1 §3.5).
+        assert!(ev.prompt.is_none());
+        assert!(!ev.stop_hook_active);
+    }
+    let ev = antigravity_fixture(PostToolUse, "post_tool_use", &env);
+    assert_eq!(ev.tool_name.as_deref(), Some("run_command"));
+    assert_eq!(ev.native_tool.as_deref(), Some("run_command"));
+    assert_eq!(ev.tool_input, Some(json!({"CommandLine": "cargo test"})));
+    assert_eq!(ev.tool_response, Some(json!({})));
+}
+
+#[test]
+fn antigravity_ids_and_cwd_fallbacks() {
+    use HookEventKind::*;
+    let env = HookEnv {
+        vars: [(
+            "ANTIGRAVITY_CONVERSATION_ID".to_string(),
+            "env-conv".to_string(),
+        )]
+        .into(),
+        home: None,
+        cwd: Some("/Users/me/.gemini/config".into()),
+    };
+    // No conversationId → the env variable; no workspacePaths → empty cwd (the handler
+    // refuses the process cwd under ~/.gemini).
+    let ev = parse_event_env(Agent::Antigravity, Stop, r#"{"workspacePaths":[]}"#, &env).unwrap();
+    assert_eq!(ev.session_id, "env-conv");
+    assert_eq!(ev.cwd, "");
+    // A failed tool call.
+    let ev = parse_event_env(
+        Agent::Antigravity,
+        PostToolUse,
+        r#"{"conversationId":"c","toolCall":{"name":"view_file","args":{"AbsolutePath":"/a/b.rs"}},"error":"見つかりません"}"#,
+        &env,
+    )
+    .unwrap();
+    assert_eq!(
+        ev.tool_response,
+        Some(json!({"is_error": true, "error": "見つかりません"}))
+    );
+    assert!(parse_event_env(Agent::Antigravity, Stop, "{}", &HookEnv::default()).is_err());
 }

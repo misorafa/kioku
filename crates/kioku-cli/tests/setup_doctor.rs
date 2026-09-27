@@ -57,7 +57,7 @@ fn free_port() -> u16 {
 /// executable `~/.local/bin/kioku`.
 fn home_with_agents(cursor: bool) -> (tempfile::TempDir, String) {
     let home = tempfile::tempdir().unwrap();
-    let mut dirs = vec![".claude", ".codex", ".gemini"];
+    let mut dirs = vec![".claude", ".codex", ".gemini/tmp"];
     if cursor {
         dirs.push(".cursor");
     }
@@ -135,6 +135,7 @@ fn agent_lines() -> Vec<String> {
         "  !!  codex       open Codex and run /hooks once to trust kioku's hooks",
         "  --  cursor      not detected (~/.cursor missing)",
         "  ok  gemini-cli  hooks + MCP ~/.gemini/settings.json, GEMINI.md",
+        "  --  antigravity not detected (~/.gemini/antigravity-cli missing)",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -570,8 +571,11 @@ fn server_machine() -> Fixture {
     std::fs::write(&unit, manager.render().unwrap()).unwrap();
 
     for (agent, status) in install_all(&fx.ctx(&bin), &InstallOptions::default(), &[]) {
+        use kioku_cli::install::agents::AllStatus;
+        // The fixture home has no Antigravity CLI.
         assert!(
-            matches!(status, kioku_cli::install::agents::AllStatus::Changed(_)),
+            matches!(status, AllStatus::Changed(_))
+                || (agent == Agent::Antigravity && matches!(status, AllStatus::NotDetected(_))),
             "{agent:?}: {status:?}"
         );
     }

@@ -185,7 +185,7 @@ WSL、コンテナ）では、`kioku serve` を自分で動かす方法（また
 ## エージェント
 
 `kioku setup` は検出したすべてのエージェントにインストールします。`kioku install <agent>` は 1 つだけ
-（`claude-code`、`codex`、`cursor`、`gemini-cli`、または `all`）、`kioku uninstall <agent>` は kioku が
+（`claude-code`、`codex`、`cursor`、`gemini-cli`、`antigravity`、または `all`）、`kioku uninstall <agent>` は kioku が
 追加したものだけを正確に取り除きます。共通事項:
 
 - フックは `<kioku の絶対パス> hook <event> --agent <agent>` を実行するので、`PATH` に関係なく動きます
@@ -247,6 +247,10 @@ kioku は各セッションの最初のツール使用時（`postToolUse`。フ�
 
 ### Gemini CLI
 
+Gemini CLI は 2026-06-18 に個人アカウント向けの提供を終了しました（Code Assist Standard/Enterprise と
+有料 API キーでは引き続き使えます）。後継は下の Antigravity CLI です。Gemini CLI の検出には `~/.gemini`
+ではなく `~/.gemini/tmp` を使います（`~/.gemini` は Antigravity も作るため）。
+
 | 内容 | 場所 |
 |------|------|
 | フック（名前は `kioku-*`） | `~/.gemini/settings.json` の `hooks`（`--project`: `<repo>/.gemini/settings.json`） |
@@ -257,6 +261,24 @@ kioku は各セッションの最初のツール使用時（`postToolUse`。フ�
 `kioku-*` の名前がある）が必要です。doctor が両方を確認します。プロジェクトのフックは、初回の実行前に
 Gemini の警告が一度表示されます。`context.fileName` で Gemini が `AGENTS.md`（Codex と共有）を読む
 場合、片方をアンインストールしても、もう片方がインストールされている間は kioku のブロックを残します。
+
+### Antigravity CLI
+
+`agy` です（`~/.gemini/antigravity-cli` か `~/.local/bin/agy` があれば検出。デスクトップアプリだけでは
+検出しません）。詳細と出典は `docs/SPEC-M2.1.md` にあります。
+
+| 内容 | 場所 |
+|------|------|
+| フック（名前付きグループ `kioku`） | `~/.gemini/config/hooks.json`（`--project`: `<repo>/.agents/hooks.json`） |
+| MCP | `~/.gemini/config/mcp_config.json` の `mcpServers.kioku`（`serverUrl`） |
+| 指示 | `~/.gemini/GEMINI.md` の区切られた kioku ブロック（`--project`: `<repo>/AGENTS.md`） |
+
+agy が読み込むのは SessionStart・PreInvocation・PostInvocation・Stop だけで、ペイロードにはプロンプトも
+cwd もありません。そのため kioku は、新しいプロンプトを会話の transcript から読み取り、会話の最初の
+モデル呼び出しで引き継ぎを渡し（`injectSteps`）、同じターンの 2 回目以降のモデル呼び出しを Stop の催促用に
+ツール実行として数え、プロジェクトは `workspacePaths` から決めます。`--add-dir` なしの `agy -p` は
+ワークスペースを送らないため記録されません。`hooks.json` にあるほかのツールのグループはそのまま残ります。
+agy が実際に読み込んだフックは `agy -p "/hooks" --output-format json` で確認できます。
 
 ## 試してみる
 

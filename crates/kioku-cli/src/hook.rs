@@ -6,7 +6,8 @@
 //! [`run_hook_with_env`] additionally takes the environment. Handlers return a neutral
 //! [`HookResult`] which [`render`] turns into the agent's wire format. Besides M1's
 //! behaviour this owns the Cursor sniff (§3.7), implicit session start (§3.9), Cursor late
-//! context (§5.6) and per-agent deadlines (§3.10).
+//! context (§5.6), per-agent deadlines (§3.10) and Antigravity's PreInvocation prompt
+//! capture, late context and Stop guard (M2.1 §3.5–§3.7).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -214,6 +215,9 @@ fn handle(ev: &HookEvent, agent: Agent, cfg: &Config, env: &HookEnv) -> anyhow::
     };
     match ev.event {
         HookEventKind::SessionStart => h.session_start(),
+        HookEventKind::UserPromptSubmit if agent == Agent::Antigravity => {
+            h.antigravity_invocation()
+        }
         HookEventKind::UserPromptSubmit
         | HookEventKind::PostToolUse
         | HookEventKind::PreCompact => h.record(),
@@ -241,9 +245,7 @@ struct Handler<'a> {
 
 impl Handler<'_> {
     fn session_start(&self) -> anyhow::Result<HookResult> {
-        if self.agent == Agent::Cursor
-            && let Some(dir) = cursor_marker_dir(self.cfg, self.env)
-        {
+        if let Some(dir) = marker_dir(self.agent, self.cfg, self.env) {
             cleanup_markers(&dir, CURSOR_MARKER_MAX_AGE);
         }
         let source = self.ev.source.clone().unwrap_or_default();
@@ -292,6 +294,17 @@ impl Handler<'_> {
                 "cursor payload has no cwd / workspace_roots and CURSOR_PROJECT_DIR is unset: dropped"
             );
         }
+        // Antigravity runs hooks in the directory of their hooks.json (M2.1 §3.3): a
+        // workspace `.agents/` identifies the repository, `~/.gemini/config` must not.
+        if self.agent == Agent::Antigravity {
+            let gemini = self.env.home.as_ref().map(|h| h.join(".gemini"));
+            return self
+                .env
+                .cwd
+                .clone()
+                .filter(|c| gemini.as_ref().is_none_or(|g| !c.starts_with(g)))
+                .context("antigravity payload has empty workspacePaths: dropped");
+        }
         self.env
             .cwd
             .clone()
@@ -300,18 +313,7 @@ impl Handler<'_> {
 
     /// prompt / tool_use / compact observation, with implicit start on an unknown session.
     fn record(&self) -> anyhow::Result<HookResult> {
-        let obs = observation_for(self.ev).context("event carries no observation")?;
-        let body = serde_json::to_value(&obs)?;
-        let mut implicit_block = None;
-        if let Err(err) = self.client.post(&["observations"], &body) {
-            if http_status(&err) != Some(404) {
-                return Err(err);
-            }
-            implicit_block = Some(self.start(IMPLICIT_SOURCE)?);
-            self.client
-                .post(&["observations"], &body)
-                .context("retrying the observation after an implicit session start")?;
-        }
+        let implicit_block = self.post_observation(self.ev)?;
         match self.ev.event {
             HookEventKind::UserPromptSubmit => {
                 // Claude / Codex / Gemini show it now; Cursor renders `{"continue":true}`
@@ -323,21 +325,105 @@ impl Handler<'_> {
                     && self.cfg.client.cursor_late_context
                     && cursor_accepts_late_context(self.ev) =>
             {
-                self.cursor_late_context()
+                self.late_context()
             }
             _ => Ok(HookResult::Silent),
         }
     }
 
-    /// First Cursor tool use of a session: the `<kioku>` block via `additional_context`
-    /// (M2 §5.6), exactly once per session thanks to an O_EXCL marker file.
-    fn cursor_late_context(&self) -> anyhow::Result<HookResult> {
-        let Some(dir) = cursor_marker_dir(self.cfg, self.env) else {
+    /// Posts `ev`'s observation; an unknown session is started implicitly (§3.9) and the
+    /// observation retried — the start's `<kioku>` block is returned then.
+    fn post_observation(&self, ev: &HookEvent) -> anyhow::Result<Option<String>> {
+        let obs = observation_for(ev).context("event carries no observation")?;
+        let body = serde_json::to_value(&obs)?;
+        let Err(err) = self.client.post(&["observations"], &body) else {
+            return Ok(None);
+        };
+        if http_status(&err) != Some(404) {
+            return Err(err);
+        }
+        let block = self.start(IMPLICIT_SOURCE)?;
+        self.client
+            .post(&["observations"], &body)
+            .context("retrying the observation after an implicit session start")?;
+        Ok(Some(block))
+    }
+
+    /// Antigravity PreInvocation (M2.1 §3.5, §3.6): records a prompt that is new in the
+    /// transcript, then delivers the `<kioku>` block once per conversation.
+    fn antigravity_invocation(&self) -> anyhow::Result<HookResult> {
+        let dir = marker_dir(self.agent, self.cfg, self.env);
+        let transcript = self
+            .ev
+            .raw
+            .get("transcriptPath")
+            .and_then(Value::as_str)
+            .filter(|p| Path::new(p).is_absolute());
+        let offset_file = dir
+            .as_ref()
+            .map(|d| d.join(format!("{}.prompt", marker_name(&self.ev.session_id))));
+        let seen: u64 = offset_file
+            .as_ref()
+            .and_then(|f| std::fs::read_to_string(f).ok())
+            .and_then(|t| t.trim().parse().ok())
+            .unwrap_or(0);
+        let mut block = None;
+        if let Some((prompt, end)) = transcript
+            .and_then(|p| last_user_input(Path::new(p)))
+            .filter(|&(_, end)| end > seen)
+        {
+            let mut ev = self.ev.clone();
+            ev.prompt = Some(prompt);
+            block = self.post_observation(&ev)?;
+            if let (Some(d), Some(f)) = (&dir, &offset_file) {
+                let _ = kioku_core::util::create_private_dir(d);
+                let _ = std::fs::write(f, end.to_string());
+            }
+        }
+        // A model call after the first one means the previous call ran tools: one
+        // `tool_round` so the Stop nudge threshold works without tool events (M2.1 §3.7).
+        let round = self
+            .ev
+            .raw
+            .get("invocationNum")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if round > 0 {
+            let mut ev = self.ev.clone();
+            ev.event = HookEventKind::PostToolUse;
+            ev.tool_name = Some(ANTIGRAVITY_TOOL_ROUND.to_string());
+            ev.native_tool = Some("PreInvocation".to_string());
+            ev.tool_input = Some(json!({ "invocationNum": round }));
+            if let Some(b) = self.post_observation(&ev)? {
+                block.get_or_insert(b);
+            }
+        }
+        match block {
+            Some(b) => {
+                // The implicit start already carries the block: mark it delivered.
+                if let Some(d) = &dir {
+                    let _ = kioku_core::util::create_private_dir(d);
+                    let _ = std::fs::write(
+                        d.join(ctx_marker_name(self.agent, &self.ev.session_id)),
+                        "",
+                    );
+                }
+                Ok(HookResult::Context(b))
+            }
+            None => self.late_context(),
+        }
+    }
+
+    /// First Cursor tool use / Antigravity model call of a session: the `<kioku>` block
+    /// (M2 §5.6, M2.1 §3.6), exactly once per session thanks to an O_EXCL marker file. An
+    /// unknown session is started implicitly and gets that start's block.
+    fn late_context(&self) -> anyhow::Result<HookResult> {
+        let Some(dir) = marker_dir(self.agent, self.cfg, self.env) else {
             return Ok(HookResult::Silent);
         };
         kioku_core::util::create_private_dir(&dir)
             .with_context(|| format!("creating {}", dir.display()))?;
-        let marker = dir.join(marker_name(&self.ev.session_id));
+        let marker = dir.join(ctx_marker_name(self.agent, &self.ev.session_id));
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -352,9 +438,16 @@ impl Handler<'_> {
             }
         }
         let block = (|| -> anyhow::Result<String> {
-            let resp = self
+            let resp = match self
                 .client
-                .get(&["sessions", &self.ev.session_id, "context"], &[])?;
+                .get(&["sessions", &self.ev.session_id, "context"], &[])
+            {
+                Ok(v) => v,
+                Err(err) if http_status(&err) == Some(404) => {
+                    return self.start(IMPLICIT_SOURCE);
+                }
+                Err(err) => return Err(err),
+            };
             let resp: SessionStartResponse =
                 serde_json::from_value(resp).context("unexpected session context response")?;
             let name = self
@@ -395,8 +488,25 @@ impl Handler<'_> {
                 .as_deref()
                 .is_none_or(|s| s == "completed");
         let nudge_enabled = self.cfg.client.stop_nudge && completed;
-        match stop_decision(&info, self.ev.stop_hook_active, nudge_enabled) {
+        // Antigravity (M2.1 §3.7): our own marker says the previous Stop nudged.
+        let nudge_marker = (self.agent == Agent::Antigravity)
+            .then(|| marker_dir(self.agent, self.cfg, self.env))
+            .flatten()
+            .map(|d| d.join(format!("{}.nudge", marker_name(&self.ev.session_id))));
+        let mut active = self.ev.stop_hook_active;
+        if let Some(m) = &nudge_marker
+            && std::fs::remove_file(m).is_ok()
+        {
+            active = true;
+        }
+        match stop_decision(&info, active, nudge_enabled) {
             StopDecision::Nudge => {
+                if let Some(m) = &nudge_marker
+                    && let Some(d) = m.parent()
+                {
+                    let _ = kioku_core::util::create_private_dir(d);
+                    let _ = std::fs::write(m, "");
+                }
                 let t = strings(self.cfg.client.lang);
                 let template = if self.agent == Agent::ClaudeCode {
                     t.stop_nudge
@@ -442,6 +552,70 @@ pub fn client_state_root(cfg: &Config, env: &HookEnv) -> Option<PathBuf> {
 /// Directory of the Cursor late-context markers: `<kioku dir>/state/cursor-ctx`.
 pub fn cursor_marker_dir(cfg: &Config, env: &HookEnv) -> Option<PathBuf> {
     client_state_root(cfg, env).map(|d| d.join("state").join("cursor-ctx"))
+}
+
+/// Directory of the Antigravity markers: `<kioku dir>/state/antigravity` (M2.1 §3.5–§3.7).
+pub fn antigravity_marker_dir(cfg: &Config, env: &HookEnv) -> Option<PathBuf> {
+    client_state_root(cfg, env).map(|d| d.join("state").join("antigravity"))
+}
+
+/// Late-context marker directory of an agent (Cursor, Antigravity); `None` for the others.
+pub fn marker_dir(agent: Agent, cfg: &Config, env: &HookEnv) -> Option<PathBuf> {
+    match agent {
+        Agent::Cursor => cursor_marker_dir(cfg, env),
+        Agent::Antigravity => antigravity_marker_dir(cfg, env),
+        _ => None,
+    }
+}
+
+/// Late-context marker file name: Cursor keeps M2's bare name, Antigravity adds `.ctx` next
+/// to its `.prompt` / `.nudge` files.
+fn ctx_marker_name(agent: Agent, session_id: &str) -> String {
+    let name = marker_name(session_id);
+    if agent == Agent::Antigravity {
+        format!("{name}.ctx")
+    } else {
+        name
+    }
+}
+
+/// Tool name recorded for an Antigravity model call after the first of a turn (M2.1 §3.7).
+pub const ANTIGRAVITY_TOOL_ROUND: &str = "tool_round";
+
+/// Bytes of an Antigravity transcript's tail searched for the last prompt (M2.1 §3.5).
+pub const TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
+
+/// The last `USER_INPUT` step in the tail of an Antigravity transcript (JSONL) and the byte
+/// offset where its line ends; `None` when the file is unreadable or holds none.
+pub fn last_user_input(path: &Path) -> Option<(String, u64)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let start = len.saturating_sub(TRANSCRIPT_TAIL_BYTES);
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    f.take(len - start).read_to_end(&mut buf).ok()?;
+    let mut found = None;
+    let mut end = start;
+    for line in buf.split_inclusive(|&b| b == b'\n') {
+        end += line.len() as u64;
+        // A partial first line (tail cut) or last line (still being written) fails to parse.
+        let Ok(v) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(Value::as_str) != Some("USER_INPUT") {
+            continue;
+        }
+        let text = match v.get("content") {
+            Some(Value::String(t)) => Some(t.clone()),
+            Some(c) => c.get("text").and_then(Value::as_str).map(str::to_string),
+            None => None,
+        };
+        if let Some(t) = text {
+            found = Some((t, end));
+        }
+    }
+    found
 }
 
 /// Marker file name for a session id (anything but `[A-Za-z0-9._-]` becomes `_`).
@@ -760,6 +934,35 @@ mod tests {
             home: Some(home.to_path_buf()),
             cwd: None,
         }
+    }
+
+    #[test]
+    fn last_user_input_reads_the_newest_prompt_from_the_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        assert_eq!(last_user_input(&path), None, "missing file");
+        let first = r#"{"type":"USER_INPUT","source":"USER_EXPLICIT","content":"一つ目の指示"}"#;
+        let model = r#"{"type":"PLANNER_RESPONSE","source":"MODEL","content":"了解"}"#;
+        let second = r#"{"type":"USER_INPUT","content":{"text":"二つ目の指示"}}"#;
+        std::fs::write(&path, format!("{first}\n{model}\n")).unwrap();
+        let (text, end1) = last_user_input(&path).unwrap();
+        assert_eq!(text, "一つ目の指示");
+        assert_eq!(end1, first.len() as u64 + 1);
+        // A newer prompt and a half-written line after it.
+        let tail = format!("{second}\n{{\"type\":\"USER_IN");
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(tail.as_bytes()).unwrap();
+        let (text, end2) = last_user_input(&path).unwrap();
+        assert_eq!(text, "二つ目の指示");
+        assert!(end2 > end1);
+        // Only the last TRANSCRIPT_TAIL_BYTES are read: a prompt before them is not seen.
+        let big = dir.path().join("big.jsonl");
+        let filler = format!("{model}\n").repeat(TRANSCRIPT_TAIL_BYTES as usize / model.len() + 1);
+        std::fs::write(&big, format!("{first}\n{filler}")).unwrap();
+        assert_eq!(last_user_input(&big), None);
     }
 
     fn fixture_text(rel: &str) -> String {

@@ -186,6 +186,8 @@ pub enum InstallTarget {
     Cursor,
     /// Gemini CLI: settings.json hooks + mcpServers + GEMINI.md.
     GeminiCli,
+    /// Antigravity CLI (`agy`): ~/.gemini/config/hooks.json + mcp_config.json + GEMINI.md.
+    Antigravity,
     /// Every detected agent.
     All,
 }
@@ -198,6 +200,7 @@ impl InstallTarget {
             InstallTarget::Codex => Some(Agent::Codex),
             InstallTarget::Cursor => Some(Agent::Cursor),
             InstallTarget::GeminiCli => Some(Agent::GeminiCli),
+            InstallTarget::Antigravity => Some(Agent::Antigravity),
             InstallTarget::All => None,
         }
     }

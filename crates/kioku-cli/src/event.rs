@@ -24,14 +24,17 @@ pub enum Agent {
     Cursor,
     /// Google Gemini CLI.
     GeminiCli,
+    /// Google Antigravity CLI (`agy`, M2.1).
+    Antigravity,
 }
 
 /// Every agent, in the order of the spec tables.
-pub const ALL_AGENTS: [Agent; 4] = [
+pub const ALL_AGENTS: [Agent; 5] = [
     Agent::ClaudeCode,
     Agent::Codex,
     Agent::Cursor,
     Agent::GeminiCli,
+    Agent::Antigravity,
 ];
 
 impl Agent {
@@ -42,6 +45,7 @@ impl Agent {
             Agent::Codex => "codex",
             Agent::Cursor => "cursor",
             Agent::GeminiCli => "gemini-cli",
+            Agent::Antigravity => "antigravity",
         }
     }
 
@@ -52,6 +56,7 @@ impl Agent {
             Agent::Codex => &[],
             Agent::Cursor => &["CURSOR_PROJECT_DIR", "CLAUDE_PROJECT_DIR"],
             Agent::GeminiCli => &["GEMINI_PROJECT_DIR", "GEMINI_CWD", "CLAUDE_PROJECT_DIR"],
+            Agent::Antigravity => &[],
         }
     }
 }
@@ -110,7 +115,7 @@ impl HookEventKind {
 }
 
 /// Hook timeout (ms) that `kioku install` registers for an agent's event (M2 §4.2, §5.2,
-/// §6.2; Claude Code: 10 s SessionStart, the agent's 60 s default elsewhere).
+/// §6.2, M2.1 §3.8 — Antigravity writes whole seconds; Claude Code: 10 s SessionStart, the agent's 60 s default elsewhere).
 pub fn registered_timeout_ms(agent: Agent, event: HookEventKind) -> u64 {
     use HookEventKind::*;
     match (agent, event) {
@@ -193,7 +198,7 @@ pub struct HookEvent {
     pub raw: Value,
     /// Native event name as sent (`hook_event_name`), empty if absent.
     pub native_event: String,
-    /// Workspace roots (Cursor `workspace_roots`); empty for other agents.
+    /// Workspace roots (Cursor `workspace_roots`, Antigravity `workspacePaths`).
     pub workspace_roots: Vec<String>,
     /// Native tool name before normalization, e.g. `apply_patch`, `Shell`, `run_shell_command`.
     pub native_tool: Option<String>,
@@ -234,6 +239,7 @@ pub fn parse_value(
         Agent::Codex => parse_codex(event, raw, env),
         Agent::Cursor => parse_cursor(event, raw, env),
         Agent::GeminiCli => parse_gemini(event, raw, env),
+        Agent::Antigravity => parse_antigravity(event, raw, env),
     }
 }
 
@@ -390,6 +396,28 @@ pub fn parse_gemini(event: HookEventKind, raw: Value, env: &HookEnv) -> anyhow::
     Ok(ev)
 }
 
+/// Antigravity CLI stdin → [`HookEvent`] (M2.1 §3.3): `conversationId`, `workspacePaths`;
+/// no event name, cwd or prompt in the payload (the prompt comes from the transcript, §3.5).
+pub fn parse_antigravity(
+    event: HookEventKind,
+    raw: Value,
+    env: &HookEnv,
+) -> anyhow::Result<HookEvent> {
+    let mut ev = common(Agent::Antigravity, event, raw, env, &["conversationId"])?;
+    if let Some(call) = ev.raw.get("toolCall").cloned() {
+        ev.tool_name = text(&call, "name");
+        ev.native_tool = ev.tool_name.clone();
+        ev.tool_input = call.get("args").cloned();
+    }
+    if event == HookEventKind::PostToolUse {
+        ev.tool_response = Some(match text(&ev.raw, "error") {
+            Some(e) => json!({ "is_error": true, "error": e }),
+            None => json!({}),
+        });
+    }
+    Ok(ev)
+}
+
 /// Fields every agent shares; tool fields are left to the agent parser.
 fn common(
     agent: Agent,
@@ -402,8 +430,13 @@ fn common(
         anyhow::bail!("hook stdin is not a JSON object");
     }
     let mut session_id = session_keys.iter().find_map(|k| text(&raw, k));
-    if session_id.is_none() && agent == Agent::GeminiCli {
-        session_id = env.var("GEMINI_SESSION_ID").map(str::to_string);
+    if session_id.is_none() {
+        let var = match agent {
+            Agent::GeminiCli => Some("GEMINI_SESSION_ID"),
+            Agent::Antigravity => Some("ANTIGRAVITY_CONVERSATION_ID"),
+            _ => None,
+        };
+        session_id = var.and_then(|k| env.var(k)).map(str::to_string);
     }
     let session_id = session_id.with_context(|| {
         format!(
@@ -413,6 +446,7 @@ fn common(
     })?;
     let workspace_roots: Vec<String> = raw
         .get("workspace_roots")
+        .or_else(|| raw.get("workspacePaths"))
         .and_then(Value::as_array)
         .map(|roots| {
             roots

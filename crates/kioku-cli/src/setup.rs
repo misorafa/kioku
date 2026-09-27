@@ -16,8 +16,8 @@ use kioku_core::{ClientConfig, Config};
 use crate::client::{ApiClient, http_status};
 use crate::event::Agent;
 use crate::install::agents::{
-    AgentReport, AllStatus, InstallCtx, InstallOptions, Instructions, detection_dir, hook_specs,
-    hooks_path, install_all, instruction_files, mcp_path, unstable_binary_warning,
+    AgentReport, AllStatus, InstallCtx, InstallOptions, Instructions, hook_specs, hooks_path,
+    install_all, instruction_files, is_detected, mcp_path, unstable_binary_warning,
     wants_instructions,
 };
 use crate::install::block;
@@ -795,12 +795,7 @@ fn agents_step(opts: &SetupOptions, env: &SetupEnv, client: &ClientConfig, r: &m
         }
     }
     // Detection happens per agent; mention a filter that matched nothing.
-    if !opts.agents.is_empty()
-        && opts
-            .agents
-            .iter()
-            .all(|a| !detection_dir(*a, &ctx).is_dir())
-    {
+    if !opts.agents.is_empty() && opts.agents.iter().all(|a| !is_detected(*a, &ctx)) {
         r.push(
             Mark::Warn,
             "agents",

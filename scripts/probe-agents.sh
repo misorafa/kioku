@@ -1,12 +1,13 @@
 #!/bin/sh
 # probe-agents.sh — capture real hook payloads from every installed coding agent.
 #
-# Runs one short, non-interactive session per agent (Codex CLI, Cursor CLI, Gemini CLI)
+# Runs one short, non-interactive session per agent (Codex CLI, Cursor CLI, Gemini CLI,
+# Antigravity CLI)
 # inside a throwaway git repo with `[client] hook_dump = true`, then restores the
 # setting. Afterwards ~/.kioku/logs/hook-dump.jsonl holds the raw payloads
 # (tokens and secret-looking env values are redacted at write time).
 #
-# Usage:  sh scripts/probe-agents.sh [codex|cursor|gemini ...]   (default: all found)
+# Usage:  sh scripts/probe-agents.sh [codex|cursor|gemini|antigravity ...]   (default: all found)
 set -eu
 
 CFG="$HOME/.kioku/config.toml"
@@ -34,7 +35,7 @@ rm -f hello.txt; rm -rf notes
 set_dump true
 [ -f "$LOG" ] && before=$(wc -l < "$LOG") || before=0
 
-want="${*:-codex cursor gemini}"
+want="${*:-codex cursor gemini antigravity}"
 for a in $want; do
   case "$a" in
     codex)
@@ -51,6 +52,12 @@ for a in $want; do
       if command -v gemini >/dev/null 2>&1; then
         echo "== gemini"; gemini --yolo -p "$PROMPT" || gemini -p "$PROMPT" || echo "(gemini exited $?)"
       else echo "-- gemini: not installed"; fi ;;
+    antigravity|agy)
+      # --add-dir: without a workspace agy sends empty workspacePaths (SPEC-M2.1 §3.3).
+      if command -v agy >/dev/null 2>&1; then
+        echo "== antigravity (agy)"; agy -p "$PROMPT" --add-dir "$PROBE" || echo "(agy exited $?)"
+        echo "-- hooks agy loaded:"; agy -p "/hooks" --output-format json || true
+      else echo "-- antigravity: agy not installed"; fi ;;
     *) echo "unknown agent: $a" >&2 ;;
   esac
   rm -f hello.txt; rm -rf notes
