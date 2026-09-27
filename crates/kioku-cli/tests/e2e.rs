@@ -370,7 +370,7 @@ fn stop_without_nudge_finalizes_and_failures_are_logged() {
     );
     let info = api_get(&server.base, "sessions/no-such-session");
     assert_eq!(info["counts"]["prompts"], 1);
-    // SessionEnd of an unknown session still 404s → silent, one log line.
+    // SessionEnd of an unknown session → silent and not logged (nothing to finalize).
     let out = hook(
         &cfg,
         HookEventKind::SessionEnd,
@@ -394,13 +394,9 @@ fn stop_without_nudge_finalizes_and_failures_are_logged() {
 
     let log = std::fs::read_to_string(client_dir.path().join("logs/hook.log")).unwrap();
     let lines: Vec<&str> = log.lines().collect();
-    assert_eq!(lines.len(), 2, "{log}");
+    assert_eq!(lines.len(), 1, "{log}");
     assert!(
-        lines[0].contains("session-end session=no-such-session-2 status=404"),
-        "{log}"
-    );
-    assert!(
-        lines[1].contains("session-start session=e2e-x status=401"),
+        lines[0].contains("session-start session=e2e-x status=401"),
         "{log}"
     );
 }
@@ -823,6 +819,20 @@ fn implicit_session_start_per_agent() {
         let info = api_get(&server.base, &format!("sessions/{sid}"));
         assert_eq!(info["status"], "open", "{info}");
         assert_eq!(info["counts"]["tool_uses"], 0);
+    }
+
+    // SessionEnd on an unknown session (Codex opened and closed without a prompt —
+    // its SessionStart only fires with the first turn): nothing to finalize, no error.
+    for agent in [Agent::Codex, Agent::Cursor, Agent::GeminiCli] {
+        let sid = format!("implicit-end-{}", agent.as_str());
+        let out = run(
+            &cfg,
+            &env,
+            agent,
+            HookEventKind::SessionEnd,
+            &fixture_payload(agent, "session_end", &sid, cwd),
+        );
+        assert_silent(agent, HookEventKind::SessionEnd, &out);
     }
     assert!(!client_dir.path().join("logs/hook.log").exists());
 }

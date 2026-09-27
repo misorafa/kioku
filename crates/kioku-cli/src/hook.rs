@@ -219,7 +219,12 @@ fn handle(ev: &HookEvent, agent: Agent, cfg: &Config, env: &HookEnv) -> anyhow::
         | HookEventKind::PreCompact => h.record(),
         HookEventKind::Stop => h.stop(),
         HookEventKind::SessionEnd => {
-            h.finalize(ev.reason.as_deref().unwrap_or("session_end"))?;
+            match h.finalize(ev.reason.as_deref().unwrap_or("session_end")) {
+                // Unknown session: SessionStart never fired (Codex fires it with the first
+                // turn, so open-then-quit sends only SessionEnd) — nothing to finalize.
+                Err(err) if http_status(&err) == Some(404) => {}
+                other => other?,
+            }
             Ok(HookResult::Silent)
         }
     }

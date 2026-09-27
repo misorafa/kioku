@@ -279,8 +279,11 @@ before `kioku install`, Cursor sessionStart race), the hook:
 Stop on an unknown session after implicit start has nothing to finalize →
 `Silent`. At most one implicit start per invocation. This applies to Claude Code
 too and replaces M1 §9's "unknown session on `observations` → hook silently
-drops" (the M1 e2e test was updated accordingly); SessionEnd on an unknown
-session still just logs the 404.
+drops" (the M1 e2e test was updated accordingly). SessionEnd on an unknown
+session is `Silent` and **not** logged: there is nothing to finalize, and it is
+the normal case for Codex, whose SessionStart only fires with the first turn —
+opening Codex and quitting without a prompt sends SessionEnd alone (seen in real
+captures 2026-09-27; it used to put a 404 in `hook.log` and a doctor WARN).
 
 ### 3.10 Per-agent deadlines
 
