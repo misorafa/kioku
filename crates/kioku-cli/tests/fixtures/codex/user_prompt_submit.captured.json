@@ -1,0 +1,10 @@
+{
+  "session_id": "01a0e073-0058-7552-88bb-020563dbb91d",
+  "turn_id": "01a0e13c-a78f-77b2-b15a-e636e7ac98c6",
+  "transcript_path": "/Users/me/.codex/sessions/2026/09/27/rollout-2026-09-27T10-20-28-<session>.jsonl",
+  "cwd": "/Users/me/Documents/APP/emu_lancher",
+  "hook_event_name": "UserPromptSubmit",
+  "model": "gpt-6-sol",
+  "permission_mode": "bypassPermissions",
+  "prompt": "ファイルの作成日を今日に揃えられる？"
+}

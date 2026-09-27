@@ -1,0 +1,9 @@
+{
+  "session_id": "01a0e073-0058-7552-88bb-020563dbb91d",
+  "transcript_path": "/Users/me/.codex/sessions/2026/09/27/rollout-2026-09-27T10-20-28-<session>.jsonl",
+  "cwd": "/Users/me/Documents/APP/emu_lancher",
+  "hook_event_name": "SessionStart",
+  "model": "gpt-6-sol",
+  "permission_mode": "bypassPermissions",
+  "source": "resume"
+}

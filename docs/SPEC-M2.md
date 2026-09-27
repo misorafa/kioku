@@ -1395,9 +1395,9 @@ systemctl.
 
 | # | item | where | fallback built in |
 |---|------|-------|-------------------|
-| 1 | First Codex version with hooks on by default (older builds need `[features] codex_hooks = true`) | §4.1 | `--enable-hooks-feature`; doctor shows `codex --version` |
+| 1 | ~~First Codex version with hooks on by default~~ — resolved 2026-09-27 with a real capture (npm Codex, `CODEX_MANAGED_BY_NPM=1`): hooks ran without any `[features]` entry, and all six registered events fired, including `Stop` | §4.1 | `--enable-hooks-feature` kept for older builds |
 | 2 | Codex hook trust key format / hash input in `[hooks.state]` | §4.1, §12 | doctor always WARNs "confirm /hooks" |
-| 3 | Codex `tool_response` shape for Bash / apply_patch | §4.3 | normalizer accepts any JSON |
+| 3 | ~~Codex `tool_response` shape for Bash~~ — resolved: a plain string (stdout); `apply_patch` still UNVERIFIED. Captured extras per event: `model`, `permission_mode` (all), `turn_id` (all but SessionStart/End), `last_assistant_message` (Stop), `source: "resume"` on SessionStart. Fixtures: `tests/fixtures/codex/*.captured.json` | §4.3 | normalizer accepts any JSON |
 | 4 | Cursor hook default timeout ("platform default") | §5.2 | kioku sets explicit timeouts |
 | 5 | Cursor: are common fields (`conversation_id`, `workspace_roots`) on every event; is `cwd` present beyond pre/postToolUse | §5.3 | resolution order §3.4 |
 | 6 | Cursor `Read` tool `tool_input` key for the path | §3.5 | tries `file_path`/`path`/`target_file`/`filePath` |
@@ -1408,3 +1408,4 @@ systemctl.
 | 11 | Gemini / Cursor tolerance of empty stdout (kioku prints `{}` anyway) | §3.6 | always print valid JSON |
 | 12 | musl cross-build of rusqlite(bundled)+lindera | §13.1 | pin gnu builds to ubuntu-22.04 |
 | 13 | ~~GitHub repo slug~~ — resolved in Step 4: `misorafa/kioku` | §13.2 | `KIOKU_REPO` / `--repo` still override it |
+| 14 | ~~Does `KIOKU_HOOK_DUMP` reach Codex hooks?~~ — resolved: no. Codex passes only a core env (`CODEX_MANAGED_BY_NPM`, `CODEX_MANAGED_PACKAGE_ROOT` were the only extras seen), so the env switch never arrives; use `[client] hook_dump = true` (`scripts/probe-agents.sh` does this) | §3.8 | config key |

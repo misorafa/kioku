@@ -1,0 +1,15 @@
+{
+  "session_id": "01a0e073-0058-7552-88bb-020563dbb91d",
+  "turn_id": "01a0e13c-a78f-77b2-b15a-e636e7ac98c6",
+  "transcript_path": "/Users/me/.codex/sessions/2026/09/27/rollout-2026-09-27T10-20-28-<session>.jsonl",
+  "cwd": "/Users/me/Documents/APP/emu_lancher",
+  "hook_event_name": "PostToolUse",
+  "model": "gpt-6-sol",
+  "permission_mode": "bypassPermissions",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "stat -f '%N | modified=%Sm' README.md lib/main.dart"
+  },
+  "tool_response": "README.md | modified=2026-09-27 13:29:56 +0900\nlib/main.dart | modified=2026-09-27 13:29:56 +0900\n",
+  "tool_use_id": "exec-82dc8f44-4ece-46f4-9119-6159ede5faa1"
+}
