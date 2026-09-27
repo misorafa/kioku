@@ -972,6 +972,44 @@ bootout → bootstrap → enable sequence only when it rewrote the plist or
 `launchctl print` says the job is not loaded (the `bootout` only when it was
 loaded); otherwise it runs nothing but the `id -u` / `print` queries.
 
+### 10.3.1 LAN reachability on macOS (added 2026-09-28, v0.3.1)
+
+Observed with v0.3.0 on two Macs with `bind = "0.0.0.0"`: LAN clients got
+through the TCP handshake, but no request ever reached kioku. Loopback worked,
+and a Python `http.server` on the same machine answered on the LAN. The cause
+was **Little Snitch**, installed on both machines. It held the new, unknown
+`kioku` binary's incoming connections, and its prompt showed only on the
+server's own screen. Once kioku was allowed there, LAN clients got answers.
+macOS Local Network privacy was suspected first but not shown to be involved.
+
+What kioku does about it:
+
+1. **Stable identity.** Firewalls and privacy prompts identify a program by its
+   code signature. The linker's ad-hoc signature carries a per-build identifier
+   (`kioku-<hash>`) and no bound Info.plist. Instead:
+   - the macOS `kioku` binary embeds an `Info.plist` in `__TEXT,__info_plist`
+     (kioku-cli `build.rs`, linker `-sectcreate`). It sets
+     `CFBundleIdentifier` `dev.kioku.kioku`, `CFBundleName` `kioku`, the
+     version keys, and `NSLocalNetworkUsageDescription` in English and
+     Japanese;
+   - the release workflow re-signs the binary ad hoc with
+     `--identifier dev.kioku.kioku`, which binds the plist.
+
+   Prompts and rule lists then show "kioku" (`dev.kioku.kioku`). Whether a
+   firewall rule survives a `kioku update` depends on the firewall; ad-hoc
+   signatures have no team identity (UNVERIFIED).
+2. **Diagnosis.** On macOS, `kioku doctor` on a machine whose `[server] bind`
+   is not loopback adds `server.lan`. It requests
+   `http://<first non-loopback IPv4>:<port>/api/v1/health` with a 3 s timeout.
+   It reports OK when the server answers. Otherwise it WARNs: "a firewall on
+   this Mac blocks LAN clients from kioku", with the fix "allow incoming
+   connections for kioku in your firewall (Little Snitch, LuLu, …) or in
+   System Settings > Privacy & Security > Local Network, then restart the
+   service".
+
+kioku never edits firewall rules and never runs itself as root to get
+around them; allowing it is the user's decision.
+
 ### 10.4 Linux: systemd user unit (no sudo)
 
 `$XDG_CONFIG_HOME/systemd/user/kioku.service` (default

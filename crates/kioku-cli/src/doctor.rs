@@ -184,6 +184,12 @@ pub fn run_doctor(env: &DoctorEnv, only: Option<Agent>) -> Vec<Check> {
     // Server, auth, index, MCP.
     let health = probe_health(&cfg.client, env.timeout);
     out.push(server_check(&cfg, &health, server_machine));
+    if server_machine
+        && matches!(health, Health::Kioku { .. })
+        && let Some(c) = lan_check(&cfg, env)
+    {
+        out.push(c);
+    }
     if config_ok && matches!(health, Health::Kioku { .. }) {
         match ApiClient::new(&cfg.client, env.timeout).and_then(|c| c.get(&["status"], &[])) {
             Ok(body) => {
@@ -473,6 +479,47 @@ fn git_check(env: &DoctorEnv) -> Check {
             Some("install git".into()),
         )
     }
+}
+
+/// True for a bind address only reachable from this machine (`127.*`, `::1`, `localhost`).
+fn is_loopback_bind(bind: &str) -> bool {
+    let b = bind.trim().trim_start_matches('[').trim_end_matches(']');
+    b.eq_ignore_ascii_case("localhost")
+        || b.parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// macOS server with a LAN bind (SPEC-M2 §10.3.1): health must answer on the machine's LAN
+/// address too — otherwise a firewall (Little Snitch, Local Network privacy) blocks LAN clients.
+fn lan_check(cfg: &Config, env: &DoctorEnv) -> Option<Check> {
+    if !cfg!(target_os = "macos") || is_loopback_bind(&cfg.server.bind) {
+        return None;
+    }
+    let ip = crate::setup::first_non_loopback_ip()?;
+    let mut client = cfg.client.clone();
+    client.server_url = format!("http://{ip}:{}", cfg.server.port);
+    let url = client.server_url.clone();
+    Some(
+        match probe_health(&client, env.timeout.min(Duration::from_secs(3))) {
+            Health::Kioku { .. } => check(
+                "server.lan",
+                Status::Ok,
+                format!("answers on the LAN at {url}"),
+                None,
+            ),
+            Health::Foreign(d) | Health::Down(d) => check(
+                "server.lan",
+                Status::Warn,
+                format!(
+                    "{url} does not answer ({}): a firewall on this Mac blocks LAN clients from kioku",
+                    kioku_core::util::truncate_chars(&d, 120)
+                ),
+                Some(
+                    "allow incoming connections for kioku in your firewall (Little Snitch, LuLu, …) or in System Settings > Privacy & Security > Local Network, then kioku service stop && kioku service start".into(),
+                ),
+            ),
+        },
+    )
 }
 
 fn server_check(cfg: &Config, health: &Health, server_machine: bool) -> Check {
@@ -1189,6 +1236,16 @@ fn hook_dump_check(cfg: &Config, env: &DoctorEnv) -> Check {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loopback_binds_skip_the_lan_check() {
+        for b in ["127.0.0.1", "localhost", "::1", "[::1]", "127.0.0.2"] {
+            assert!(is_loopback_bind(b), "{b}");
+        }
+        for b in ["0.0.0.0", "192.168.1.240", "::", "kioku.local"] {
+            assert!(!is_loopback_bind(b), "{b}");
+        }
+    }
 
     #[test]
     fn command_parsing() {

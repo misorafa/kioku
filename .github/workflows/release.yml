@@ -22,10 +22,9 @@ jobs:
             cross: true
           # Static musl binaries run on any distro (the gnu builds need ubuntu-latest's
           # glibc, which e.g. Ubuntu 22.04 servers lack); install.sh tries musl first.
-          # UNVERIFIED in CI (SPEC-M2 §13.1 / §18 #12): whether rusqlite `bundled` and
-          # lindera `embed-ipadic` build cleanly for musl under `cross`. If these two jobs
-          # fail: delete them and pin the two gnu jobs above to `os: ubuntu-22.04` instead
-          # (install.sh then falls back from the missing musl asset to gnu by itself).
+          # Verified by the v0.3.0 release (SPEC-M2 §18 #12). Should they ever break: delete
+          # them and pin the two gnu jobs above to `os: ubuntu-22.04` instead (install.sh then
+          # falls back from the missing musl asset to gnu by itself).
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             cross: true
@@ -56,6 +55,14 @@ jobs:
           else
             cargo build --release --locked -p kioku-cli --target ${{ matrix.target }}
           fi
+      # SPEC-M2 §10.3.1: bind the embedded Info.plist and a stable identifier into the
+      # ad-hoc signature, so macOS Local Network privacy can recognise and prompt for kioku.
+      - name: Sign (macOS, ad hoc, stable identifier)
+        if: runner.os == 'macOS'
+        run: |
+          codesign -s - --force --identifier dev.kioku.kioku "target/${{ matrix.target }}/release/kioku"
+          codesign -dv "target/${{ matrix.target }}/release/kioku" 2>&1 | grep -E 'Identifier=dev.kioku.kioku'
+          codesign -dv "target/${{ matrix.target }}/release/kioku" 2>&1 | grep -E 'Info.plist entries='
       - name: Package
         shell: bash
         run: |

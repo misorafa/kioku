@@ -305,6 +305,11 @@ kioku status
 `kioku service stop && kioku service start`）。続いて `kioku setup --print-client-command` を実行し、
 表示されたコマンドをほかのすべてのマシンで実行します。
 
+**macOS のサーバーでは、ファイアウォールの許可を確認してください。** Little Snitch や LuLu などが入っていると、
+新しい kioku への LAN からの接続が、許可の画面（サーバー機の画面にだけ出ます）で止まります。症状は
+「接続はできるのに応答が返らない」です。`kioku doctor` の `server.lan` が、LAN のアドレスから届くかを
+確認します。許可したら `kioku service stop && kioku service start` を実行してください。
+
 フックは、このマシン上またはプライベートネットワーク上のサーバーへのリクエストを、環境変数の
 `HTTP(S)_PROXY` 経由では送りません（ループバック、10/8、172.16/12、192.168/16、fc00::/7、fe80::/10、
 `*.local` / `*.lan` / `*.internal` の名前）。それ以外のホスト（例: `kioku.tailnet.ts.net` のような

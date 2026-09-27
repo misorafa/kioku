@@ -337,6 +337,12 @@ there, then `kioku service stop && kioku service start`). Then run
 `kioku setup --print-client-command` and the printed command on every other
 machine.
 
+**On a macOS server, check your firewall.** With Little Snitch, LuLu or similar installed, LAN
+connections to a new kioku binary wait on an allow prompt that shows only on the server's own
+screen: clients connect but never get an answer. `kioku doctor` checks this as `server.lan`
+(health over the machine's LAN address). After allowing kioku, run
+`kioku service stop && kioku service start`.
+
 Hooks never send requests to a server on this machine or a private network
 through an `HTTP(S)_PROXY` from the environment (loopback, 10/8, 172.16/12,
 192.168/16, fc00::/7, fe80::/10, and `*.local` / `*.lan` / `*.internal`
