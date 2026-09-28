@@ -23,18 +23,57 @@ pub fn sibling(exe: &Path, suffix: &str) -> PathBuf {
     exe.with_file_name(name)
 }
 
-/// Deletes a `kioku.exe.old` left next to the running binary by a Windows update
+/// Deletes the `kioku.exe.old*` copies a Windows update left next to the running binary
 /// (SPEC-M2.2 §5 step 3). Best effort, and a no-op elsewhere.
 pub fn remove_stale_old_binary() {
     if !cfg!(windows) {
         return;
     }
     if let Ok(exe) = std::env::current_exe() {
-        let old = sibling(&exe, ".old");
-        if old.exists() {
-            let _ = std::fs::remove_file(old);
+        remove_old_copies(&exe);
+    }
+}
+
+/// Deletes every `<exe>.old*` next to `exe` that can be deleted. A copy still executing (a
+/// `kioku mcp` an agent started before the update, or an app that lingers in the background
+/// like Orca) cannot be, and is left for a later run.
+pub fn remove_old_copies(exe: &Path) {
+    let (Some(dir), Some(name)) = (exe.parent(), exe.file_name()) else {
+        return;
+    };
+    let prefix = format!("{}.old", name.to_string_lossy());
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        if e.file_name().to_string_lossy().starts_with(&prefix) {
+            let _ = std::fs::remove_file(e.path());
         }
     }
+}
+
+/// A free name to move `exe` aside to: `<exe>.old`, or when that one is still there (in
+/// use, so it could not be deleted) `<exe>.old-<unix ms>[-n]`.
+fn aside_name(exe: &Path) -> PathBuf {
+    let old = sibling(exe, ".old");
+    if !old.exists() {
+        return old;
+    }
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    (0u32..)
+        .map(|n| {
+            let suffix = if n == 0 {
+                format!(".old-{ms}")
+            } else {
+                format!(".old-{ms}-{n}")
+            };
+            sibling(exe, &suffix)
+        })
+        .find(|p| !p.exists())
+        .unwrap_or_else(|| sibling(exe, ".old-x"))
 }
 
 /// The `tar` to run: on Windows the system's own bsdtar (`%SystemRoot%\System32\tar.exe`,
@@ -53,15 +92,17 @@ fn tar_program() -> String {
 }
 
 /// Puts `new` in the place of `exe`. Without `rename_dance` (unix) one atomic rename; with
-/// it (Windows, where a running exe cannot be overwritten but can be renamed): delete a
-/// stale `<exe>.old`, rename `exe` → `<exe>.old`, then `new` → `exe`, moving the old one
+/// it (Windows, where a running exe cannot be overwritten but can be renamed): delete the
+/// `<exe>.old*` copies nothing runs any more, rename `exe` to a free `.old…` name (see
+/// [`aside_name`]: an old copy still in use no longer blocks the update — found on a real
+/// Windows 11 where Orca kept `kioku mcp` alive), then `new` → `exe`, moving the old one
 /// back if the second rename fails (SPEC-M2.2 §5).
 pub fn swap_binary(new: &Path, exe: &Path, rename_dance: bool) -> anyhow::Result<()> {
     if !rename_dance {
         return std::fs::rename(new, exe).with_context(|| format!("replacing {}", exe.display()));
     }
-    let old = sibling(exe, ".old");
-    let _ = std::fs::remove_file(&old);
+    remove_old_copies(exe);
+    let old = aside_name(exe);
     let moved = exe.exists();
     if moved {
         std::fs::rename(exe, &old)
@@ -356,6 +397,38 @@ mod tests {
             });
         });
         format!("http://{}/releases", rx.recv().unwrap())
+    }
+
+    /// Regression (real Windows 11, 2026-09-29): a `kioku.exe.old` that cannot be deleted
+    /// (still executing) must not block the update. A directory stands in for the locked file.
+    #[test]
+    fn a_locked_old_copy_does_not_block_the_swap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("kioku.exe");
+        let locked = sibling(&exe, ".old");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("in-use"), "x").unwrap();
+        std::fs::write(&exe, "v1").unwrap();
+        let new = sibling(&exe, ".new");
+        std::fs::write(&new, "v2").unwrap();
+        swap_binary(&new, &exe, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "v2");
+        assert!(locked.is_dir(), "the locked copy is left alone");
+        let aside: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("kioku.exe.old-"))
+            .collect();
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(&aside[0])).unwrap(),
+            "v1"
+        );
+        // A later run cleans up what it can: the free copy goes, the locked one stays.
+        remove_old_copies(&exe);
+        assert!(!tmp.path().join(&aside[0]).exists());
+        assert!(locked.is_dir());
     }
 
     #[test]

@@ -324,6 +324,23 @@ try {
     Check 'iex join mode: kioku.exe join <url> <code>, no setup' ($script:Rc -eq 0 -and (Has 'STUB-ARGV: [join] [http://192.168.1.240:7391] [K7Q2M9XD]') -and -not (Has '[setup]'))
     Check 'iex join mode: user PATH and this window''s $env:Path both get the dir' ((Get-Content -LiteralPath $PathFile -Raw) -eq "C:\Windows\system32;C:\Tools;$Dir" -and ($script:Out -split "`r?`n" | Where-Object { $_ -like 'SESSION-PATH=*' -and $_.Contains($Dir) }))
     Check 'iex join mode: bilingual end message, no variables left in the window' ((Has 'The kioku command works in new PowerShell windows') -and (Has 'LEAK=False'))
+    # Regression (real Windows 11, 2026-09-29): a kioku.exe.old still in use must not block the
+    # update. An open handle without sharing stands in for the running copy (it cannot be
+    # deleted, like an exe that is executing).
+    $locked = Join-Path $Dir 'kioku.exe.old'
+    [System.IO.File]::WriteAllText($locked, 'in use')
+    $handle = [System.IO.File]::Open($locked, 'Open', 'Read', 'None')
+    try {
+        Invoke-Install @('-InstallDir', $Dir, '-Version', 'v9.9.8', '-NoSetup')
+        $aside = @(Get-ChildItem -LiteralPath $Dir -Filter 'kioku.exe.old-*' -File -ErrorAction SilentlyContinue)
+        Check 'a locked kioku.exe.old does not block the update' ($script:Rc -eq 0 -and (Test-Path -LiteralPath (Join-Path $Dir 'kioku.exe')) -and (Test-Path -LiteralPath $locked))
+        if ($script:Rc -ne 0) { Write-Host $script:Out }
+    } finally {
+        $handle.Close()
+    }
+    Remove-Item -LiteralPath $locked -Force -ErrorAction SilentlyContinue
+    Get-ChildItem -LiteralPath $Dir -Filter 'kioku.exe.old*' -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+
     # SPEC-M2.3 section 9: the Windows line kioku invite prints since v0.6.1.
     Invoke-Install @() 'rawiex' @{ KIOKU_VERSION = 'v9.9.8'; KIOKU_INSTALL_DIR = $Dir; KIOKU_JOIN = '192.168.1.240:7391/K7Q2M9XD' }
     Check 'KIOKU_JOIN + irm | iex: kioku.exe join <url> <code>' ($script:Rc -eq 0 -and (Has 'STUB-ARGV: [join] [http://192.168.1.240:7391] [K7Q2M9XD]'))
