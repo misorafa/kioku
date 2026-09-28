@@ -82,13 +82,16 @@ fn server_home(port: u16) -> tempfile::TempDir {
     home
 }
 
-/// The code in the `macOS / Linux:` line of `kioku invite`.
+/// The code in the `macOS / Linux / Git Bash:` line of `kioku invite` (the `curl … | sh` URL).
 fn code_of(invite_stdout: &str) -> String {
     let line = invite_stdout
         .lines()
-        .find(|l| l.trim_start().starts_with("macOS / Linux:"))
+        .find(|l| l.trim_start().starts_with("macOS / Linux"))
         .unwrap_or_else(|| panic!("{invite_stdout}"));
-    let url = line.split_whitespace().nth(5).unwrap();
+    let url = line
+        .split_whitespace()
+        .find(|w| w.starts_with("http://"))
+        .unwrap_or_else(|| panic!("{line}"));
     url.rsplit('/').next().unwrap().to_string()
 }
 
@@ -110,7 +113,27 @@ fn invite_then_join_writes_the_client_config_without_printing_the_token() {
     assert!(inv.stdout.contains("| iex"));
     assert!(!inv.stdout.contains(TOKEN) && !inv.stderr.contains(TOKEN));
     let code = code_of(&inv.stdout);
-    assert!(inv.stdout.contains(&format!("/i/{code}.ps1 | iex")));
+    // SPEC-M2.3 §9: the Windows line passes the invite in KIOKU_JOIN to install.ps1 from GitHub.
+    // The host is the one `kioku invite` advertises (the LAN rule), as in the curl line.
+    let curl_url = inv
+        .stdout
+        .split_whitespace()
+        .find(|w| w.starts_with("http://") && w.contains("/i/"))
+        .unwrap()
+        .to_string();
+    let hostport = curl_url
+        .trim_start_matches("http://")
+        .split("/i/")
+        .next()
+        .unwrap();
+    assert!(
+        inv.stdout.contains(&format!(
+            "$env:KIOKU_JOIN='{hostport}/{code}'; irm https://raw.githubusercontent.com/misorafa/kioku/main/install.ps1 | iex"
+        )),
+        "{}",
+        inv.stdout
+    );
+    assert!(!inv.stdout.contains("Bypass"));
 
     // The new machine: Claude Code installed, nothing else.
     let client = tempfile::tempdir().unwrap();

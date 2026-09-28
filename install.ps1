@@ -4,7 +4,7 @@
 #   irm http://192.168.1.240:7391/i/K7Q2M9XD.ps1 | iex     # the line `kioku invite` prints
 #   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/misorafa/kioku/main/install.ps1))) -ClientOnly http://192.168.1.240:7391 <token>
 #   & ([scriptblock]::Create((irm .../install.ps1))) -Version v0.5.0 -NoSetup
-#   powershell -ExecutionPolicy Bypass -File install.ps1 -Join http://home.lan:7391 <code>
+#   $env:KIOKU_JOIN='home.lan:7391/<code>'; irm https://raw.githubusercontent.com/misorafa/kioku/main/install.ps1 | iex
 #
 # Downloads kioku.exe (x86_64-pc-windows-msvc) from the GitHub release, verifies its
 # SHA-256 against the release's SHA256SUMS, installs it to
@@ -33,6 +33,9 @@
 # download runs nothing. This file stays ASCII (Windows PowerShell 5.1 reads a BOM-less
 # -File script as ANSI): Japanese text is written with \u escapes (see Ja).
 
+# Everything runs inside one script block, so `irm .../install.ps1 | iex` leaves no functions,
+# variables or $ErrorActionPreference behind in the user's window (SPEC-M2.3 section 9).
+& {
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -304,6 +307,21 @@ function Invoke-KiokuInstall([object[]]$Arguments) {
     $joinCode = ''
     if ($KiokuJoinUrl) { $joinUrl = [string]$KiokuJoinUrl }
     if ($KiokuJoinCode) { $joinCode = [string]$KiokuJoinCode }
+    # SPEC-M2.3 section 9: `$env:KIOKU_JOIN='<server>:<port>/<code>'; irm <github>/install.ps1 | iex`
+    # -- the script comes from GitHub over https, not from a bare LAN IP, and no execution-policy
+    # bypass is involved (Defender flagged `powershell -ExecutionPolicy Bypass -c irm http://<ip>/... | iex`).
+    if (-not $joinUrl -and $env:KIOKU_JOIN) {
+        $j = ([string]$env:KIOKU_JOIN).Trim()
+        $scheme = 'http://'
+        if ($j -match '^(https?://)') { $scheme = $Matches[1]; $j = $j.Substring($scheme.Length) }
+        $slash = $j.LastIndexOf('/')
+        if ($slash -lt 1 -or $slash -eq $j.Length - 1) {
+            Die 'KIOKU_JOIN must look like <server>:<port>/<code>, as kioku invite prints it'
+        }
+        $joinUrl = $scheme + $j.Substring(0, $slash)
+        $joinCode = $j.Substring($slash + 1)
+        Remove-Item Env:KIOKU_JOIN -ErrorAction SilentlyContinue
+    }
     $pass = New-Object System.Collections.Generic.List[string]
 
     $i = 0
@@ -410,3 +428,4 @@ function Invoke-KiokuInstall([object[]]$Arguments) {
 }
 
 Invoke-KiokuInstall $args
+} @args

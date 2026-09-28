@@ -324,9 +324,29 @@ check "no checksum at all aborts, nothing installed" \
     eval '[ "$RC" != 0 ] && has "refusing to install an unverified binary" && nothing_installed'
 
 newhome
-inst MINGW64_NT-10.0 x86_64 --no-setup
-check "Git Bash on Windows -> points at kioku invite / install.ps1, nothing installed" \
-    eval '[ "$RC" = 1 ] && has "use PowerShell: run kioku invite on the server" && has "install.ps1" && nothing_installed'
+# Git Bash on Windows (SPEC-M2.3 §9): hand over to install.ps1 run by PowerShell from a local
+# file, with KIOKU_JOIN carrying the invite; never `-ExecutionPolicy Bypass` / `irm … | iex`.
+printf '# fixture install.ps1\n' >"$FIX/install.ps1"
+cat >"$FAKEBIN/powershell.exe" <<'PS'
+#!/bin/sh
+echo "PS-ARGV: $*"
+echo "PS-JOIN: [${KIOKU_JOIN:-}]"
+f=$(printf '%s' "$*" | sed -n "s/.*ReadAllText('\([^']*\)').*/\1/p")
+[ -f "$f" ] && echo "PS-FILE: $(cat "$f")"
+exit 0
+PS
+chmod 755 "$FAKEBIN/powershell.exe"
+newhome
+RC=0
+OUT=$(cd "$H" && env HOME="$H" SHELL=/bin/bash PATH="$FAKEBIN:$PATH0" KIOKU_UNAME_S=MINGW64_NT-10.0 \
+    KIOKU_UNAME_M=x86_64 KIOKU_PS1_URL="http://127.0.0.1:$PORT/install.ps1" \
+    KIOKU_JOIN_URL=http://192.168.1.240:7391 KIOKU_JOIN_CODE=K7Q2M9XD \
+    "$TEST_SH" "$ROOT/install.sh" 2>&1) || RC=$?
+check "Git Bash on Windows -> install.ps1 via PowerShell from a file, invite passed as KIOKU_JOIN" \
+    eval '[ "$RC" = 0 ] && has "PS-JOIN: [http://192.168.1.240:7391/K7Q2M9XD]" && has "PS-FILE: # fixture install.ps1" &&
+        has "-NoProfile -Command" && lacks "Bypass" && lacks "iex" && nothing_installed'
+rm -f "$FAKEBIN/powershell.exe"
+
 
 # ---------------------------------------------------------------- source fallback
 
@@ -422,6 +442,19 @@ OUT=$(cd "$H" && env HOME="$H" SHELL=/bin/zsh PATH="$FAKEBIN:$PATH0" KIOKU_DOWNL
 check "KIOKU_JOIN_URL / KIOKU_JOIN_CODE env; extra args go to kioku join; --no-modify-path" \
     eval '[ "$RC" = 0 ] && has "STUB-ARGV: [join] [http://mini.local:7391] [ABCD2345] [--agents] [codex]" &&
         [ ! -e "$H/.zshrc" ] && lacks "新しいターミナル"'
+
+newhome
+RC=0
+OUT=$(cd "$H" && env HOME="$H" SHELL=/bin/zsh PATH="$FAKEBIN:$PATH0" KIOKU_DOWNLOAD_BASE="$BASE" \
+    KIOKU_UNAME_S=Linux KIOKU_UNAME_M=x86_64 KIOKU_VERSION=v9.9.9 KIOKU_JOIN=mini.local:7391/ABCD2345 \
+    "$TEST_SH" "$ROOT/install.sh" --no-modify-path 2>&1) || RC=$?
+check "KIOKU_JOIN=<server>:<port>/<code> (what kioku invite prints)" \
+    eval '[ "$RC" = 0 ] && has "STUB-ARGV: [join] [http://mini.local:7391] [ABCD2345]"'
+RC=0
+OUT=$(cd "$H" && env HOME="$H" SHELL=/bin/zsh PATH="$FAKEBIN:$PATH0" KIOKU_DOWNLOAD_BASE="$BASE" \
+    KIOKU_UNAME_S=Linux KIOKU_UNAME_M=x86_64 KIOKU_VERSION=v9.9.9 KIOKU_JOIN=no-code-here \
+    "$TEST_SH" "$ROOT/install.sh" --no-modify-path 2>&1) || RC=$?
+check "a malformed KIOKU_JOIN is refused" eval '[ "$RC" = 1 ] && has "KIOKU_JOIN must look like"'
 
 newhome
 inst Linux x86_64 --version v9.9.9 --join http://h:7391 CODE2345
