@@ -55,14 +55,18 @@ jobs:
           else
             cargo build --release --locked -p kioku-cli --target ${{ matrix.target }}
           fi
-      # SPEC-M2 §10.3.1: bind the embedded Info.plist and a stable identifier into the
-      # ad-hoc signature, so macOS Local Network privacy can recognise and prompt for kioku.
-      - name: Sign (macOS, ad hoc, stable identifier)
+      # SPEC-M2 §10.3.1: Developer ID signature (+ notarization) when the secrets exist, so
+      # firewalls and Local Network privacy keep recognising kioku across updates; otherwise
+      # ad hoc with the stable identifier dev.kioku.kioku.
+      - name: Sign (macOS)
         if: runner.os == 'macOS'
-        run: |
-          codesign -s - --force --identifier dev.kioku.kioku "target/${{ matrix.target }}/release/kioku"
-          codesign -dv "target/${{ matrix.target }}/release/kioku" 2>&1 | grep -E 'Identifier=dev.kioku.kioku'
-          codesign -dv "target/${{ matrix.target }}/release/kioku" 2>&1 | grep -E 'Info.plist entries='
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: sh scripts/sign-macos.sh "target/${{ matrix.target }}/release/kioku"
       - name: Package
         shell: bash
         run: |

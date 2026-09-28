@@ -995,9 +995,22 @@ What kioku does about it:
    - the release workflow re-signs the binary ad hoc with
      `--identifier dev.kioku.kioku`, which binds the plist.
 
-   Prompts and rule lists then show "kioku" (`dev.kioku.kioku`). Whether a
-   firewall rule survives a `kioku update` depends on the firewall; ad-hoc
-   signatures have no team identity (UNVERIFIED).
+   Prompts and rule lists then show "kioku" (`dev.kioku.kioku`). An ad-hoc
+   signature has no team identity, and it was observed not to survive every
+   update: Little Snitch asked again for v0.4.0. So
+   `scripts/sign-macos.sh`, the release workflow's macOS step, signs with a
+   **Developer ID Application** certificate when the secrets exist, with
+   hardened runtime, a secure timestamp and `--identifier dev.kioku.kioku`,
+   and notarizes the zipped binary with `notarytool`. The secrets are:
+   - `MACOS_CERT_P12` (base64 .p12) and `MACOS_CERT_PASSWORD`;
+   - `NOTARY_KEY_P8` (base64 App Store Connect API key), `NOTARY_KEY_ID` and
+     `NOTARY_ISSUER_ID`.
+
+   A bare binary cannot be stapled, so Gatekeeper checks the ticket online;
+   downloads made with curl carry no quarantine anyway. The team identity is
+   what keeps a firewall rule valid across updates. Without the secrets the
+   script falls back to the ad-hoc signature, and a missing notary key only
+   skips notarization.
 2. **Diagnosis.** On macOS, `kioku doctor` on a machine whose `[server] bind`
    is not loopback adds `server.lan`. It requests
    `http://<first non-loopback IPv4>:<port>/api/v1/health` with a 3 s timeout.
