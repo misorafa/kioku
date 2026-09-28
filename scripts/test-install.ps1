@@ -241,7 +241,11 @@ try {
         $eap = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         try {
-            if ($Mode -eq 'iex') {
+            if ($Mode -eq 'rawiex') {
+                # What `$env:KIOKU_JOIN='<server>/<code>'; irm <github>/install.ps1 | iex` runs.
+                $cmd = "[System.IO.File]::ReadAllText('$InstallPs1') | Invoke-Expression; Write-Host ('ENVLEFT=' + [string](Test-Path Env:KIOKU_JOIN)); Write-Host ('FNLEFT=' + [string](Test-Path function:Invoke-KiokuInstall)); Write-Host ('EAP=' + `$ErrorActionPreference)"
+                $script:Out = (& $Shell -NoProfile -Command $cmd 2>&1 | Out-String)
+            } elseif ($Mode -eq 'iex') {
                 $served = Join-Path $Work 'served.ps1'
                 $text = "& {`n`$KiokuJoinUrl = '$($InstallArgs[0])'`n`$KiokuJoinCode = '$($InstallArgs[1])'`n" + [System.IO.File]::ReadAllText($InstallPs1) + "`n}`n"
                 [System.IO.File]::WriteAllText($served, $text)
@@ -320,6 +324,10 @@ try {
     Check 'iex join mode: kioku.exe join <url> <code>, no setup' ($script:Rc -eq 0 -and (Has 'STUB-ARGV: [join] [http://192.168.1.240:7391] [K7Q2M9XD]') -and -not (Has '[setup]'))
     Check 'iex join mode: user PATH and this window''s $env:Path both get the dir' ((Get-Content -LiteralPath $PathFile -Raw) -eq "C:\Windows\system32;C:\Tools;$Dir" -and ($script:Out -split "`r?`n" | Where-Object { $_ -like 'SESSION-PATH=*' -and $_.Contains($Dir) }))
     Check 'iex join mode: bilingual end message, no variables left in the window' ((Has 'The kioku command works in new PowerShell windows') -and (Has 'LEAK=False'))
+    # SPEC-M2.3 section 9: the Windows line kioku invite prints since v0.6.1.
+    Invoke-Install @() 'rawiex' @{ KIOKU_VERSION = 'v9.9.8'; KIOKU_INSTALL_DIR = $Dir; KIOKU_JOIN = '192.168.1.240:7391/K7Q2M9XD' }
+    Check 'KIOKU_JOIN + irm | iex: kioku.exe join <url> <code>' ($script:Rc -eq 0 -and (Has 'STUB-ARGV: [join] [http://192.168.1.240:7391] [K7Q2M9XD]'))
+    Check 'KIOKU_JOIN + irm | iex: nothing left in the window (env var, functions, ErrorActionPreference)' ((Has 'ENVLEFT=False') -and (Has 'FNLEFT=False') -and -not (Has 'EAP=Stop'))
     Invoke-Install @('-InstallDir', $Dir, '-Version', 'v9.9.8', '-Join', 'http://h:7391', 'CODE2345', '--agents', 'codex')
     Check '-Join <url> <code> plus args for kioku join' ($script:Rc -eq 0 -and (Has 'STUB-ARGV: [join] [http://h:7391] [CODE2345] [--agents] [codex]'))
     Invoke-Install @('-InstallDir', $Dir, '-Version', 'v9.9.8', '-Join', 'http://h:7391')

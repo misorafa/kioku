@@ -117,8 +117,8 @@ $ kioku invite
 追加するマシンで、次のどちらか 1 行を貼り付けてください（10 分間・1 回だけ有効）:
 Paste ONE of these on the machine to add (valid 10 minutes, once):
 
-  Windows (PowerShell):  irm http://192.168.1.240:7391/i/K7Q2M9XD.ps1 | iex
-  macOS / Linux:         curl -sSL http://192.168.1.240:7391/i/K7Q2M9XD | sh
+  Windows (PowerShell):  $env:KIOKU_JOIN='192.168.1.240:7391/K7Q2M9XD'; irm https://raw.githubusercontent.com/misorafa/kioku/main/install.ps1 | iex
+  macOS / Linux / Git Bash:  curl -sSL http://192.168.1.240:7391/i/K7Q2M9XD | sh
 
 (On this LAN you can also use http://mini-M2.local:7391/…; over a VPN use the IP.)
 ```
@@ -159,8 +159,10 @@ Claude Code（CLI と Claude デスクトップアプリの Code タブ）と Co
 構いません。いつも自分のユーザーにインストールします）:
 
 ```powershell
-irm http://192.168.1.240:7391/i/K7Q2M9XD.ps1 | iex
+$env:KIOKU_JOIN='192.168.1.240:7391/K7Q2M9XD'; irm https://raw.githubusercontent.com/misorafa/kioku/main/install.ps1 | iex
 ```
+
+**PowerShell** に貼り付けてください。Git Bash では `curl … | sh` の行を貼ると、自動で PowerShell に引き継ぎます。どちらの行も `powershell -ExecutionPolicy Bypass -c …` で包まないでください（Windows Defender が `Trojan:Win32/Commando.A!ml` として止めます）。
 
 `install.ps1` は `kioku-<tag>-x86_64-pc-windows-msvc.tar.gz` をダウンロードして `SHA256SUMS` で
 検証し（`Get-FileHash`）、`kioku.exe` を `%LOCALAPPDATA%\Programs\kioku` にインストールし、そのフォルダを

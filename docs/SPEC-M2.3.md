@@ -30,7 +30,7 @@ On the server machine:
 $ kioku invite
 Paste ONE of these on the machine to add (valid 10 minutes, once):
 
-  Windows (PowerShell):  irm http://192.168.1.240:7391/i/K7Q2M9XD.ps1 | iex
+  Windows (PowerShell):  $env:KIOKU_JOIN='192.168.1.240:7391/K7Q2M9XD'; irm https://raw.githubusercontent.com/misorafa/kioku/main/install.ps1 | iex   (since v0.6.1, §9)
   macOS / Linux:         curl -fsSL http://192.168.1.240:7391/i/K7Q2M9XD | sh
 
 (On this LAN you can also use http://mini-M2.local:7391/…; over a VPN use the IP.)
@@ -242,3 +242,42 @@ Recorded by the implementing session; each choice follows §1's principle.
     the real binary (`invite_join.rs`), not yet by a paste on a real Windows
     11 machine. The first release containing `kioku join` must exist before the
     invite line works for users, because the installer downloads `latest`.
+
+## 9. Windows line changed after a real Defender block (2026-09-29, v0.6.1)
+
+On the user's Windows 11, the pasted `irm http://192.168.1.240:7391/i/<code>.ps1 | iex`
+was first put into Git Bash, where `irm` does not exist. The fallback I suggested,
+`powershell -ExecutionPolicy Bypass -c "irm http://<LAN IP>/i/<code>.ps1 | iex"`, was
+then **blocked by Windows Defender as `Trojan:Win32/Commando.A!ml`**. Defender matched
+the command-line shape (`CmdLine:`), not kioku's content. A download cradle from a
+bare IP over http, together with `-ExecutionPolicy Bypass`, is a malware pattern.
+
+Changes:
+
+1. **The Windows line** printed by `kioku invite` is now
+   `$env:KIOKU_JOIN='<host:port>/<code>'; irm https://raw.githubusercontent.com/misorafa/kioku/main/install.ps1 | iex`.
+   - The script comes from GitHub over https: the same path that installed v0.5.0
+     cleanly on that machine.
+   - Only the invite (server address plus code, no token) comes from the LAN.
+   - The line has no `-ExecutionPolicy Bypass` and never starts a second
+     `powershell.exe`.
+2. **install.ps1**
+   - It reads `KIOKU_JOIN` (`[http(s)://]host:port/code`) when no
+     `$KiokuJoinUrl` is set, then removes the variable.
+   - The whole file is wrapped in `& { … } @args`, so `irm … | iex` leaves no
+     functions, variables or `$ErrorActionPreference` in the user's window. The
+     server-served `/i/<code>.ps1` wrapping still exists.
+3. **install.sh on Windows** (Git Bash / MSYS / Cygwin)
+   - It no longer stops with advice. It downloads install.ps1
+     (`KIOKU_PS1_URL` overrides this for tests) and runs it as
+     `powershell.exe -NoProfile -Command "& ([scriptblock]::Create([IO.File]::ReadAllText('<file>')))"`,
+     with `KIOKU_JOIN` set from the join variables.
+   - That command line has no Bypass and no `irm | iex`, and a script block read
+     from a string is not subject to the execution policy.
+   - So the macOS/Linux `curl … | sh` line also works when pasted into Git
+     Bash, and it is labelled "macOS / Linux / Git Bash".
+4. **install.sh** also accepts `KIOKU_JOIN` for symmetry.
+
+The `/i/<code>.ps1` route stays, for older printed lines. Code signing
+(Authenticode) and a winget package remain the longer-term way to earn Windows
+reputation. They are not in this change.

@@ -80,6 +80,27 @@ fetch() {
     fi
 }
 
+# Windows (Git Bash / MSYS / Cygwin): hand over to install.ps1 run by PowerShell from a local
+# file (SPEC-M2.3 §9). No `-ExecutionPolicy Bypass` and no `irm <url> | iex` on the command line
+# (Defender flags that shape); a script block read from a file is not subject to the policy.
+windows_delegate() {
+    have powershell.exe || die "on Windows this installer needs PowerShell (powershell.exe)"
+    [ -n "$DL" ] || die "curl or wget is required"
+    wtmp=$(mktemp -d 2>/dev/null || mktemp -d -t kioku)
+    ps1="$wtmp/install.ps1"
+    fetch "${KIOKU_PS1_URL:-https://raw.githubusercontent.com/$REPO/main/install.ps1}" "$ps1" ||
+        { rm -rf "$wtmp"; die "could not download install.ps1 (network error)"; }
+    win=$(cygpath -w "$ps1" 2>/dev/null || printf '%s' "$ps1")
+    join=""
+    [ -z "$JOIN_URL" ] || join="$JOIN_URL/$JOIN_CODE"
+    say "Windows: continuing with PowerShell (install.ps1) / Windows のため PowerShell で続けます"
+    rc=0
+    KIOKU_JOIN="$join" powershell.exe -NoProfile -Command \
+        "& ([scriptblock]::Create([IO.File]::ReadAllText('$win')))" || rc=$?
+    rm -rf "$wtmp"
+    return "$rc"
+}
+
 # Final URL after redirects; non-zero on a network or HTTP error (nothing printed then).
 final_url() {
     if [ "$DL" = curl ]; then
@@ -397,6 +418,16 @@ main() {
     done
 
     [ -n "${HOME:-}" ] || die "HOME is not set"
+    # KIOKU_JOIN=<server>:<port>/<code> (what `kioku invite` prints; SPEC-M2.3 §9).
+    if [ -z "$JOIN_URL" ] && [ -n "${KIOKU_JOIN:-}" ]; then
+        j=$KIOKU_JOIN
+        scheme=http://
+        case "$j" in http://* | https://*) scheme="${j%%://*}://" && j=${j#*://} ;; esac
+        case "$j" in
+            ?*/?*) JOIN_URL="$scheme${j%/*}" && JOIN_CODE=${j##*/} ;;
+            *) die "KIOKU_JOIN must look like <server>:<port>/<code>, as kioku invite prints it" ;;
+        esac
+    fi
     if [ -n "$JOIN_URL" ] && [ -z "$JOIN_CODE" ]; then
         die "join mode needs both KIOKU_JOIN_URL and KIOKU_JOIN_CODE (or --join <url> <code>)"
     fi
@@ -421,6 +452,12 @@ main() {
 
     DL=""
     if have curl; then DL=curl; elif have wget; then DL=wget; fi
+    case "${KIOKU_UNAME_S:-$(uname -s 2>/dev/null || true)}" in
+        MINGW* | MSYS* | CYGWIN* | Windows_NT)
+            windows_delegate
+            exit $?
+            ;;
+    esac
     INSTALLED=0
     if [ "$FROM_SOURCE" = 0 ]; then
         [ -n "$DL" ] || die "curl or wget is required"

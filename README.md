@@ -127,8 +127,8 @@ $ kioku invite
 追加するマシンで、次のどちらか 1 行を貼り付けてください（10 分間・1 回だけ有効）:
 Paste ONE of these on the machine to add (valid 10 minutes, once):
 
-  Windows (PowerShell):  irm http://192.168.1.240:7391/i/K7Q2M9XD.ps1 | iex
-  macOS / Linux:         curl -sSL http://192.168.1.240:7391/i/K7Q2M9XD | sh
+  Windows (PowerShell):  $env:KIOKU_JOIN='192.168.1.240:7391/K7Q2M9XD'; irm https://raw.githubusercontent.com/misorafa/kioku/main/install.ps1 | iex
+  macOS / Linux / Git Bash:  curl -sSL http://192.168.1.240:7391/i/K7Q2M9XD | sh
 
 (On this LAN you can also use http://mini-M2.local:7391/…; over a VPN use the IP.)
 ```
@@ -174,8 +174,10 @@ plus the `kioku mcp` bridge. The server stays on a Mac or Linux machine. Run
 normal or administrator — it always installs for your own user):
 
 ```powershell
-irm http://192.168.1.240:7391/i/K7Q2M9XD.ps1 | iex
+$env:KIOKU_JOIN='192.168.1.240:7391/K7Q2M9XD'; irm https://raw.githubusercontent.com/misorafa/kioku/main/install.ps1 | iex
 ```
+
+Paste it into **PowerShell**. From Git Bash, paste the `curl … | sh` line instead: it hands over to PowerShell by itself. Do not wrap either line in `powershell -ExecutionPolicy Bypass -c …`: Windows Defender flags that shape as `Trojan:Win32/Commando.A!ml`.
 
 `install.ps1` downloads `kioku-<tag>-x86_64-pc-windows-msvc.tar.gz`, verifies it
 against `SHA256SUMS` (`Get-FileHash`), installs `kioku.exe` to

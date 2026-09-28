@@ -4,6 +4,10 @@
 
 use std::time::Duration;
 
+/// install.ps1 on GitHub (https): what the Windows invite line fetches (SPEC-M2.3 §9).
+pub const WINDOWS_INSTALLER: &str =
+    "https://raw.githubusercontent.com/misorafa/kioku/main/install.ps1";
+
 use kioku_core::config::CONFIG_FILE;
 use kioku_core::{ClientConfig, Config};
 use serde_json::{Value, json};
@@ -159,12 +163,15 @@ pub fn render_invite(code: &str, url: &crate::setup::ClientUrl, minutes: u32, us
     out.push_str(&format!(
         "Paste ONE of these on the machine to add ({valid_en}):\n\n"
     ));
+    // SPEC-M2.3 §9: the Windows line fetches install.ps1 from GitHub over https and passes the
+    // invite in KIOKU_JOIN — Defender flagged `powershell -ExecutionPolicy Bypass -c irm
+    // http://<LAN IP>/… | iex` as Trojan:Win32/Commando.A!ml.
+    let join = url.url.trim_start_matches("http://");
     out.push_str(&format!(
-        "  Windows (PowerShell):  irm {}/i/{code}.ps1 | iex\n",
-        url.url
+        "  Windows (PowerShell):  $env:KIOKU_JOIN='{join}/{code}'; irm {WINDOWS_INSTALLER} | iex\n"
     ));
     out.push_str(&format!(
-        "  macOS / Linux:         curl -sSL {}/i/{code} | sh\n",
+        "  macOS / Linux / Git Bash:  curl -sSL {}/i/{code} | sh\n",
         url.url
     ));
     if let Some(alt) = &url.mdns_alternative {
@@ -325,6 +332,7 @@ mod tests {
 
     #[test]
     fn invite_text() {
+        // (SPEC-M2.3 §9 shapes)
         let url = crate::setup::ClientUrl {
             url: "http://192.168.1.240:7391".into(),
             mdns_alternative: Some("http://mini-M2.local:7391".into()),
@@ -332,11 +340,18 @@ mod tests {
         };
         let t = render_invite("K7Q2M9XD", &url, 10, 1);
         assert!(t.contains(
-            "  Windows (PowerShell):  irm http://192.168.1.240:7391/i/K7Q2M9XD.ps1 | iex\n"
-        ));
-        assert!(t.contains(
-            "  macOS / Linux:         curl -sSL http://192.168.1.240:7391/i/K7Q2M9XD | sh\n"
-        ));
+            "  Windows (PowerShell):  $env:KIOKU_JOIN='192.168.1.240:7391/K7Q2M9XD'; irm https://raw.githubusercontent.com/misorafa/kioku/main/install.ps1 | iex\n"
+        ), "{t}");
+        assert!(
+            t.contains(
+                "  macOS / Linux / Git Bash:  curl -sSL http://192.168.1.240:7391/i/K7Q2M9XD | sh\n"
+            ),
+            "{t}"
+        );
+        assert!(
+            !t.contains("Bypass") && !t.contains("/i/K7Q2M9XD.ps1"),
+            "{t}"
+        );
         assert!(t.contains("(valid 10 minutes, once)"));
         assert!(t.contains("10 分間・1 回だけ有効"));
         assert!(t.contains("http://mini-M2.local:7391/…"));
