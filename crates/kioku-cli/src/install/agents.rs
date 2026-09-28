@@ -14,7 +14,7 @@ use serde_json::{Map, Value, json};
 
 use super::block::{self, FileOutcome};
 use super::{
-    HookSpec, McpChange, SettingsChange, Written, agent_hook_command, claude_specs,
+    HookPlatform, HookSpec, McpChange, SettingsChange, Written, agent_hook_command, claude_specs,
     mcp_server_entry, mcp_url, merge_flat, merge_mcp_entry, merge_nested, read_settings,
     register_mcp_entry, remove_flat, remove_hooks, remove_mcp_server, rewrite_json_after_removal,
     unregister_mcp_entry, write_settings,
@@ -35,6 +35,8 @@ pub struct InstallCtx {
     pub bin: String,
     /// `[client]` settings: server URL, token, language.
     pub client: ClientConfig,
+    /// How hook commands are rendered (the running OS outside tests).
+    pub platform: HookPlatform,
 }
 
 impl InstallCtx {
@@ -51,6 +53,7 @@ impl InstallCtx {
             cwd: std::env::current_dir().context("reading current directory")?,
             bin,
             client,
+            platform: HookPlatform::current(),
         })
     }
 
@@ -231,7 +234,14 @@ pub fn detection_paths(agent: Agent, ctx: &InstallCtx) -> Vec<PathBuf> {
 }
 
 /// True when the agent is installed on this machine (any [`detection_paths`] entry exists).
+/// Gemini CLI and Antigravity are never detected on Windows (SPEC-M2.2 §1: out of scope
+/// there; `kioku install <agent>` still works when asked for by name).
 pub fn is_detected(agent: Agent, ctx: &InstallCtx) -> bool {
+    if ctx.platform == HookPlatform::Windows
+        && matches!(agent, Agent::GeminiCli | Agent::Antigravity)
+    {
+        return false;
+    }
     detection_paths(agent, ctx).iter().any(|p| p.exists())
 }
 
@@ -328,14 +338,23 @@ fn secs(agent: Agent, event: HookEventKind) -> u64 {
 }
 
 /// Codex `hooks.json` groups (M2 §4.2).
-pub fn codex_specs(bin: &str) -> Vec<HookSpec> {
+pub fn codex_specs(bin: &str, platform: HookPlatform) -> Vec<HookSpec> {
     let a = Agent::Codex;
     ALL_EVENTS
         .iter()
         .map(|&event| {
             let mut handler = Map::new();
             handler.insert("type".into(), json!("command"));
-            handler.insert("command".into(), json!(agent_hook_command(a, bin, event)));
+            handler.insert(
+                "command".into(),
+                json!(agent_hook_command(a, bin, event, platform)),
+            );
+            if platform == HookPlatform::Windows {
+                handler.insert(
+                    "commandWindows".into(),
+                    json!(super::powershell_hook_command(a, bin, event)),
+                );
+            }
             handler.insert("timeout".into(), json!(secs(a, event)));
             if event == HookEventKind::SessionStart {
                 handler.insert("statusMessage".into(), json!("kioku: loading handoff"));
@@ -375,13 +394,16 @@ pub const CURSOR_EVENTS: [(&str, HookEventKind, Option<&str>); 8] = [
 ];
 
 /// Cursor `hooks.json` handlers (M2 §5.2).
-pub fn cursor_specs(bin: &str) -> Vec<HookSpec> {
+pub fn cursor_specs(bin: &str, platform: HookPlatform) -> Vec<HookSpec> {
     let a = Agent::Cursor;
     CURSOR_EVENTS
         .iter()
         .map(|&(key, event, matcher)| {
             let mut handler = Map::new();
-            handler.insert("command".into(), json!(agent_hook_command(a, bin, event)));
+            handler.insert(
+                "command".into(),
+                json!(agent_hook_command(a, bin, event, platform)),
+            );
             if let Some(m) = matcher {
                 handler.insert("matcher".into(), json!(m));
             }
@@ -417,7 +439,7 @@ pub const GEMINI_EVENTS: [(&str, HookEventKind, &str); 6] = [
 ];
 
 /// Gemini CLI `settings.json` hook groups (M2 §6.2); timeouts in milliseconds.
-pub fn gemini_specs(bin: &str) -> Vec<HookSpec> {
+pub fn gemini_specs(bin: &str, platform: HookPlatform) -> Vec<HookSpec> {
     let a = Agent::GeminiCli;
     GEMINI_EVENTS
         .iter()
@@ -425,7 +447,7 @@ pub fn gemini_specs(bin: &str) -> Vec<HookSpec> {
             let handler = json!({
                 "name": name,
                 "type": "command",
-                "command": agent_hook_command(a, bin, event),
+                "command": agent_hook_command(a, bin, event, platform),
                 "timeout": registered_timeout_ms(a, event),
             });
             let mut group = Map::new();
@@ -457,14 +479,14 @@ pub const ANTIGRAVITY_EVENTS: [(&str, HookEventKind, Option<&str>); 4] = [
 ];
 
 /// Antigravity CLI handlers of the `kioku` group (M2.1 §4.1); timeouts in seconds.
-pub fn antigravity_specs(bin: &str) -> Vec<HookSpec> {
+pub fn antigravity_specs(bin: &str, platform: HookPlatform) -> Vec<HookSpec> {
     let a = Agent::Antigravity;
     ANTIGRAVITY_EVENTS
         .iter()
         .map(|&(key, event, matcher)| {
             let handler = json!({
                 "type": "command",
-                "command": agent_hook_command(a, bin, event),
+                "command": agent_hook_command(a, bin, event, platform),
                 "timeout": secs(a, event),
             });
             let entry = match matcher {
@@ -522,9 +544,8 @@ pub fn hook_commands(map: &Value, key: &str) -> Vec<String> {
             Some(inner) => inner.iter().collect::<Vec<_>>(),
             None => vec![item],
         })
-        .filter_map(|h| h.get("command").and_then(Value::as_str))
+        .filter_map(crate::install::handler_command_line)
         .filter(|c| crate::install::is_kioku_command(c))
-        .map(str::to_string)
         .collect()
 }
 
@@ -539,13 +560,13 @@ pub fn hooks_map(agent: Agent, settings: &Value) -> Option<&Value> {
 }
 
 /// The hook registrations `install` writes for `agent` (one per native event key).
-pub fn hook_specs(agent: Agent, bin: &str) -> Vec<HookSpec> {
+pub fn hook_specs(agent: Agent, bin: &str, platform: HookPlatform) -> Vec<HookSpec> {
     match agent {
-        Agent::ClaudeCode => claude_specs(bin),
-        Agent::Codex => codex_specs(bin),
-        Agent::Cursor => cursor_specs(bin),
-        Agent::GeminiCli => gemini_specs(bin),
-        Agent::Antigravity => antigravity_specs(bin),
+        Agent::ClaudeCode => claude_specs(bin, platform),
+        Agent::Codex => codex_specs(bin, platform),
+        Agent::Cursor => cursor_specs(bin, platform),
+        Agent::GeminiCli => gemini_specs(bin, platform),
+        Agent::Antigravity => antigravity_specs(bin, platform),
     }
 }
 
@@ -555,13 +576,18 @@ pub fn is_flat(agent: Agent) -> bool {
 }
 
 /// Our hooks merged into `settings` in the agent's format.
-pub fn merge_agent_hooks(agent: Agent, settings: &Value, bin: &str) -> anyhow::Result<Value> {
+pub fn merge_agent_hooks(
+    agent: Agent,
+    settings: &Value,
+    bin: &str,
+    platform: HookPlatform,
+) -> anyhow::Result<Value> {
     if agent == Agent::Antigravity {
-        merge_group(settings, &hook_specs(agent, bin))
+        merge_group(settings, &hook_specs(agent, bin, platform))
     } else if is_flat(agent) {
-        merge_flat(settings, &hook_specs(agent, bin))
+        merge_flat(settings, &hook_specs(agent, bin, platform))
     } else {
-        merge_nested(settings, &hook_specs(agent, bin))
+        merge_nested(settings, &hook_specs(agent, bin, platform))
     }
 }
 
@@ -577,8 +603,8 @@ pub fn remove_agent_hooks(agent: Agent, settings: &Value) -> anyhow::Result<(Val
 }
 
 /// The hooks to add by hand when the file cannot be edited.
-fn hooks_snippet(agent: Agent, bin: &str) -> String {
-    let v = merge_agent_hooks(agent, &json!({}), bin).unwrap_or_default();
+fn hooks_snippet(agent: Agent, bin: &str, platform: HookPlatform) -> String {
+    let v = merge_agent_hooks(agent, &json!({}), bin, platform).unwrap_or_default();
     serde_json::to_string_pretty(&v).unwrap_or_default()
 }
 
@@ -671,7 +697,7 @@ fn install_hook_file(
         let mut msg = format!(
             "{e:#}\nAdd these hooks to {} yourself:\n{}",
             path.display(),
-            hooks_snippet(agent, &ctx.bin)
+            hooks_snippet(agent, &ctx.bin, ctx.platform)
         );
         if let Some(entry) = mcp_entry {
             msg.push_str(&format!(
@@ -684,7 +710,7 @@ fn install_hook_file(
     let current = read_settings(path).map_err(manual)?;
     let existed = current.is_some();
     let before = current.unwrap_or_else(|| Value::Object(Map::new()));
-    let mut after = merge_agent_hooks(agent, &before, &ctx.bin)
+    let mut after = merge_agent_hooks(agent, &before, &ctx.bin, ctx.platform)
         .with_context(|| format!("{}: not touching it", path.display()))
         .map_err(manual)?;
     if let Some(entry) = mcp_entry {
@@ -1001,7 +1027,7 @@ pub fn unstable_binary_warning(bin: &str) -> Option<String> {
     let in_target = path.components().any(|c| c.as_os_str() == "target");
     let tmp = std::env::temp_dir();
     let in_tmp = path.starts_with(&tmp)
-        || std::fs::canonicalize(&tmp).is_ok_and(|t| path.starts_with(t))
+        || kioku_core::util::canonical_plain(&tmp).is_ok_and(|t| path.starts_with(t))
         || path.starts_with("/tmp");
     (in_target || in_tmp).then(|| {
         format!(

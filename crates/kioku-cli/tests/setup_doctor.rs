@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use kioku_cli::doctor::{self, Check, DoctorEnv, Status};
 use kioku_cli::event::Agent;
+use kioku_cli::install::HookPlatform;
 use kioku_cli::install::agents::{InstallCtx, InstallOptions, install_agent, install_all};
 use kioku_cli::service::{CmdOutput, Platform, Runner, ServiceSpec, render_unit};
 use kioku_cli::setup::{SetupEnv, SetupOptions, run_setup};
@@ -90,6 +91,7 @@ fn setup_env(home: &Path, bin: &str, vars: HashMap<String, String>, runner: Runn
         bin: bin.to_string(),
         runner,
         platform: Some(Platform::Systemd),
+        hook_platform: HookPlatform::Unix,
         request_timeout: Duration::from_secs(3),
         poll_interval: Duration::from_millis(50),
         poll_timeout: Duration::from_secs(10),
@@ -225,8 +227,40 @@ fn setup_without_service_installs_agents_and_is_idempotent() {
         "  curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh -s -- --client-only http://"
     ));
     assert!(line.ends_with(&format!(":7391 {TOKEN}")), "{line}");
+    // SPEC-M2.2 §8: then the install.ps1 line for Windows clients, same URL and token.
+    let ps1 = text.lines().find(|l| l.contains("install.ps1")).unwrap();
+    assert!(ps1.starts_with(
+        "  & ([scriptblock]::Create((irm https://raw.githubusercontent.com/misorafa/kioku/main/install.ps1))) -ClientOnly http://"
+    ));
+    assert!(ps1.ends_with(&format!(":7391 {TOKEN}")), "{ps1}");
+    let url_of = |l: &str| l.split_whitespace().rev().nth(1).unwrap().to_string();
+    assert_eq!(url_of(ps1), url_of(line));
     assert!(text.contains("listens on 127.0.0.1 only"));
     assert_eq!(snapshot(home.path(), &[]), before);
+}
+
+#[test]
+fn setup_on_windows_requires_client_only() {
+    let (home, bin) = home_with_agents(true);
+    let mut env = setup_env(
+        home.path(),
+        &bin,
+        HashMap::new(),
+        Runner::recording(|_| CmdOutput::ok("")),
+    );
+    env.hook_platform = HookPlatform::Windows;
+    let before = snapshot(home.path(), &[]);
+    let r = run_setup(&SetupOptions::default(), &env);
+    assert_eq!(r.exit_code(), 1);
+    assert!(
+        r.render().contains(
+            "Windows runs kioku as a client: kioku setup --client-only <url> <token> (the server runs on macOS/Linux)"
+        ),
+        "{}",
+        r.render()
+    );
+    assert!(env.runner.calls().is_empty(), "no service command ran");
+    assert_eq!(snapshot(home.path(), &[]), before, "nothing written");
 }
 
 #[test]
@@ -728,6 +762,7 @@ impl Fixture {
             bin: self.bin.clone(),
             runner: self.runner.clone(),
             platform: Some(Platform::Systemd),
+            hook_platform: HookPlatform::Unix,
             timeout: Duration::from_secs(3),
         }
     }
@@ -740,6 +775,7 @@ impl Fixture {
             cwd: self.home.path().to_path_buf(),
             bin: bin.to_string(),
             client: cfg.client,
+            platform: HookPlatform::Unix,
         }
     }
 
@@ -997,6 +1033,7 @@ fn doctor_without_config_fails() {
             "KIOKU_SERVER_URL",
             &format!("http://127.0.0.1:{}", free_port()),
         )]),
+        hook_platform: HookPlatform::Unix,
         home: home.path().to_path_buf(),
         bin,
         runner: Runner::recording(|argv| {
@@ -1060,6 +1097,7 @@ fn doctor_on_a_client_only_machine_skips_data_dir_and_service() {
     assert_eq!(r.exit_code(), 0, "{}", r.render());
     let denv = DoctorEnv {
         vars: HashMap::new(),
+        hook_platform: HookPlatform::Unix,
         home: home.path().to_path_buf(),
         bin,
         runner: Runner::recording(|argv| {

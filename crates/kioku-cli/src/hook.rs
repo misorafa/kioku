@@ -81,6 +81,15 @@ pub fn stop_decision(
     }
 }
 
+/// Hook stdin bytes as text (SPEC-M2.2 §4.4): a leading UTF-8 BOM is dropped and the rest
+/// decoded as UTF-8 (lossily: a stray invalid byte never loses the whole payload). Never
+/// goes through an ANSI code page, so Japanese survives on Japanese Windows; CRLF is left
+/// to the JSON parser, which treats it as whitespace.
+pub fn decode_stdin(bytes: &[u8]) -> String {
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
 /// Runs one hook with the real process environment; see [`run_hook_with_env`].
 pub fn run_hook(event: HookEventKind, agent: Agent, stdin_json: &str, cfg: &Config) -> HookOutcome {
     run_hook_with_env(event, agent, stdin_json, cfg, &HookEnv::from_process())
@@ -99,7 +108,8 @@ pub fn run_hook_with_env(
     let mut agent = agent;
     let mut session = String::from("-");
     let raw: anyhow::Result<Value> =
-        serde_json::from_str(stdin_json.trim()).context("hook stdin is not JSON");
+        serde_json::from_str(stdin_json.trim_start_matches('\u{feff}').trim())
+            .context("hook stdin is not JSON");
     if agent == Agent::ClaudeCode
         && let Ok(raw) = &raw
         && is_cursor_invocation(raw)
@@ -1043,6 +1053,30 @@ mod tests {
         let out = run_hook_with_env(HookEventKind::Stop, Agent::ClaudeCode, &stdin, &cfg, &env);
         // Claude Code's fail-open rendering (empty stdout), not Cursor's `{}`.
         assert_eq!(out, HookOutcome::ok());
+    }
+
+    #[test]
+    fn stdin_with_bom_crlf_and_japanese_survives() {
+        // SPEC-M2.2 §4.4: what a Windows runtime may hand us — BOM, CRLF, raw UTF-8.
+        let body = "{\r\n  \"session_id\": \"s-win\",\r\n  \"cwd\": \"C:\\\\Users\\\\山田\\\\repo\",\r\n  \"hook_event_name\": \"UserPromptSubmit\",\r\n  \"prompt\": \"検索インデックスの日本語トークナイズを直して\"\r\n}\r\n";
+        let mut bytes = b"\xEF\xBB\xBF".to_vec();
+        bytes.extend_from_slice(body.as_bytes());
+        let text = decode_stdin(&bytes);
+        assert!(!text.starts_with('\u{feff}'));
+        let ev = parse_event(Agent::ClaudeCode, HookEventKind::UserPromptSubmit, &text).unwrap();
+        assert_eq!(
+            ev.prompt.as_deref(),
+            Some("検索インデックスの日本語トークナイズを直して")
+        );
+        assert_eq!(ev.cwd, r"C:\Users\山田\repo");
+        // A BOM that reaches run_hook as text is tolerated too.
+        let with_bom = format!("\u{feff}{body}");
+        let raw: Value = serde_json::from_str(with_bom.trim_start_matches('\u{feff}')).unwrap();
+        assert_eq!(raw["session_id"], "s-win");
+        // One invalid byte does not lose the payload.
+        let mut broken = body.as_bytes().to_vec();
+        broken.insert(2, 0xFF);
+        assert!(decode_stdin(&broken).contains("日本語"));
     }
 
     #[test]
