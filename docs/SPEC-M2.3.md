@@ -1,0 +1,171 @@
+# kioku — SPEC-M2.3: one-command join (`kioku invite`)
+
+Status: spec, 2026-09-28. Amends SPEC-M2 (and M2.2). Read CLAUDE.md, SPEC-M2.md
+§11, §13, §19–§21 and SPEC-M2.2 first.
+
+## 1. Why
+
+Adding a machine must be **one pasted line that leaves kioku fully usable**, for
+people who are not comfortable with terminals. The first real Windows 11 install
+(2026-09-28) broke that promise in several ways:
+
+- the PowerShell line `& ([scriptblock]::Create((irm …))) -ClientOnly <url>
+  <64-hex token>` was long and fragile, and copying it dropped the leading `&`;
+- the auth token had to be copied by hand, it ended up in a screenshot, and it had
+  to be rotated;
+- `kioku` was not on PATH after the install, because the installer only printed a
+  hint;
+- admin vs normal PowerShell needed explaining;
+- after `rotate-token`, updating a Windows client needed ssh plus shell variables.
+
+Principle for everything below: the person on the new machine pastes one short line
+and does nothing else. The **server owner** runs one command to get that line. No
+token is ever shown or copied.
+
+## 2. User flow
+
+On the server machine:
+
+```
+$ kioku invite
+Paste ONE of these on the machine to add (valid 10 minutes, once):
+
+  Windows (PowerShell):  irm http://192.168.1.240:7391/i/K7Q2M9XD.ps1 | iex
+  macOS / Linux:         curl -fsSL http://192.168.1.240:7391/i/K7Q2M9XD | sh
+
+(On this LAN you can also use http://mini-M2.local:7391/…; over a VPN use the IP.)
+```
+
+On the new machine the user pastes the line. That one command:
+
+1. downloads and verifies kioku from GitHub Releases (as today);
+2. installs it and puts it on PATH;
+3. exchanges the invite code for the server's token;
+4. writes a client-only config.toml;
+5. registers every detected agent (hooks + `kioku mcp`);
+6. ends with a short bilingual message: "kioku の準備ができました。Claude / Codex /
+   Cursor などを再起動してください。 / kioku is ready — restart Claude, Codex,
+   Cursor, …".
+
+A pasted line that is broken, expired or already used fails with one clear
+sentence that says to run `kioku invite` again on the server.
+
+After `kioku rotate-token`, the owner runs `kioku invite` again and pastes the
+new line on each machine. `join` replaces the old client config, so there is no
+ssh and no token handling.
+
+## 3. Server
+
+### 3.1 Invites (in memory)
+
+- An invite is `{code, created_at, expires_at, uses_left}`. It is held in memory
+  in the server's shared state (`Arc<parking_lot::Mutex<…>>`). A server restart
+  drops all invites, which is fine for a 10-minute object.
+- **Code:** 8 characters from Crockford base32 without the ambiguous letters
+  (`0-9A-Z` minus `I L O U`), shown upper-case and matched case-insensitively.
+  It comes from `util::generate_token`'s random source.
+- Defaults are a 10 minute TTL and 1 use. `--ttl <minutes>` is capped at 60 and
+  `--uses <n>` at 20, for adding several machines at once.
+- Expired invites are purged on every access.
+
+### 3.2 Routes
+
+| route | auth | does |
+|-------|------|------|
+| `POST /api/v1/invites` `{ttl_minutes?, uses?}` | **bearer token** | creates an invite and returns `{code, expires_at, uses}` |
+| `GET /i/<code>` | none | a valid, unexpired invite returns the **sh** installer (§4) with `text/plain`; otherwise 404 with a one-line sh `echo … >&2; exit 1` explaining what to do |
+| `GET /i/<code>.ps1` | none | the same, for **PowerShell** |
+| `POST /api/v1/join` `{code}` | none | consumes one use and returns `{token, server_url}`; invalid, expired or used → 404 `{error}` |
+
+Rules:
+
+- The installer script is the repo's `install.sh` / `install.ps1`, embedded in the
+  server binary (`include_str!`). It gets two variables prepended:
+  `KIOKU_JOIN_URL` and `KIOKU_JOIN_CODE` (sh), or `$KiokuJoinUrl` and
+  `$KiokuJoinCode` (ps1).
+- `KIOKU_JOIN_URL` is `http://<Host header>` of the request that fetched the
+  script. That is the address the new machine used to reach the server, so it
+  is right for LAN IP, `.local` and VPN alike. A missing or malformed Host header
+  gets a 400.
+- Fetching the script does **not** consume the invite; only `/api/v1/join` does,
+  so a retried download still works.
+- **Rate limit** on the unauthenticated routes: at most 10 failed code lookups
+  per minute per peer IP and 30 overall. Past that the server answers 429 for 60
+  seconds. With 32^8 codes, a 10-minute TTL and one use, guessing is hopeless.
+- `server_url` in the join response is the same Host-derived URL. The token is
+  the server's current `[server] auth_token`.
+- These routes are **not** under the bearer middleware. Every other route stays
+  protected. `serve` still refuses a non-loopback bind without a token.
+
+## 4. Installers
+
+### 4.1 Join mode
+
+- install.sh with `KIOKU_JOIN_URL`/`KIOKU_JOIN_CODE` set (or `--join <url>
+  <code>`) installs as today and then runs `kioku join <url> <code>`. The
+  pasted pipe `curl … | sh` needs no arguments.
+- install.ps1 with `$KiokuJoinUrl`/`$KiokuJoinCode` set (or `-Join <url>
+  <code>`) does the same with `kioku.exe join`. The pasted `irm … | iex` needs no
+  arguments and no `&`/scriptblock.
+
+### 4.2 PATH on by default
+
+- **Windows:** install.ps1 adds the install dir to the **user** PATH by default
+  (`[Environment]::SetEnvironmentVariable(…, 'User')`) and also to the current
+  session's `$env:Path`. `-NoPath` opts out. It says what it did.
+- **macOS / Linux:** install.sh adds `export PATH="$HOME/.local/bin:$PATH"` to the
+  user's shell rc when the dir is not on PATH: `~/.zshrc` for zsh, `~/.bashrc` for
+  bash, else `~/.profile`. It writes one marked line and is idempotent.
+  `--no-modify-path` opts out. This reverses install.sh's old "never edits shell
+  files" rule, which the one-command principle overrides. README and SPEC-M2
+  §13.2 are updated.
+
+### 4.3 Robustness
+
+- install.ps1 works in both an elevated and a normal PowerShell, and in both
+  Windows PowerShell 5.1 and pwsh 7. It installs for the invoking user either
+  way; elevation is only mentioned, never an error.
+- Messages at the end are bilingual (ja + en), short, and list the agents that
+  were set up.
+
+## 5. CLI
+
+- **`kioku invite [--ttl <minutes>] [--uses <n>]`**
+  - Runs on the server machine (config has `[server]`). It calls `POST
+    /api/v1/invites` on its own server with its own token.
+  - It prints the two lines of §2, using the URL rule of `setup::client_url`
+    (LAN IP) and the `.local` alternative.
+  - On a client machine it refuses: "run kioku invite on the server machine".
+- **`kioku join <url> <code>`**
+  - Calls `POST <url>/api/v1/join`, then does exactly what `setup
+    --client-only <url> <token>` does. It shares the implementation and never
+    prints the token.
+  - On a former server machine the §11 "retire [server]" rule applies as usual.
+  - A failure prints one sentence: code expired or used → "ask for a new
+    `kioku invite`"; unreachable → the URL and the firewall hint.
+- **`--print-client-command`** keeps working, but its output now recommends
+  `kioku invite`.
+
+## 6. Tests (same standards as before; Japanese where search is involved)
+
+- **Server:** invite creation needs the token; the code format and the
+  case-insensitive match; script served with the right variables and the
+  Host-derived URL; 404 for a bad or expired code; join consumes uses
+  (`uses=2` works twice, the third call is 404); expiry, with an injectable
+  clock; the rate limit gives 429; protected routes still need the token.
+- **CLI:** e2e `kioku invite` → `kioku join` against a test server writes the
+  client config with the right token and never prints it (assert the token is
+  absent from stdout/stderr); refusals.
+- **install.sh** (`scripts/test-install.sh`): join mode via env vars, and PATH
+  added to the right rc exactly once; `--no-modify-path`.
+- **install.ps1** (`scripts/test-install.ps1`, windows-latest): join mode via
+  variables, user PATH set, `-NoPath`, and it runs under both 5.1 and 7.
+
+## 7. Deliverables (for the implementing session)
+
+Branch `m2.3-invite`, a draft PR against `main`, CI green on every job including
+Windows, and README / README.ja rewritten so the **first** install instruction
+for a second machine is "run `kioku invite` on the server, paste the line". The
+old `--client-only` path stays documented as the manual alternative. Update this
+spec with anything that turned out different. Do not merge, tag or change
+secrets.
