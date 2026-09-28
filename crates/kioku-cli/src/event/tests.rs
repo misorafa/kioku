@@ -913,3 +913,15 @@ fn absolute_paths_of_every_os_are_accepted_on_every_os() {
         assert!(!is_absolute_anywhere(p), "{p}");
     }
 }
+
+#[test]
+fn relative_patch_paths_join_with_the_payload_os_separator() {
+    assert_eq!(
+        join_payload_path("/home/u/repo/", "src/a.rs"),
+        "/home/u/repo/src/a.rs"
+    );
+    assert_eq!(
+        join_payload_path(r"C:\Users\山田\repo", "src/検索.rs"),
+        r"C:\Users\山田\repo\src\検索.rs"
+    );
+}

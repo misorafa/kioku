@@ -14,6 +14,7 @@ fn spec(home: &str) -> ServiceSpec {
     }
 }
 
+#[cfg(unix)] // used by the unix-only golden tests
 const SPEC_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -45,6 +46,7 @@ const SPEC_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 </plist>
 "#;
 
+#[cfg(unix)] // used by the unix-only golden tests
 const SPEC_UNIT: &str = "[Unit]
 Description=kioku shared memory server for AI coding agents
 After=network.target

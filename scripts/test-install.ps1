@@ -267,7 +267,8 @@ try {
         }
     }
 
-    Write-Host "install.ps1 under $Shell ($((& $Shell -NoProfile -Command '$PSVersionTable.PSVersion.ToString()') | Out-String).Trim())"
+    $psVersion = (& $Shell -NoProfile -Command '$PSVersionTable.PSVersion.ToString()' | Out-String).Trim()
+    Write-Host "install.ps1 under $Shell ($psVersion)"
 
     # ------------------------------------------------------------ cases
 
@@ -290,7 +291,7 @@ try {
 
     Invoke-Install @('-InstallDir', $Dir, '-Version', 'v9.9.8', '-NoSetup', '-AddToPath')
     Check '-AddToPath appends the dir to the user PATH' ($script:Rc -eq 0 -and (Get-Content -LiteralPath $PathFile -Raw) -eq "C:\Windows\system32;C:\Tools;$Dir" -and (Has 'added'))
-    Check 'a stale kioku.exe.old is removed by the next install' (-not (Test-Path -LiteralPath "$Exe.old"))
+    Check 'a stale kioku.exe.old is removed, and a replaced exe nothing runs leaves none' (-not (Test-Path -LiteralPath "$Exe.old"))
     Invoke-Install @('-InstallDir', $Dir, '-Version', 'v9.9.8', '-NoSetup')
     Check 'no PATH hint when the dir is on the user PATH' ($script:Rc -eq 0 -and -not (Has 'not on your user PATH'))
 

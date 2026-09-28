@@ -330,6 +330,7 @@ mod tests {
     }
 
     /// Serves `files` (path → body) on an ephemeral port; unknown paths are 404.
+    #[cfg(unix)] // only the unix-only replace test uses it
     fn serve(files: Vec<(String, Vec<u8>)>) -> String {
         use axum::http::{StatusCode, Uri};
         let files = std::sync::Arc::new(files);

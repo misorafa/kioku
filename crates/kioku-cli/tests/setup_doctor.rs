@@ -313,7 +313,12 @@ fn setup_dry_run_writes_nothing_and_prints_the_plan() {
         "  ok  cursor      would change: hooks ~/.cursor/hooks.json (8), MCP ~/.cursor/mcp.json"
     )));
     let text = r.render();
-    let unit = home.path().join(".config/systemd/user/kioku.service");
+    let unit = home
+        .path()
+        .join(".config")
+        .join("systemd")
+        .join("user")
+        .join("kioku.service");
     assert!(text.contains(&format!("        write {}\n", unit.display())));
     assert!(text.contains("        systemctl --user enable --now kioku.service\n"));
     assert!(
@@ -445,7 +450,12 @@ fn rotate_token_restarts_the_service_with_a_new_token() {
     let port = free_port();
     let old = "old-token-0123456789abcdef";
     let config = server_config(home.path(), port, old);
-    let unit = home.path().join(".config/systemd/user/kioku.service");
+    let unit = home
+        .path()
+        .join(".config")
+        .join("systemd")
+        .join("user")
+        .join("kioku.service");
     std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
     std::fs::write(&unit, "[Unit]\n").unwrap();
     // `restart` starts the server from whatever config.toml says now.
@@ -589,7 +599,12 @@ fn setup_client_only_retires_a_former_server() {
         ),
     )
     .unwrap();
-    let unit = home.path().join(".config/systemd/user/kioku.service");
+    let unit = home
+        .path()
+        .join(".config")
+        .join("systemd")
+        .join("user")
+        .join("kioku.service");
     std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
     std::fs::write(&unit, "[Unit]\n").unwrap();
     let runner = Runner::recording(|_| CmdOutput::ok(""));
@@ -680,7 +695,12 @@ fn setup_installs_the_service_and_polls_health() {
             "loginctl show-user me -p Linger",
         ]
     );
-    let unit = home.path().join(".config/systemd/user/kioku.service");
+    let unit = home
+        .path()
+        .join(".config")
+        .join("systemd")
+        .join("user")
+        .join("kioku.service");
     assert_eq!(
         std::fs::read_to_string(&unit).unwrap(),
         render_unit(&ServiceSpec {

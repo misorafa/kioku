@@ -133,7 +133,8 @@ function Get-Tar {
 
 # Puts $New in the place of $Exe: a running kioku.exe cannot be overwritten, but it can be
 # renamed, so kioku.exe -> kioku.exe.old (a stale .old is deleted first) and then
-# kioku.exe.new -> kioku.exe; the next kioku run deletes the .old (SPEC-M2.2 section 5).
+# kioku.exe.new -> kioku.exe; the .old is deleted right away when nothing runs it, else by the
+# next kioku run (SPEC-M2.2 section 5).
 function Move-IntoPlace([string]$New, [string]$Exe) {
     $old = "$Exe.old"
     Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue
@@ -154,6 +155,8 @@ function Move-IntoPlace([string]$New, [string]$Exe) {
         Remove-Item -LiteralPath $New -Force -ErrorAction SilentlyContinue
         Die "cannot replace $($Exe): $($_.Exception.Message)"
     }
+    # Not running any more (the usual case): the .old can go right away.
+    Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue
 }
 
 # Downloads, verifies, extracts and installs kioku.exe; returns its path.
