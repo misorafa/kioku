@@ -438,6 +438,7 @@ fn write_text_inner(
         && existed
         && std::fs::read_to_string(path)
             .is_ok_and(|old| text.matches("Bearer ").count() > old.matches("Bearer ").count());
+    #[allow(unused_mut)] // only set on unix
     let mut made_private = false;
     let bak = backup_path(path);
     if make_backup && existed && !bak.exists() {
