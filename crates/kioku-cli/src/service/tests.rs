@@ -14,6 +14,7 @@ fn spec(home: &str) -> ServiceSpec {
     }
 }
 
+#[cfg(unix)] // used by the unix-only golden tests
 const SPEC_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -45,6 +46,7 @@ const SPEC_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 </plist>
 "#;
 
+#[cfg(unix)] // used by the unix-only golden tests
 const SPEC_UNIT: &str = "[Unit]
 Description=kioku shared memory server for AI coding agents
 After=network.target
@@ -64,12 +66,16 @@ RestartSec=5
 WantedBy=default.target
 ";
 
+// launchd / systemd definitions hold unix paths; Windows has no service (SPEC-M2.2 §3, §4.7).
+#[cfg(unix)]
 #[test]
 fn plist_and_unit_match_the_spec_exactly() {
     assert_eq!(render_plist(&spec("/Users/me")), SPEC_PLIST);
     assert_eq!(render_unit(&spec("/home/me")), SPEC_UNIT);
 }
 
+// launchd / systemd definitions hold unix paths; Windows has no service (SPEC-M2.2 §3, §4.7).
+#[cfg(unix)]
 #[test]
 fn golden_definitions_for_a_home_with_a_space() {
     let plist = render_plist(&spec("/Users/Jane Doe"));
@@ -104,6 +110,8 @@ WantedBy=default.target
     }
 }
 
+// launchd / systemd definitions hold unix paths; Windows has no service (SPEC-M2.2 §3, §4.7).
+#[cfg(unix)]
 #[test]
 fn xml_and_systemd_escaping() {
     assert_eq!(
@@ -311,6 +319,8 @@ fn linger_failure_prints_the_sudo_hint_without_running_it() {
     assert!(runner.calls().iter().all(|c| c[0] != "sudo"));
 }
 
+// launchd / systemd definitions hold unix paths; Windows has no service (SPEC-M2.2 §3, §4.7).
+#[cfg(unix)]
 #[test]
 fn launchd_commands() {
     let home = tempfile::tempdir().unwrap();
@@ -522,6 +532,28 @@ fn systemd_restart_uses_systemctl_restart() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_runs_kioku_as_a_client_only() {
+    let home = tempfile::tempdir().unwrap();
+    let runner = Runner::recording(|_| CmdOutput::ok(""));
+    let m = ServiceManager::detect(
+        runner.clone(),
+        home.path().to_path_buf(),
+        home.path().join(".config"),
+        spec("/home/me"),
+        None,
+    );
+    assert_eq!(
+        m.platform,
+        Platform::Unsupported("Windows: kioku runs as a client only".into())
+    );
+    assert!(runner.calls().is_empty(), "no systemctl probe on Windows");
+    assert!(!m.is_installed());
+}
+
+// launchd / systemd definitions hold unix paths; Windows has no service (SPEC-M2.2 §3, §4.7).
+#[cfg(unix)]
 #[test]
 fn unsupported_platform_explains_the_alternatives() {
     let home = tempfile::tempdir().unwrap();

@@ -408,7 +408,7 @@ impl ServiceManager {
         let platform = if cfg!(target_os = "macos") {
             Platform::Launchd
         } else if cfg!(target_os = "windows") {
-            Platform::Unsupported("Windows is not supported".into())
+            Platform::Unsupported("Windows: kioku runs as a client only".into())
         } else if runner
             .run(&["systemctl", "--user", "show-environment"])
             .success

@@ -24,6 +24,7 @@ fn ctx(home: &Path, cwd: &Path, bin: &str) -> InstallCtx {
             auth_token: Some(TOKEN.into()),
             ..ClientConfig::default()
         },
+        platform: HookPlatform::Unix,
     }
 }
 
@@ -208,7 +209,10 @@ fn roundtrip(agent: Agent, project: bool) {
     assert!(r.changed, "{agent:?}: {:?}", r.lines);
     let v = read_json(&hooks);
     let ours = our_commands(agent, &v);
-    let expected_keys: Vec<String> = hook_specs(agent, BIN).into_iter().map(|s| s.key).collect();
+    let expected_keys: Vec<String> = hook_specs(agent, BIN, HookPlatform::Unix)
+        .into_iter()
+        .map(|s| s.key)
+        .collect();
     assert_eq!(ours.len(), expected_keys.len(), "{agent:?} {ours:?}");
     for cmds in ours.values() {
         assert_eq!(cmds.len(), 1);
@@ -541,7 +545,7 @@ fn stdio_bridge_entries_hold_no_token() {
 #[test]
 fn registered_timeouts_match_the_hook_deadlines() {
     for agent in ALL_AGENTS {
-        for spec in hook_specs(agent, BIN) {
+        for spec in hook_specs(agent, BIN, HookPlatform::Unix) {
             let handlers: Vec<Value> = match spec.entry.get("hooks") {
                 Some(Value::Array(h)) => h.clone(),
                 _ => vec![spec.entry.clone()],
@@ -1018,4 +1022,122 @@ fn a_shared_agents_md_block_stays_while_another_agent_uses_it() {
     install_agent(Agent::GeminiCli, &c, &opts(true)).unwrap();
     uninstall_all(&c, true, false);
     assert_eq!(std::fs::read_to_string(&agents_md).unwrap(), "# Rules\n");
+}
+
+/// SPEC-M2.2 §7: the Windows shapes, rendered on every OS (§7.4).
+const WIN_BIN: &str = r"C:\Users\山田 太郎\AppData\Local\Programs\kioku\kioku.exe";
+
+fn win_ctx(home: &Path) -> InstallCtx {
+    InstallCtx {
+        platform: HookPlatform::Windows,
+        ..ctx(home, home, WIN_BIN)
+    }
+}
+
+#[test]
+fn windows_hook_and_mcp_shapes() {
+    let home = tempfile::tempdir().unwrap();
+    let c = win_ctx(home.path());
+    let agents = [Agent::ClaudeCode, Agent::Codex, Agent::Cursor];
+    for agent in agents {
+        install_agent(agent, &c, &opts(false)).unwrap();
+    }
+    // Claude Code: exec form, no shell (§7.1).
+    let claude = read_json(&home.path().join(".claude/settings.json"));
+    assert_eq!(
+        claude["hooks"]["SessionStart"][0]["hooks"][0],
+        json!({"type": "command", "command": WIN_BIN, "args": ["hook", "session-start"], "timeout": 10})
+    );
+    assert_eq!(
+        claude["hooks"]["Stop"][0]["hooks"][0],
+        json!({"type": "command", "command": WIN_BIN, "args": ["hook", "stop"]})
+    );
+    // The file holds JSON-escaped backslashes.
+    let text = std::fs::read_to_string(home.path().join(".claude/settings.json")).unwrap();
+    assert!(text.contains(r#""C:\\Users\\山田 太郎\\AppData\\Local\\Programs\\kioku\\kioku.exe""#));
+    assert_eq!(
+        read_json(&home.path().join(".claude.json"))["mcpServers"]["kioku"],
+        json!({"type": "stdio", "command": WIN_BIN, "args": ["mcp"]})
+    );
+    // Codex: cmd.exe-safe `command` plus PowerShell `commandWindows` (§7.2).
+    let codex = read_json(&home.path().join(".codex/hooks.json"));
+    let stop = &codex["hooks"]["Stop"][0]["hooks"][0];
+    assert_eq!(
+        stop["command"],
+        json!(format!("\"{WIN_BIN}\" hook stop --agent codex"))
+    );
+    assert_eq!(
+        stop["commandWindows"],
+        json!(format!("& \"{WIN_BIN}\" hook stop --agent codex"))
+    );
+    assert_eq!(stop["timeout"], json!(10));
+    let toml_text = std::fs::read_to_string(home.path().join(".codex/config.toml")).unwrap();
+    assert!(
+        toml_text.contains(&format!("command = '{WIN_BIN}'\nargs = [\"mcp\"]\n")),
+        "{toml_text}"
+    );
+    let parsed: toml::Table = toml::from_str(&toml_text).unwrap();
+    assert_eq!(
+        parsed["mcp_servers"]["kioku"]["command"].as_str(),
+        Some(WIN_BIN)
+    );
+    // Cursor: the double-quoted string form (§7.3).
+    let cursor = read_json(&home.path().join(".cursor/hooks.json"));
+    assert_eq!(
+        cursor["hooks"]["stop"][0]["command"],
+        json!(format!("\"{WIN_BIN}\" hook stop --agent cursor"))
+    );
+
+    // Re-install is byte-identical; the exec-form entries are recognised as ours.
+    let before = snapshot(home.path());
+    for agent in agents {
+        install_agent(agent, &c, &opts(false)).unwrap();
+    }
+    assert_eq!(snapshot(home.path()), before);
+    for agent in agents {
+        let v = read_json(&hooks_path(agent, &c, false));
+        let hooks = hooks_map(agent, &v).unwrap();
+        for spec in hook_specs(agent, WIN_BIN, HookPlatform::Windows) {
+            assert_eq!(
+                hook_commands(hooks, &spec.key).len(),
+                1,
+                "{agent:?} {}",
+                spec.key
+            );
+        }
+    }
+    // A unix-form install over it replaces the entry instead of adding a second one.
+    let unix = ctx(home.path(), home.path(), BIN);
+    install_agent(Agent::ClaudeCode, &unix, &opts(false)).unwrap();
+    let claude = read_json(&home.path().join(".claude/settings.json"));
+    assert_eq!(claude["hooks"]["Stop"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        claude["hooks"]["Stop"][0]["hooks"][0]["command"],
+        json!(format!("{BIN} hook stop"))
+    );
+    install_agent(Agent::ClaudeCode, &c, &opts(false)).unwrap();
+    // Uninstall removes every Windows-form entry.
+    for agent in agents {
+        uninstall_agent(agent, &c, false, false).unwrap();
+    }
+    for agent in agents {
+        if let Ok(Some(v)) = read_settings(&hooks_path(agent, &c, false)) {
+            assert!(v.get("hooks").is_none(), "{agent:?}: {v}");
+        }
+    }
+}
+
+#[test]
+fn gemini_and_antigravity_are_not_detected_on_windows() {
+    let home = tempfile::tempdir().unwrap();
+    for d in [".gemini/tmp", ".gemini/antigravity-cli", ".claude"] {
+        std::fs::create_dir_all(home.path().join(d)).unwrap();
+    }
+    let unix = ctx(home.path(), home.path(), BIN);
+    let win = win_ctx(home.path());
+    assert!(is_detected(Agent::GeminiCli, &unix));
+    assert!(is_detected(Agent::Antigravity, &unix));
+    assert!(!is_detected(Agent::GeminiCli, &win));
+    assert!(!is_detected(Agent::Antigravity, &win));
+    assert!(is_detected(Agent::ClaudeCode, &win));
 }

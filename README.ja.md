@@ -120,6 +120,45 @@ macOS では、インストール済みのバイナリに `cp` で上書きし�
 （`rm ~/.cargo/bin/kioku && cp target/release/kioku ~/.cargo/bin/`）、`kioku service stop && kioku service start`
 で再起動します。`kioku update` と `cargo install` は最初からこの方法で置き換えます。
 
+### Windows（クライアント専用）
+
+Windows 11（x64）では、kioku は WSL を使わずネイティブの**クライアント**として動きます。対象は
+Claude Code（CLI と Claude デスクトップアプリの Code タブ）と Codex デスクトップアプリ / CLI のフック、
+それに `kioku mcp` ブリッジです。サーバーは Mac か Linux のマシンに置いたままにします。サーバーで
+`kioku setup --print-client-command` を実行すると、`install.sh` の行に続いて PowerShell 用の行が
+表示されます。PowerShell（5.1 または 7、管理者権限は不要）で実行します:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/misorafa/kioku/main/install.ps1))) -ClientOnly http://<server>:7391 <token>
+```
+
+`install.ps1` は `kioku-<tag>-x86_64-pc-windows-msvc.tar.gz` をダウンロードして `SHA256SUMS` で
+検証し（`Get-FileHash`）、`kioku.exe` を `%LOCALAPPDATA%\Programs\kioku` にインストールして
+`kioku setup --client-only <url> <token>` を実行します。オプションは `-Version <tag>`、
+`-InstallDir <dir>`、`-Repo <owner/name>`（環境変数は `install.sh` と同じ）、`-NoSetup`、`-AddToPath`
+です。`-AddToPath` が無ければ、ユーザーの `PATH` にディレクトリを追加するコマンドを表示するだけです
+（フックは絶対パスを使うので、どちらでも動きます）。それ以外の引数は `kioku setup` に渡されます。
+Windows では `--client-only` なしの `kioku setup` は実行を拒否し、`kioku service` も使えません。
+
+- **フック:** Claude Code には exec 形式（`"command": "C:\\…\\kioku.exe", "args": ["hook", "stop"]`）
+  を登録するので、シェルを経由しません。Codex には `command` と PowerShell 用の `commandWindows`
+  （`& "C:\…\kioku.exe" hook stop --agent codex`）、Cursor（ベストエフォート）には引用符付きの
+  コマンド文字列を登録します。Gemini CLI と Antigravity は Windows では設定しません。フックの入力は
+  UTF-8 のバイト列として読む（BOM は無視）ので、日本語ロケールの Windows でも日本語のプロンプトが
+  化けません。
+- **更新:** `kioku update` はほかの OS と同じように使えます。実行中の `kioku.exe` は上書きできないため
+  `kioku.exe.old` に名前を変え、次の実行時に削除します。
+- **SmartScreen:** Windows 版のバイナリはまだコード署名していません。ダウンロードした `kioku.exe` の
+  初回実行時に Windows が警告を出すことがあります。
+- **アクセス権:** `%USERPROFILE%\.kioku` 以下のファイルはユーザープロファイルの ACL（本人と管理者のみ）
+  を引き継ぎます。unix の 0600 / 0700 は適用されません。
+- **WSL と Orca:** WSL の中で動くエージェント（Codex の「Agent environment = WSL」、Orca の WSL
+  ターミナル）は Linux のプロセスです。WSL の中に Linux 版の kioku を `install.sh --client-only …` で
+  入れてください。Orca は WSL 上の Codex に専用のホームを与えるため、`~/.codex/hooks.json` が
+  見えないことがあります（既知の制限）。ネイティブの Windows エージェントが
+  `\\wsl.localhost\<distro>\…` のリポジトリで作業した場合も git のリモートから同じプロジェクト ID に
+  なるはずですが、未検証です。
+
 ## `kioku setup`
 
 ```

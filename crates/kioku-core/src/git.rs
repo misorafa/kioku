@@ -1,7 +1,6 @@
 //! Git commit helper for the wiki: shells out to `git`, tolerates its absence (warns once).
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::OnceLock;
 
 /// Commit author name.
@@ -20,7 +19,7 @@ pub struct Git {
 pub fn git_available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
-        let ok = Command::new("git")
+        let ok = crate::util::quiet_command("git")
             .arg("--version")
             .output()
             .map(|o| o.status.success())
@@ -97,7 +96,7 @@ impl Git {
     }
 
     fn run(&self, args: &[&str]) -> bool {
-        match Command::new("git")
+        match crate::util::quiet_command("git")
             .arg("-C")
             .arg(&self.root)
             .args(args)
@@ -124,6 +123,7 @@ impl Git {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn commits_only_when_changed() {

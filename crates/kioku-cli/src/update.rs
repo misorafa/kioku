@@ -2,17 +2,79 @@
 //! built for, verify its SHA-256 exactly like install.sh, replace the running binary
 //! atomically and restart the kioku service when one is installed.
 
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
 use sha2::{Digest, Sha256};
 
-use crate::setup::{KIOKU_REPO, SetupEnv, VERSION, install_sh_url};
+use crate::setup::{KIOKU_REPO, SetupEnv, VERSION, install_ps1_url, install_sh_url};
 
 /// Target triple this binary was built for (`build.rs`); a musl build updates to musl.
 pub const TARGET: &str = env!("KIOKU_TARGET");
+
+/// File name of the kioku binary, in a release archive and on disk (`kioku.exe` on Windows).
+pub const BIN_NAME: &str = if cfg!(windows) { "kioku.exe" } else { "kioku" };
+
+/// `<exe><suffix>` next to `exe`, e.g. `kioku.exe.old`.
+pub fn sibling(exe: &Path, suffix: &str) -> PathBuf {
+    let mut name = exe.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    exe.with_file_name(name)
+}
+
+/// Deletes a `kioku.exe.old` left next to the running binary by a Windows update
+/// (SPEC-M2.2 §5 step 3). Best effort, and a no-op elsewhere.
+pub fn remove_stale_old_binary() {
+    if !cfg!(windows) {
+        return;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let old = sibling(&exe, ".old");
+        if old.exists() {
+            let _ = std::fs::remove_file(old);
+        }
+    }
+}
+
+/// The `tar` to run: on Windows the system's own bsdtar (`%SystemRoot%\System32\tar.exe`,
+/// shipped since Windows 10 1803) — a GNU tar from Git for Windows earlier on PATH reads
+/// `C:\…` as a remote host; elsewhere `tar` from PATH.
+fn tar_program() -> String {
+    if cfg!(windows)
+        && let Some(root) = std::env::var_os("SystemRoot")
+    {
+        let tar = PathBuf::from(root).join("System32").join("tar.exe");
+        if tar.is_file() {
+            return tar.display().to_string();
+        }
+    }
+    "tar".to_string()
+}
+
+/// Puts `new` in the place of `exe`. Without `rename_dance` (unix) one atomic rename; with
+/// it (Windows, where a running exe cannot be overwritten but can be renamed): delete a
+/// stale `<exe>.old`, rename `exe` → `<exe>.old`, then `new` → `exe`, moving the old one
+/// back if the second rename fails (SPEC-M2.2 §5).
+pub fn swap_binary(new: &Path, exe: &Path, rename_dance: bool) -> anyhow::Result<()> {
+    if !rename_dance {
+        return std::fs::rename(new, exe).with_context(|| format!("replacing {}", exe.display()));
+    }
+    let old = sibling(exe, ".old");
+    let _ = std::fs::remove_file(&old);
+    let moved = exe.exists();
+    if moved {
+        std::fs::rename(exe, &old)
+            .with_context(|| format!("moving {} out of the way", exe.display()))?;
+    }
+    if let Err(e) = std::fs::rename(new, exe) {
+        if moved {
+            let _ = std::fs::rename(&old, exe);
+        }
+        return Err(e).with_context(|| format!("replacing {}", exe.display()));
+    }
+    Ok(())
+}
 
 /// The tag in a `…/releases/tag/<tag>` URL (where GitHub's `releases/latest` lands).
 pub fn tag_from_release_url(url: &str) -> Option<String> {
@@ -96,10 +158,21 @@ pub fn run_update(version: Option<String>, check: bool) -> anyhow::Result<i32> {
         return Ok(0);
     }
     let exe = std::env::current_exe().context("locating the kioku binary")?;
-    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    let exe = kioku_core::util::canonical_plain(&exe).unwrap_or(exe);
     let dir = exe.parent().context("binary has no parent directory")?;
-    let new = dir.join(format!(".kioku.new.{}", std::process::id()));
+    let new = if cfg!(windows) {
+        sibling(&exe, ".new")
+    } else {
+        dir.join(format!(".kioku.new.{}", std::process::id()))
+    };
     if std::fs::write(&new, b"").is_err() {
+        if cfg!(windows) {
+            bail!(
+                "{} is not writable; re-run the installer instead:\n  & ([scriptblock]::Create((irm {}))) -Version {tag} -NoSetup",
+                dir.display(),
+                install_ps1_url()
+            );
+        }
         bail!(
             "{} is not writable; re-run the installer instead (never with sudo):\n  curl -fsSL {} | sh -s -- --version {tag} --no-setup",
             dir.display(),
@@ -149,7 +222,7 @@ fn replace(
     std::fs::create_dir_all(work)?;
     let tarball = work.join(&asset);
     std::fs::write(&tarball, &bytes)?;
-    let status = Command::new("tar")
+    let status = kioku_core::util::quiet_command(&tar_program())
         .arg("-xzf")
         .arg(&tarball)
         .arg("-C")
@@ -159,14 +232,18 @@ fn replace(
     if !status.success() {
         bail!("tar could not extract {asset}");
     }
-    let bin = work.join(format!("kioku-{tag}-{TARGET}")).join("kioku");
+    let bin = work.join(format!("kioku-{tag}-{TARGET}")).join(BIN_NAME);
     std::fs::copy(&bin, new).with_context(|| format!("{asset} has no kioku binary"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(new, std::fs::Permissions::from_mode(0o755))?;
     }
-    let out = Command::new(new).arg("--version").output()?;
+    // On Windows run the extracted `kioku.exe`: `kioku.exe.new` has no executable extension.
+    let probe = if cfg!(windows) { &bin } else { new };
+    let out = kioku_core::util::quiet_command(&probe.display().to_string())
+        .arg("--version")
+        .output()?;
     if !out.status.success() {
         bail!(
             "the new binary does not run here: {}",
@@ -174,7 +251,8 @@ fn replace(
         );
     }
     // Same directory: atomic; a running `kioku serve` keeps the old inode until restarted.
-    std::fs::rename(new, exe).with_context(|| format!("replacing {}", exe.display()))?;
+    // On Windows the running exe is renamed aside first (SPEC-M2.2 §5).
+    swap_binary(new, exe, cfg!(windows))?;
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
@@ -252,6 +330,7 @@ mod tests {
     }
 
     /// Serves `files` (path → body) on an ephemeral port; unknown paths are 404.
+    #[cfg(unix)] // only the unix-only replace test uses it
     fn serve(files: Vec<(String, Vec<u8>)>) -> String {
         use axum::http::{StatusCode, Uri};
         let files = std::sync::Arc::new(files);
@@ -280,6 +359,33 @@ mod tests {
     }
 
     #[test]
+    fn swap_binary_renames_the_running_exe_aside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("kioku.exe");
+        let new = sibling(&exe, ".new");
+        assert_eq!(new, tmp.path().join("kioku.exe.new"));
+        let old = sibling(&exe, ".old");
+        // A stale .old from an earlier update is replaced.
+        std::fs::write(&old, "stale").unwrap();
+        std::fs::write(&exe, "v1").unwrap();
+        std::fs::write(&new, "v2").unwrap();
+        swap_binary(&new, &exe, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "v2");
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), "v1");
+        assert!(!new.exists());
+        // A failed second rename puts the current binary back.
+        assert!(swap_binary(&tmp.path().join("missing.new"), &exe, true).is_err());
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "v2");
+        // Plain rename (unix).
+        std::fs::write(&new, "v3").unwrap();
+        swap_binary(&new, &exe, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "v3");
+        assert!(BIN_NAME.starts_with("kioku"));
+    }
+
+    // The fixture "binary" is a shell script, which only runs on unix.
+    #[cfg(unix)]
+    #[test]
     fn replace_verifies_the_checksum_before_touching_the_binary() {
         let tmp = tempfile::tempdir().unwrap();
         let name = format!("kioku-v9.9.9-{TARGET}");
@@ -290,7 +396,7 @@ mod tests {
         )
         .unwrap();
         let tarball = tmp.path().join(format!("{name}.tar.gz"));
-        let ok = Command::new("tar")
+        let ok = std::process::Command::new("tar")
             .arg("-czf")
             .arg(&tarball)
             .arg("-C")

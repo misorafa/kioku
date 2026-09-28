@@ -21,7 +21,7 @@ use crate::install::agents::{
     install_all, instruction_files, is_detected, mcp_path, unstable_binary_warning,
     wants_instructions,
 };
-use crate::install::block;
+use crate::install::{HookPlatform, block};
 use crate::service::{Health, Platform, Runner, ServiceManager, ServiceSpec, probe_health};
 
 /// GitHub repository of kioku (`KIOKU_REPO` / `--repo` default of install.sh).
@@ -31,6 +31,14 @@ pub const KIOKU_REPO: &str = "misorafa/kioku";
 pub fn install_sh_url() -> String {
     format!("https://raw.githubusercontent.com/{KIOKU_REPO}/main/install.sh")
 }
+
+/// Raw URL of `install.ps1` (the Windows installer) on the default branch.
+pub fn install_ps1_url() -> String {
+    format!("https://raw.githubusercontent.com/{KIOKU_REPO}/main/install.ps1")
+}
+
+/// Why `kioku setup` without `--client-only` stops on Windows (SPEC-M2.2 §4.7).
+pub const WINDOWS_CLIENT_ONLY: &str = "Windows runs kioku as a client: kioku setup --client-only <url> <token> (the server runs on macOS/Linux)";
 
 /// Version of this binary.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -73,6 +81,8 @@ pub struct SetupEnv {
     pub runner: Runner,
     /// Forces the service platform (tests); `None` detects it.
     pub platform: Option<Platform>,
+    /// The OS kioku runs on: hook command shapes, and Windows is client-only (SPEC-M2.2).
+    pub hook_platform: HookPlatform,
     /// Timeout of one health / status request.
     pub request_timeout: Duration,
     /// Health polling after `service install`: interval and total.
@@ -91,6 +101,7 @@ impl SetupEnv {
             bin,
             runner: Runner::real(),
             platform: None,
+            hook_platform: HookPlatform::current(),
             request_timeout: Duration::from_secs(5),
             poll_interval: Duration::from_millis(200),
             poll_timeout: Duration::from_secs(15),
@@ -126,6 +137,7 @@ impl SetupEnv {
             cwd: self.cwd.clone(),
             bin: self.bin.clone(),
             client: client.clone(),
+            platform: self.hook_platform,
         }
     }
 
@@ -244,11 +256,18 @@ impl SetupReport {
     }
 }
 
-/// `path` with the home directory abbreviated to `~`.
+/// `path` with the home directory abbreviated to `~`; the rest is joined with `/` on every
+/// OS, so Windows shows `~/.claude/settings.json`, not `~/.claude\settings.json`.
 pub fn tilde(path: &Path, home: &Path) -> String {
     match path.strip_prefix(home) {
         Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
-        Ok(rest) => format!("~/{}", rest.display()),
+        Ok(rest) => {
+            let parts: Vec<String> = rest
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            format!("~/{}", parts.join("/"))
+        }
         Err(_) => path.display().to_string(),
     }
 }
@@ -282,6 +301,12 @@ pub fn run_setup(opts: &SetupOptions, env: &SetupEnv) -> SetupReport {
         lines: Vec::new(),
         footer: Vec::new(),
     };
+
+    // SPEC-M2.2 §4.7: Windows is a client only.
+    if env.hook_platform == HookPlatform::Windows && opts.client_only.is_none() {
+        r.push(Mark::Fail, "setup", WINDOWS_CLIENT_ONLY);
+        return r;
+    }
 
     // 1. Binary
     match unstable_binary_warning(&env.bin) {
@@ -830,7 +855,7 @@ fn agent_text(agent: Agent, ctx: &InstallCtx, iopts: &InstallOptions) -> String 
         format!(
             "hooks {} ({}), MCP {}",
             tilde(&hooks, &ctx.home),
-            hook_specs(agent, &ctx.bin).len(),
+            hook_specs(agent, &ctx.bin, ctx.platform).len(),
             tilde(&mcp, &ctx.home)
         )
     };
@@ -988,7 +1013,17 @@ fn client_command(state: &ConfigState) -> Vec<String> {
         url.url
     ));
     out.extend(url.alternative_line());
+    out.push("On Windows, in PowerShell (also contains the token):".into());
+    out.push(format!("  {}", install_ps1_command(&url.url, &token)));
     out
+}
+
+/// The PowerShell line that installs a Windows client (SPEC-M2.2 §6, §8).
+pub fn install_ps1_command(url: &str, token: &str) -> String {
+    format!(
+        "& ([scriptblock]::Create((irm {}))) -ClientOnly {url} {token}",
+        install_ps1_url()
+    )
 }
 
 /// The URL other machines should use for this server (SPEC-M2 §11, §19.3).
@@ -1168,6 +1203,7 @@ Check any time with: kioku doctor
             bin: home.path().join("bin/kioku").display().to_string(),
             runner: runner.clone(),
             platform: Some(Platform::Systemd),
+            hook_platform: HookPlatform::Unix,
             request_timeout: Duration::from_secs(3),
             poll_interval: Duration::from_millis(20),
             poll_timeout: Duration::from_secs(5),

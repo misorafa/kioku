@@ -95,6 +95,8 @@ pub struct DoctorEnv {
     pub runner: Runner,
     /// Forces the service platform (tests); `None` detects it.
     pub platform: Option<Platform>,
+    /// The OS kioku runs on (hook command shapes, SPEC-M2.2 §7.4).
+    pub hook_platform: crate::install::HookPlatform,
     /// Per-request timeout.
     pub timeout: Duration,
 }
@@ -108,6 +110,7 @@ impl DoctorEnv {
             bin,
             runner: Runner::real(),
             platform: None,
+            hook_platform: crate::install::HookPlatform::current(),
             timeout: DOCTOR_TIMEOUT,
         }
     }
@@ -120,6 +123,7 @@ impl DoctorEnv {
             bin: self.bin.clone(),
             runner: self.runner.clone(),
             platform: self.platform.clone(),
+            hook_platform: self.hook_platform,
             request_timeout: self.timeout,
             poll_interval: Duration::from_millis(200),
             poll_timeout: Duration::from_secs(0),
@@ -311,16 +315,12 @@ fn is_executable(p: &Path) -> bool {
     true
 }
 
-/// The first `kioku` executable in `path_var`.
+/// The first `kioku` executable in `path_var` (split the platform's way: `;` and quoted
+/// entries on Windows, `:` elsewhere), trying `kioku` and `kioku.exe` in each directory.
 pub fn find_on_path(path_var: &str) -> Option<PathBuf> {
-    let sep = if cfg!(windows) { ';' } else { ':' };
-    path_var
-        .split(sep)
-        .filter(|d| !d.is_empty())
-        .flat_map(|d| {
-            let d = Path::new(d);
-            [d.join("kioku"), d.join("kioku.exe")]
-        })
+    std::env::split_paths(path_var)
+        .filter(|d| !d.as_os_str().is_empty())
+        .flat_map(|d| [d.join("kioku"), d.join("kioku.exe")])
         .find(|p| is_executable(p))
 }
 
@@ -786,19 +786,24 @@ fn our_commands_at(agent: Agent, settings: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The binary part of a hook command (`"/a b/kioku" hook stop` → `/a b/kioku`).
+/// The binary part of a hook command (`"/a b/kioku" hook stop` → `/a b/kioku`). A
+/// PowerShell call operator (`& "C:\…\kioku.exe" hook …`) is skipped, and a backslash only
+/// escapes what `sh` quoting escapes (`"`, `\`, `$`, backtick), so Windows paths keep theirs.
 pub fn command_binary(cmd: &str) -> String {
     let cmd = cmd.trim();
+    let cmd = cmd.strip_prefix("& ").unwrap_or(cmd).trim_start();
     if let Some(rest) = cmd.strip_prefix('"') {
         let mut out = String::new();
-        let mut chars = rest.chars();
+        let mut chars = rest.chars().peekable();
         while let Some(c) = chars.next() {
             match c {
-                '\\' => {
-                    if let Some(n) = chars.next() {
+                '\\' => match chars.peek() {
+                    Some(&n) if matches!(n, '"' | '\\' | '$' | '`') => {
+                        chars.next();
                         out.push(n);
                     }
-                }
+                    _ => out.push('\\'),
+                },
                 '"' => break,
                 c => out.push(c),
             }
@@ -837,15 +842,17 @@ fn hooks_check(agent: Agent, ctx: &InstallCtx) -> Check {
             return check(&id, Status::Warn, format!("{e:#}"), fix);
         }
     };
-    let specs = hook_specs(agent, &ctx.bin);
+    let specs = hook_specs(agent, &ctx.bin, ctx.platform);
     let mut missing = Vec::new();
     let mut bins = Vec::new();
     for spec in &specs {
-        let expected = spec
-            .entry
-            .get("command")
-            .or_else(|| spec.entry["hooks"][0].get("command"))
-            .and_then(Value::as_str)
+        let handler = if spec.entry.get("command").is_some() {
+            &spec.entry
+        } else {
+            &spec.entry["hooks"][0]
+        };
+        let expected = crate::install::handler_command_line(handler)
+            .as_deref()
             .map(command_suffix)
             .unwrap_or_default();
         let found: Vec<String> = our_commands_at(agent, &settings, &spec.key)
@@ -1356,6 +1363,50 @@ mod tests {
             command_suffix("\"/a b/kioku\" hook stop --agent codex"),
             " hook stop --agent codex"
         );
+        // Windows forms (SPEC-M2.2 §7): backslashes are kept, `&` is skipped.
+        let win = r"C:\Users\u\AppData\Local\Programs\kioku\kioku.exe";
+        assert_eq!(
+            command_binary(&format!("\"{win}\" hook stop --agent codex")),
+            win
+        );
+        assert_eq!(
+            command_binary(&format!("& \"{win}\" hook stop --agent codex")),
+            win
+        );
+    }
+
+    #[test]
+    fn hooks_check_understands_the_windows_shapes() {
+        use crate::install::HookPlatform;
+        use crate::install::agents::{InstallOptions, install_agent};
+        let home = tempfile::tempdir().unwrap();
+        // A real file standing in for C:\…\kioku.exe (hooks_check wants it to exist).
+        let bin_path = home.path().join("Programs").join("kioku").join("kioku.exe");
+        std::fs::create_dir_all(bin_path.parent().unwrap()).unwrap();
+        std::fs::write(&bin_path, "").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let ctx = InstallCtx {
+            home: home.path().to_path_buf(),
+            codex_home: home.path().join(".codex"),
+            cwd: home.path().to_path_buf(),
+            bin: bin_path.display().to_string(),
+            client: kioku_core::ClientConfig::default(),
+            platform: HookPlatform::Windows,
+        };
+        for agent in [Agent::ClaudeCode, Agent::Codex, Agent::Cursor] {
+            install_agent(agent, &ctx, &InstallOptions::default()).unwrap();
+            let c = hooks_check(agent, &ctx);
+            assert_eq!(c.status, Status::Ok, "{agent:?}: {}", c.message);
+        }
+        // A moved binary is reported for the exec form too.
+        std::fs::remove_file(&bin_path).unwrap();
+        let c = hooks_check(Agent::ClaudeCode, &ctx);
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains("kioku.exe"), "{}", c.message);
     }
 
     #[test]

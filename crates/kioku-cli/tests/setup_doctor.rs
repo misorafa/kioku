@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use kioku_cli::doctor::{self, Check, DoctorEnv, Status};
 use kioku_cli::event::Agent;
+use kioku_cli::install::HookPlatform;
 use kioku_cli::install::agents::{InstallCtx, InstallOptions, install_agent, install_all};
 use kioku_cli::service::{CmdOutput, Platform, Runner, ServiceSpec, render_unit};
 use kioku_cli::setup::{SetupEnv, SetupOptions, run_setup};
@@ -90,6 +91,7 @@ fn setup_env(home: &Path, bin: &str, vars: HashMap<String, String>, runner: Runn
         bin: bin.to_string(),
         runner,
         platform: Some(Platform::Systemd),
+        hook_platform: HookPlatform::Unix,
         request_timeout: Duration::from_secs(3),
         poll_interval: Duration::from_millis(50),
         poll_timeout: Duration::from_secs(10),
@@ -146,7 +148,7 @@ fn agent_lines() -> Vec<String> {
 fn setup_without_service_installs_agents_and_is_idempotent() {
     let (base, _server) = test_server();
     let (home, bin) = home_with_agents(false);
-    let config = home.path().join(".kioku/config.toml");
+    let config = home.path().join(".kioku").join("config.toml");
     let env = setup_env(
         home.path(),
         &bin,
@@ -225,8 +227,40 @@ fn setup_without_service_installs_agents_and_is_idempotent() {
         "  curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh -s -- --client-only http://"
     ));
     assert!(line.ends_with(&format!(":7391 {TOKEN}")), "{line}");
+    // SPEC-M2.2 §8: then the install.ps1 line for Windows clients, same URL and token.
+    let ps1 = text.lines().find(|l| l.contains("install.ps1")).unwrap();
+    assert!(ps1.starts_with(
+        "  & ([scriptblock]::Create((irm https://raw.githubusercontent.com/misorafa/kioku/main/install.ps1))) -ClientOnly http://"
+    ));
+    assert!(ps1.ends_with(&format!(":7391 {TOKEN}")), "{ps1}");
+    let url_of = |l: &str| l.split_whitespace().rev().nth(1).unwrap().to_string();
+    assert_eq!(url_of(ps1), url_of(line));
     assert!(text.contains("listens on 127.0.0.1 only"));
     assert_eq!(snapshot(home.path(), &[]), before);
+}
+
+#[test]
+fn setup_on_windows_requires_client_only() {
+    let (home, bin) = home_with_agents(true);
+    let mut env = setup_env(
+        home.path(),
+        &bin,
+        HashMap::new(),
+        Runner::recording(|_| CmdOutput::ok("")),
+    );
+    env.hook_platform = HookPlatform::Windows;
+    let before = snapshot(home.path(), &[]);
+    let r = run_setup(&SetupOptions::default(), &env);
+    assert_eq!(r.exit_code(), 1);
+    assert!(
+        r.render().contains(
+            "Windows runs kioku as a client: kioku setup --client-only <url> <token> (the server runs on macOS/Linux)"
+        ),
+        "{}",
+        r.render()
+    );
+    assert!(env.runner.calls().is_empty(), "no service command ran");
+    assert_eq!(snapshot(home.path(), &[]), before, "nothing written");
 }
 
 #[test]
@@ -256,7 +290,7 @@ fn setup_dry_run_writes_nothing_and_prints_the_plan() {
     assert!(env.runner.calls().is_empty(), "--dry-run runs no command");
     assert_eq!(r.exit_code(), 0, "{}", r.render());
     let lines = r.summary_lines();
-    let config = home.path().join(".kioku/config.toml");
+    let config = home.path().join(".kioku").join("config.toml");
     assert_eq!(
         lines[1],
         format!(
@@ -279,7 +313,12 @@ fn setup_dry_run_writes_nothing_and_prints_the_plan() {
         "  ok  cursor      would change: hooks ~/.cursor/hooks.json (8), MCP ~/.cursor/mcp.json"
     )));
     let text = r.render();
-    let unit = home.path().join(".config/systemd/user/kioku.service");
+    let unit = home
+        .path()
+        .join(".config")
+        .join("systemd")
+        .join("user")
+        .join("kioku.service");
     assert!(text.contains(&format!("        write {}\n", unit.display())));
     assert!(text.contains("        systemctl --user enable --now kioku.service\n"));
     assert!(
@@ -322,7 +361,7 @@ fn setup_client_only_checks_the_token_before_touching_anything() {
         },
         &env,
     );
-    let config = home.path().join(".kioku/config.toml");
+    let config = home.path().join(".kioku").join("config.toml");
     let mut expected = vec![
         binary_line(&bin),
         format!(
@@ -411,7 +450,12 @@ fn rotate_token_restarts_the_service_with_a_new_token() {
     let port = free_port();
     let old = "old-token-0123456789abcdef";
     let config = server_config(home.path(), port, old);
-    let unit = home.path().join(".config/systemd/user/kioku.service");
+    let unit = home
+        .path()
+        .join(".config")
+        .join("systemd")
+        .join("user")
+        .join("kioku.service");
     std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
     std::fs::write(&unit, "[Unit]\n").unwrap();
     // `restart` starts the server from whatever config.toml says now.
@@ -555,7 +599,12 @@ fn setup_client_only_retires_a_former_server() {
         ),
     )
     .unwrap();
-    let unit = home.path().join(".config/systemd/user/kioku.service");
+    let unit = home
+        .path()
+        .join(".config")
+        .join("systemd")
+        .join("user")
+        .join("kioku.service");
     std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
     std::fs::write(&unit, "[Unit]\n").unwrap();
     let runner = Runner::recording(|_| CmdOutput::ok(""));
@@ -622,7 +671,7 @@ fn setup_installs_the_service_and_polls_health() {
         ..SetupOptions::default()
     };
     let first = run_setup(&opts, &env);
-    let config = home.path().join(".kioku/config.toml");
+    let config = home.path().join(".kioku").join("config.toml");
     let base = format!("http://127.0.0.1:{port}");
     let expected = vec![
         binary_line(&bin),
@@ -646,7 +695,12 @@ fn setup_installs_the_service_and_polls_health() {
             "loginctl show-user me -p Linger",
         ]
     );
-    let unit = home.path().join(".config/systemd/user/kioku.service");
+    let unit = home
+        .path()
+        .join(".config")
+        .join("systemd")
+        .join("user")
+        .join("kioku.service");
     assert_eq!(
         std::fs::read_to_string(&unit).unwrap(),
         render_unit(&ServiceSpec {
@@ -728,6 +782,7 @@ impl Fixture {
             bin: self.bin.clone(),
             runner: self.runner.clone(),
             platform: Some(Platform::Systemd),
+            hook_platform: HookPlatform::Unix,
             timeout: Duration::from_secs(3),
         }
     }
@@ -740,11 +795,12 @@ impl Fixture {
             cwd: self.home.path().to_path_buf(),
             bin: bin.to_string(),
             client: cfg.client,
+            platform: HookPlatform::Unix,
         }
     }
 
     fn config_path(&self) -> PathBuf {
-        self.home.path().join(".kioku/config.toml")
+        self.home.path().join(".kioku").join("config.toml")
     }
 }
 
@@ -997,6 +1053,7 @@ fn doctor_without_config_fails() {
             "KIOKU_SERVER_URL",
             &format!("http://127.0.0.1:{}", free_port()),
         )]),
+        hook_platform: HookPlatform::Unix,
         home: home.path().to_path_buf(),
         bin,
         runner: Runner::recording(|argv| {
@@ -1060,6 +1117,7 @@ fn doctor_on_a_client_only_machine_skips_data_dir_and_service() {
     assert_eq!(r.exit_code(), 0, "{}", r.render());
     let denv = DoctorEnv {
         vars: HashMap::new(),
+        hook_platform: HookPlatform::Unix,
         home: home.path().to_path_buf(),
         bin,
         runner: Runner::recording(|argv| {

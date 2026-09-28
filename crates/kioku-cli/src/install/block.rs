@@ -255,6 +255,16 @@ pub fn toml_string(s: &str) -> String {
     out
 }
 
+/// TOML string for a path: a literal string (`'C:\…\kioku.exe'`) when it holds a backslash
+/// and can be one (SPEC-M2.2 §7.2: Windows paths stay readable), else [`toml_string`].
+pub fn toml_path_string(s: &str) -> String {
+    if s.contains('\\') && !s.contains('\'') && !s.chars().any(char::is_control) {
+        format!("'{s}'")
+    } else {
+        toml_string(s)
+    }
+}
+
 /// How Codex reaches kioku's MCP tools (M2 §20.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CodexMcp<'a> {
@@ -288,7 +298,7 @@ pub fn codex_block(mcp: CodexMcp, enable_hooks: bool) -> String {
         CodexMcp::Stdio(bin) => {
             body.push_str(&format!(
                 "command = {}\nargs = [\"mcp\"]\n",
-                toml_string(bin)
+                toml_path_string(bin)
             ));
         }
         CodexMcp::Http(url, token) => {

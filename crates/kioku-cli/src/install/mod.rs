@@ -42,18 +42,71 @@ pub fn settings_path(project: bool) -> anyhow::Result<PathBuf> {
     Ok(base.join(".claude").join("settings.json"))
 }
 
+/// Which OS the hook commands are rendered for (SPEC-M2.2 §7.4). A parameter, not `cfg!`,
+/// so every shape is unit-tested on every OS; [`HookPlatform::current`] is what installs use.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HookPlatform {
+    /// macOS / Linux: `sh`-quoted command strings.
+    #[default]
+    Unix,
+    /// Windows: Claude Code exec form, cmd.exe-quoted strings, Codex `commandWindows`.
+    Windows,
+}
+
+impl HookPlatform {
+    /// The platform this binary runs on.
+    pub fn current() -> HookPlatform {
+        if cfg!(windows) {
+            HookPlatform::Windows
+        } else {
+            HookPlatform::Unix
+        }
+    }
+
+    /// The binary as the first word of a hook command string: `sh` quoting on unix; on
+    /// Windows always double-quoted (a Windows path cannot contain `"`), which cmd.exe,
+    /// PowerShell and Git Bash all read as one word with the backslashes kept.
+    pub fn quote_bin(self, bin: &str) -> String {
+        match self {
+            HookPlatform::Unix => shell_quote(bin),
+            HookPlatform::Windows => format!("\"{bin}\""),
+        }
+    }
+}
+
 /// Shell command registered for an event, e.g. `/usr/local/bin/kioku hook stop`.
 pub fn hook_command(bin: &str, event: HookEventKind) -> String {
-    format!("{} hook {}", shell_quote(bin), event.cli_name())
+    platform_hook_command(HookPlatform::Unix, bin, event)
+}
+
+/// [`hook_command`] for `platform`, e.g. `"C:\…\kioku.exe" hook stop` on Windows.
+pub fn platform_hook_command(platform: HookPlatform, bin: &str, event: HookEventKind) -> String {
+    format!("{} hook {}", platform.quote_bin(bin), event.cli_name())
 }
 
 /// Hook command for an agent: Claude Code keeps M1's form, the others add `--agent <name>`
 /// (M2 §8.1), e.g. `/usr/local/bin/kioku hook stop --agent codex`.
-pub fn agent_hook_command(agent: Agent, bin: &str, event: HookEventKind) -> String {
+pub fn agent_hook_command(
+    agent: Agent,
+    bin: &str,
+    event: HookEventKind,
+    platform: HookPlatform,
+) -> String {
+    let base = platform_hook_command(platform, bin, event);
     match agent {
-        Agent::ClaudeCode => hook_command(bin, event),
-        _ => format!("{} --agent {}", hook_command(bin, event), agent.as_str()),
+        Agent::ClaudeCode => base,
+        _ => format!("{base} --agent {}", agent.as_str()),
     }
+}
+
+/// Codex's `commandWindows` (SPEC-M2.2 §7.2): Codex runs it through PowerShell
+/// (`pwsh -NoProfile -Command`), where a quoted path alone is a string, so the call
+/// operator `&` is needed: `& "C:\…\kioku.exe" hook stop --agent codex`.
+pub fn powershell_hook_command(agent: Agent, bin: &str, event: HookEventKind) -> String {
+    format!(
+        "& {}",
+        agent_hook_command(agent, bin, event, HookPlatform::Windows)
+    )
 }
 
 /// True when a hook command is one of ours (`…kioku hook …`, quoted or `.exe`).
@@ -66,6 +119,23 @@ pub fn is_kioku_command(cmd: &str) -> bool {
     ]
     .iter()
     .any(|needle| cmd.contains(needle))
+}
+
+/// A hook handler's command line: its `command` string, or for Claude Code's exec form
+/// (`command` = executable, `args` = argument vector, no shell) the executable in double
+/// quotes followed by the arguments, e.g. `"C:\…\kioku.exe" hook stop`. `None` when the
+/// handler has no string `command` (or a non-string argument).
+pub fn handler_command_line(handler: &Value) -> Option<String> {
+    let cmd = handler.get("command")?.as_str()?;
+    let Some(args) = handler.get("args").and_then(Value::as_array) else {
+        return Some(cmd.to_string());
+    };
+    let mut line = format!("\"{cmd}\"");
+    for a in args {
+        line.push(' ');
+        line.push_str(a.as_str()?);
+    }
+    Some(line)
 }
 
 fn shell_quote(s: &str) -> String {
@@ -84,11 +154,20 @@ fn shell_quote(s: &str) -> String {
     out
 }
 
-/// Our matcher group for one event.
-fn our_group(bin: &str, event: HookEventKind) -> Value {
+/// Our matcher group for one event. On Windows the handler uses Claude Code's exec form
+/// (`command` + `args`), so no shell (Git Bash / PowerShell) is involved (SPEC-M2.2 §7.1).
+fn our_group(bin: &str, event: HookEventKind, platform: HookPlatform) -> Value {
     let mut hook = Map::new();
     hook.insert("type".into(), json!("command"));
-    hook.insert("command".into(), json!(hook_command(bin, event)));
+    match platform {
+        HookPlatform::Unix => {
+            hook.insert("command".into(), json!(hook_command(bin, event)));
+        }
+        HookPlatform::Windows => {
+            hook.insert("command".into(), json!(bin));
+            hook.insert("args".into(), json!(["hook", event.cli_name()]));
+        }
+    }
     if event == HookEventKind::SessionStart {
         hook.insert("timeout".into(), json!(SESSION_START_TIMEOUT_SECS));
     }
@@ -107,9 +186,7 @@ fn our_group(bin: &str, event: HookEventKind) -> Value {
 }
 
 fn is_ours(hook: &Value) -> bool {
-    hook.get("command")
-        .and_then(Value::as_str)
-        .is_some_and(is_kioku_command)
+    handler_command_line(hook).is_some_and(|c| is_kioku_command(&c))
 }
 
 /// Removes our hook entries from one event's group list. Returns the cleaned list, the
@@ -247,20 +324,20 @@ pub fn remove_flat(settings: &Value) -> anyhow::Result<(Value, usize)> {
     Ok((out, total))
 }
 
-/// Claude Code's hook specs (M1 §8.5).
-pub fn claude_specs(bin: &str) -> Vec<HookSpec> {
+/// Claude Code's hook specs (M1 §8.5; exec form on Windows, SPEC-M2.2 §7.1).
+pub fn claude_specs(bin: &str, platform: HookPlatform) -> Vec<HookSpec> {
     ALL_EVENTS
         .iter()
         .map(|&event| HookSpec {
             key: event.claude_code_name().to_string(),
-            entry: our_group(bin, event),
+            entry: our_group(bin, event, platform),
         })
         .collect()
 }
 
 /// Returns `settings` with exactly one kioku entry per Claude Code event (foreign hooks kept).
-pub fn merge_hooks(settings: &Value, bin: &str) -> anyhow::Result<Value> {
-    merge_nested(settings, &claude_specs(bin))
+pub fn merge_hooks(settings: &Value, bin: &str, platform: HookPlatform) -> anyhow::Result<Value> {
+    merge_nested(settings, &claude_specs(bin, platform))
 }
 
 /// Returns `settings` without any kioku hook entry and the number of entries removed.
@@ -438,6 +515,7 @@ fn write_text_inner(
         && existed
         && std::fs::read_to_string(path)
             .is_ok_and(|old| text.matches("Bearer ").count() > old.matches("Bearer ").count());
+    #[allow(unused_mut)] // only set on unix
     let mut made_private = false;
     let bak = backup_path(path);
     if make_backup && existed && !bak.exists() {
@@ -483,11 +561,15 @@ fn write_text_inner(
 }
 
 /// Installs our hooks into the settings file at `path` using `bin` as the kioku binary.
-pub fn install_settings(path: &Path, bin: &str) -> anyhow::Result<SettingsChange> {
+pub fn install_settings(
+    path: &Path,
+    bin: &str,
+    platform: HookPlatform,
+) -> anyhow::Result<SettingsChange> {
     let current = read_settings(path)?;
     let existed = current.is_some();
     let before = current.unwrap_or_else(|| Value::Object(Map::new()));
-    let after = merge_hooks(&before, bin)?;
+    let after = merge_hooks(&before, bin, platform)?;
     let changed = !existed || after != before;
     let backup = if changed {
         write_settings(path, existed, &after, false)?.backup
@@ -779,7 +861,7 @@ mod tests {
 
     #[test]
     fn merge_shapes_entries() {
-        let v = merge_hooks(&json!({}), BIN).unwrap();
+        let v = merge_hooks(&json!({}), BIN, HookPlatform::Unix).unwrap();
         let ss = &v["hooks"]["SessionStart"][0];
         assert_eq!(ss["matcher"], SESSION_START_MATCHER);
         assert_eq!(ss["hooks"][0]["type"], "command");
@@ -795,8 +877,8 @@ mod tests {
             assert_eq!(entries.len(), 1);
             assert_eq!(entries[0]["command"], hook_command(BIN, e));
         }
-        assert!(merge_hooks(&json!([1]), BIN).is_err());
-        assert!(merge_hooks(&json!({"hooks": {"Stop": 3}}), BIN).is_err());
+        assert!(merge_hooks(&json!([1]), BIN, HookPlatform::Unix).is_err());
+        assert!(merge_hooks(&json!({"hooks": {"Stop": 3}}), BIN, HookPlatform::Unix).is_err());
     }
 
     #[test]
@@ -807,18 +889,18 @@ mod tests {
         let original = serde_json::to_string_pretty(&foreign()).unwrap();
         std::fs::write(&path, &original).unwrap();
 
-        let first = install_settings(&path, BIN).unwrap();
+        let first = install_settings(&path, BIN, HookPlatform::Unix).unwrap();
         assert!(first.changed);
         let bak = dir.path().join(".claude").join("settings.json.kioku-bak");
         assert_eq!(first.backup.as_deref(), Some(bak.as_path()));
         assert_eq!(std::fs::read_to_string(&bak).unwrap(), original);
 
-        let second = install_settings(&path, BIN).unwrap();
+        let second = install_settings(&path, BIN, HookPlatform::Unix).unwrap();
         assert!(!second.changed, "second install is a no-op");
         assert!(second.backup.is_none());
 
         // A moved binary replaces our entry instead of adding a second one.
-        let third = install_settings(&path, "/usr/local/bin/kioku").unwrap();
+        let third = install_settings(&path, "/usr/local/bin/kioku", HookPlatform::Unix).unwrap();
         assert!(third.changed);
         assert!(
             third.backup.is_none(),
@@ -859,7 +941,7 @@ mod tests {
     fn install_into_missing_file_and_mixed_group() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
-        let r = install_settings(&path, BIN).unwrap();
+        let r = install_settings(&path, BIN, HookPlatform::Unix).unwrap();
         assert!(r.changed && r.backup.is_none());
         assert!(uninstall_settings(&path).unwrap().removed == 6);
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -876,7 +958,7 @@ mod tests {
             v,
             json!({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "say done"}]}]}})
         );
-        let merged = merge_hooks(&mixed, BIN).unwrap();
+        let merged = merge_hooks(&mixed, BIN, HookPlatform::Unix).unwrap();
         assert_eq!(kioku_entries(&merged, "Stop").len(), 1);
         assert_eq!(merged["hooks"]["Stop"].as_array().unwrap().len(), 2);
     }
@@ -886,7 +968,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         std::fs::write(&path, "{ not json").unwrap();
-        assert!(install_settings(&path, BIN).is_err());
+        assert!(install_settings(&path, BIN, HookPlatform::Unix).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
     }
 

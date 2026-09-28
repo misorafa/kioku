@@ -175,9 +175,73 @@ pub fn env_vars_from(
         .collect()
 }
 
+/// A path without Windows' verbatim prefix: `\\?\C:\x` → `C:\x` and
+/// `\\?\UNC\host\share` → `\\host\share` (what `std::fs::canonicalize` returns on
+/// Windows, and what git and humans do not want). Other paths are returned unchanged.
+pub fn plain_path(p: &std::path::Path) -> std::path::PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return std::path::PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return std::path::PathBuf::from(rest);
+    }
+    p.to_path_buf()
+}
+
+/// `std::fs::canonicalize` followed by [`plain_path`].
+pub fn canonical_plain(p: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    std::fs::canonicalize(p).map(|c| plain_path(&c))
+}
+
+/// A `Command` for a background child (git, tar, …): on Windows it gets `CREATE_NO_WINDOW`
+/// so a hook never flashes a console window; elsewhere it is a plain `Command::new`.
+pub fn quiet_command(program: &str) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut cmd = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // `CREATE_NO_WINDOW` from the Win32 process creation flags.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_path_strips_the_verbatim_prefix() {
+        use std::path::{Path, PathBuf};
+        assert_eq!(
+            plain_path(Path::new(r"\\?\C:\Users\u\repo")),
+            PathBuf::from(r"C:\Users\u\repo")
+        );
+        assert_eq!(
+            plain_path(Path::new(r"\\?\UNC\wsl.localhost\Ubuntu\home\u")),
+            PathBuf::from(r"\\wsl.localhost\Ubuntu\home\u")
+        );
+        assert_eq!(
+            plain_path(Path::new("/home/u/リポジトリ")),
+            PathBuf::from("/home/u/リポジトリ")
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let c = canonical_plain(tmp.path()).unwrap();
+        assert!(!c.to_string_lossy().starts_with(r"\\?\"), "{}", c.display());
+        assert!(c.is_absolute());
+    }
+
+    #[test]
+    fn quiet_command_runs_children() {
+        // git is on PATH on every CI runner; the flag must not break spawning or output.
+        let Ok(out) = quiet_command("git").arg("--version").output() else {
+            return;
+        };
+        assert!(String::from_utf8_lossy(&out.stdout).contains("git"));
+    }
 
     #[test]
     fn truncate_is_char_safe_and_bounded() {

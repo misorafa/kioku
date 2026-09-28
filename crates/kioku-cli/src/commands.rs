@@ -4,7 +4,7 @@
 //! `service` and `doctor` (M2 §10–§12).
 
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -146,8 +146,10 @@ fn hook(event: HookEventKind, agent: Agent) -> i32 {
         .skip(1)
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
-    let mut stdin = String::new();
-    let stdin_err = std::io::stdin().read_to_string(&mut stdin).err();
+    // Bytes, not read_to_string: a BOM or one invalid byte must not lose the payload.
+    let mut raw = Vec::new();
+    let stdin_err = std::io::stdin().read_to_end(&mut raw).err();
+    let stdin = crate::hook::decode_stdin(&raw);
     let outcome = match Config::load() {
         Ok(cfg) => match stdin_err {
             None => dump::run_hook_invocation(event, agent, &argv, &stdin, &cfg, &env),
@@ -176,8 +178,10 @@ fn hook(event: HookEventKind, agent: Agent) -> i32 {
             outcome
         }
     };
-    print!("{}", outcome.stdout);
-    eprint!("{}", outcome.stderr);
+    // UTF-8 bytes straight to the pipes (never an ANSI code page; SPEC-M2.2 §4.4).
+    let _ = std::io::stdout().write_all(outcome.stdout.as_bytes());
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().write_all(outcome.stderr.as_bytes());
     outcome.exit_code
 }
 
@@ -424,7 +428,8 @@ fn project_id(path: Option<PathBuf>) -> anyhow::Result<()> {
 
 fn current_binary() -> anyhow::Result<String> {
     let exe = std::env::current_exe().context("locating the kioku binary")?;
-    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    // Plain `C:\…` on Windows, not `\\?\C:\…`: this path is written into hook configs.
+    let exe = kioku_core::util::canonical_plain(&exe).unwrap_or(exe);
     Ok(exe.display().to_string())
 }
 

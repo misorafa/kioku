@@ -1,7 +1,6 @@
 //! Project identity (spec §4): `.kioku.toml`, git remote, or path → stable project id.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -35,7 +34,7 @@ struct ProjectFile {
 
 /// Identifies the project that `cwd` belongs to (spec §4 priority order).
 pub fn identify(cwd: &Path) -> Result<ProjectIdentity> {
-    let cwd = std::fs::canonicalize(cwd)
+    let cwd = crate::util::canonical_plain(cwd)
         .with_context(|| format!("resolving working directory {}", cwd.display()))?;
 
     if let Some(found) = find_project_file(&cwd)? {
@@ -43,7 +42,7 @@ pub fn identify(cwd: &Path) -> Result<ProjectIdentity> {
     }
 
     if let Some(root) = git_toplevel(&cwd) {
-        let root = std::fs::canonicalize(&root).unwrap_or(root);
+        let root = crate::util::canonical_plain(&root).unwrap_or(root);
         let dir_name = basename(&root);
         let remote = git_remote(&root).map(|r| normalize_remote(&r));
         let (id, name) = match &remote {
@@ -207,7 +206,7 @@ fn basename(p: &Path) -> String {
 }
 
 fn git_output(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
+    let out = crate::util::quiet_command("git")
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -232,6 +231,7 @@ fn git_remote(root: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     fn git(dir: &Path, args: &[&str]) -> bool {
         Command::new("git")
@@ -403,7 +403,7 @@ mod tests {
         assert_eq!(id.name, "マイプロジェクト");
         assert_eq!(
             id.root,
-            std::fs::canonicalize(tmp.path())
+            crate::util::canonical_plain(tmp.path())
                 .unwrap()
                 .display()
                 .to_string()
