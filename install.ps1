@@ -164,7 +164,7 @@ function Get-Tar {
 function Remove-OldCopies([string]$Exe) {
     $dir = Split-Path -Parent $Exe
     $leaf = Split-Path -Leaf $Exe
-    Get-ChildItem -LiteralPath $dir -Filter "$leaf.old*" -ErrorAction SilentlyContinue |
+    Get-ChildItem -LiteralPath $dir -Filter "$leaf.old*" -File -ErrorAction SilentlyContinue |
         ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
 }
 
