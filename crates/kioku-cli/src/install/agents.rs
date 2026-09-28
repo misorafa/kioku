@@ -124,6 +124,9 @@ pub struct InstallOptions {
     pub enable_hooks_feature: bool,
     /// Gemini CLI `--trust-mcp`.
     pub trust_mcp: bool,
+    /// `--mcp-http`: register the v0.3 URL + token MCP entry instead of the `kioku mcp`
+    /// stdio bridge (M2 §20.2).
+    pub mcp_http: bool,
 }
 
 /// What one agent's install / uninstall did.
@@ -607,6 +610,38 @@ pub fn antigravity_mcp_entry(ctx: &InstallCtx) -> Value {
     v
 }
 
+/// The `kioku mcp` stdio bridge entry (M2 §20.2): `{command, args: ["mcp"]}` — no URL,
+/// no token; Claude Code adds `type: "stdio"`, Gemini CLI its `timeout` (+ `trust`).
+pub fn stdio_mcp_entry(agent: Agent, ctx: &InstallCtx, trust: bool) -> Value {
+    let mut v = Map::new();
+    if agent == Agent::ClaudeCode {
+        v.insert("type".into(), json!("stdio"));
+    }
+    v.insert("command".into(), json!(ctx.bin));
+    v.insert("args".into(), json!(["mcp"]));
+    if agent == Agent::GeminiCli {
+        v.insert("timeout".into(), json!(30_000));
+        if trust {
+            v.insert("trust".into(), json!(true));
+        }
+    }
+    Value::Object(v)
+}
+
+/// The agent's `mcpServers.kioku` entry: the stdio bridge, or with `--mcp-http` the v0.3
+/// URL + token form. (Codex's TOML block is [`block::CodexMcp`].)
+pub fn mcp_entry(agent: Agent, ctx: &InstallCtx, opts: &InstallOptions) -> Value {
+    if !opts.mcp_http {
+        return stdio_mcp_entry(agent, ctx, opts.trust_mcp);
+    }
+    match agent {
+        Agent::ClaudeCode | Agent::Codex => mcp_server_entry(&ctx.client),
+        Agent::Cursor => cursor_mcp_entry(ctx),
+        Agent::GeminiCli => gemini_mcp_entry(ctx, opts.trust_mcp),
+        Agent::Antigravity => antigravity_mcp_entry(ctx),
+    }
+}
+
 /// Gemini CLI `mcpServers.kioku` (M2 §6.5): `{httpUrl, headers, timeout}` (+ `trust`).
 pub fn gemini_mcp_entry(ctx: &InstallCtx, trust: bool) -> Value {
     let mut v = json!({ "httpUrl": mcp_url(&ctx.client) });
@@ -759,7 +794,7 @@ pub fn install_agent(
     match agent {
         Agent::GeminiCli if !opts.project => {
             // Hooks and MCP share ~/.gemini/settings.json: one edit, one backup.
-            let entry = gemini_mcp_entry(ctx, opts.trust_mcp);
+            let entry = mcp_entry(agent, ctx, opts);
             let c = install_hook_file(agent, &hooks, ctx, Some(&entry), dry)?;
             report_hooks(&mut r, &c, dry, "hooks + MCP server `kioku`");
         }
@@ -770,7 +805,7 @@ pub fn install_agent(
     }
     match agent {
         Agent::ClaudeCode => {
-            let entry = mcp_server_entry(&ctx.client);
+            let entry = mcp_entry(agent, ctx, opts);
             r.mcp(register_mcp_entry(
                 &mcp_path(agent, ctx),
                 &entry,
@@ -781,13 +816,13 @@ pub fn install_agent(
         Agent::Cursor => {
             r.mcp(register_mcp_entry(
                 &mcp_path(agent, ctx),
-                &cursor_mcp_entry(ctx),
+                &mcp_entry(agent, ctx, opts),
                 "Cursor",
                 dry,
             ));
         }
         Agent::GeminiCli if opts.project => {
-            let entry = gemini_mcp_entry(ctx, opts.trust_mcp);
+            let entry = mcp_entry(agent, ctx, opts);
             r.mcp(register_mcp_entry(
                 &mcp_path(agent, ctx),
                 &entry,
@@ -799,7 +834,7 @@ pub fn install_agent(
         Agent::Antigravity => {
             r.mcp(register_mcp_entry(
                 &mcp_path(agent, ctx),
-                &antigravity_mcp_entry(ctx),
+                &mcp_entry(agent, ctx, opts),
                 "Antigravity CLI",
                 dry,
             ));
@@ -807,13 +842,13 @@ pub fn install_agent(
         Agent::Codex => {
             let path = mcp_path(agent, ctx);
             let token = ctx.token();
-            let c = block::install_codex_config(
-                &path,
-                &mcp_url(&ctx.client),
-                token.as_deref(),
-                opts.enable_hooks_feature,
-                dry,
-            )?;
+            let url = mcp_url(&ctx.client);
+            let mcp = if opts.mcp_http {
+                block::CodexMcp::Http(&url, token.as_deref())
+            } else {
+                block::CodexMcp::Stdio(&ctx.bin)
+            };
+            let c = block::install_codex_config(&path, mcp, opts.enable_hooks_feature, dry)?;
             r.file("MCP server `kioku`", &path, &c.outcome, dry);
             r.lines.extend(c.notes);
             let layer = if opts.project {

@@ -52,6 +52,7 @@ pub fn run(cli: Cli) -> i32 {
             bind,
             no_instructions,
             dry_run,
+            mcp_http,
             print_client_command,
         } => {
             let opts = crate::setup::SetupOptions {
@@ -65,6 +66,7 @@ pub fn run(cli: Cli) -> i32 {
                 bind,
                 no_instructions,
                 dry_run,
+                mcp_http,
                 print_client_command,
             };
             return setup(&opts);
@@ -86,6 +88,7 @@ pub fn run(cli: Cli) -> i32 {
             agents,
             enable_hooks_feature,
             trust_mcp,
+            mcp_http,
         } => {
             let opts = InstallOptions {
                 project,
@@ -99,6 +102,7 @@ pub fn run(cli: Cli) -> i32 {
                 dry_run,
                 enable_hooks_feature,
                 trust_mcp,
+                mcp_http,
             };
             install_cmd(target, &opts, &agents)
         }
@@ -116,6 +120,9 @@ pub fn run(cli: Cli) -> i32 {
         },
         Command::Reindex => reindex(),
         Command::Status => status(),
+        Command::Mcp => Config::load()
+            .map_err(anyhow::Error::from)
+            .and_then(|cfg| crate::bridge::run(cfg.client)),
     };
     match result {
         Ok(()) => 0,

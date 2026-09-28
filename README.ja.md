@@ -158,8 +158,8 @@ kioku doctor --json           # {"checks":[{id, status, message, fix?}]}
 
 バイナリと `PATH`、`config.toml`（とそのモード 0600）、データディレクトリ、`git`、サーバー（到達できるか、
 バージョンが同じか）、トークン、インデックスのバージョン、MCP、サービス、そして検出した各エージェントに
-ついて、フックがあり既存のバイナリを指しているか、MCP エントリの URL とトークン（比較するだけで表示は
-しません）、エージェント固有のスイッチ、指示スニペットを確認します。`hook.log` の最近のフックエラーと、
+ついて、フックがあり既存のバイナリを指しているか、MCP エントリ（stdio の中継なら実行ファイル、URL 形式なら URL とトークン。トークンは比較する
+だけで表示しません）、エージェント固有のスイッチ、指示スニペットを確認します。`hook.log` の最近のフックエラーと、
 ペイロードダンプが有効になっていることも指摘します。FAIL が 1 つでもあれば終了コード 1 です。
 
 ## `kioku service`
@@ -198,7 +198,12 @@ WSL、コンテナ）では、`kioku serve` を自分で動かす方法（また
 - シンボリックリンクの設定ファイル（dotfiles リポジトリなど）はリンク越しに編集します。リンクは残り、
   リンク先が更新されます（バックアップはリンク先の隣）。ほかのユーザーが読めるファイルに kioku が
   トークンを追加するときは、モードを 0600 にしてその旨を表示します;
-- `--project` はフック（と指示）を現在のリポジトリに書きます。トークンを含む MCP エントリは常に
+- MCP サーバーは **`kioku mcp`（stdio の中継）** として登録します（`{"command": "<kioku>", "args": ["mcp"]}`）。
+  エージェントが kioku を起動し、kioku が `~/.kioku/config.toml` のサーバーに各ツールの呼び出しを中継します。
+  エージェントの設定ファイルにはサーバーの URL もトークンも入らず、フックと同じ粘り強い接続（覚えたアドレス、
+  IPv6/IPv4）が使われ、サーバーを変えるときも `kioku setup --client-only …` だけで済みます。`--mcp-http` を
+  付けると、従来の URL + トークンの形で登録します;
+- `--project` はフック（と指示）を現在のリポジトリに書きます。MCP のエントリは常に
   ユーザー設定に置かれ、リポジトリには決して入りません。プロジェクトのフックファイルにはマシン固有の
   パスが入るので、コミットしないでください。プロジェクトのディレクトリがホームディレクトリそのもの
   の場合、`--project` は実行を拒否します;
@@ -209,7 +214,7 @@ WSL、コンテナ）では、`kioku serve` を自分で動かす方法（また
 | 内容 | 場所 |
 |------|------|
 | フック（SessionStart、UserPromptSubmit、PostToolUse、PreCompact、Stop、SessionEnd） | `~/.claude/settings.json`（`--project`: `./.claude/settings.json`） |
-| MCP | `~/.claude.json` の `mcpServers.kioku`: `{"type": "http", "url": "http://127.0.0.1:7391/mcp", "headers": {"Authorization": "Bearer <token>"}}` |
+| MCP | `~/.claude.json` の `mcpServers.kioku`: `{"type": "stdio", "command": "<kioku>", "args": ["mcp"]}` |
 | 指示 | 既定では無し（フックがコンテキストを注入します）。`--instructions` で `~/.claude/CLAUDE.md` にブロックを追加 |
 
 kioku は `claude mcp add` を実行しないので、トークンがコマンドラインに現れることはありません。
@@ -219,7 +224,7 @@ kioku は `claude mcp add` を実行しないので、トークンがコマン�
 | 内容 | 場所 |
 |------|------|
 | フック | `~/.codex/hooks.json`（`$CODEX_HOME`。`--project`: `<repo>/.codex/hooks.json`） |
-| MCP | `~/.codex/config.toml` 内の管理ブロック `[mcp_servers.kioku]`（url + `Authorization` ヘッダー）。ブロック外のバイトは決して変更せず、Codex があとからブロック内に追加したテーブル（プロジェクトやフックの信頼）はブロックの外へ移し、決して消しません |
+| MCP | `~/.codex/config.toml` 内の管理ブロック `[mcp_servers.kioku]`（`command` + `args = ["mcp"]`）。ブロック外のバイトは決して変更せず、Codex があとからブロック内に追加したテーブル（プロジェクトやフックの信頼）はブロックの外へ移し、決して消しません |
 | 指示 | `~/.codex/AGENTS.md` の区切られた kioku ブロック（`--project`: `<repo>/AGENTS.md`） |
 
 **信頼の手順:** Codex は、新しいフックや変更されたフックを、信頼されるまで実行しません。Codex を一度
@@ -310,7 +315,7 @@ kioku status
 - `<ホスト名>.local` は、IP が変わっても使えます。ただし mDNS なので、同じ LAN の中でしか名前が引けません。
 - kioku のサーバーは `bind = "0.0.0.0"` のとき IPv4 と IPv6 の両方で待ち受けます。そのため、名前が IPv6 に解決されても届きます。
 - フックと CLI は、名前で接続して成功したアドレスを `~/.kioku/state/server-addrs.json` に覚えます。次からはそのアドレスを先に試すので、VPN で外にいて名前が引けないときもつながります。
-- エージェントの MCP は設定された URL に直接つなぐので、LAN と VPN を行き来するマシンでは、IP か DNS の名前（Tailscale の MagicDNS など）を使ってください。
+- エージェントの MCP は `kioku mcp` の中継を通るので、フックと同じく覚えたアドレスが使われます（`--mcp-http` で登録したエージェントは設定の URL に直接つなぐので、IP か DNS の名前を使ってください）。
 
 **macOS のサーバーでは、ファイアウォールの許可を確認してください。** Little Snitch や LuLu などが入っていると、
 新しい kioku への LAN からの接続が、許可の画面（サーバー機の画面にだけ出ます）で止まります。症状は

@@ -233,14 +233,22 @@ fn roundtrip(agent: Agent, project: bool) {
             );
         }
     }
-    // MCP always at user level; the token never lands in the project.
+    // MCP always at user level: the `kioku mcp` stdio bridge (M2 §20.2) — the binary,
+    // never the token or the URL.
     let mcp = mcp_path(agent, &c);
     let mcp_text = std::fs::read_to_string(&mcp).unwrap();
     assert!(
-        mcp_text.contains(TOKEN),
-        "{agent:?}: MCP entry carries the token"
+        mcp_text.contains(BIN) && mcp_text.contains("mcp"),
+        "{agent:?}: MCP entry runs `kioku mcp`: {mcp_text}"
     );
-    assert!(mcp_text.contains("http://127.0.0.1:7391/mcp"));
+    assert!(
+        !mcp_text.contains(TOKEN),
+        "{agent:?}: no token in the MCP entry"
+    );
+    assert!(
+        !mcp_text.contains("http://127.0.0.1:7391/mcp"),
+        "{agent:?}: no URL"
+    );
     if project {
         for (p, bytes) in snapshot(proj.path()) {
             assert!(
@@ -290,6 +298,11 @@ fn roundtrip(agent: Agent, project: bool) {
         assert_eq!(cmds.len(), 1);
         assert!(cmds[0].starts_with(MOVED), "{}", cmds[0]);
     }
+    let mcp_text = std::fs::read_to_string(&mcp).unwrap();
+    assert!(
+        mcp_text.contains(MOVED) && !mcp_text.contains(BIN),
+        "{agent:?}: the MCP bridge follows the moved binary: {mcp_text}"
+    );
     for (rel, bytes) in before_home.iter() {
         let bak = backup_path(&home.path().join(rel));
         if bak.exists() {
@@ -370,8 +383,13 @@ fn gemini_user_and_project() {
 fn exact_hook_shapes_on_an_empty_home() {
     let home = tempfile::tempdir().unwrap();
     let c = ctx(home.path(), home.path(), BIN);
+    // `--mcp-http`: the v0.3 URL + token MCP form (the stdio default has its own test).
+    let http = InstallOptions {
+        mcp_http: true,
+        ..opts(false)
+    };
     for agent in [Agent::Codex, Agent::Cursor, Agent::GeminiCli] {
-        install_agent(agent, &c, &opts(false)).unwrap();
+        install_agent(agent, &c, &http).unwrap();
     }
     let cmd = |a: &str, e: &str| format!("{BIN} hook {e} --agent {a}");
     let codex = |e: &str| cmd("codex", e);
@@ -462,6 +480,62 @@ fn exact_hook_shapes_on_an_empty_home() {
             assert_eq!(mode(&home.path().join(p)), 0o644, "{p}");
         }
     }
+}
+
+/// M2 §20.2: every agent's MCP entry is the `kioku mcp` stdio bridge; no file holds the
+/// token or the URL.
+#[test]
+fn stdio_bridge_entries_hold_no_token() {
+    let home = tempfile::tempdir().unwrap();
+    let c = ctx(home.path(), home.path(), BIN);
+    for agent in ALL_AGENTS {
+        install_agent(agent, &c, &opts(false)).unwrap();
+    }
+    let kioku = |p: &str| read_json(&home.path().join(p))["mcpServers"]["kioku"].clone();
+    assert_eq!(
+        kioku(".claude.json"),
+        json!({"type": "stdio", "command": BIN, "args": ["mcp"]})
+    );
+    assert_eq!(
+        kioku(".cursor/mcp.json"),
+        json!({"command": BIN, "args": ["mcp"]})
+    );
+    assert_eq!(
+        kioku(".gemini/settings.json"),
+        json!({"command": BIN, "args": ["mcp"], "timeout": 30000})
+    );
+    assert_eq!(
+        kioku(".gemini/config/mcp_config.json"),
+        json!({"command": BIN, "args": ["mcp"]})
+    );
+    let toml_text = std::fs::read_to_string(home.path().join(".codex/config.toml")).unwrap();
+    assert_eq!(
+        toml_text,
+        format!(
+            "{}\n[mcp_servers.kioku]\ncommand = \"{BIN}\"\nargs = [\"mcp\"]\n{}\n",
+            TOML_MARKERS.begin, TOML_MARKERS.end
+        )
+    );
+    for (p, bytes) in snapshot(home.path()) {
+        let t = String::from_utf8_lossy(&bytes);
+        assert!(!t.contains(TOKEN), "token in {}", p.display());
+        assert!(!t.contains("7391"), "server URL in {}", p.display());
+    }
+    // Re-installing with --mcp-http switches back to the URL form in place, and vice versa.
+    let http = InstallOptions {
+        mcp_http: true,
+        ..opts(false)
+    };
+    install_agent(Agent::Cursor, &c, &http).unwrap();
+    assert_eq!(
+        kioku(".cursor/mcp.json")["url"],
+        json!("http://127.0.0.1:7391/mcp")
+    );
+    install_agent(Agent::Cursor, &c, &opts(false)).unwrap();
+    assert_eq!(
+        kioku(".cursor/mcp.json"),
+        json!({"command": BIN, "args": ["mcp"]})
+    );
 }
 
 #[test]
@@ -835,11 +909,8 @@ fn antigravity_exact_group_next_to_a_foreign_one() {
     let mcp = home.path().join(".gemini/config/mcp_config.json");
     assert_eq!(
         read_json(&mcp),
-        json!({"mcpServers": {"kioku": {"serverUrl": "http://127.0.0.1:7391/mcp",
-            "headers": {"Authorization": format!("Bearer {TOKEN}")}}}})
+        json!({"mcpServers": {"kioku": {"command": BIN, "args": ["mcp"]}}})
     );
-    #[cfg(unix)]
-    assert_eq!(mode(&mcp), 0o600);
     // The legacy desktop-app MCP file is never touched.
     assert!(
         !home

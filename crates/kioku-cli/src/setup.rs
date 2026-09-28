@@ -52,6 +52,8 @@ pub struct SetupOptions {
     pub no_instructions: bool,
     /// `--dry-run`.
     pub dry_run: bool,
+    /// `--mcp-http`: URL + token MCP entries instead of the stdio bridge (M2 §20.2).
+    pub mcp_http: bool,
     /// `--print-client-command` (prints the token).
     pub print_client_command: bool,
 }
@@ -871,6 +873,7 @@ fn agents_step(opts: &SetupOptions, env: &SetupEnv, client: &ClientConfig, r: &m
         dry_run: opts.dry_run,
         enable_hooks_feature: false,
         trust_mcp: false,
+        mcp_http: opts.mcp_http,
     };
     for (agent, status) in install_all(&ctx, &iopts, &opts.agents) {
         let name = agent.as_str();

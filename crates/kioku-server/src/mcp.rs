@@ -1,5 +1,6 @@
 //! The MCP service (spec §10): six `kioku_*` tools over the `Store`, served through rmcp's
-//! streamable HTTP transport at `/mcp`. Tool descriptions are what the model reads, so they
+//! streamable HTTP transport at `/mcp`. The tool descriptions, parameter types and output
+//! formatters are public so the `kioku mcp` stdio bridge (M2 §20) serves identical tools. Tool descriptions are what the model reads, so they
 //! are written in Japanese with one English line each; outputs are plain text.
 
 use std::sync::Arc;
@@ -23,17 +24,23 @@ use crate::shared::{DEFAULT_MCP_LIMIT, blocking, clamp_limit, resolve_scope, wit
 /// `instructions` returned on initialize.
 pub const INSTRUCTIONS: &str = "kioku は、このユーザーのすべてのマシン・すべてのコーディングエージェントで共有される記憶（過去のセッション要約、STATE.md、保存済みページ、引き継ぎ）です。作業を始めるとき、特にコードベースを探索したり調査を繰り返したりする前に、まず kioku_query で関連する過去の記録・決定事項を検索し、見つかったページは kioku_read で読んでください（project には SessionStart で渡された id を使う）。後で役立つ知見や設計判断は kioku_write_page で残し、セッションを終える前（または作業の区切りやコンテキストが尽きる前）には必ず kioku_handoff_write（project と、SessionStart で渡された session の id を指定）で 要約 / 次にやること / 未解決の質問 / 決定事項 を記録してください。次のセッションはそれを自動で受け取ります。 kioku is shared memory across agents and machines: query it before exploring, and write a handoff with kioku_handoff_write before you stop.";
 
-const QUERY_DESC: &str = "kioku の記憶（過去のセッション要約・各プロジェクトの STATE.md・保存済みページ）を全文検索する。日本語・英語どちらのクエリも使える（形態素解析済み）。コードを探索したり同じ調査を繰り返したりする前に、まずこれを呼ぶこと。project を渡すとそのプロジェクトとグローバルのページに絞られる。結果の path は kioku_read で全文を読める。\nSearch kioku's shared memory (past sessions, STATE.md, pages) before exploring; Japanese and English queries both work.";
+/// Tool description of `query` (shared with the `kioku mcp` bridge).
+pub const QUERY_DESC: &str = "kioku の記憶（過去のセッション要約・各プロジェクトの STATE.md・保存済みページ）を全文検索する。日本語・英語どちらのクエリも使える（形態素解析済み）。コードを探索したり同じ調査を繰り返したりする前に、まずこれを呼ぶこと。project を渡すとそのプロジェクトとグローバルのページに絞られる。結果の path は kioku_read で全文を読める。\nSearch kioku's shared memory (past sessions, STATE.md, pages) before exploring; Japanese and English queries both work.";
 
-const READ_DESC: &str = "kioku のページを path（kioku_query の結果に出る wiki 内の相対パス。例: <project_id>/STATE.md, <project_id>/sessions/2026-09-25-0c2f1a2b.md, _global/<slug>.md）で読み、frontmatter の要約と本文を返す。\nRead one kioku page by its wiki-relative path.";
+/// Tool description of `read` (shared with the `kioku mcp` bridge).
+pub const READ_DESC: &str = "kioku のページを path（kioku_query の結果に出る wiki 内の相対パス。例: <project_id>/STATE.md, <project_id>/sessions/2026-09-25-0c2f1a2b.md, _global/<slug>.md）で読み、frontmatter の要約と本文を返す。\nRead one kioku page by its wiki-relative path.";
 
-const WRITE_PAGE_DESC: &str = "後で役に立つ知見・設計判断・手順・調査結果を Markdown ページとして kioku に保存する（検索対象になり、git に履歴が残る）。同じ title（または path）で書くと本文を置き換える。scope=project（project を渡した場合の既定）はそのプロジェクト専用、scope=global はプロジェクトを横断する個人的なメモ。セッションの引き継ぎには使わず kioku_handoff_write を使うこと。\nSave durable knowledge as a searchable page; writing the same title/path replaces it.";
+/// Tool description of `write_page` (shared with the `kioku mcp` bridge).
+pub const WRITE_PAGE_DESC: &str = "後で役に立つ知見・設計判断・手順・調査結果を Markdown ページとして kioku に保存する（検索対象になり、git に履歴が残る）。同じ title（または path）で書くと本文を置き換える。scope=project（project を渡した場合の既定）はそのプロジェクト専用、scope=global はプロジェクトを横断する個人的なメモ。セッションの引き継ぎには使わず kioku_handoff_write を使うこと。\nSave durable knowledge as a searchable page; writing the same title/path replaces it.";
 
-const HANDOFF_WRITE_DESC: &str = "このセッションの引き継ぎを記録する。このプロジェクトで次に始まるセッション（別のエージェントや別マシンでも）の冒頭に自動で渡される。作業を終える前、区切りがついたとき、コンテキストが尽きそうなときに必ず呼ぶこと。project と session には SessionStart の <kioku> ブロックに書かれた project の id と session の id を渡すこと（session を省略すると、そのプロジェクトで最後に観測のあった開いているセッションに紐づく）。summary=何をしたか・今どういう状態か、next_steps=次の一手（ファイル名やコマンドまで具体的に）、open_questions=未解決の点、decisions=決めたこととその理由。\nRecord a handoff for the next session of this project; always call it before you stop. Pass `project` and `session` from the SessionStart <kioku> block.";
+/// Tool description of `handoff_write` (shared with the `kioku mcp` bridge).
+pub const HANDOFF_WRITE_DESC: &str = "このセッションの引き継ぎを記録する。このプロジェクトで次に始まるセッション（別のエージェントや別マシンでも）の冒頭に自動で渡される。作業を終える前、区切りがついたとき、コンテキストが尽きそうなときに必ず呼ぶこと。project と session には SessionStart の <kioku> ブロックに書かれた project の id と session の id を渡すこと（session を省略すると、そのプロジェクトで最後に観測のあった開いているセッションに紐づく）。summary=何をしたか・今どういう状態か、next_steps=次の一手（ファイル名やコマンドまで具体的に）、open_questions=未解決の点、decisions=決めたこととその理由。\nRecord a handoff for the next session of this project; always call it before you stop. Pass `project` and `session` from the SessionStart <kioku> block.";
 
-const HANDOFF_PENDING_DESC: &str = "プロジェクトの未受領の引き継ぎ（最新のもの）を取得する。既定の accept=false では覗くだけで消費しない。accept=true にすると受領済みにして、同じプロジェクトの古い未受領の引き継ぎもまとめて受領済みにする（通常は SessionStart フックが自動で行うので不要）。\nPeek at (or accept) the pending handoff of a project.";
+/// Tool description of `handoff_pending` (shared with the `kioku mcp` bridge).
+pub const HANDOFF_PENDING_DESC: &str = "プロジェクトの未受領の引き継ぎ（最新のもの）を取得する。既定の accept=false では覗くだけで消費しない。accept=true にすると受領済みにして、同じプロジェクトの古い未受領の引き継ぎもまとめて受領済みにする（通常は SessionStart フックが自動で行うので不要）。\nPeek at (or accept) the pending handoff of a project.";
 
-const STATUS_DESC: &str = "kioku サーバーの状態を返す: データディレクトリ、プロジェクト・ページ・セッション・観測・引き継ぎの件数、検索索引の文書数、登録済みプロジェクトの id 一覧。\nShow kioku server status, counts and known project ids.";
+/// Tool description of `status` (shared with the `kioku mcp` bridge).
+pub const STATUS_DESC: &str = "kioku サーバーの状態を返す: データディレクトリ、プロジェクト・ページ・セッション・観測・引き継ぎの件数、検索索引の文書数、登録済みプロジェクトの id 一覧。\nShow kioku server status, counts and known project ids.";
 
 /// Search scope accepted by `kioku_query`.
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
@@ -49,7 +56,8 @@ pub enum QueryScope {
 }
 
 impl QueryScope {
-    fn as_str(self) -> &'static str {
+    /// Query-string / `resolve_scope` spelling.
+    pub fn as_str(self) -> &'static str {
         match self {
             QueryScope::Project => "project",
             QueryScope::Global => "global",

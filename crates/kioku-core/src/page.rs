@@ -78,7 +78,9 @@ impl PageKind {
 }
 
 /// Parsed frontmatter; keys kioku does not know are kept in `extra` and written back.
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+/// `Deserialize` reads the API's JSON form (the `kioku mcp` bridge, M2 §20).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Frontmatter {
     /// Page title.
     pub title: String,
@@ -186,7 +188,7 @@ impl Frontmatter {
 }
 
 /// A page as stored in `wiki/`.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Page {
     /// Path relative to `wiki/`, with `/` separators.
     pub path: String,

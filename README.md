@@ -174,7 +174,7 @@ kioku doctor --json           # {"checks":[{id, status, message, fix?}]}
 Checks the binary and `PATH`, `config.toml` (and its 0600 mode), the data dir,
 `git`, the server (reachable, same version), the token, the index version, MCP,
 the service, and for every detected agent: hooks present and pointing at an
-existing binary, the MCP entry's URL and token (compared, never printed),
+existing binary, the MCP entry (the stdio bridge's binary, or for the URL form its URL and token — compared, never printed),
 agent-specific switches, and the instruction snippet. Also flags recent hook
 errors in `hook.log` and an enabled payload dump. Exit 1 if any check fails.
 
@@ -218,9 +218,16 @@ uninstall <agent>` removes exactly what kioku added. Common to all:
   through the link: the link stays, its target is updated (backup next to
   the target). When kioku adds the token to a file others can read, it sets
   the file to 0600 and says so;
+- the MCP server is registered as the **`kioku mcp` stdio bridge**
+  (`{"command": "<kioku>", "args": ["mcp"]}`): the agent starts kioku, which
+  relays each tool call to the server in `~/.kioku/config.toml`. No agent file
+  holds the server URL or the token, the bridge uses the same resilient
+  connection as the hooks (last-good addresses, IPv6/IPv4), and changing
+  server is just `kioku setup --client-only …`. `--mcp-http` registers the old
+  URL + token form instead;
 - `--project` writes hooks (and instructions) into the current repository
-  instead; the MCP entry, which holds the token, always stays in your user
-  config, never in a repository. Project hook files contain a machine-specific
+  instead; the MCP entry always stays in your user config, never in a
+  repository. Project hook files contain a machine-specific
   path — do not commit them. `--project` refuses to run when the project
   directory is your home directory;
 - `--dry-run` shows what would change.
@@ -230,7 +237,7 @@ uninstall <agent>` removes exactly what kioku added. Common to all:
 | what | where |
 |------|-------|
 | hooks (SessionStart, UserPromptSubmit, PostToolUse, PreCompact, Stop, SessionEnd) | `~/.claude/settings.json` (`--project`: `./.claude/settings.json`) |
-| MCP | `mcpServers.kioku` in `~/.claude.json`: `{"type": "http", "url": "http://127.0.0.1:7391/mcp", "headers": {"Authorization": "Bearer <token>"}}` |
+| MCP | `mcpServers.kioku` in `~/.claude.json`: `{"type": "stdio", "command": "<kioku>", "args": ["mcp"]}` |
 | instructions | none by default (the hooks inject context); `--instructions` adds a block to `~/.claude/CLAUDE.md` |
 
 kioku does not run `claude mcp add`, so the token never appears on a command
@@ -241,7 +248,7 @@ line.
 | what | where |
 |------|-------|
 | hooks | `~/.codex/hooks.json` (`$CODEX_HOME`; `--project`: `<repo>/.codex/hooks.json`) |
-| MCP | a managed block `[mcp_servers.kioku]` (url + `Authorization` header) in `~/.codex/config.toml`; bytes outside the block are never changed, and tables Codex itself later adds inside it (project trust, hook trust) are moved out of it, never deleted |
+| MCP | a managed block `[mcp_servers.kioku]` (`command` + `args = ["mcp"]`) in `~/.codex/config.toml`; bytes outside the block are never changed, and tables Codex itself later adds inside it (project trust, hook trust) are moved out of it, never deleted |
 | instructions | a delimited kioku block in `~/.codex/AGENTS.md` (`--project`: `<repo>/AGENTS.md`) |
 
 **Trust step:** Codex runs a new or changed hook only after you trust it.
@@ -342,7 +349,7 @@ machine.
 - `<host>.local` survives address changes, but it is mDNS, so it only resolves on the LAN itself.
 - With `bind = "0.0.0.0"` the server listens on IPv4 and IPv6, so a name that resolves to IPv6 still reaches it.
 - Hooks and the CLI remember the addresses that worked for a named server in `~/.kioku/state/server-addrs.json` and try them first, so they keep working over a VPN where the name no longer resolves.
-- Agents' MCP connects to its configured URL directly, so a machine that moves between the LAN and a VPN should use an IP or a DNS name (e.g. Tailscale MagicDNS).
+- Agents' MCP goes through the `kioku mcp` bridge, so it gets the same last-good addresses as the hooks. (Agents installed with `--mcp-http` connect to their configured URL directly: use an IP or a DNS name there.)
 
 **On a macOS server, check your firewall.** With Little Snitch, LuLu or similar installed, LAN
 connections to a new kioku binary wait on an allow prompt that shows only on the server's own

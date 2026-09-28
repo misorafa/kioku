@@ -6,7 +6,7 @@
 
 mod api;
 mod auth;
-mod mcp;
+pub mod mcp;
 mod shared;
 
 use std::sync::Arc;

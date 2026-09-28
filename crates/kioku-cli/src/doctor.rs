@@ -906,9 +906,16 @@ fn hooks_check(agent: Agent, ctx: &InstallCtx) -> Check {
     }
 }
 
-/// `(url, authorization header)` of our MCP entry; `Err` = file unparseable, `Ok(None)` =
-/// entry missing.
-fn mcp_entry(agent: Agent, path: &Path) -> anyhow::Result<Option<(String, Option<String>)>> {
+/// Our MCP entry as registered: the `kioku mcp` stdio bridge or the v0.3 URL form.
+enum McpFound {
+    /// `command` + `args` (M2 §20.2).
+    Stdio { command: String, args: Vec<String> },
+    /// URL and Authorization header.
+    Url { url: String, auth: Option<String> },
+}
+
+/// Our MCP entry; `Err` = file unparseable, `Ok(None)` = entry missing.
+fn mcp_entry(agent: Agent, path: &Path) -> anyhow::Result<Option<McpFound>> {
     if agent == Agent::Codex {
         let Some(text) = block::read_text(path)? else {
             return Ok(None);
@@ -917,16 +924,28 @@ fn mcp_entry(agent: Agent, path: &Path) -> anyhow::Result<Option<(String, Option
         let Some(e) = t.get("mcp_servers").and_then(|m| m.get("kioku")) else {
             return Ok(None);
         };
-        let url = e
-            .get("url")
-            .and_then(toml::Value::as_str)
-            .unwrap_or_default();
+        let s = |k: &str| e.get(k).and_then(toml::Value::as_str).map(str::to_string);
+        if let Some(command) = s("command") {
+            let args = e
+                .get("args")
+                .and_then(toml::Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            return Ok(Some(McpFound::Stdio { command, args }));
+        }
         let auth = e
             .get("http_headers")
             .and_then(|h| h.get("Authorization"))
             .and_then(toml::Value::as_str)
             .map(str::to_string);
-        return Ok(Some((url.to_string(), auth)));
+        return Ok(Some(McpFound::Url {
+            url: s("url").unwrap_or_default(),
+            auth,
+        }));
     }
     let Some(v) = read_settings(path)? else {
         return Ok(None);
@@ -934,6 +953,21 @@ fn mcp_entry(agent: Agent, path: &Path) -> anyhow::Result<Option<(String, Option
     let Some(e) = v.get("mcpServers").and_then(|m| m.get("kioku")) else {
         return Ok(None);
     };
+    if let Some(command) = e.get("command").and_then(Value::as_str) {
+        let args = e
+            .get("args")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        return Ok(Some(McpFound::Stdio {
+            command: command.to_string(),
+            args,
+        }));
+    }
     let url_key = match agent {
         Agent::GeminiCli => "httpUrl",
         Agent::Antigravity => "serverUrl",
@@ -945,7 +979,10 @@ fn mcp_entry(agent: Agent, path: &Path) -> anyhow::Result<Option<(String, Option
         .and_then(|h| h.get("Authorization"))
         .and_then(Value::as_str)
         .map(str::to_string);
-    Ok(Some((url.to_string(), auth)))
+    Ok(Some(McpFound::Url {
+        url: url.to_string(),
+        auth,
+    }))
 }
 
 fn mcp_agent_check(agent: Agent, ctx: &InstallCtx) -> Check {
@@ -953,7 +990,10 @@ fn mcp_agent_check(agent: Agent, ctx: &InstallCtx) -> Check {
     let path = mcp_path(agent, ctx);
     let fix = Some(format!("kioku install {}", agent.as_str()));
     let (url, auth) = match mcp_entry(agent, &path) {
-        Ok(Some(e)) => e,
+        Ok(Some(McpFound::Stdio { command, args })) => {
+            return stdio_mcp_check(&id, &path, &command, &args, ctx, fix);
+        }
+        Ok(Some(McpFound::Url { url, auth })) => (url, auth),
         Ok(None) => {
             return check(
                 &id,
@@ -993,7 +1033,11 @@ fn mcp_agent_check(agent: Agent, ctx: &InstallCtx) -> Check {
         check(
             &id,
             Status::Ok,
-            format!("{} -> {url}", path.display()),
+            format!(
+                "{} -> {url} (URL form; `kioku install {}` switches to the kioku mcp bridge)",
+                path.display(),
+                agent.as_str()
+            ),
             None,
         )
     } else {
@@ -1004,6 +1048,59 @@ fn mcp_agent_check(agent: Agent, ctx: &InstallCtx) -> Check {
             fix,
         )
     }
+}
+
+/// `agent.<a>.mcp` for the stdio bridge: `args == ["mcp"]`, an existing executable, and
+/// this binary (M2 §20.2).
+fn stdio_mcp_check(
+    id: &str,
+    path: &Path,
+    command: &str,
+    args: &[String],
+    ctx: &InstallCtx,
+    fix: Option<String>,
+) -> Check {
+    if args != ["mcp"] {
+        return check(
+            id,
+            Status::Warn,
+            format!(
+                "{}: `kioku` runs {command} {}, not the kioku mcp bridge",
+                path.display(),
+                args.join(" ")
+            ),
+            fix,
+        );
+    }
+    if !is_executable(Path::new(command)) {
+        return check(
+            id,
+            Status::Fail,
+            format!(
+                "{}: runs {command}, which does not exist (moved binary?)",
+                path.display()
+            ),
+            fix,
+        );
+    }
+    if command != ctx.bin {
+        return check(
+            id,
+            Status::Warn,
+            format!(
+                "{}: runs {command} mcp, not this binary ({})",
+                path.display(),
+                ctx.bin
+            ),
+            fix,
+        );
+    }
+    check(
+        id,
+        Status::Ok,
+        format!("{} -> kioku mcp (stdio bridge)", path.display()),
+        None,
+    )
 }
 
 fn instructions_check(agent: Agent, ctx: &InstallCtx) -> Option<Check> {

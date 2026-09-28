@@ -150,6 +150,12 @@ impl ApiClient {
         self.send(|c| c.post(url.clone()).json(body))
     }
 
+    /// Authenticated PUT of a JSON body to `/api/v1/<segments>`; returns the JSON body.
+    pub fn put(&self, segments: &[&str], body: &Value) -> anyhow::Result<Value> {
+        let url = self.api_url(segments)?;
+        self.send(|c| c.put(url.clone()).json(body))
+    }
+
     /// Sends the request built by `make`: first to the cached last-good addresses (with a
     /// third of the remaining time), then — if those do not connect — with normal DNS.
     fn send(&self, make: impl Fn(&Client) -> RequestBuilder) -> anyhow::Result<Value> {

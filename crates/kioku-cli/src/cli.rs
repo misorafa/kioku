@@ -63,6 +63,10 @@ pub enum Command {
         /// Print the plan; write nothing.
         #[arg(long)]
         dry_run: bool,
+        /// Register the server URL + token as the agents' MCP server (v0.3 form) instead of
+        /// the `kioku mcp` stdio bridge.
+        #[arg(long)]
+        mcp_http: bool,
         /// Also print the command for other machines (`curl -fsSL
         /// https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh -s --
         /// --client-only <url> <token>`); it contains the token.
@@ -141,6 +145,10 @@ pub enum Command {
         /// Gemini CLI: register the MCP server with `"trust": true`.
         #[arg(long)]
         trust_mcp: bool,
+        /// Register the server URL + token as the MCP server (v0.3 form) instead of the
+        /// `kioku mcp` stdio bridge.
+        #[arg(long)]
+        mcp_http: bool,
     },
     /// Remove kioku hooks, the MCP server and the instruction snippet from an agent.
     Uninstall {
@@ -173,6 +181,9 @@ pub enum Command {
     Reindex,
     /// Show server status and counts.
     Status,
+    /// Serve the kioku MCP tools on stdin/stdout for an agent, relaying to the server in
+    /// [client] (what `kioku install` registers as the agents' MCP server).
+    Mcp,
 }
 
 /// Agents `install` / `uninstall` know about.

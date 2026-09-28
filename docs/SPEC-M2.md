@@ -1532,3 +1532,71 @@ server's LAN IP for that reason, and now adds the `.local` name as an
 alternative for machines that stay on the LAN. A local stdio MCP bridge
 (`kioku mcp`), which would give MCP the same resilience, is a candidate for a
 later version.
+
+## 20. `kioku mcp`: a local stdio bridge for MCP (added 2026-09-28, v0.4.0)
+
+Why: §19's connection robustness (last-good addresses, split connect timeout)
+only helps kioku's own HTTP client. Agents' MCP clients connect to the fixed
+URL in their config, so a machine that moves between the LAN and a VPN had
+to pin an IP, which breaks when DHCP changes it. The token was also copied
+into every agent's config file.
+
+### 20.1 Command
+
+`kioku mcp` runs an MCP server on stdin/stdout (rmcp stdio transport,
+newline-delimited JSON-RPC). It serves the same six tools as the server's
+`/mcp`, with the same names, descriptions, input schemas and `instructions`.
+Each tool call is one REST request to `[client] server_url` through
+`ApiClient` (§19.2), with a 30 s deadline per call. It keeps no MCP session
+of its own with the server, so a server restart is invisible to the agent.
+
+| tool | REST call | output |
+|------|-----------|--------|
+| `kioku_query` | `GET /search?q=&project=&scope=&limit=` (limit defaults to the MCP default, 8) | the `/mcp` hit format |
+| `kioku_read` | `GET /pages/<path>` | the `/mcp` page format |
+| `kioku_write_page` | `PUT /pages` | `wrote <path>` |
+| `kioku_handoff_write` | `POST /handoffs` | `handoff recorded for <project_id>` |
+| `kioku_handoff_pending` | `GET /handoffs/pending?project=&accept=` | the `/mcp` handoff format, or `none` |
+| `kioku_status` | `GET /status` | the `/mcp` status format |
+
+A server error comes back as the tool's error text: the server's `{error}`
+message, which carries the same project hint as `/mcp`. A connection failure
+reads `kioku server <url> unreachable: …`.
+
+Additive REST fields, which an older server omits and which the bridge
+tolerates missing:
+
+- `POST /handoffs` returns `{id, project_id}`;
+- `GET /status` adds `project_ids: [<id>…]` (`projects` is already the count).
+
+### 20.2 Registration
+
+`kioku install` / `setup` now register the bridge, not the URL, for every
+agent:
+
+| agent | file | entry |
+|-------|------|-------|
+| Claude Code | `~/.claude.json` | `mcpServers.kioku = {"type":"stdio","command":"<bin>","args":["mcp"]}` |
+| Codex | `config.toml` managed block | `[mcp_servers.kioku]` `command = "<bin>"`, `args = ["mcp"]` |
+| Cursor | `~/.cursor/mcp.json` | `mcpServers.kioku = {"command":"<bin>","args":["mcp"]}` |
+| Gemini CLI | `~/.gemini/settings.json` | `mcpServers.kioku = {"command":"<bin>","args":["mcp"],"timeout":30000}` (+`trust`) |
+| Antigravity | `~/.gemini/config/mcp_config.json` | `mcpServers.kioku = {"command":"<bin>","args":["mcp"]}` |
+
+- No agent file holds the token or the URL any more. Both live only in
+  `~/.kioku/config.toml`, so changing server is `kioku setup --client-only`
+  plus an agent restart, and nothing else to edit.
+- Re-running `install` / `setup` replaces an old URL-style entry in place.
+- `--mcp-http` (install and setup) keeps the v0.3 URL + token form, for an
+  agent machine that cannot run the kioku binary.
+
+`kioku doctor`'s `agent.<a>.mcp` accepts either form:
+
+- **stdio:** OK when the command is an existing executable and `args ==
+  ["mcp"]`. It WARNs when the command is not this binary.
+- **URL (v0.3):** checked as before, plus the hint "re-run `kioku install
+  <a>` to switch to the stdio bridge".
+
+### 20.3 What stays
+
+The server keeps serving `/mcp` over streamable HTTP, for `--mcp-http`
+agents and for clients without the binary.

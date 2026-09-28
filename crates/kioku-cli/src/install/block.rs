@@ -255,15 +255,51 @@ pub fn toml_string(s: &str) -> String {
     out
 }
 
-/// The Codex managed block: `[mcp_servers.kioku]` with `url` and (with a token)
-/// `http_headers`, plus `[features] hooks = true` when `enable_hooks` (M2 §4.1, §4.5).
-pub fn codex_block(url: &str, token: Option<&str>, enable_hooks: bool) -> String {
-    let mut body = format!("[mcp_servers.kioku]\nurl = {}\n", toml_string(url));
-    if let Some(token) = token {
-        body.push_str(&format!(
-            "http_headers = {{ Authorization = {} }}\n",
-            toml_string(&format!("Bearer {token}"))
-        ));
+/// How Codex reaches kioku's MCP tools (M2 §20.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodexMcp<'a> {
+    /// `command = "<bin>"`, `args = ["mcp"]`: the `kioku mcp` stdio bridge (default).
+    Stdio(&'a str),
+    /// `url` and, with a token, bearer `http_headers` (v0.3 form, `--mcp-http`).
+    Http(&'a str, Option<&'a str>),
+}
+
+impl CodexMcp<'_> {
+    /// True when the parsed config's `mcp_servers.kioku` is exactly this form.
+    fn matches(&self, t: &toml::Table) -> bool {
+        let get = |k: &str| table_get(t, &["mcp_servers", "kioku", k]);
+        match self {
+            CodexMcp::Stdio(bin) => {
+                get("command").and_then(toml::Value::as_str) == Some(*bin)
+                    && get("args")
+                        .and_then(toml::Value::as_array)
+                        .is_some_and(|a| a.len() == 1 && a[0].as_str() == Some("mcp"))
+            }
+            CodexMcp::Http(url, _) => get("url").and_then(toml::Value::as_str) == Some(*url),
+        }
+    }
+}
+
+/// The Codex managed block: `[mcp_servers.kioku]` in the given form, plus
+/// `[features] hooks = true` when `enable_hooks` (M2 §4.1, §4.5, §20.2).
+pub fn codex_block(mcp: CodexMcp, enable_hooks: bool) -> String {
+    let mut body = String::from("[mcp_servers.kioku]\n");
+    match mcp {
+        CodexMcp::Stdio(bin) => {
+            body.push_str(&format!(
+                "command = {}\nargs = [\"mcp\"]\n",
+                toml_string(bin)
+            ));
+        }
+        CodexMcp::Http(url, token) => {
+            body.push_str(&format!("url = {}\n", toml_string(url)));
+            if let Some(token) = token {
+                body.push_str(&format!(
+                    "http_headers = {{ Authorization = {} }}\n",
+                    toml_string(&format!("Bearer {token}"))
+                ));
+            }
+        }
     }
     if enable_hooks {
         body.push_str("[features]\nhooks = true\n");
@@ -447,8 +483,7 @@ pub fn read_codex_config(path: &Path) -> Option<toml::Table> {
 /// Installs the managed block into the Codex `config.toml` at `path` (M2 §4.6).
 pub fn install_codex_config(
     path: &Path,
-    url: &str,
-    token: Option<&str>,
+    mcp: CodexMcp,
     enable_hooks_feature: bool,
     dry_run: bool,
 ) -> anyhow::Result<CodexConfigChange> {
@@ -470,7 +505,7 @@ pub fn install_codex_config(
     let parsed = match parse_toml(text) {
         Ok(t) => t,
         Err(e) => {
-            let block = codex_block(url, token, enable_hooks_feature);
+            let block = codex_block(mcp, enable_hooks_feature);
             return Ok(manual(
                 format!(
                     "{} is not valid TOML ({}); not touching it",
@@ -487,7 +522,7 @@ pub fn install_codex_config(
     let normalized = match normalize_codex_blocks(text) {
         Ok(n) => n,
         Err(e) => {
-            let block = codex_block(url, token, enable_hooks_feature);
+            let block = codex_block(mcp, enable_hooks_feature);
             return Ok(manual(
                 format!("{}: {e:#}; not touching it", path.display()),
                 notes,
@@ -499,7 +534,7 @@ pub fn install_codex_config(
     let ranges = match block_ranges(text, TOML_MARKERS) {
         Ok(r) => r,
         Err(e) => {
-            let block = codex_block(url, token, enable_hooks_feature);
+            let block = codex_block(mcp, enable_hooks_feature);
             return Ok(manual(
                 format!("{}: {e:#}; not touching it", path.display()),
                 notes,
@@ -527,7 +562,7 @@ pub fn install_codex_config(
             ));
         }
     }
-    let block = codex_block(url, token, feature);
+    let block = codex_block(mcp, feature);
     // 3. A foreign `mcp_servers.kioku` (table or inline) is not ours to replace.
     if table_get(&foreign, &["mcp_servers", "kioku"]).is_some() {
         return Ok(manual(
@@ -541,15 +576,8 @@ pub fn install_codex_config(
     }
     // 2 / 4. Replace the block in place, or append it.
     let after = upsert_block(text, &block, TOML_MARKERS)?;
-    // 5. The result must parse and carry our URL.
-    let ok = parse_toml(&after)
-        .ok()
-        .and_then(|t| {
-            table_get(&t, &["mcp_servers", "kioku", "url"])
-                .and_then(toml::Value::as_str)
-                .map(|u| u == url)
-        })
-        .unwrap_or(false);
+    // 5. The result must parse and carry our entry.
+    let ok = parse_toml(&after).is_ok_and(|t| mcp.matches(&t));
     if !ok {
         return Ok(manual(
             format!(
@@ -603,7 +631,8 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, ODD).unwrap();
 
-        let r = install_codex_config(&path, URL, Some("tok"), false, false).unwrap();
+        let r =
+            install_codex_config(&path, CodexMcp::Http(URL, Some("tok")), false, false).unwrap();
         assert_eq!(r.outcome, FileOutcome::Written);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
@@ -640,7 +669,8 @@ mod tests {
         }
 
         // Second run: byte-identical, no write.
-        let r = install_codex_config(&path, URL, Some("tok"), false, false).unwrap();
+        let r =
+            install_codex_config(&path, CodexMcp::Http(URL, Some("tok")), false, false).unwrap();
         assert_eq!(r.outcome, FileOutcome::Unchanged);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
 
@@ -648,8 +678,13 @@ mod tests {
         let mut edited = text.clone();
         edited.push_str("\n[tui]\nnotifications = true\n");
         std::fs::write(&path, &edited).unwrap();
-        let r =
-            install_codex_config(&path, "https://kioku.lan/mcp", Some("t2"), false, false).unwrap();
+        let r = install_codex_config(
+            &path,
+            CodexMcp::Http("https://kioku.lan/mcp", Some("t2")),
+            false,
+            false,
+        )
+        .unwrap();
         assert_eq!(r.outcome, FileOutcome::Written);
         let replaced = std::fs::read_to_string(&path).unwrap();
         assert_eq!(block_ranges(&replaced, TOML_MARKERS).unwrap().len(), 1);
@@ -683,7 +718,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, ODD).unwrap();
-        install_codex_config(&path, URL, None, false, false).unwrap();
+        install_codex_config(&path, CodexMcp::Http(URL, None), false, false).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("http_headers"), "no token → no header");
         uninstall_codex_config(&path, false).unwrap();
@@ -691,7 +726,7 @@ mod tests {
 
         // A config.toml kioku created holds the token (0600) and disappears on uninstall.
         let fresh = dir.path().join("new").join("config.toml");
-        install_codex_config(&fresh, URL, Some("tok"), false, false).unwrap();
+        install_codex_config(&fresh, CodexMcp::Http(URL, Some("tok")), false, false).unwrap();
         assert!(
             std::fs::read_to_string(&fresh)
                 .unwrap()
@@ -718,7 +753,8 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "model = \"o3\"\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let r = install_codex_config(&path, URL, Some("tok"), false, false).unwrap();
+        let r =
+            install_codex_config(&path, CodexMcp::Http(URL, Some("tok")), false, false).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         assert_eq!(r.notes.len(), 1, "{:?}", r.notes);
@@ -726,7 +762,7 @@ mod tests {
         // Without a token nothing is tightened.
         std::fs::write(&path, "model = \"o3\"\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let r = install_codex_config(&path, URL, None, false, false).unwrap();
+        let r = install_codex_config(&path, CodexMcp::Http(URL, None), false, false).unwrap();
         assert!(r.notes.is_empty());
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o644);
@@ -742,7 +778,13 @@ mod tests {
             "[mcp_servers]\nkioku = { command = \"kioku-mcp\" }\n",
         ] {
             std::fs::write(&path, foreign).unwrap();
-            let r = install_codex_config(&path, URL, Some("secret-token"), false, false).unwrap();
+            let r = install_codex_config(
+                &path,
+                CodexMcp::Http(URL, Some("secret-token")),
+                false,
+                false,
+            )
+            .unwrap();
             assert_eq!(r.outcome, FileOutcome::Unchanged, "{foreign}");
             let note = r.notes.join("\n");
             assert!(
@@ -753,7 +795,7 @@ mod tests {
         }
         // Unparseable.
         std::fs::write(&path, "model = \n[[[").unwrap();
-        let r = install_codex_config(&path, URL, None, false, false).unwrap();
+        let r = install_codex_config(&path, CodexMcp::Http(URL, None), false, false).unwrap();
         assert_eq!(r.outcome, FileOutcome::Unchanged);
         assert!(r.notes[0].contains("not valid TOML"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "model = \n[[[");
@@ -761,13 +803,13 @@ mod tests {
         // re-parse check refuses the edit.
         let inline = "mcp_servers = { other = { command = \"x\" } }\n";
         std::fs::write(&path, inline).unwrap();
-        let r = install_codex_config(&path, URL, None, false, false).unwrap();
+        let r = install_codex_config(&path, CodexMcp::Http(URL, None), false, false).unwrap();
         assert_eq!(r.outcome, FileOutcome::Unchanged);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), inline);
         // A begin marker without an end marker.
         let broken = format!("{}\n[mcp_servers.kioku]\nurl = \"x\"\n", TOML_MARKERS.begin);
         std::fs::write(&path, &broken).unwrap();
-        let r = install_codex_config(&path, URL, None, false, false).unwrap();
+        let r = install_codex_config(&path, CodexMcp::Http(URL, None), false, false).unwrap();
         assert_eq!(r.outcome, FileOutcome::Unchanged);
         assert!(uninstall_codex_config(&path, false).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
@@ -778,19 +820,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "model = \"o3\"\n").unwrap();
-        install_codex_config(&path, URL, None, true, false).unwrap();
+        install_codex_config(&path, CodexMcp::Http(URL, None), true, false).unwrap();
         let t = parse_toml(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
             table_get(&t, &["features", "hooks"]).unwrap().as_bool(),
             Some(true)
         );
         // Reinstall without the flag keeps it (it is inside our block).
-        let r = install_codex_config(&path, URL, None, false, false).unwrap();
+        let r = install_codex_config(&path, CodexMcp::Http(URL, None), false, false).unwrap();
         assert_eq!(r.outcome, FileOutcome::Unchanged);
 
         let foreign = "[features]\nweb_search = true\nhooks = false\n";
         std::fs::write(&path, foreign).unwrap();
-        let r = install_codex_config(&path, URL, None, true, false).unwrap();
+        let r = install_codex_config(&path, CodexMcp::Http(URL, None), true, false).unwrap();
         assert_eq!(r.outcome, FileOutcome::Written);
         let notes = r.notes.join("\n");
         assert!(notes.contains("hooks = false"), "{notes}");
@@ -811,7 +853,7 @@ mod tests {
         for original in ["", "model = \"o3\"\n"] {
             std::fs::write(&path, original).unwrap();
             let _ = std::fs::remove_file(backup_path(&path));
-            install_codex_config(&path, URL, Some("tok"), true, false).unwrap();
+            install_codex_config(&path, CodexMcp::Http(URL, Some("tok")), true, false).unwrap();
             let installed = std::fs::read_to_string(&path).unwrap();
             // Simulate Codex (toml_edit) adding trust tables at the end of the document.
             let cut = installed.rfind(TOML_MARKERS.end).unwrap();
@@ -821,7 +863,8 @@ mod tests {
             std::fs::write(&path, &edited).unwrap();
 
             // install → install → uninstall: the foreign tables are kept every time.
-            let r = install_codex_config(&path, URL, Some("tok"), false, false).unwrap();
+            let r = install_codex_config(&path, CodexMcp::Http(URL, Some("tok")), false, false)
+                .unwrap();
             assert_eq!(r.outcome, FileOutcome::Written, "{original:?}");
             let once = std::fs::read_to_string(&path).unwrap();
             let block_end = once.find(TOML_MARKERS.end).unwrap();
@@ -847,7 +890,8 @@ mod tests {
                 Some(true),
                 "our sticky [features] stays ours"
             );
-            let r = install_codex_config(&path, URL, Some("tok"), false, false).unwrap();
+            let r = install_codex_config(&path, CodexMcp::Http(URL, Some("tok")), false, false)
+                .unwrap();
             assert_eq!(r.outcome, FileOutcome::Unchanged);
             assert_eq!(std::fs::read_to_string(&path).unwrap(), once);
 
@@ -878,7 +922,7 @@ mod tests {
         );
         assert_eq!(parse_toml(&n).unwrap(), parse_toml(&text).unwrap());
         // A clean block is left byte-identical.
-        let clean = codex_block(URL, None, true);
+        let clean = codex_block(CodexMcp::Http(URL, None), true);
         assert_eq!(normalize_codex_blocks(&clean).unwrap(), clean);
     }
 

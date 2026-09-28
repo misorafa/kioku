@@ -234,7 +234,7 @@ async fn pending_handoff(
     Ok(Json(json!({ "handoff": handoff })))
 }
 
-/// `POST /api/v1/handoffs` → `{id}`.
+/// `POST /api/v1/handoffs` → `{id, project_id}`.
 async fn write_handoff(
     State(store): State<Arc<Store>>,
     body: Result<Json<HandoffInput>, JsonRejection>,
@@ -245,14 +245,24 @@ async fn write_handoff(
             .map_err(|e| with_project_hint(s, e, Some(&input.project)))
     })
     .await?;
-    Ok(Json(json!({ "id": handoff.id })))
+    Ok(Json(
+        json!({ "id": handoff.id, "project_id": handoff.project_id }),
+    ))
 }
 
 /// `GET /api/v1/status` (M2 §9.2: `version` is this server crate's version).
 async fn status(State(store): State<Arc<Store>>) -> ApiResult {
-    let mut report = blocking(&store, |s| s.status()).await?;
+    let (mut report, projects) = blocking(&store, |s| {
+        let projects: Vec<String> = s.list_projects()?.into_iter().map(|p| p.id).collect();
+        Ok((s.status()?, projects))
+    })
+    .await?;
     report.version = SERVER_VERSION.to_string();
-    to_json(report)
+    // M2 §20.1: `project_ids` is additive (the `kioku mcp` bridge prints it like `/mcp`).
+    let mut v =
+        serde_json::to_value(report).map_err(|e| Error::Internal(anyhow::Error::from(e)))?;
+    v["project_ids"] = json!(projects);
+    Ok(Json(v))
 }
 
 /// `POST /api/v1/reindex` → `{docs}` (planner addition: remote CLIs have no data dir).

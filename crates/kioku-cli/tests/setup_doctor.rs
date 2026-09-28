@@ -181,15 +181,14 @@ fn setup_without_service_installs_agents_and_is_idempotent() {
         "--no-service runs no command"
     );
 
-    // The agents really point at the server with the token.
-    let claude: Value =
-        serde_json::from_str(&std::fs::read_to_string(home.path().join(".claude.json")).unwrap())
-            .unwrap();
-    assert_eq!(claude["mcpServers"]["kioku"]["url"], format!("{base}/mcp"));
+    // The agents run the `kioku mcp` bridge; only config.toml knows the server and token.
+    let claude_text = std::fs::read_to_string(home.path().join(".claude.json")).unwrap();
+    let claude: Value = serde_json::from_str(&claude_text).unwrap();
     assert_eq!(
-        claude["mcpServers"]["kioku"]["headers"]["Authorization"],
-        format!("Bearer {TOKEN}")
+        claude["mcpServers"]["kioku"],
+        json!({"type": "stdio", "command": bin, "args": ["mcp"]})
     );
+    assert!(!claude_text.contains(TOKEN) && !claude_text.contains(&base));
     let cfg_text = std::fs::read_to_string(&config).unwrap();
     assert!(cfg_text.contains("[server]") && cfg_text.contains(TOKEN));
 
@@ -739,16 +738,34 @@ fn doctor_all_ok_then_warn_and_fail_scenarios() {
     assert!(!only.iter().any(|c| c.id.starts_with("agent.claude-code")));
     assert!(!only.iter().any(|c| c.id == "agent.cursor.duplicate"));
 
-    // Token mismatch in an agent's MCP entry → WARN, and no token text anywhere.
+    // The stdio bridge entry is OK; a v0.3 URL entry with the wrong token → WARN, and no
+    // token text anywhere; a bridge pointing at a missing binary → FAIL.
     let cursor_mcp = fx.home.path().join(".cursor/mcp.json");
     let original = std::fs::read_to_string(&cursor_mcp).unwrap();
+    let checks = doctor::run_doctor(&fx.env(), None);
+    let c = find(&checks, "agent.cursor.mcp");
+    assert_eq!(c.status, Status::Ok, "{}", c.message);
+    assert!(
+        c.message.contains("kioku mcp (stdio bridge)"),
+        "{}",
+        c.message
+    );
     let mut v: Value = serde_json::from_str(&original).unwrap();
-    v["mcpServers"]["kioku"]["headers"]["Authorization"] = json!("Bearer not-the-token-XYZ");
+    v["mcpServers"]["kioku"] = json!({"url": "http://127.0.0.1:7391/mcp",
+        "headers": {"Authorization": "Bearer not-the-token-XYZ"}});
     std::fs::write(&cursor_mcp, v.to_string()).unwrap();
     let checks = doctor::run_doctor(&fx.env(), None);
     let c = find(&checks, "agent.cursor.mcp");
     assert_eq!(c.status, Status::Warn);
     assert!(c.message.contains("does not match"));
+    v["mcpServers"]["kioku"] = json!({"command": "/nonexistent/kioku", "args": ["mcp"]});
+    std::fs::write(&cursor_mcp, v.to_string()).unwrap();
+    let c = find(&doctor::run_doctor(&fx.env(), None), "agent.cursor.mcp").clone();
+    assert_eq!(c.status, Status::Fail, "{}", c.message);
+    v["mcpServers"]["kioku"] = json!({"url": "http://127.0.0.1:7391/mcp",
+        "headers": {"Authorization": "Bearer not-the-token-XYZ"}});
+    std::fs::write(&cursor_mcp, v.to_string()).unwrap();
+    let checks = doctor::run_doctor(&fx.env(), None);
     let text = doctor::render_text(&checks) + &doctor::render_json(&checks).to_string();
     assert!(!text.contains(TOKEN) && !text.contains("not-the-token-XYZ"));
     assert_eq!(doctor::exit_code(&checks), 0);

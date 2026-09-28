@@ -1056,7 +1056,13 @@ mod tests {
         std::fs::write(&real_toml, "model = \"o3\"\n").unwrap();
         let toml_link = dir.path().join("config.toml");
         std::os::unix::fs::symlink(&real_toml, &toml_link).unwrap();
-        block::install_codex_config(&toml_link, "http://h/mcp", Some("t"), false, false).unwrap();
+        block::install_codex_config(
+            &toml_link,
+            block::CodexMcp::Http("http://h/mcp", Some("t")),
+            false,
+            false,
+        )
+        .unwrap();
         assert!(
             std::fs::read_to_string(&real_toml)
                 .unwrap()

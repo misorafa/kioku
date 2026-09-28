@@ -8,6 +8,7 @@
 
 #![warn(missing_docs)]
 
+pub mod bridge;
 pub mod cli;
 pub mod client;
 pub mod commands;
