@@ -304,6 +304,11 @@ inst Linux x86_64 --no-setup --version v9.9.5
 check "no checksum at all aborts, nothing installed" \
     eval '[ "$RC" != 0 ] && has "refusing to install an unverified binary" && nothing_installed'
 
+newhome
+inst MINGW64_NT-10.0 x86_64 --no-setup
+check "Git Bash on Windows -> points at install.ps1, nothing installed" \
+    eval '[ "$RC" = 1 ] && has "use install.ps1 in PowerShell" && nothing_installed'
+
 # ---------------------------------------------------------------- source fallback
 
 newhome

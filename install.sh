@@ -135,7 +135,7 @@ detect_targets() {
             [ -n "$ARCH" ] && TARGETS="$ARCH-apple-darwin"
             ;;
         MINGW* | MSYS* | CYGWIN* | Windows_NT)
-            die "Windows is not supported; run kioku inside WSL"
+            die "on Windows, use install.ps1 in PowerShell: & ([scriptblock]::Create((irm https://raw.githubusercontent.com/$DEFAULT_REPO/main/install.ps1))) -ClientOnly <url> <token> (inside WSL, this installer works as on Linux)"
             ;;
     esac
     if [ -z "$TARGETS" ]; then
