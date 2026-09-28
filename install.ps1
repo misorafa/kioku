@@ -157,12 +157,23 @@ function Get-Tar {
 }
 
 # Puts $New in the place of $Exe: a running kioku.exe cannot be overwritten, but it can be
-# renamed, so kioku.exe -> kioku.exe.old (a stale .old is deleted first) and then
-# kioku.exe.new -> kioku.exe; the .old is deleted right away when nothing runs it, else by the
-# next kioku run (SPEC-M2.2 section 5).
+# renamed. So every kioku.exe.old* that nothing runs any more is deleted, kioku.exe is moved
+# aside to a free name (kioku.exe.old, or kioku.exe.old-<utc time> when an old copy is still
+# in use -- a `kioku mcp` an app such as Orca keeps alive in the background; this used to
+# need a reboot), and kioku.exe.new takes its place (SPEC-M2.2 section 5).
+function Remove-OldCopies([string]$Exe) {
+    $dir = Split-Path -Parent $Exe
+    $leaf = Split-Path -Leaf $Exe
+    Get-ChildItem -LiteralPath $dir -Filter "$leaf.old*" -ErrorAction SilentlyContinue |
+        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+}
+
 function Move-IntoPlace([string]$New, [string]$Exe) {
+    Remove-OldCopies $Exe
     $old = "$Exe.old"
-    Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $old) {
+        $old = "$Exe.old-" + [DateTime]::UtcNow.ToString('yyyyMMddHHmmssfff')
+    }
     $moved = $false
     if (Test-Path -LiteralPath $Exe) {
         try {
@@ -180,8 +191,8 @@ function Move-IntoPlace([string]$New, [string]$Exe) {
         Remove-Item -LiteralPath $New -Force -ErrorAction SilentlyContinue
         Die "cannot replace $($Exe): $($_.Exception.Message)"
     }
-    # Not running any more (the usual case): the .old can go right away.
-    Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue
+    # Not running any more (the usual case): the moved-aside copy can go right away.
+    Remove-OldCopies $Exe
 }
 
 # Downloads, verifies, extracts and installs kioku.exe; returns its path.

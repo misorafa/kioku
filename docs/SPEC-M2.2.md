@@ -106,6 +106,22 @@ A running `kioku.exe` cannot be overwritten, but it can be renamed. So:
 
 There is no service to restart on Windows.
 
+**Amended 2026-09-29 (v0.6.2).** On the user's Windows 11, an update failed with "cannot
+move kioku.exe out of the way: Cannot create a file when that file already exists". The
+`kioku.exe.old` from the previous update was still executing: a `kioku mcp` that an app
+(Orca) kept alive in the background, even after it was closed. So it could not be deleted,
+and the fixed `.old` name was taken. Only a reboot helped.
+
+Now both `kioku update` (`swap_binary`) and install.ps1 (`Move-IntoPlace`):
+
+- delete every `kioku.exe.old*` that can be deleted;
+- move `kioku.exe` aside to a **free** name: `kioku.exe.old`, else
+  `kioku.exe.old-<time>`;
+- clean up the leftovers on later runs.
+
+An old copy in use never blocks an update again. There are regression tests on both
+sides; a directory stands in for the locked file.
+
 ## 6. `install.ps1` (repo root, next to install.sh)
 
 Usage, printed by `--print-client-command` when the server machine asks
