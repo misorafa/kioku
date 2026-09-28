@@ -897,3 +897,19 @@ fn cursor_captured_payloads() {
         );
     }
 }
+
+#[test]
+fn absolute_paths_of_every_os_are_accepted_on_every_os() {
+    // SPEC-M2.2: a Windows client may see unix payloads (tests, WSL) and vice versa.
+    for p in [
+        "/home/u/kioku",
+        r"C:\Users\u\repo",
+        "C:/Users/u/repo",
+        r"\\wsl.localhost\Ubuntu\home\u",
+    ] {
+        assert!(is_absolute_anywhere(p), "{p}");
+    }
+    for p in ["", "repo", r"repo\src", "./x"] {
+        assert!(!is_absolute_anywhere(p), "{p}");
+    }
+}

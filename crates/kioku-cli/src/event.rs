@@ -536,7 +536,7 @@ fn resolve_cwd(agent: Agent, raw: &Value, roots: &[String], env: &HookEnv) -> St
             .filter_map(|k| env.var(k).map(str::to_string)),
     );
     for c in candidates {
-        if Path::new(&c).is_absolute() || looks_like_windows_abs(&c) {
+        if is_absolute_anywhere(&c) {
             return c;
         }
     }
@@ -547,6 +547,16 @@ fn resolve_cwd(agent: Agent, raw: &Value, roots: &[String], env: &HookEnv) -> St
 fn looks_like_windows_abs(p: &str) -> bool {
     let b = p.as_bytes();
     b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+}
+
+/// True for an absolute path of any OS, whatever OS kioku runs on: this OS's own rule, a
+/// Windows drive path, a UNC path (`\\host\share`), or a unix path (`/…`, which Windows'
+/// `Path::is_absolute` rejects for lacking a drive).
+fn is_absolute_anywhere(p: &str) -> bool {
+    Path::new(p).is_absolute()
+        || looks_like_windows_abs(p)
+        || p.starts_with('/')
+        || p.starts_with(r"\\")
 }
 
 /// `{command}` from a shell tool input whose `command` is a string or an argv array.
@@ -594,7 +604,7 @@ fn apply_patch_input(input: Option<Value>, cwd: &str) -> Option<Value> {
     let paths: Vec<Value> = patch_paths(&patch)
         .into_iter()
         .map(|p| {
-            if Path::new(&p).is_absolute() || cwd.is_empty() {
+            if is_absolute_anywhere(&p) || cwd.is_empty() {
                 Value::String(p)
             } else {
                 Value::String(Path::new(cwd).join(&p).display().to_string())

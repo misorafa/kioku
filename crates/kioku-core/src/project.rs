@@ -403,7 +403,7 @@ mod tests {
         assert_eq!(id.name, "マイプロジェクト");
         assert_eq!(
             id.root,
-            std::fs::canonicalize(tmp.path())
+            crate::util::canonical_plain(tmp.path())
                 .unwrap()
                 .display()
                 .to_string()

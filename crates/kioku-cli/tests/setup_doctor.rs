@@ -148,7 +148,7 @@ fn agent_lines() -> Vec<String> {
 fn setup_without_service_installs_agents_and_is_idempotent() {
     let (base, _server) = test_server();
     let (home, bin) = home_with_agents(false);
-    let config = home.path().join(".kioku/config.toml");
+    let config = home.path().join(".kioku").join("config.toml");
     let env = setup_env(
         home.path(),
         &bin,
@@ -290,7 +290,7 @@ fn setup_dry_run_writes_nothing_and_prints_the_plan() {
     assert!(env.runner.calls().is_empty(), "--dry-run runs no command");
     assert_eq!(r.exit_code(), 0, "{}", r.render());
     let lines = r.summary_lines();
-    let config = home.path().join(".kioku/config.toml");
+    let config = home.path().join(".kioku").join("config.toml");
     assert_eq!(
         lines[1],
         format!(
@@ -356,7 +356,7 @@ fn setup_client_only_checks_the_token_before_touching_anything() {
         },
         &env,
     );
-    let config = home.path().join(".kioku/config.toml");
+    let config = home.path().join(".kioku").join("config.toml");
     let mut expected = vec![
         binary_line(&bin),
         format!(
@@ -656,7 +656,7 @@ fn setup_installs_the_service_and_polls_health() {
         ..SetupOptions::default()
     };
     let first = run_setup(&opts, &env);
-    let config = home.path().join(".kioku/config.toml");
+    let config = home.path().join(".kioku").join("config.toml");
     let base = format!("http://127.0.0.1:{port}");
     let expected = vec![
         binary_line(&bin),
@@ -780,7 +780,7 @@ impl Fixture {
     }
 
     fn config_path(&self) -> PathBuf {
-        self.home.path().join(".kioku/config.toml")
+        self.home.path().join(".kioku").join("config.toml")
     }
 }
 

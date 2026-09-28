@@ -256,11 +256,18 @@ impl SetupReport {
     }
 }
 
-/// `path` with the home directory abbreviated to `~`.
+/// `path` with the home directory abbreviated to `~`; the rest is joined with `/` on every
+/// OS, so Windows shows `~/.claude/settings.json`, not `~/.claude\settings.json`.
 pub fn tilde(path: &Path, home: &Path) -> String {
     match path.strip_prefix(home) {
         Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
-        Ok(rest) => format!("~/{}", rest.display()),
+        Ok(rest) => {
+            let parts: Vec<String> = rest
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            format!("~/{}", parts.join("/"))
+        }
         Err(_) => path.display().to_string(),
     }
 }

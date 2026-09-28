@@ -339,7 +339,8 @@ mod tests {
         let other = dir.path().join("elsewhere");
         std::fs::write(
             dir.path().join(CONFIG_FILE),
-            format!("[server]\ndata_dir = \"{}\"\n", other.display()),
+            // A TOML literal string, so Windows backslashes are not escapes.
+            format!("[server]\ndata_dir = '{}'\n", other.display()),
         )
         .unwrap();
         let c = Config::load_from_dir(dir.path(), &HashMap::new()).unwrap();
