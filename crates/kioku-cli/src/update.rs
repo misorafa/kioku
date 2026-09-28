@@ -37,6 +37,21 @@ pub fn remove_stale_old_binary() {
     }
 }
 
+/// The `tar` to run: on Windows the system's own bsdtar (`%SystemRoot%\System32\tar.exe`,
+/// shipped since Windows 10 1803) — a GNU tar from Git for Windows earlier on PATH reads
+/// `C:\…` as a remote host; elsewhere `tar` from PATH.
+fn tar_program() -> String {
+    if cfg!(windows)
+        && let Some(root) = std::env::var_os("SystemRoot")
+    {
+        let tar = PathBuf::from(root).join("System32").join("tar.exe");
+        if tar.is_file() {
+            return tar.display().to_string();
+        }
+    }
+    "tar".to_string()
+}
+
 /// Puts `new` in the place of `exe`. Without `rename_dance` (unix) one atomic rename; with
 /// it (Windows, where a running exe cannot be overwritten but can be renamed): delete a
 /// stale `<exe>.old`, rename `exe` → `<exe>.old`, then `new` → `exe`, moving the old one
@@ -207,7 +222,7 @@ fn replace(
     std::fs::create_dir_all(work)?;
     let tarball = work.join(&asset);
     std::fs::write(&tarball, &bytes)?;
-    let status = kioku_core::util::quiet_command("tar")
+    let status = kioku_core::util::quiet_command(&tar_program())
         .arg("-xzf")
         .arg(&tarball)
         .arg("-C")
@@ -224,7 +239,9 @@ fn replace(
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(new, std::fs::Permissions::from_mode(0o755))?;
     }
-    let out = kioku_core::util::quiet_command(&new.display().to_string())
+    // On Windows run the extracted `kioku.exe`: `kioku.exe.new` has no executable extension.
+    let probe = if cfg!(windows) { &bin } else { new };
+    let out = kioku_core::util::quiet_command(&probe.display().to_string())
         .arg("--version")
         .output()?;
     if !out.status.success() {

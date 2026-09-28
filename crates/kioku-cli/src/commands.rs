@@ -29,7 +29,6 @@ use crate::render::{HookResult, render};
 
 /// Runs a parsed command line; returns the process exit code.
 pub fn run(cli: Cli) -> i32 {
-    crate::update::remove_stale_old_binary();
     let result = match cli.command {
         Command::Hook { event, agent } => return hook(event, agent),
         Command::HookDump {

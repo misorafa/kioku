@@ -51,3 +51,29 @@ jobs:
       - name: install.sh tests (dash)
         if: runner.os == 'Linux'
         run: KIOKU_TEST_SH=dash dash scripts/test-install.sh
+
+  # SPEC-M2.2 §6.7: install.ps1 against a local fixture server, under PowerShell 7 and
+  # Windows PowerShell 5.1, plus the real kioku.exe (setup refusal, hook stdin, update).
+  install-ps1:
+    name: install.ps1 (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+      - uses: Swatinem/rust-cache@v2
+      - name: Build kioku.exe
+        run: cargo build --locked -p kioku-cli
+      - name: install.ps1 tests (pwsh)
+        shell: pwsh
+        env:
+          KIOKU_TEST_PS: pwsh
+          KIOKU_TEST_REAL_BIN: target\debug\kioku.exe
+        run: ./scripts/test-install.ps1
+      - name: install.ps1 tests (Windows PowerShell 5.1)
+        if: ${{ !cancelled() }}
+        shell: powershell
+        env:
+          KIOKU_TEST_PS: powershell
+        run: ./scripts/test-install.ps1
