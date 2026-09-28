@@ -968,12 +968,16 @@ fn client_command(state: &ConfigState) -> Vec<String> {
         .or_else(|| cfg.server.auth_token.clone())
         .unwrap_or_else(|| "<token>".into());
     let mut out = vec![String::new()];
+    let mut mdns_name = None;
     let url = if state.client_only {
         cfg.client.server_url.trim_end_matches('/').to_string()
     } else {
         let bind = cfg.server.bind.trim();
         let wildcard = matches!(bind, "0.0.0.0" | "::" | "[::]" | "");
         let host = if wildcard || cfg.is_loopback_bind() {
+            if wildcard {
+                mdns_name = local_host_name();
+            }
             first_non_loopback_ip().unwrap_or_else(|| "<this-host>".into())
         } else {
             bind.to_string()
@@ -996,7 +1000,23 @@ fn client_command(state: &ConfigState) -> Vec<String> {
         "  curl -fsSL {} | sh -s -- --client-only {url} {token}",
         install_sh_url()
     ));
+    if let Some(name) = mdns_name {
+        // SPEC-M2 §19.3: the IP also works over a VPN that routes this LAN; the mDNS name
+        // survives address changes but only resolves on the LAN itself.
+        out.push(format!(
+            "  (the IP also works over a VPN that routes this network; machines that stay on this LAN can use http://{name}:{} instead, which survives an address change)",
+            cfg.server.port
+        ));
+    }
     out
+}
+
+/// This machine's mDNS name (`<host>.local`), from `hostname`; `None` if unavailable.
+fn local_host_name() -> Option<String> {
+    let out = std::process::Command::new("hostname").output().ok()?;
+    let name = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    let short = name.split('.').next().filter(|s| !s.is_empty())?;
+    Some(format!("{short}.local"))
 }
 
 /// This machine's first non-loopback IP address (from the route to a documentation

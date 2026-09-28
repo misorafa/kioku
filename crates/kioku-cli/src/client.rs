@@ -2,7 +2,12 @@
 //!
 //! Hooks and the `search` / `status` / `reindex` commands all go through this client: a
 //! laptop running only hooks has no data dir, so nothing here touches the store directly.
+//! It also owns connection robustness (SPEC-M2 §19.2): the connect timeout is split across
+//! a name's addresses, and a named server's last-good addresses are tried first.
 
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow};
@@ -31,31 +36,76 @@ impl std::fmt::Display for HttpError {
 
 impl std::error::Error for HttpError {}
 
+/// File under `~/.kioku/state/` holding named servers' last-good addresses (SPEC-M2 §19.2).
+pub const ADDR_CACHE_FILE: &str = "server-addrs.json";
+
+/// Addresses kept per server in [`ADDR_CACHE_FILE`].
+const ADDR_CACHE_MAX: usize = 4;
+
 /// API client bound to one server URL, token and deadline.
 #[derive(Clone, Debug)]
 pub struct ApiClient {
     base: Url,
     token: Option<String>,
     http: Client,
+    /// Same client with DNS replaced by the cached last-good addresses (named hosts only).
+    pinned: Option<Client>,
+    /// `host:port` key of a named server in the address cache.
+    cache_key: Option<String>,
+    cache_path: Option<PathBuf>,
     deadline: Instant,
 }
 
 impl ApiClient {
-    /// Builds a client whose requests must all finish within `total` from now.
+    /// Builds a client whose requests must all finish within `total` from now, with the
+    /// address cache in `~/.kioku/state/`.
     pub fn new(cfg: &ClientConfig, total: Duration) -> anyhow::Result<ApiClient> {
+        let cache = kioku_core::util::home_dir_opt()
+            .map(|h| h.join(".kioku").join("state").join(ADDR_CACHE_FILE));
+        ApiClient::with_addr_cache(cfg, total, cache)
+    }
+
+    /// [`ApiClient::new`] with an explicit address-cache file (`None`: no cache).
+    pub fn with_addr_cache(
+        cfg: &ClientConfig,
+        total: Duration,
+        cache_path: Option<PathBuf>,
+    ) -> anyhow::Result<ApiClient> {
         let base = Url::parse(cfg.server_url.trim())
             .with_context(|| format!("invalid [client] server_url: {}", cfg.server_url))?;
         if !matches!(base.scheme(), "http" | "https") {
             anyhow::bail!("[client] server_url must be http(s): {}", cfg.server_url);
         }
-        let mut builder = Client::builder().timeout(total);
-        if is_local_url(&base) {
-            // A proxy from the environment must never see requests to a server on this
-            // machine or the local network (it could not reach it, and would see the token).
-            // Other hosts follow HTTP(S)_PROXY / NO_PROXY as usual.
-            builder = builder.no_proxy();
-        }
-        let http = builder.build().context("building HTTP client")?;
+        let local = is_local_url(&base);
+        let builder = |connect: Duration| {
+            // hyper splits the connect timeout across a name's addresses and races IPv6
+            // against IPv4, so one dead address cannot use up the whole deadline.
+            let mut b = Client::builder().timeout(total).connect_timeout(connect);
+            if local {
+                // A proxy from the environment must never see requests to a server on this
+                // machine or the local network (it could not reach it, and would see the
+                // token). Other hosts follow HTTP(S)_PROXY / NO_PROXY as usual.
+                b = b.no_proxy();
+            }
+            b
+        };
+        let http = builder(total * 2 / 3)
+            .build()
+            .context("building HTTP client")?;
+        let cache_key = named_host_key(&base);
+        let cached = match (&cache_key, &cache_path) {
+            (Some(key), Some(path)) => read_addr_cache(path).remove(key).unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let pinned = match (&cache_key, base.host_str()) {
+            (Some(_), Some(host)) if !cached.is_empty() => Some(
+                builder(total / 3)
+                    .resolve_to_addrs(host, &cached)
+                    .build()
+                    .context("building HTTP client")?,
+            ),
+            _ => None,
+        };
         Ok(ApiClient {
             base,
             token: cfg
@@ -65,6 +115,9 @@ impl ApiClient {
                 .filter(|t| !t.is_empty())
                 .map(str::to_string),
             http,
+            pinned,
+            cache_key,
+            cache_path,
             deadline: Instant::now() + total,
         })
     }
@@ -84,25 +137,50 @@ impl ApiClient {
     /// Authenticated GET of `/api/v1/<segments>` with query parameters; returns the JSON body.
     pub fn get(&self, segments: &[&str], query: &[(&str, String)]) -> anyhow::Result<Value> {
         let url = self.api_url(segments)?;
-        self.send(self.http.get(url).query(query))
+        self.send(|c| c.get(url.clone()).query(query))
     }
 
     /// Authenticated POST of a JSON body to `/api/v1/<segments>`; returns the JSON body.
     pub fn post(&self, segments: &[&str], body: &Value) -> anyhow::Result<Value> {
         let url = self.api_url(segments)?;
-        self.send(self.http.post(url).json(body))
+        self.send(|c| c.post(url.clone()).json(body))
     }
 
-    fn send(&self, req: RequestBuilder) -> anyhow::Result<Value> {
-        let remaining = self.deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            anyhow::bail!("deadline exceeded before the request was sent");
+    /// Sends the request built by `make`: first to the cached last-good addresses (with a
+    /// third of the remaining time), then — if those do not connect — with normal DNS.
+    fn send(&self, make: impl Fn(&Client) -> RequestBuilder) -> anyhow::Result<Value> {
+        let prepare = |c: &Client, budget: Duration| -> anyhow::Result<RequestBuilder> {
+            let remaining = self.deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("deadline exceeded before the request was sent");
+            }
+            let mut req = make(c).timeout(remaining.min(budget));
+            if let Some(token) = &self.token {
+                req = req.bearer_auth(token);
+            }
+            Ok(req)
+        };
+        if let Some(pinned) = &self.pinned {
+            let third = self.deadline.saturating_duration_since(Instant::now()) / 3;
+            match prepare(pinned, third)?.send() {
+                Ok(resp) => return self.finish(resp),
+                // Moved server or a different network: fall through to normal resolution.
+                Err(e) if e.is_connect() || e.is_timeout() => {}
+                Err(e) => return Err(anyhow!("request failed: {e}")),
+            }
         }
-        let mut req = req.timeout(remaining);
-        if let Some(token) = &self.token {
-            req = req.bearer_auth(token);
+        let resp = prepare(&self.http, Duration::MAX)?
+            .send()
+            .map_err(|e| anyhow!("request failed: {e}"))?;
+        self.finish(resp)
+    }
+
+    fn finish(&self, resp: reqwest::blocking::Response) -> anyhow::Result<Value> {
+        if let (Some(key), Some(path), Some(addr)) =
+            (&self.cache_key, &self.cache_path, resp.remote_addr())
+        {
+            remember_addr(path, key, addr);
         }
-        let resp = req.send().map_err(|e| anyhow!("request failed: {e}"))?;
         let status = resp.status();
         let text = resp.text().context("reading response body")?;
         let body: Value = serde_json::from_str(&text).unwrap_or(Value::String(text));
@@ -122,6 +200,64 @@ impl ApiClient {
             .into());
         }
         Ok(body)
+    }
+}
+
+/// `host:port` of a URL whose host is a name (IP literals need no cache), else `None`.
+fn named_host_key(url: &Url) -> Option<String> {
+    let host = url.host_str()?;
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if bare.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    Some(format!(
+        "{}:{}",
+        host.to_ascii_lowercase(),
+        url.port_or_known_default()?
+    ))
+}
+
+/// The address cache (§19.2); unreadable or corrupt → empty.
+fn read_addr_cache(path: &std::path::Path) -> BTreeMap<String, Vec<SocketAddr>> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<BTreeMap<String, Vec<String>>>(&t).ok())
+        .map(|m| {
+            m.into_iter()
+                .map(|(k, v)| (k, v.iter().filter_map(|a| a.parse().ok()).collect()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Puts `addr` first in `key`'s list (at most [`ADDR_CACHE_MAX`]); writes only on change.
+/// Best effort: errors are ignored.
+fn remember_addr(path: &std::path::Path, key: &str, addr: SocketAddr) {
+    // IPv4-mapped IPv6 peers (dual-stack servers) are stored as plain IPv4.
+    let addr = match addr {
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(v4) => SocketAddr::new(v4.into(), v6.port()),
+            None => addr,
+        },
+        v4 => v4,
+    };
+    let mut cache = read_addr_cache(path);
+    let list = cache.entry(key.to_string()).or_default();
+    if list.first() == Some(&addr) {
+        return;
+    }
+    list.retain(|a| *a != addr);
+    list.insert(0, addr);
+    list.truncate(ADDR_CACHE_MAX);
+    let text: BTreeMap<&String, Vec<String>> = cache
+        .iter()
+        .map(|(k, v)| (k, v.iter().map(ToString::to_string).collect()))
+        .collect();
+    if let Some(dir) = path.parent() {
+        let _ = kioku_core::util::create_private_dir(dir);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(&text) {
+        let _ = kioku_core::util::write_private_file(path, &(json + "\n"));
     }
 }
 
@@ -174,6 +310,133 @@ pub fn http_status(err: &anyhow::Error) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tiny HTTP server on 127.0.0.1 answering every request with `{"ok":true}`.
+    fn tiny_server() -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body = r#"{"ok":true}"#;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        port
+    }
+
+    fn dead_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    fn cfg(url: String) -> ClientConfig {
+        ClientConfig {
+            server_url: url,
+            ..ClientConfig::default()
+        }
+    }
+
+    fn write_cache(path: &std::path::Path, key: &str, addrs: &[String]) {
+        let v = serde_json::json!({ key: addrs });
+        std::fs::write(path, v.to_string()).unwrap();
+    }
+
+    /// WireGuard case (SPEC-M2 §19.2): the name no longer resolves, the cached LAN address works.
+    #[test]
+    fn unresolvable_name_uses_the_cached_address() {
+        let port = tiny_server();
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join(ADDR_CACHE_FILE);
+        let key = format!("kioku-test.invalid:{port}");
+        write_cache(&cache, &key, &[format!("127.0.0.1:{port}")]);
+        let c = ApiClient::with_addr_cache(
+            &cfg(format!("http://kioku-test.invalid:{port}")),
+            Duration::from_secs(3),
+            Some(cache.clone()),
+        )
+        .unwrap();
+        assert_eq!(c.get(&["health"], &[]).unwrap()["ok"], true);
+        // Without the cache the same name fails.
+        let bare = ApiClient::with_addr_cache(
+            &cfg(format!("http://kioku-test.invalid:{port}")),
+            Duration::from_secs(3),
+            None,
+        )
+        .unwrap();
+        assert!(bare.get(&["health"], &[]).is_err());
+    }
+
+    /// A moved server: the cached address is dead, normal resolution finds it and the cache
+    /// is updated.
+    #[test]
+    fn stale_cache_falls_back_to_dns_and_is_updated() {
+        let port = tiny_server();
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join(ADDR_CACHE_FILE);
+        let key = format!("localhost:{port}");
+        write_cache(&cache, &key, &[format!("127.0.0.1:{}", dead_port())]);
+        let c = ApiClient::with_addr_cache(
+            &cfg(format!("http://localhost:{port}")),
+            Duration::from_secs(3),
+            Some(cache.clone()),
+        )
+        .unwrap();
+        assert_eq!(c.get(&["health"], &[]).unwrap()["ok"], true);
+        let now = read_addr_cache(&cache);
+        assert_eq!(
+            now[&key].first().unwrap().to_string(),
+            format!("127.0.0.1:{port}"),
+            "{now:?}"
+        );
+        assert_eq!(
+            now[&key].len(),
+            2,
+            "the old address is kept behind: {now:?}"
+        );
+    }
+
+    #[test]
+    fn names_are_learned_ip_literals_are_not() {
+        let port = tiny_server();
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("state").join(ADDR_CACHE_FILE);
+        let ip = ApiClient::with_addr_cache(
+            &cfg(format!("http://127.0.0.1:{port}")),
+            Duration::from_secs(3),
+            Some(cache.clone()),
+        )
+        .unwrap();
+        ip.get(&["health"], &[]).unwrap();
+        assert!(!cache.exists(), "IP literals are not cached");
+        let named = ApiClient::with_addr_cache(
+            &cfg(format!("http://localhost:{port}")),
+            Duration::from_secs(3),
+            Some(cache.clone()),
+        )
+        .unwrap();
+        named.get(&["health"], &[]).unwrap();
+        let learned = read_addr_cache(&cache);
+        assert_eq!(
+            learned[&format!("localhost:{port}")][0].to_string(),
+            format!("127.0.0.1:{port}")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&cache).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        // A corrupt cache is ignored, not fatal.
+        std::fs::write(&cache, "{not json").unwrap();
+        named.get(&["health"], &[]).unwrap();
+    }
 
     fn client(url: &str) -> ApiClient {
         let cfg = ClientConfig {

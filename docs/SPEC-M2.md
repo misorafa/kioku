@@ -1468,3 +1468,60 @@ systemctl.
 | 12 | ~~musl cross-build of rusqlite(bundled)+lindera~~ — resolved 2026-09-27: the v0.3.0 release built all six targets (x86_64/aarch64 × linux-musl, linux-gnu, apple-darwin) | §13.1 | pin gnu builds to ubuntu-22.04 |
 | 13 | ~~GitHub repo slug~~ — resolved in Step 4: `misorafa/kioku` | §13.2 | `KIOKU_REPO` / `--repo` still override it |
 | 14 | ~~Does `KIOKU_HOOK_DUMP` reach Codex hooks?~~ — resolved: no. Codex passes only a core env (`CODEX_MANAGED_BY_NPM`, `CODEX_MANAGED_PACKAGE_ROOT` were the only extras seen), so the env switch never arrives; use `[client] hook_dump = true` (`scripts/probe-agents.sh` does this) | §3.8 | config key |
+
+## 19. Connection robustness (added 2026-09-28, v0.3.2)
+
+Field report (this Mac → a Mac mini server with `bind = "0.0.0.0"`):
+`mini-M2.local` resolved to two IPv6 link-local addresses, `192.168.1.240` and
+`192.168.1.57`. The server listened on IPv4 only and one IPv4 address did not
+answer, so a hook tried dead addresses in turn and ran out of its 3 s. From
+outside the LAN, over WireGuard, mDNS names do not resolve at all, and the
+router's DNS does not know host names. DHCP reservations cannot be assumed.
+
+### 19.1 Server: dual stack
+
+With `[server] bind = "0.0.0.0"` on a unix platform whose IPv6 sockets are
+dual stack by default, `kioku serve` listens on `[::]`, which accepts both IPv6
+and IPv4 (v4-mapped) connections. That covers macOS, and Linux when
+`/proc/sys/net/ipv6/bindv6only` reads `0`. If binding `[::]` fails (no IPv6),
+it falls back to `0.0.0.0`. Any other bind value is used as given. The
+"listening" log line shows the address actually bound.
+
+### 19.2 Client: several addresses, and a last-good address
+
+`ApiClient` (hooks, `search`, `status`, `reindex`, `doctor`):
+
+1. **Connect timeout split across addresses.** The reqwest client gets
+   `connect_timeout` = ⅔ of the invocation deadline. hyper divides it across
+   the addresses a name resolves to, and races IPv6 against IPv4 (Happy
+   Eyeballs, 300 ms), so one dead address cannot eat the whole budget.
+2. **Last-good addresses.** When `server_url` has a host *name* (not an IP
+   literal), every successful response records the peer address
+   (`Response::remote_addr`) in `~/.kioku/state/server-addrs.json`:
+   `{"<host>:<port>": ["<ip>:<port>", …]}`, most recent first, at most 4, and
+   written only when the list changes.
+3. **Try the last-good address first.** A request to a named host with a
+   cached address first goes straight to those addresses: DNS is skipped via
+   `resolve_to_addrs`, and the attempt gets ⅓ of the remaining time. If that
+   attempt fails to connect, the request is retried once with normal
+   resolution, which covers a server whose address changed.
+   - Outside the LAN over a VPN that routes the LAN (WireGuard), the mDNS name
+     no longer resolves, but a cached LAN address still works, because the
+     VPN routes it.
+   - At home, the cached address answers immediately and no mDNS lookup
+     happens at all.
+
+The cache is advisory: an unreadable or corrupt file is ignored. It holds
+addresses only, never the token.
+
+### 19.3 What this does not cover
+
+Agents' MCP clients connect to the `server_url` written into each agent's
+config (§8). They get neither the cache nor the retry. A machine that moves
+between the LAN and a VPN should use a `server_url` that works in both
+places: an IP address (routed by the VPN), a DNS name, or a VPN name such as
+Tailscale MagicDNS. `kioku setup --print-client-command` keeps printing the
+server's LAN IP for that reason, and now adds the `.local` name as an
+alternative for machines that stay on the LAN. A local stdio MCP bridge
+(`kioku mcp`), which would give MCP the same resilience, is a candidate for a
+later version.

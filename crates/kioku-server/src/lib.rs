@@ -59,9 +59,7 @@ pub async fn serve(store: Arc<Store>, bind: String, port: u16) -> anyhow::Result
     let mcp_config = mcp::transport_config();
     let mcp_cancel = mcp_config.cancellation_token.clone();
     let app = app(store, token, mcp_config);
-    let listener = tokio::net::TcpListener::bind((bind.as_str(), port))
-        .await
-        .with_context(|| format!("binding {bind}:{port}"))?;
+    let listener = bind_listener(&bind, port).await?;
     let addr = listener.local_addr().context("reading local address")?;
     tracing::info!(%addr, "kioku server listening (API /api/v1, MCP /mcp)");
     axum::serve(listener, app)
@@ -74,6 +72,34 @@ pub async fn serve(store: Arc<Store>, bind: String, port: u16) -> anyhow::Result
         .await
         .context("serving HTTP")?;
     Ok(())
+}
+
+/// Binds the listener (SPEC-M2 §19.1): `0.0.0.0` becomes the dual-stack `[::]` where IPv6
+/// sockets accept IPv4 too, so clients reaching the server by an IPv6 address of its name
+/// get through; without IPv6 it falls back to `0.0.0.0`. Other binds are used as given.
+pub async fn bind_listener(bind: &str, port: u16) -> anyhow::Result<tokio::net::TcpListener> {
+    if bind.trim() == "0.0.0.0" && dual_stack_default() {
+        match tokio::net::TcpListener::bind(("::", port)).await {
+            Ok(l) => return Ok(l),
+            Err(e) => tracing::info!(error = %e, "IPv6 unavailable, listening on 0.0.0.0 only"),
+        }
+    }
+    tokio::net::TcpListener::bind((bind, port))
+        .await
+        .with_context(|| format!("binding {bind}:{port}"))
+}
+
+/// True where a `[::]` socket also accepts IPv4 by default: macOS, and Linux with
+/// `net.ipv6.bindv6only = 0`.
+fn dual_stack_default() -> bool {
+    if cfg!(target_os = "macos") {
+        return true;
+    }
+    if cfg!(target_os = "linux") {
+        return std::fs::read_to_string("/proc/sys/net/ipv6/bindv6only")
+            .is_ok_and(|v| v.trim() == "0");
+    }
+    false
 }
 
 /// True for `localhost`, `127.*` and `::1` (with or without brackets).
@@ -115,6 +141,25 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `0.0.0.0` answers over IPv4 and, where dual stack is the default, over IPv6 too.
+    #[tokio::test]
+    async fn any_address_bind_is_dual_stack() {
+        let listener = bind_listener("0.0.0.0", 0).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move {
+            for _ in 0..2 {
+                let _ = listener.accept().await;
+            }
+        });
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        if dual_stack_default() && std::net::TcpListener::bind("[::1]:0").is_ok() {
+            tokio::net::TcpStream::connect(("::1", port)).await.unwrap();
+        }
+        accept.abort();
+    }
 
     #[test]
     fn loopback_detection() {

@@ -337,6 +337,13 @@ there, then `kioku service stop && kioku service start`). Then run
 `kioku setup --print-client-command` and the printed command on every other
 machine.
 
+**Which URL to use.** `--print-client-command` prints the server's LAN IP.
+- The IP also works over a VPN that routes the LAN (WireGuard), but breaks if the server's address changes.
+- `<host>.local` survives address changes, but it is mDNS, so it only resolves on the LAN itself.
+- With `bind = "0.0.0.0"` the server listens on IPv4 and IPv6, so a name that resolves to IPv6 still reaches it.
+- Hooks and the CLI remember the addresses that worked for a named server in `~/.kioku/state/server-addrs.json` and try them first, so they keep working over a VPN where the name no longer resolves.
+- Agents' MCP connects to its configured URL directly, so a machine that moves between the LAN and a VPN should use an IP or a DNS name (e.g. Tailscale MagicDNS).
+
 **On a macOS server, check your firewall.** With Little Snitch, LuLu or similar installed, LAN
 connections to a new kioku binary wait on an allow prompt that shows only on the server's own
 screen: clients connect but never get an answer. `kioku doctor` checks this as `server.lan`

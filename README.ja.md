@@ -305,6 +305,13 @@ kioku status
 `kioku service stop && kioku service start`）。続いて `kioku setup --print-client-command` を実行し、
 表示されたコマンドをほかのすべてのマシンで実行します。
 
+**接続先の選び方。** `--print-client-command` はサーバーの LAN の IP を表示します。
+- IP は、LAN を経由させる VPN（WireGuard など）の先からも使えます。ただしサーバーの IP が変わると、つながらなくなります。
+- `<ホスト名>.local` は、IP が変わっても使えます。ただし mDNS なので、同じ LAN の中でしか名前が引けません。
+- kioku のサーバーは `bind = "0.0.0.0"` のとき IPv4 と IPv6 の両方で待ち受けます。そのため、名前が IPv6 に解決されても届きます。
+- フックと CLI は、名前で接続して成功したアドレスを `~/.kioku/state/server-addrs.json` に覚えます。次からはそのアドレスを先に試すので、VPN で外にいて名前が引けないときもつながります。
+- エージェントの MCP は設定された URL に直接つなぐので、LAN と VPN を行き来するマシンでは、IP か DNS の名前（Tailscale の MagicDNS など）を使ってください。
+
 **macOS のサーバーでは、ファイアウォールの許可を確認してください。** Little Snitch や LuLu などが入っていると、
 新しい kioku への LAN からの接続が、許可の画面（サーバー機の画面にだけ出ます）で止まります。症状は
 「接続はできるのに応答が返らない」です。`kioku doctor` の `server.lan` が、LAN のアドレスから届くかを
