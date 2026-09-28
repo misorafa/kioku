@@ -131,6 +131,47 @@ the kernel caches the old code signature and kills the new binary (SIGKILL,
 then `kioku service stop && kioku service start`. `kioku update` and
 `cargo install` already replace the file this way.
 
+### Windows (client only)
+
+On Windows 11 (x64) kioku runs natively as a **client**: hooks for Claude Code
+(the CLI and the Claude desktop app's Code tab) and the Codex desktop app / CLI,
+plus the `kioku mcp` bridge. The server stays on a Mac or Linux machine. On the
+server, `kioku setup --print-client-command` prints the PowerShell line after the
+`install.sh` one; run it in PowerShell (5.1 or 7, no administrator rights):
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/misorafa/kioku/main/install.ps1))) -ClientOnly http://<server>:7391 <token>
+```
+
+`install.ps1` downloads `kioku-<tag>-x86_64-pc-windows-msvc.tar.gz`, verifies it
+against `SHA256SUMS` (`Get-FileHash`), installs `kioku.exe` to
+`%LOCALAPPDATA%\Programs\kioku` and runs `kioku setup --client-only <url> <token>`.
+Options: `-Version <tag>`, `-InstallDir <dir>`, `-Repo <owner/name>` (same
+environment variables as `install.sh`), `-NoSetup`, and `-AddToPath`: without it
+the installer only prints the command that adds the directory to your user
+`PATH` (the hooks use the absolute path, so they work either way). Other
+arguments go to `kioku setup`. `kioku setup` without `--client-only` refuses to
+run on Windows, and `kioku service` is not available there.
+
+- **Hooks:** Claude Code gets the exec form (`"command": "C:\\…\\kioku.exe",
+  "args": ["hook", "stop"]`), so no shell is involved; Codex gets a `command`
+  plus a PowerShell `commandWindows` (`& "C:\…\kioku.exe" hook stop --agent
+  codex`); Cursor (best effort) a quoted command string. Gemini CLI and
+  Antigravity are not set up on Windows. Hook input is read as UTF-8 bytes (a
+  BOM is ignored), so Japanese prompts survive on a Japanese-locale Windows.
+- **Updates:** `kioku update` works as elsewhere; a running `kioku.exe` cannot be
+  overwritten, so it is renamed to `kioku.exe.old` and removed by the next run.
+- **SmartScreen:** the Windows binary is not code-signed yet; Windows may warn
+  the first time the downloaded `kioku.exe` runs.
+- **Permissions:** files under `%USERPROFILE%\.kioku` inherit your profile's
+  ACL (only you and administrators); the unix 0600/0700 modes do not apply.
+- **WSL and Orca:** an agent running inside WSL (Codex's "Agent environment =
+  WSL", Orca's WSL terminals) runs Linux processes; install the Linux kioku
+  inside WSL with `install.sh --client-only …`. Orca gives a WSL-hosted Codex its
+  own isolated home, which may not see `~/.codex/hooks.json` (known limitation).
+  A native Windows agent working in a `\\wsl.localhost\<distro>\…` repository
+  should get the same project id through the git remote, but this is untested.
+
 ## `kioku setup`
 
 ```
