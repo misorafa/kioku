@@ -1,4 +1,5 @@
-# Tests for install.ps1 (docs/SPEC-M2.2.md section 6.7), the Windows side of scripts/test-install.sh.
+# Tests for install.ps1 (docs/SPEC-M2.2.md section 6.7, SPEC-M2.3 section 6), the Windows side of
+# scripts/test-install.sh.
 #
 #   pwsh -NoProfile -File scripts/test-install.ps1                         # install.ps1 under pwsh
 #   $env:KIOKU_TEST_PS = 'powershell'; powershell -File scripts/test-install.ps1   # under 5.1
@@ -219,7 +220,10 @@ try {
     Set-Content -LiteralPath $PathFile -Value 'C:\Windows\system32;C:\Tools' -NoNewline
 
     # Runs install.ps1 with $InstallArgs in a fresh $Shell; sets $script:Out and $script:Rc.
-    # $Mode 'file' = `-File install.ps1`, 'block' = the documented `& ([scriptblock]::Create(...))`.
+    # $Mode 'file' = `-File install.ps1`, 'block' = the documented `& ([scriptblock]::Create(...))`,
+    # 'iex' = what `irm http://<server>/i/<code>.ps1 | iex` runs: the server's script (install.ps1
+    # in `& { ... }` with $KiokuJoinUrl / $KiokuJoinCode first) piped to Invoke-Expression, then
+    # prints this window's $env:Path and whether a join variable leaked into it.
     function Invoke-Install([string[]]$InstallArgs, [string]$Mode = 'file', [hashtable]$ExtraEnv = @{}) {
         $saved = @{}
         $vars = @{
@@ -237,7 +241,13 @@ try {
         $eap = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         try {
-            if ($Mode -eq 'block') {
+            if ($Mode -eq 'iex') {
+                $served = Join-Path $Work 'served.ps1'
+                $text = "& {`n`$KiokuJoinUrl = '$($InstallArgs[0])'`n`$KiokuJoinCode = '$($InstallArgs[1])'`n" + [System.IO.File]::ReadAllText($InstallPs1) + "`n}`n"
+                [System.IO.File]::WriteAllText($served, $text)
+                $cmd = "[System.IO.File]::ReadAllText('$served') | Invoke-Expression; Write-Host ('SESSION-PATH=' + `$env:Path); Write-Host ('LEAK=' + [string](Test-Path variable:KiokuJoinUrl))"
+                $script:Out = (& $Shell -NoProfile -ExecutionPolicy Bypass -Command $cmd 2>&1 | Out-String)
+            } elseif ($Mode -eq 'block') {
                 $quoted = ($InstallArgs | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join ' '
                 $cmd = "& ([scriptblock]::Create((Get-Content -Raw -LiteralPath '$InstallPs1'))) $quoted"
                 $script:Out = (& $Shell -NoProfile -ExecutionPolicy Bypass -Command $cmd 2>&1 | Out-String)
@@ -277,7 +287,13 @@ try {
     Check '-ClientOnly <url> <token> and other args reach kioku setup' (Has 'STUB-ARGV: [setup] [--client-only] [http://h.lan:7391] [tok-SECRET-1] [--agents] [codex,claude-code]')
     $installerLines = ($script:Out -split "`r?`n" | Where-Object { $_ -like 'kioku-install:*' }) -join "`n"
     Check 'the token is never echoed by the installer' (-not $installerLines.Contains('tok-SECRET-1'))
-    Check 'PATH hint names the exact command; the user PATH is not edited' ((Has 'is not on your user PATH') -and (Has "SetEnvironmentVariable('Path'") -and (Get-Content -LiteralPath $PathFile -Raw) -eq 'C:\Windows\system32;C:\Tools')
+    Check 'the install dir is added to the user PATH by default' ((Has "added $Dir to your user PATH") -and (Get-Content -LiteralPath $PathFile -Raw) -eq "C:\Windows\system32;C:\Tools;$Dir")
+    $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if ($elevated) {
+        Check 'elevated PowerShell: mentioned, not an error' ($script:Rc -eq 0 -and (Has 'runs as administrator, which is not needed'))
+    } else {
+        Check 'normal PowerShell: no elevation note' (-not (Has 'runs as administrator'))
+    }
     Check 'no kioku.exe.new left behind' (-not (Test-Path -LiteralPath "$Exe.new"))
 
     # Replace a running kioku.exe (SPEC-M2.2 section 5), through the documented scriptblock form.
@@ -290,10 +306,24 @@ try {
     Start-Sleep -Milliseconds 300
 
     Invoke-Install @('-InstallDir', $Dir, '-Version', 'v9.9.8', '-NoSetup', '-AddToPath')
-    Check '-AddToPath appends the dir to the user PATH' ($script:Rc -eq 0 -and (Get-Content -LiteralPath $PathFile -Raw) -eq "C:\Windows\system32;C:\Tools;$Dir" -and (Has 'added'))
+    Check '-AddToPath (old flag) is accepted; the dir is on the user PATH once' ($script:Rc -eq 0 -and (Get-Content -LiteralPath $PathFile -Raw) -eq "C:\Windows\system32;C:\Tools;$Dir" -and -not (Has 'added'))
     Check 'a stale kioku.exe.old is removed, and a replaced exe nothing runs leaves none' (-not (Test-Path -LiteralPath "$Exe.old"))
     Invoke-Install @('-InstallDir', $Dir, '-Version', 'v9.9.8', '-NoSetup')
     Check 'no PATH hint when the dir is on the user PATH' ($script:Rc -eq 0 -and -not (Has 'not on your user PATH'))
+
+    Set-Content -LiteralPath $PathFile -Value 'C:\Windows\system32;C:\Tools' -NoNewline
+    Invoke-Install @('-InstallDir', $Dir, '-Version', 'v9.9.8', '-NoSetup', '-NoPath')
+    Check '-NoPath: the user PATH is not edited, the exact command is shown' ($script:Rc -eq 0 -and (Has 'is not on your user PATH') -and (Has "SetEnvironmentVariable('Path'") -and (Get-Content -LiteralPath $PathFile -Raw) -eq 'C:\Windows\system32;C:\Tools')
+
+    # Join mode (SPEC-M2.3 section 4.1): the pasted `irm .../i/<code>.ps1 | iex`.
+    Invoke-Install @('http://192.168.1.240:7391', 'K7Q2M9XD') 'iex' @{ KIOKU_VERSION = 'v9.9.9'; KIOKU_INSTALL_DIR = $Dir }
+    Check 'iex join mode: kioku.exe join <url> <code>, no setup' ($script:Rc -eq 0 -and (Has 'STUB-ARGV: [join] [http://192.168.1.240:7391] [K7Q2M9XD]') -and -not (Has '[setup]'))
+    Check 'iex join mode: user PATH and this window''s $env:Path both get the dir' ((Get-Content -LiteralPath $PathFile -Raw) -eq "C:\Windows\system32;C:\Tools;$Dir" -and ($script:Out -split "`r?`n" | Where-Object { $_ -like 'SESSION-PATH=*' -and $_.Contains($Dir) }))
+    Check 'iex join mode: bilingual end message, no variables left in the window' ((Has 'The kioku command works in new PowerShell windows') -and (Has 'LEAK=False'))
+    Invoke-Install @('-InstallDir', $Dir, '-Version', 'v9.9.9', '-Join', 'http://h:7391', 'CODE2345', '--agents', 'codex')
+    Check '-Join <url> <code> plus args for kioku join' ($script:Rc -eq 0 -and (Has 'STUB-ARGV: [join] [http://h:7391] [CODE2345] [--agents] [codex]'))
+    Invoke-Install @('-InstallDir', $Dir, '-Version', 'v9.9.9', '-Join', 'http://h:7391')
+    Check '-Join without a code is refused' ($script:Rc -ne 0 -and (Has '-Join needs <url> <code>'))
 
     Invoke-Install @('-InstallDir', $Dir, '-Version', 'v9.9.7', '-NoSetup')
     Check 'checksum mismatch aborts, nothing installed' ($script:Rc -ne 0 -and (Has 'checksum mismatch') -and (Installed-Version) -eq "kioku 9.9.8 ($Target)")

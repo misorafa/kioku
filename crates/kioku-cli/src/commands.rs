@@ -71,6 +71,29 @@ pub fn run(cli: Cli) -> i32 {
             };
             return setup(&opts);
         }
+        Command::Invite { ttl, uses } => {
+            let opts = crate::invite::InviteOptions {
+                ttl_minutes: ttl,
+                uses,
+            };
+            return with_setup_env(|env| crate::invite::run_invite(&opts, env));
+        }
+        Command::Join {
+            url,
+            code,
+            agents,
+            no_agents,
+            no_instructions,
+            mcp_http,
+        } => {
+            let opts = crate::invite::JoinOptions {
+                agents,
+                no_agents,
+                no_instructions,
+                mcp_http,
+            };
+            return with_setup_env(|env| crate::invite::run_join(&url, &code, &opts, env));
+        }
         Command::Service { command } => service(command),
         Command::Doctor { json, agent } => return doctor(json, agent),
         Command::Search {
@@ -236,8 +259,9 @@ fn init() -> anyhow::Result<()> {
     println!("Next steps:");
     println!("  1. kioku serve                    # start the server (keep it running)");
     println!("  2. kioku install all              # hooks + MCP for every agent on this machine");
+    println!("  3. other machines: run `kioku invite` here and paste the line it prints there");
     println!(
-        "  3. other machines: kioku init --client-only http://<this-host>:{} <auth_token from {}>",
+        "     (manual: kioku setup --client-only http://<this-host>:{} <auth_token from {}>)",
         cfg.server.port, report.config_file
     );
     if cfg.is_loopback_bind() {
@@ -445,6 +469,22 @@ fn setup(opts: &crate::setup::SetupOptions) -> i32 {
     let report = crate::setup::run_setup(opts, &env);
     print!("{}", report.render());
     report.exit_code()
+}
+
+/// Runs `f` with the process's [`crate::setup::SetupEnv`] and prints its report; returns
+/// the exit code (`invite` / `join`).
+fn with_setup_env(f: impl FnOnce(&crate::setup::SetupEnv) -> crate::invite::CommandReport) -> i32 {
+    let env = match current_binary().and_then(crate::setup::SetupEnv::from_process) {
+        Ok(e) => e,
+        Err(err) => {
+            eprintln!("kioku: error: {err:#}");
+            return 1;
+        }
+    };
+    let report = f(&env);
+    print!("{}", report.stdout);
+    eprint!("{}", report.stderr);
+    report.exit_code
 }
 
 /// `kioku rotate-token [--dry-run]` (M2 §21); returns the exit code.

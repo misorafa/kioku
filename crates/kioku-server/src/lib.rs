@@ -6,6 +6,7 @@
 
 mod api;
 mod auth;
+pub mod invite;
 pub mod mcp;
 mod shared;
 
@@ -17,19 +18,40 @@ use kioku_core::Store;
 use rmcp::transport::streamable_http_server::StreamableHttpServerConfig;
 
 pub use api::ApiError;
+pub use invite::Invites;
 pub use mcp::{INSTRUCTIONS, KiokuMcp};
 
-/// Builds the full router: `/api/v1/*` + `/mcp`, bearer auth on everything but health.
+/// Builds the full router: `/api/v1/*` + `/mcp`, bearer auth on everything but health and
+/// the invite routes `GET /i/<code>` and `POST /api/v1/join` (SPEC-M2.3 §3.2).
 ///
 /// An empty `auth_token` disables auth (spec §9: auth is enforced when a token is set);
 /// `serve` refuses that combination on non-loopback binds.
 pub fn build_app(store: Arc<Store>, auth_token: String) -> Router {
-    app(store, auth_token, mcp::transport_config())
+    build_app_with_invites(store, auth_token, Arc::new(Invites::new()))
 }
 
-fn app(store: Arc<Store>, auth_token: String, mcp_config: StreamableHttpServerConfig) -> Router {
-    let mut protected =
-        api::protected_routes(store.clone()).nest_service("/mcp", mcp::service(store, mcp_config));
+/// [`build_app`] with a given invite store (tests inject one with a fake clock).
+pub fn build_app_with_invites(
+    store: Arc<Store>,
+    auth_token: String,
+    invites: Arc<Invites>,
+) -> Router {
+    app(store, auth_token, invites, mcp::transport_config())
+}
+
+fn app(
+    store: Arc<Store>,
+    auth_token: String,
+    invites: Arc<Invites>,
+    mcp_config: StreamableHttpServerConfig,
+) -> Router {
+    let join = invite::JoinState {
+        invites,
+        token: Arc::from(auth_token.as_str()),
+    };
+    let mut protected = api::protected_routes(store.clone())
+        .merge(invite::protected_routes(join.clone()))
+        .nest_service("/mcp", mcp::service(store, mcp_config));
     if auth_token.is_empty() {
         tracing::warn!("no auth_token configured: the API and /mcp are unauthenticated");
     } else {
@@ -39,7 +61,9 @@ fn app(store: Arc<Store>, auth_token: String, mcp_config: StreamableHttpServerCo
             auth::require_bearer,
         ));
     }
-    api::public_routes().merge(protected)
+    api::public_routes()
+        .merge(invite::public_routes(join))
+        .merge(protected)
 }
 
 /// Binds `bind:port` and serves the app until Ctrl-C / SIGTERM, using the store's
@@ -58,19 +82,23 @@ pub async fn serve(store: Arc<Store>, bind: String, port: u16) -> anyhow::Result
     }
     let mcp_config = mcp::transport_config();
     let mcp_cancel = mcp_config.cancellation_token.clone();
-    let app = app(store, token, mcp_config);
+    let app = app(store, token, Arc::new(Invites::new()), mcp_config);
     let listener = bind_listener(&bind, port).await?;
     let addr = listener.local_addr().context("reading local address")?;
     tracing::info!(%addr, "kioku server listening (API /api/v1, MCP /mcp)");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            tracing::info!("shutting down");
-            // Closes open MCP SSE streams so graceful shutdown does not wait on them.
-            mcp_cancel.cancel();
-        })
-        .await
-        .context("serving HTTP")?;
+    // Connect info: the invite routes rate-limit failed lookups per peer (SPEC-M2.3 §3.2).
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        tracing::info!("shutting down");
+        // Closes open MCP SSE streams so graceful shutdown does not wait on them.
+        mcp_cancel.cancel();
+    })
+    .await
+    .context("serving HTTP")?;
     Ok(())
 }
 

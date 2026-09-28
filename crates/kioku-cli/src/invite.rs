@@ -1,0 +1,346 @@
+//! `kioku invite` and `kioku join` (SPEC-M2.3 §5): the server owner gets one line to paste
+//! on a new machine; that machine exchanges the one-time code for the token and runs the
+//! `setup --client-only` flow. The token is never printed.
+
+use std::time::Duration;
+
+use kioku_core::config::CONFIG_FILE;
+use kioku_core::{ClientConfig, Config};
+use serde_json::{Value, json};
+
+use crate::client::{ApiClient, http_status};
+use crate::event::{ALL_AGENTS, Agent};
+use crate::setup::{Mark, SetupEnv, SetupOptions, client_url, has_server_section, run_setup};
+
+/// Flags of `kioku invite`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InviteOptions {
+    /// `--ttl <minutes>` (the server caps it at 60).
+    pub ttl_minutes: u32,
+    /// `--uses <n>` (the server caps it at 20).
+    pub uses: u32,
+}
+
+impl Default for InviteOptions {
+    fn default() -> Self {
+        InviteOptions {
+            ttl_minutes: 10,
+            uses: 1,
+        }
+    }
+}
+
+/// Output of `invite` / `join`: text for stdout, text for stderr, exit code.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CommandReport {
+    /// Printed on stdout.
+    pub stdout: String,
+    /// Printed on stderr.
+    pub stderr: String,
+    /// Process exit code.
+    pub exit_code: i32,
+}
+
+impl CommandReport {
+    fn fail(msg: impl Into<String>) -> CommandReport {
+        let mut stderr = msg.into();
+        if !stderr.ends_with('\n') {
+            stderr.push('\n');
+        }
+        CommandReport {
+            stdout: String::new(),
+            stderr,
+            exit_code: 1,
+        }
+    }
+}
+
+/// The URL this machine's own server answers on: loopback unless it binds one address.
+pub fn own_server_url(cfg: &Config) -> String {
+    let bind = cfg.server.bind.trim();
+    let host = match bind {
+        "" | "0.0.0.0" => "127.0.0.1".to_string(),
+        "::" | "[::]" => "[::1]".to_string(),
+        b if b.eq_ignore_ascii_case("localhost") => "127.0.0.1".to_string(),
+        b if b.contains(':') && !b.starts_with('[') => format!("[{b}]"),
+        b => b.to_string(),
+    };
+    format!("http://{host}:{}", cfg.server.port)
+}
+
+/// Runs `kioku invite`: creates an invite on this machine's own server and returns the
+/// lines to paste on the new machine.
+pub fn run_invite(opts: &InviteOptions, env: &SetupEnv) -> CommandReport {
+    let config_dir = env.config_dir();
+    let path = config_dir.join(CONFIG_FILE);
+    // Docker: no config.toml, the server's token comes from KIOKU_AUTH_TOKEN.
+    let env_token = env
+        .vars
+        .get("KIOKU_AUTH_TOKEN")
+        .is_some_and(|t| !t.trim().is_empty());
+    let is_server = if path.exists() {
+        has_server_section(&path)
+    } else {
+        env_token
+    };
+    if !is_server {
+        return CommandReport::fail(format!(
+            "kioku: この機械はサーバーではありません。kioku invite はサーバー機で実行してください。\n\
+             kioku: {} has no [server] section: run kioku invite on the server machine.",
+            path.display()
+        ));
+    }
+    let cfg = match Config::load_from_dir(&config_dir, &env.vars) {
+        Ok(c) => c,
+        Err(e) => return CommandReport::fail(format!("kioku: error: {e:#}")),
+    };
+    let token = cfg.server.auth_token.clone().unwrap_or_default();
+    if token.trim().is_empty() {
+        return CommandReport::fail(format!(
+            "kioku: {} has no [server] auth_token: run kioku setup first.",
+            path.display()
+        ));
+    }
+    let own = own_server_url(&cfg);
+    let client = ClientConfig {
+        server_url: own.clone(),
+        auth_token: Some(token),
+        ..cfg.client.clone()
+    };
+    let body = json!({ "ttl_minutes": opts.ttl_minutes, "uses": opts.uses });
+    let created = ApiClient::new(&client, env.request_timeout.max(Duration::from_secs(5)))
+        .and_then(|c| c.post(&["invites"], &body));
+    let resp = match created {
+        Ok(v) => v,
+        Err(e) => {
+            let why = match http_status(&e) {
+                Some(404) => "the running server is older than this kioku and has no invites: restart it (kioku service stop && kioku service start)".to_string(),
+                Some(401) => "the running server rejected this machine's [server] auth_token (it runs with another token): restart it (kioku service stop && kioku service start)".to_string(),
+                Some(_) => format!("{e:#}"),
+                None => format!("the kioku server does not answer at {own} ({e:#}): start it with kioku service start (or kioku setup)"),
+            };
+            return CommandReport::fail(format!("kioku: error: {why}"));
+        }
+    };
+    let Some(code) = resp.get("code").and_then(Value::as_str) else {
+        return CommandReport::fail("kioku: error: unexpected answer from POST /api/v1/invites");
+    };
+    let uses = resp.get("uses").and_then(Value::as_u64).unwrap_or(1);
+    let minutes = opts.ttl_minutes.clamp(1, 60);
+    let url = client_url(&cfg);
+    CommandReport {
+        stdout: render_invite(code, &url, minutes, uses),
+        stderr: String::new(),
+        exit_code: 0,
+    }
+}
+
+/// The text `kioku invite` prints (SPEC-M2.3 §2).
+pub fn render_invite(code: &str, url: &crate::setup::ClientUrl, minutes: u32, uses: u64) -> String {
+    let (valid_ja, valid_en) = if uses <= 1 {
+        (
+            format!("{minutes} 分間・1 回だけ有効"),
+            format!("valid {minutes} minutes, once"),
+        )
+    } else {
+        (
+            format!("{minutes} 分間・{uses} 台まで有効"),
+            format!("valid {minutes} minutes, up to {uses} machines"),
+        )
+    };
+    let mut out = String::new();
+    if let Some(note) = &url.loopback_note {
+        out.push_str(note);
+        out.push_str("\n\n");
+    }
+    out.push_str(&format!(
+        "追加するマシンで、次のどちらか 1 行を貼り付けてください（{valid_ja}）:\n"
+    ));
+    out.push_str(&format!(
+        "Paste ONE of these on the machine to add ({valid_en}):\n\n"
+    ));
+    out.push_str(&format!(
+        "  Windows (PowerShell):  irm {}/i/{code}.ps1 | iex\n",
+        url.url
+    ));
+    out.push_str(&format!(
+        "  macOS / Linux:         curl -sSL {}/i/{code} | sh\n",
+        url.url
+    ));
+    if let Some(alt) = &url.mdns_alternative {
+        out.push_str(&format!(
+            "\n(On this LAN you can also use {alt}/…; over a VPN use the IP.)\n"
+        ));
+    }
+    out
+}
+
+/// Flags of `kioku join` (the `kioku setup` flags that make sense for a client).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JoinOptions {
+    /// `--agents a,b`.
+    pub agents: Vec<Agent>,
+    /// `--no-agents`.
+    pub no_agents: bool,
+    /// `--no-instructions`.
+    pub no_instructions: bool,
+    /// `--mcp-http`.
+    pub mcp_http: bool,
+}
+
+/// `http://` added when the scheme is missing; no trailing slash.
+fn normalize_url(url: &str) -> String {
+    let url = url.trim().trim_end_matches('/');
+    if url.contains("://") {
+        url.to_string()
+    } else {
+        format!("http://{url}")
+    }
+}
+
+/// The one sentence (ja + en) for an invite the server refused.
+const INVALID: &str = "kioku: この招待コードは無効か、期限切れか、使用済みです。サーバーで kioku invite をもう一度実行してもらい、新しい行を貼り付けてください。\n\
+kioku: This invite code is invalid, expired or already used: ask for a new kioku invite on the server and paste the new line.";
+
+/// Runs `kioku join <url> <code>`: exchanges the code for the token, then does what
+/// `kioku setup --client-only <url> <token>` does. Nothing printed contains the token.
+pub fn run_join(url: &str, code: &str, opts: &JoinOptions, env: &SetupEnv) -> CommandReport {
+    let url = normalize_url(url);
+    let parsed = match reqwest::Url::parse(&url) {
+        Ok(u) if matches!(u.scheme(), "http" | "https") => u,
+        _ => {
+            return CommandReport::fail(format!(
+                "kioku: サーバーの URL が正しくありません: {url}\nkioku: invalid server URL: {url} (paste the line kioku invite printed as it is)"
+            ));
+        }
+    };
+    let port = parsed.port_or_known_default().unwrap_or(7391);
+    let client = ClientConfig {
+        server_url: url.clone(),
+        auth_token: None,
+        ..ClientConfig::default()
+    };
+    let answer = ApiClient::new(&client, env.request_timeout.max(Duration::from_secs(5)))
+        .and_then(|c| c.post(&["join"], &json!({ "code": code.trim() })));
+    let token = match answer {
+        Ok(v) => match v.get("token").and_then(Value::as_str) {
+            Some(t) if !t.trim().is_empty() => t.trim().to_string(),
+            _ => return CommandReport::fail("kioku: error: the server's join answer has no token"),
+        },
+        Err(e) => {
+            return CommandReport::fail(match http_status(&e) {
+                Some(404) => INVALID.to_string(),
+                Some(429) => "kioku: 失敗した試行が多すぎます。1 分待ってから、サーバーで kioku invite をもう一度実行してもらってください。\n\
+                     kioku: Too many failed attempts: wait a minute, then ask for a new kioku invite on the server."
+                    .to_string(),
+                Some(status) => format!(
+                    "kioku: サーバーが招待を受け付けませんでした (HTTP {status})。\nkioku: The server at {url} refused the invite: {e:#}"
+                ),
+                None => format!(
+                    "kioku: {url} に接続できません。サーバー機が起動していて同じネットワーク（または VPN）にあり、ファイアウォールがポート {port} を許可しているか確認してください。\n\
+                     kioku: Cannot reach {url}: check that the server machine is on, on this network (or VPN), and that its firewall allows port {port} (macOS: System Settings > Network > Firewall)."
+                ),
+            });
+        }
+    };
+
+    let setup_opts = SetupOptions {
+        client_only: Some((url.clone(), token.clone())),
+        agents: opts.agents.clone(),
+        no_agents: opts.no_agents,
+        no_instructions: opts.no_instructions,
+        mcp_http: opts.mcp_http,
+        ..SetupOptions::default()
+    };
+    let report = run_setup(&setup_opts, env);
+    let mut stdout = format!("kioku join (v{})\n", crate::setup::VERSION);
+    for line in report.summary_lines() {
+        stdout.push_str(&line);
+        stdout.push('\n');
+    }
+    let code = report.exit_code();
+    let agents: Vec<&str> = ALL_AGENTS
+        .iter()
+        .filter(|a| {
+            report
+                .lines
+                .iter()
+                .any(|l| l.step == a.as_str() && l.mark == Mark::Ok)
+        })
+        .map(|a| a.display_name())
+        .collect();
+    stdout.push('\n');
+    if code != 0 {
+        stdout.push_str(
+            "kioku の設定が完了しませんでした。上の xx の行を確認してください。\n\
+             kioku is not ready: see the xx line above.\n",
+        );
+    } else if opts.no_agents {
+        stdout.push_str("kioku の準備ができました。/ kioku is ready.\n");
+    } else if agents.is_empty() {
+        stdout.push_str(
+            "kioku の準備ができましたが、エージェントが見つかりませんでした。Claude Code などを入れたら kioku setup を実行してください。\n\
+             kioku is ready, but no agent was found: install Claude Code, Codex, … and run kioku setup.\n",
+        );
+    } else {
+        let list = agents.join(" / ");
+        stdout.push_str(&format!(
+            "kioku の準備ができました。{list} を再起動してください。\nkioku is ready - restart {}.\n",
+            agents.join(", ")
+        ));
+    }
+    // Belt and braces: nothing we print may contain the token.
+    let stdout = stdout.replace(&token, "<token>");
+    CommandReport {
+        stdout,
+        stderr: String::new(),
+        exit_code: code,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn own_url_and_normalization() {
+        let mut cfg = Config::for_data_dir(std::path::Path::new("/tmp/k"));
+        cfg.server.port = 7391;
+        for (bind, want) in [
+            ("0.0.0.0", "http://127.0.0.1:7391"),
+            ("127.0.0.1", "http://127.0.0.1:7391"),
+            ("::", "http://[::1]:7391"),
+            ("192.168.1.5", "http://192.168.1.5:7391"),
+            ("fe80::1", "http://[fe80::1]:7391"),
+        ] {
+            cfg.server.bind = bind.into();
+            assert_eq!(own_server_url(&cfg), want, "{bind}");
+        }
+        assert_eq!(
+            normalize_url("192.168.1.240:7391/"),
+            "http://192.168.1.240:7391"
+        );
+        assert_eq!(normalize_url("https://k.example"), "https://k.example");
+    }
+
+    #[test]
+    fn invite_text() {
+        let url = crate::setup::ClientUrl {
+            url: "http://192.168.1.240:7391".into(),
+            mdns_alternative: Some("http://mini-M2.local:7391".into()),
+            loopback_note: None,
+        };
+        let t = render_invite("K7Q2M9XD", &url, 10, 1);
+        assert!(t.contains(
+            "  Windows (PowerShell):  irm http://192.168.1.240:7391/i/K7Q2M9XD.ps1 | iex\n"
+        ));
+        assert!(t.contains(
+            "  macOS / Linux:         curl -sSL http://192.168.1.240:7391/i/K7Q2M9XD | sh\n"
+        ));
+        assert!(t.contains("(valid 10 minutes, once)"));
+        assert!(t.contains("10 分間・1 回だけ有効"));
+        assert!(t.contains("http://mini-M2.local:7391/…"));
+        let t = render_invite("K7Q2M9XD", &url, 30, 3);
+        assert!(t.contains("valid 30 minutes, up to 3 machines"));
+    }
+}

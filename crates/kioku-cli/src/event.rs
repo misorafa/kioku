@@ -49,6 +49,17 @@ impl Agent {
         }
     }
 
+    /// Product name for messages (`Claude Code`, `Codex`, …).
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Agent::ClaudeCode => "Claude Code",
+            Agent::Codex => "Codex",
+            Agent::Cursor => "Cursor",
+            Agent::GeminiCli => "Gemini CLI",
+            Agent::Antigravity => "Antigravity",
+        }
+    }
+
     /// Environment variables naming the project dir, in resolution order (M2 §3.4 step 3).
     pub fn project_dir_env(self) -> &'static [&'static str] {
         match self {

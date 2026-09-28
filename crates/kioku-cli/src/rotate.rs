@@ -1,6 +1,7 @@
 //! `kioku rotate-token` (SPEC-M2 §21): replaces the server's auth token in config.toml,
-//! restarts the service and prints the `kioku setup --client-only` line for every other
-//! machine. Agents hold no token since v0.4.0, so config.toml is all there is to update.
+//! restarts the service and points at `kioku invite` (plus the manual `kioku setup
+//! --client-only` line) for every other machine. Agents hold no token since v0.4.0, so
+//! config.toml is all there is to update.
 
 use std::time::Instant;
 
@@ -116,8 +117,14 @@ pub fn run_rotate(dry_run: bool, env: &SetupEnv) -> RotateReport {
         );
     }
     r.lines.push(String::new());
+    // SPEC-M2.3 §2: `kioku invite` is the easy way to update the other machines.
     r.lines.push(
-        "On every other machine (this line contains the new token - keep it private):".into(),
+        "Update every other machine: run `kioku invite --uses <n>` here and paste the line it prints on each of them."
+            .into(),
+    );
+    r.lines.push(
+        "Or manually, on every other machine (this line contains the new token - keep it private):"
+            .into(),
     );
     r.lines
         .push(format!("  kioku setup --client-only {} {token}", url.url));

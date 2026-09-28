@@ -218,7 +218,7 @@ pub fn run_doctor(env: &DoctorEnv, only: Option<Agent>) -> Vec<Check> {
                     Status::Fail,
                     msg,
                     Some(format!(
-                        "make [client] auth_token in {} match the server's [server] auth_token (kioku setup --client-only <url> <token>)",
+                        "make [client] auth_token in {} match the server's [server] auth_token: run kioku invite on the server and paste the line here (or kioku setup --client-only <url> <token>)",
                         config_path.display()
                     )),
                 ));
@@ -362,8 +362,10 @@ fn config_check(
         let _ = c.apply_env(&env.vars);
         c
     };
-    let fix_setup =
-        Some("run `kioku setup` (or `kioku setup --client-only <url> <token>`)".to_string());
+    let fix_setup = Some(
+        "run `kioku setup` (on a client: `kioku invite` on the server, then paste its line here)"
+            .to_string(),
+    );
     if !path.exists() {
         out.push(check(
             "config",

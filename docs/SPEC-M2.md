@@ -1289,6 +1289,9 @@ Behaviour:
    dictionary download).
 8. PATH: if `<dir>` is not in `$PATH`, print the exact line for the user's
    shell (`$SHELL` basename zsh/bash/fish) — never edit rc files.
+   **Superseded by SPEC-M2.3 §4.2 / §8 (2026-09-28):** the line is now added to
+   the shell's rc file by default (once, marked), `--no-modify-path` restores
+   the print-only behaviour.
 9. Unless `--no-setup`: `exec "<dir>/kioku" setup <passthrough args>` (absolute
    path, so PATH does not matter).
 

@@ -236,6 +236,9 @@ fn setup_without_service_installs_agents_and_is_idempotent() {
     let url_of = |l: &str| l.split_whitespace().rev().nth(1).unwrap().to_string();
     assert_eq!(url_of(ps1), url_of(line));
     assert!(text.contains("listens on 127.0.0.1 only"));
+    // SPEC-M2.3 §5: the output recommends `kioku invite` first.
+    let invite = text.find("run `kioku invite` here").unwrap();
+    assert!(invite < text.find(line).unwrap(), "{text}");
     assert_eq!(snapshot(home.path(), &[]), before);
 }
 
@@ -254,7 +257,7 @@ fn setup_on_windows_requires_client_only() {
     assert_eq!(r.exit_code(), 1);
     assert!(
         r.render().contains(
-            "Windows runs kioku as a client: kioku setup --client-only <url> <token> (the server runs on macOS/Linux)"
+            "Windows runs kioku as a client: kioku setup --client-only <url> <token> (the server runs on macOS/Linux; easiest: run kioku invite there and paste its Windows line here)"
         ),
         "{}",
         r.render()
@@ -494,6 +497,14 @@ fn rotate_token_restarts_the_service_with_a_new_token() {
         r.lines
             .iter()
             .any(|l| l.contains("accepts only the new token")),
+        "{:?}",
+        r.lines
+    );
+    // SPEC-M2.3 §2: other machines are updated with `kioku invite`.
+    assert!(
+        r.lines
+            .iter()
+            .any(|l| l.contains("run `kioku invite --uses <n>` here")),
         "{:?}",
         r.lines
     );

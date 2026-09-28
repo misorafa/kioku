@@ -1,22 +1,28 @@
 #!/bin/sh
-# kioku installer (docs/SPEC-M2.md §13.2).
+# kioku installer (docs/SPEC-M2.md §13.2, docs/SPEC-M2.3.md §4).
 #
 #   curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh
 #   curl -fsSL …/install.sh | sh -s -- --version v0.2.0 --no-setup
 #   curl -fsSL …/install.sh | sh -s -- --client-only http://home.lan:7391 <token>
+#   curl -sSL http://<server>:7391/i/<code> | sh      # the line `kioku invite` prints
 #
 # Downloads the release binary for this machine, verifies its SHA-256 against the
-# release's SHA256SUMS, installs it to ~/.local/bin/kioku and runs `kioku setup`.
-# Never uses sudo and never edits shell rc files. POSIX sh; the body lives in `main`,
+# release's SHA256SUMS, installs it to ~/.local/bin/kioku, puts that directory on PATH
+# (one marked line in your shell's rc file) and runs `kioku setup` — or, in join mode,
+# `kioku join <url> <code>`. Never uses sudo. POSIX sh; the body lives in `main`,
 # called on the last line, so a truncated download runs nothing.
 #
 # Options (a flag wins over its environment variable):
 #   --version <tag>      KIOKU_VERSION      release tag (default: latest)
 #   --install-dir <dir>  KIOKU_INSTALL_DIR  destination (default: $HOME/.local/bin)
 #   --repo <owner/name>  KIOKU_REPO         GitHub repository (default: misorafa/kioku)
+#   --join <url> <code>  KIOKU_JOIN_URL + KIOKU_JOIN_CODE
+#                                           join that server with an invite code
+#                                           (`kioku invite`) instead of `kioku setup`
+#   --no-modify-path                        do not add the install dir to PATH
 #   --from-source                           build with cargo instead of downloading
-#   --no-setup                              install only, do not run `kioku setup`
-#   anything else (and everything after `--`) is passed to `kioku setup`,
+#   --no-setup                              install only, do not run `kioku setup` / `join`
+#   anything else (and everything after `--`) is passed to `kioku setup` (or `kioku join`),
 #   e.g. --client-only <url> <token>, --no-service, --agents codex,cursor, --dry-run.
 # Test-only overrides: KIOKU_DOWNLOAD_BASE (replaces https://github.com/<repo>/releases),
 # KIOKU_UNAME_S, KIOKU_UNAME_M.
@@ -55,12 +61,13 @@ add_pass() {
 usage() {
     cat <<'EOF_USAGE'
 usage: install.sh [--version <tag>] [--install-dir <dir>] [--repo <owner/name>]
-                  [--from-source] [--no-setup] [kioku setup options...] [-- kioku setup options...]
+                  [--join <url> <code>] [--no-modify-path] [--from-source] [--no-setup]
+                  [kioku setup options...] [-- kioku setup options...]
 
   curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh
-  curl -fsSL .../install.sh | sh -s -- --client-only http://home.lan:7391 <token>
+  curl -sSL http://<server>:7391/i/<code> | sh       (the line `kioku invite` prints)
 
-Every option this installer does not know is passed to `kioku setup`.
+Every option this installer does not know is passed to `kioku setup` (or `kioku join`).
 EOF_USAGE
 }
 
@@ -135,7 +142,7 @@ detect_targets() {
             [ -n "$ARCH" ] && TARGETS="$ARCH-apple-darwin"
             ;;
         MINGW* | MSYS* | CYGWIN* | Windows_NT)
-            die "on Windows, use install.ps1 in PowerShell: & ([scriptblock]::Create((irm https://raw.githubusercontent.com/$DEFAULT_REPO/main/install.ps1))) -ClientOnly <url> <token> (inside WSL, this installer works as on Linux)"
+            die "on Windows, use PowerShell: run kioku invite on the server and paste its Windows line (irm http://<server>:7391/i/<code>.ps1 | iex); install.ps1 from https://raw.githubusercontent.com/$DEFAULT_REPO/main/install.ps1 is the manual alternative (inside WSL, this installer works as on Linux)"
             ;;
     esac
     if [ -z "$TARGETS" ]; then
@@ -254,27 +261,83 @@ from_source() {
     install_binary "$FS_BIN" || die "the freshly built binary does not run"
 }
 
-path_hint() {
-    case ":${PATH:-}:" in
-        *":$DIR:"* | *":$DIR/:"*) return 0 ;;
-    esac
+# Sets PH_DIR ($DIR with $HOME spelled `$HOME`), PH_SHELL (basename of $SHELL) and
+# PH_RC (the rc file for that shell, SPEC-M2.3 §4.2: zsh ~/.zshrc; bash ~/.bashrc, or
+# ~/.bash_profile on macOS, whose terminals start login shells; fish conf.d; else ~/.profile).
+path_names() {
     PH_DIR=$DIR
     case "$DIR" in
         "$HOME"/*) PH_DIR="\$HOME/${DIR#"$HOME"/}" ;;
     esac
-    say "$DIR is not on your PATH; add it (this installer never edits shell files):"
-    case "$(basename "${SHELL:-sh}")" in
-        zsh) PH_RC=.zshrc ;;
-        bash) if [ "${OS:-}" = Darwin ]; then PH_RC=.bash_profile; else PH_RC=.bashrc; fi ;;
-        fish) PH_RC="" ;;
-        *) PH_RC=.profile ;;
+    PH_SHELL=$(basename "${SHELL:-sh}")
+    case "$PH_SHELL" in
+        zsh) PH_RC="${ZDOTDIR:-$HOME}/.zshrc" ;;
+        bash) if [ "${OS:-}" = Darwin ]; then PH_RC="$HOME/.bash_profile"; else PH_RC="$HOME/.bashrc"; fi ;;
+        fish) PH_RC="$HOME/.config/fish/conf.d/kioku.fish" ;;
+        *) PH_RC="$HOME/.profile" ;;
     esac
-    if [ -n "$PH_RC" ]; then
-        say "  echo 'export PATH=\"$PH_DIR:\$PATH\"' >> ~/$PH_RC"
-    else
+    PH_SHOW=$PH_RC
+    # shellcheck disable=SC2088 # a display name, not a path to expand
+    case "$PH_RC" in
+        "$HOME"/*) PH_SHOW="~/${PH_RC#"$HOME"/}" ;;
+    esac
+}
+
+# Prints the line to add by hand (--no-modify-path, or a directory we cannot quote).
+path_hint() {
+    say "$DIR is not on your PATH; to use the kioku command, add it:"
+    if [ "$PH_SHELL" = fish ]; then
         say "  fish_add_path $PH_DIR"
+    else
+        say "  echo 'export PATH=\"$PH_DIR:\$PATH\"' >> $PH_SHOW"
     fi
     say "(kioku setup and the agent hooks use the absolute path, so they work either way)"
+}
+
+# Puts $DIR on PATH for new terminals (SPEC-M2.3 §4.2): one marked line in the shell's rc
+# file, written once. Sets PATH_ADDED=1 when the line is there.
+ensure_path() {
+    PATH_ADDED=0
+    case ":${PATH:-}:" in
+        *":$DIR:"* | *":$DIR/:"*) return 0 ;;
+    esac
+    path_names
+    if [ "$MODIFY_PATH" = 0 ]; then
+        path_hint
+        return 0
+    fi
+    case "$DIR" in
+        *'"'* | *'\'* | *'`'* | *'$'*)
+            path_hint
+            return 0
+            ;;
+    esac
+    if [ "$PH_SHELL" = fish ]; then
+        EP_LINE="contains \"$PH_DIR\" \$PATH; or set -gx PATH \"$PH_DIR\" \$PATH # added by the kioku installer"
+    else
+        EP_LINE="export PATH=\"$PH_DIR:\$PATH\" # added by the kioku installer"
+    fi
+    if [ -f "$PH_RC" ] && grep -F -x -- "$EP_LINE" "$PH_RC" >/dev/null 2>&1; then
+        PATH_ADDED=1
+        say "$PH_DIR is already on PATH in $PH_SHOW (open a new terminal to use kioku)"
+        return 0
+    fi
+    EP_OK=1
+    mkdir -p "$(dirname "$PH_RC")" 2>/dev/null || EP_OK=0
+    # A last line without a newline must not swallow ours.
+    if [ "$EP_OK" = 1 ] && [ -s "$PH_RC" ] && [ -n "$(tail -c 1 "$PH_RC" 2>/dev/null)" ]; then
+        printf '\n' >>"$PH_RC" 2>/dev/null || EP_OK=0
+    fi
+    if [ "$EP_OK" = 1 ]; then
+        printf '%s\n' "$EP_LINE" >>"$PH_RC" 2>/dev/null || EP_OK=0
+    fi
+    if [ "$EP_OK" = 0 ]; then
+        warn "could not write to $PH_SHOW"
+        path_hint
+        return 0
+    fi
+    PATH_ADDED=1
+    say "added $PH_DIR to PATH in $PH_SHOW for new terminals (--no-modify-path skips this)"
 }
 
 main() {
@@ -283,6 +346,11 @@ main() {
     REPO=${KIOKU_REPO:-$DEFAULT_REPO}
     FROM_SOURCE=0
     SETUP=1
+    MODIFY_PATH=1
+    PATH_ADDED=0
+    # Join mode (SPEC-M2.3 §4.1): `GET /i/<code>` prepends these two variables.
+    JOIN_URL=${KIOKU_JOIN_URL:-}
+    JOIN_CODE=${KIOKU_JOIN_CODE:-}
     PASS=""
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -299,6 +367,13 @@ main() {
             --install-dir=*) DIR=${1#*=}; shift ;;
             --repo=*) REPO=${1#*=}; shift ;;
             --from-source) FROM_SOURCE=1; shift ;;
+            --no-modify-path) MODIFY_PATH=0; shift ;;
+            --join)
+                [ $# -ge 3 ] || die "--join needs <url> <code>"
+                JOIN_URL=$2
+                JOIN_CODE=$3
+                shift 3
+                ;;
             --no-setup) SETUP=0; shift ;;
             -h | --help) usage; exit 0 ;;
             --)
@@ -322,6 +397,9 @@ main() {
     done
 
     [ -n "${HOME:-}" ] || die "HOME is not set"
+    if [ -n "$JOIN_URL" ] && [ -z "$JOIN_CODE" ]; then
+        die "join mode needs both KIOKU_JOIN_URL and KIOKU_JOIN_CODE (or --join <url> <code>)"
+    fi
     if [ "$(id -u)" = 0 ] && [ -z "$DIR" ]; then
         die "refusing to run as root: kioku is a per-user install (config, service and hooks live in the user's home). Run as your normal user, or pass --install-dir explicitly."
     fi
@@ -373,15 +451,29 @@ main() {
     fi
     [ "$INSTALLED" = 1 ] || from_source
 
-    path_hint
+    ensure_path
 
     if [ "$SETUP" = 0 ]; then
-        say "done (--no-setup). Next: $DIR/kioku setup"
+        if [ -n "$JOIN_URL" ]; then
+            say "done (--no-setup). Next: $DIR/kioku join $JOIN_URL $JOIN_CODE"
+        else
+            say "done (--no-setup). Next: $DIR/kioku setup"
+        fi
         return 0
     fi
     rm -rf "$TMP"
     trap - EXIT
     eval "set -- $PASS"
+    if [ -n "$JOIN_URL" ]; then
+        # `kioku join` fetches the token itself and never prints it.
+        say "running: $DIR/kioku join $JOIN_URL"
+        JOIN_RC=0
+        "$DIR/kioku" join "$JOIN_URL" "$JOIN_CODE" "$@" </dev/null || JOIN_RC=$?
+        if [ "$JOIN_RC" = 0 ] && [ "$PATH_ADDED" = 1 ]; then
+            say "新しいターミナルを開くと kioku コマンドが使えます。/ Open a new terminal to use the kioku command."
+        fi
+        exit "$JOIN_RC"
+    fi
     # The arguments may hold the token: never echo them.
     say "running: $DIR/kioku setup"
     exec "$DIR/kioku" setup "$@" </dev/null

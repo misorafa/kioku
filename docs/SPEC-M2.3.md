@@ -1,6 +1,6 @@
 # kioku — SPEC-M2.3: one-command join (`kioku invite`)
 
-Status: spec, 2026-09-28. Amends SPEC-M2 (and M2.2). Read CLAUDE.md, SPEC-M2.md
+Status: implemented (branch `m2.3-invite`), 2026-09-28; see §8 for what changed. Amends SPEC-M2 (and M2.2). Read CLAUDE.md, SPEC-M2.md
 §11, §13, §19–§21 and SPEC-M2.2 first.
 
 ## 1. Why
@@ -169,3 +169,76 @@ for a second machine is "run `kioku invite` on the server, paste the line". The
 old `--client-only` path stays documented as the manual alternative. Update this
 spec with anything that turned out different. Do not merge, tag or change
 secrets.
+
+## 8. Implementation notes (what turned out different)
+
+Recorded by the implementing session; each choice follows §1's principle.
+
+1. **`curl -sSL`, not `curl -fsSL`, in the printed line.** With `-f` curl
+   swallows the body of a 404/429, so `sh` would get an empty script and the
+   user would see only `curl: (22) …`. Without `-f` the failure body (the
+   one-line `echo …>&2; exit 1` of §3.2) runs and prints the one clear sentence.
+2. **PowerShell failure bodies are plain text, not a script.** `irm` never
+   pipes an error response into `iex`; both Windows PowerShell 5.1 and pwsh 7
+   show the body of an error response as the error message. So `/i/<code>.ps1`
+   answers 404/429/400 with the ja + en sentences.
+3. **The `.ps1` script is wrapped in `& { … }`.** `irm … | iex` runs in the
+   caller's scope, so a bare install.ps1 would leave `$ErrorActionPreference =
+   'Stop'`, its functions and `$KiokuJoinUrl` in the user's window (a later
+   plain install.ps1 run there would re-join with a used code). The server emits
+   `& {`, the two variables, install.ps1, `}`. The user PATH change and
+   `$env:Path` of the window are process-wide and survive the block.
+4. **Host rule.** `GET /i/<code>` accepts `/i/<code>`, `/i/<code>.sh` and
+   `/i/<code>.ps1` (axum routes one segment; the suffix is parsed in the handler).
+   The Host header must be `name[:port]` or `[ipv6][:port]` from `[A-Za-z0-9.-]`
+   (checked before it is pasted into single-quoted strings); anything else is a
+   400 with the same kind of body as a 404. Without a Host header the URI
+   authority is used (HTTP/2).
+5. **Rate limit details.** Failed lookups on all three public invite routes
+   count. The 10th failure from one peer within 60 s blocks that peer, the 30th
+   overall blocks everyone, for 60 s; a blocked peer gets 429 even for a valid
+   code. The peer is the socket address (`into_make_service_with_connect_info`;
+   IPv4-mapped IPv6 as IPv4). `POST /api/v1/invites` answers 409 when the server
+   has no token (loopback-only, auth disabled): there is nothing to hand out.
+6. **`kioku join` uses the `<url>` it was given** for `[client] server_url`
+   (it is the same Host-derived URL as `server_url` in the join answer, and it
+   is the address this machine has just reached). A missing `http://` is added.
+   Flags: `--agents`, `--no-agents`, `--no-instructions`, `--mcp-http` (passed to
+   the shared setup code); install.sh / install.ps1 pass extra arguments to it.
+   The output is the setup summary plus the bilingual final message naming the
+   agents that were set up; as a last guard the token is replaced by `<token>`
+   in anything printed.
+7. **`kioku invite` in Docker.** With no config.toml but `KIOKU_AUTH_TOKEN`
+   set, the machine counts as a server (the printed address is the
+   container's; README says to replace it with the host's). It talks to its own
+   server at `127.0.0.1:<port>` (`[::1]` for `bind = "::"`, the bind address
+   when it binds one address). Errors name the fix: server not running → `kioku
+   service start`; 404 on `/invites` (server older than the CLI, e.g. right
+   after an update without restart) → restart the service.
+8. **PATH on macOS / fish.** bash on macOS writes `~/.bash_profile` (Terminal
+   starts login shells, which do not read `~/.bashrc`); fish gets
+   `~/.config/fish/conf.d/kioku.fish` (`contains … ; or set -gx PATH …`), since
+   fish reads no `~/.profile`. The rc line is
+   `export PATH="$HOME/.local/bin:$PATH" # added by the kioku installer`;
+   idempotence is an exact-line match; a last line without a newline gets one
+   first. A directory containing `"`, `\`, `` ` `` or `$` is never written,
+   only hinted.
+9. **Windows PATH** is appended to the user PATH with
+   `[Environment]::SetEnvironmentVariable('Path', …, 'User')` as specified
+   (this rewrites the value as REG_SZ; `%VAR%` entries are stored expanded,
+   which keeps them working). `-AddToPath` is still accepted and does nothing
+   (it is the default). install.ps1 stays ASCII (5.1 reads a BOM-less `-File`
+   script as ANSI), so its Japanese text is built from `\u` escapes. An
+   elevated PowerShell gets one line saying elevation is not needed.
+10. **Other pointers to `kioku invite`:** `--print-client-command` prints
+    "Easiest: run `kioku invite` here …" before the manual line;
+    `rotate-token` now recommends `kioku invite --uses <n>` and still prints the
+    manual line; `kioku init`'s next steps, doctor's auth fix, the Windows
+    `setup` refusal and install.sh's Git-Bash message mention it.
+11. **Not verified on a real network:** the full `irm … | iex` / `curl … | sh`
+    flow was run end-to-end on macOS against a local server and a fixture
+    release (installer → `kioku join` → client config); the Windows flow is
+    covered by CI with a stub binary (install.ps1) and by the Rust e2e test with
+    the real binary (`invite_join.rs`), not yet by a paste on a real Windows
+    11 machine. The first release containing `kioku join` must exist before the
+    invite line works for users, because the installer downloads `latest`.
