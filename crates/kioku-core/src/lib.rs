@@ -24,10 +24,10 @@ pub mod strings;
 pub mod util;
 
 pub use config::{ClientConfig, Config, ServerConfig};
-pub use db::ProjectRow;
+pub use db::{ProjectAlias, ProjectRow};
 pub use digest::{FileCount, SessionDigest};
 pub use error::{Error, Result};
-pub use handoff::{Handoff, HandoffInput, HandoffSource};
+pub use handoff::{Handoff, HandoffInput, HandoffSource, PendingHandoff};
 pub use index::{Hit, SearchScope};
 pub use layout::{DataDir, InitReport, init};
 pub use page::{Frontmatter, Page, PageKind, PageScope};
@@ -37,7 +37,7 @@ pub use session::{
     RecentSession, Session, SessionCounts, SessionInfo, SessionStartRequest, SessionStartResponse,
     SessionStatus,
 };
-pub use store::{StatusReport, Store, WritePageRequest};
+pub use store::{MergeReport, StatusReport, Store, WritePageRequest};
 pub use strings::Lang;
 
 /// Crate version, for `/api/v1/health`.

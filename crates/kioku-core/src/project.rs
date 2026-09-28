@@ -1,6 +1,9 @@
-//! Project identity (spec §4): `.kioku.toml`, git remote, or path → stable project id.
+//! Project identity (spec §4): `.kioku.toml`, git remote, or path → stable project id; the
+//! handoff lane of a working directory (M2.4 §1) and the root / id helpers behind project
+//! aliases (M2.4 §2).
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -228,6 +231,122 @@ fn git_remote(root: &Path) -> Option<String> {
     git_output(root, &["remote", "get-url", "origin"])
 }
 
+/// True when `id` has the shape of a path- or remote-derived id: `<slug>-<8 lowercase hex>`.
+pub fn is_derived_id(id: &str) -> bool {
+    match id.rsplit_once('-') {
+        Some((head, hash)) => {
+            !head.is_empty()
+                && hash.len() == 8
+                && hash
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        }
+        None => false,
+    }
+}
+
+/// A root path for comparison: without Windows' `\\?\` prefix and trailing separators.
+pub fn comparable_root(root: &str) -> String {
+    let plain = crate::util::plain_path(Path::new(root.trim()))
+        .display()
+        .to_string();
+    let trimmed = plain.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        plain
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Last component of a root path written with `/` or `\` separators (on any platform).
+pub fn root_basename(root: &str) -> String {
+    comparable_root(root)
+        .rsplit(['/', '\\'])
+        .find(|s| !s.is_empty())
+        .unwrap_or("root")
+        .to_string()
+}
+
+/// True when `identity.id` is exactly the remote-derived id of its root and remote (it came
+/// from git, not from `.kioku.toml`).
+pub fn is_remote_derived(identity: &ProjectIdentity) -> bool {
+    identity
+        .remote
+        .as_deref()
+        .is_some_and(|r| id_from_remote(&root_basename(&identity.root), r) == identity.id)
+}
+
+/// Longest lane name kept verbatim (M2.4 §1.1); longer names get a hash suffix.
+pub const MAX_LANE_CHARS: usize = 200;
+
+/// A lane name as stored: trimmed, empty → `None` (the project lane), longer than
+/// [`MAX_LANE_CHARS`] → cut and suffixed with `-<8 hex of sha256(name)>`.
+pub fn normalize_lane(raw: &str) -> Option<String> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return None;
+    }
+    if name.chars().count() <= MAX_LANE_CHARS {
+        return Some(name.to_string());
+    }
+    let head: String = name.chars().take(MAX_LANE_CHARS - 9).collect();
+    Some(format!("{head}-{}", &sha256_hex(name)[..8]))
+}
+
+/// `git -C <dir> <args>` with a deadline; trimmed stdout on success, `None` otherwise.
+fn git_output_within(dir: &Path, args: &[&str], deadline: Duration) -> Option<String> {
+    let mut cmd = crate::util::quiet_command("git");
+    cmd.arg("-C").arg(dir).args(args);
+    let out = crate::util::output_with_deadline(cmd, deadline)?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// The branch checked out in `dir` (`git symbolic-ref --short -q HEAD`); `None` on a
+/// detached HEAD, outside a repository or without git.
+pub fn current_branch(dir: &Path, deadline: Duration) -> Option<String> {
+    git_output_within(dir, &["symbolic-ref", "--short", "-q", "HEAD"], deadline)
+}
+
+/// The repository's default branch (M2.4 §1.2): `origin/HEAD`, else `main`, else `master`
+/// if such a local branch exists; `None` when unknown.
+pub fn default_branch(dir: &Path, deadline: Duration) -> Option<String> {
+    if let Some(head) = git_output_within(
+        dir,
+        &["symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"],
+        deadline,
+    ) {
+        let name = head.strip_prefix("origin/").unwrap_or(&head);
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+    ["main", "master"].into_iter().find_map(|b| {
+        git_output_within(
+            dir,
+            &["rev-parse", "--verify", "-q", &format!("refs/heads/{b}")],
+            deadline,
+        )
+        .map(|_| b.to_string())
+    })
+}
+
+/// The handoff lane of a session started in `dir` (M2.4 §1.1): the checked-out branch when
+/// it is not the default branch; `None` (the project lane) on the default branch, on a
+/// detached HEAD, outside git, or when the default branch is unknown. Each git call gets
+/// `deadline`.
+pub fn lane(dir: &Path, deadline: Duration) -> Option<String> {
+    let branch = current_branch(dir, deadline)?;
+    let default = default_branch(dir, deadline)?;
+    if branch == default {
+        return None;
+    }
+    normalize_lane(&branch)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +360,154 @@ mod tests {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    const DEADLINE: Duration = Duration::from_secs(10);
+
+    fn git_commit(dir: &Path) -> bool {
+        git(
+            dir,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "x",
+            ],
+        )
+    }
+
+    #[test]
+    fn lane_follows_the_branch_except_on_the_default_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        // outside git: no lane, no default branch
+        assert_eq!(lane(&repo, DEADLINE), None);
+        assert_eq!(default_branch(&repo, DEADLINE), None);
+        if !git(&repo, &["-c", "init.defaultBranch=main", "init", "-q"]) {
+            return;
+        }
+        // unborn main: the default branch is unknown yet → project lane
+        assert_eq!(current_branch(&repo, DEADLINE).as_deref(), Some("main"));
+        assert_eq!(default_branch(&repo, DEADLINE), None);
+        assert_eq!(lane(&repo, DEADLINE), None);
+        assert!(git_commit(&repo));
+        assert_eq!(default_branch(&repo, DEADLINE).as_deref(), Some("main"));
+        assert_eq!(lane(&repo, DEADLINE), None, "default branch = project lane");
+
+        assert!(git(&repo, &["checkout", "-q", "-b", "feature/検索"]));
+        assert_eq!(lane(&repo, DEADLINE).as_deref(), Some("feature/検索"));
+
+        // detached HEAD → project lane
+        assert!(git(&repo, &["checkout", "-q", "--detach"]));
+        assert_eq!(current_branch(&repo, DEADLINE), None);
+        assert_eq!(lane(&repo, DEADLINE), None);
+
+        // a second worktree on its own branch has its own lane; the main one has none
+        assert!(git(&repo, &["checkout", "-q", "main"]));
+        let wt = tmp.path().join("wt");
+        assert!(git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "task-b",
+                wt.to_str().unwrap()
+            ]
+        ));
+        assert_eq!(lane(&wt, DEADLINE).as_deref(), Some("task-b"));
+        assert_eq!(lane(&wt.join("."), DEADLINE).as_deref(), Some("task-b"));
+        assert_eq!(lane(&repo, DEADLINE), None);
+
+        // origin/HEAD wins over main/master
+        assert!(git(
+            &repo,
+            &["update-ref", "refs/remotes/origin/develop", "HEAD"]
+        ));
+        assert!(git(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/develop"
+            ]
+        ));
+        assert_eq!(default_branch(&repo, DEADLINE).as_deref(), Some("develop"));
+        assert_eq!(lane(&repo, DEADLINE).as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn master_is_the_fallback_default_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        if !git(
+            tmp.path(),
+            &["-c", "init.defaultBranch=master", "init", "-q"],
+        ) {
+            return;
+        }
+        assert!(git_commit(tmp.path()));
+        assert_eq!(
+            default_branch(tmp.path(), DEADLINE).as_deref(),
+            Some("master")
+        );
+        assert_eq!(lane(tmp.path(), DEADLINE), None);
+        assert!(git(tmp.path(), &["checkout", "-q", "-b", "fix-1"]));
+        assert_eq!(lane(tmp.path(), DEADLINE).as_deref(), Some("fix-1"));
+        // neither main nor master (and no origin/HEAD) → lanes are never recorded
+        assert!(git(tmp.path(), &["branch", "-q", "-m", "master", "trunk"]));
+        assert_eq!(default_branch(tmp.path(), DEADLINE), None);
+        assert_eq!(lane(tmp.path(), DEADLINE), None);
+    }
+
+    #[test]
+    fn lane_names_are_trimmed_and_capped() {
+        assert_eq!(normalize_lane("  feat/x \n").as_deref(), Some("feat/x"));
+        assert_eq!(normalize_lane("   "), None);
+        let long = "枝".repeat(300);
+        let n = normalize_lane(&long).unwrap();
+        assert_eq!(n.chars().count(), MAX_LANE_CHARS);
+        assert!(n.starts_with("枝枝"));
+        assert_ne!(n, normalize_lane(&format!("{long}x")).unwrap());
+        let exact = "a".repeat(MAX_LANE_CHARS);
+        assert_eq!(normalize_lane(&exact).unwrap(), exact);
+    }
+
+    #[test]
+    fn alias_helpers() {
+        assert!(is_derived_id("kioku-71002b89"));
+        assert!(is_derived_id("ai-agents-shared-memory-02036d30"));
+        assert!(!is_derived_id("my-proj"));
+        assert!(!is_derived_id("x-71002B89"));
+        assert!(!is_derived_id("-71002b89"));
+        assert_eq!(comparable_root("/home/u/kioku/"), "/home/u/kioku");
+        assert_eq!(comparable_root(r"\\?\C:\src\kioku\"), r"C:\src\kioku");
+        assert_eq!(comparable_root("/"), "/");
+        assert_eq!(root_basename(r"C:\src\記憶"), "記憶");
+        assert_eq!(root_basename("/home/u/kioku/"), "kioku");
+        let remote = "github.com/misorafa/kioku";
+        let id = ProjectIdentity {
+            id: id_from_remote("AI_agents_shared_memory", remote),
+            name: "kioku".into(),
+            root: "/Users/u/AI_agents_shared_memory".into(),
+            remote: Some(remote.into()),
+        };
+        assert!(is_remote_derived(&id));
+        let toml = ProjectIdentity {
+            id: "my-proj".into(),
+            ..id.clone()
+        };
+        assert!(!is_remote_derived(&toml));
+        let no_remote = ProjectIdentity { remote: None, ..id };
+        assert!(!is_remote_derived(&no_remote));
     }
 
     #[test]

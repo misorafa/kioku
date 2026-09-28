@@ -4,6 +4,7 @@ use std::path::Path;
 
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, Row, params};
+use serde::{Deserialize, Serialize};
 
 use crate::handoff::{Handoff, HandoffSource};
 use crate::project::ProjectIdentity;
@@ -26,7 +27,8 @@ CREATE TABLE IF NOT EXISTS sessions(
     started_at TEXT NOT NULL,
     ended_at TEXT,
     status TEXT NOT NULL DEFAULT 'open',
-    root_path TEXT
+    root_path TEXT,
+    lane TEXT
 );
 CREATE INDEX IF NOT EXISTS sessions_project ON sessions(project_id, started_at);
 CREATE TABLE IF NOT EXISTS observations(
@@ -50,7 +52,8 @@ CREATE TABLE IF NOT EXISTS handoffs(
     accepted_at TEXT,
     accepted_by TEXT,
     updated_at TEXT,
-    seq_at INTEGER
+    seq_at INTEGER,
+    lane TEXT
 );
 CREATE INDEX IF NOT EXISTS handoffs_project ON handoffs(project_id, created_at);
 CREATE INDEX IF NOT EXISTS handoffs_session ON handoffs(session_id);
@@ -66,6 +69,11 @@ CREATE TABLE IF NOT EXISTS pages(
     hash TEXT
 );
 CREATE INDEX IF NOT EXISTS pages_project ON pages(project_id, kind, created_at);
+CREATE TABLE IF NOT EXISTS project_aliases(
+    alias TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 "#;
 
 /// A project row.
@@ -120,10 +128,12 @@ pub fn open(path: &Path) -> anyhow::Result<Connection> {
 
 /// Columns added after the first M1 schema; `CREATE TABLE IF NOT EXISTS` does not add them
 /// to an existing database, so they are added here.
-const ADDED_COLUMNS: [(&str, &str, &str); 3] = [
+const ADDED_COLUMNS: [(&str, &str, &str); 5] = [
     ("sessions", "root_path", "TEXT"),
     ("handoffs", "updated_at", "TEXT"),
     ("handoffs", "seq_at", "INTEGER"),
+    ("sessions", "lane", "TEXT"),
+    ("handoffs", "lane", "TEXT"),
 ];
 
 fn migrate(conn: &Connection) -> anyhow::Result<()> {
@@ -147,6 +157,102 @@ pub fn upsert_project(conn: &Connection, p: &ProjectIdentity, now: &str) -> anyh
            remote_url = excluded.remote_url",
         params![p.id, p.name, p.root, p.remote, now],
     )?;
+    Ok(())
+}
+
+/// A project alias: `alias` is resolved to `project_id` wherever a project id comes in.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectAlias {
+    /// The alias (an id a client may send).
+    pub alias: String,
+    /// The canonical project id it stands for.
+    pub project_id: String,
+}
+
+/// The canonical id an alias points to, if `id` is an alias.
+pub fn resolve_alias(conn: &Connection, id: &str) -> anyhow::Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT project_id FROM project_aliases WHERE alias = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// Records (or re-points) `alias → project_id`.
+pub fn upsert_alias(
+    conn: &Connection,
+    alias: &str,
+    project_id: &str,
+    now: &str,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO project_aliases(alias, project_id, created_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(alias) DO UPDATE SET project_id = excluded.project_id",
+        params![alias, project_id, now],
+    )?;
+    Ok(())
+}
+
+/// Re-points every alias of `from` to `into` (after a merge).
+pub fn repoint_aliases(conn: &Connection, from: &str, into: &str) -> anyhow::Result<usize> {
+    Ok(conn.execute(
+        "UPDATE project_aliases SET project_id = ?2 WHERE project_id = ?1",
+        params![from, into],
+    )?)
+}
+
+/// All aliases, ordered by alias.
+pub fn list_aliases(conn: &Connection) -> anyhow::Result<Vec<ProjectAlias>> {
+    let mut stmt = conn.prepare("SELECT alias, project_id FROM project_aliases ORDER BY alias")?;
+    let rows = stmt.query_map([], |r| {
+        Ok(ProjectAlias {
+            alias: r.get(0)?,
+            project_id: r.get(1)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Rows of a project that a merge moves.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProjectRowCounts {
+    /// Sessions.
+    pub sessions: u64,
+    /// Observations.
+    pub observations: u64,
+    /// Handoffs.
+    pub handoffs: u64,
+}
+
+/// Session / observation / handoff counts of a project.
+pub fn project_row_counts(conn: &Connection, project: &str) -> anyhow::Result<ProjectRowCounts> {
+    let n = |table: &str| -> anyhow::Result<u64> {
+        let v: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE project_id = ?1"),
+            params![project],
+            |r| r.get(0),
+        )?;
+        Ok(v as u64)
+    };
+    Ok(ProjectRowCounts {
+        sessions: n("sessions")?,
+        observations: n("observations")?,
+        handoffs: n("handoffs")?,
+    })
+}
+
+/// Moves sessions, observations, handoffs and page rows of `from` to `into` and deletes the
+/// `from` project row (a merge; run inside a transaction).
+pub fn move_project_rows(conn: &Connection, from: &str, into: &str) -> anyhow::Result<()> {
+    for table in ["sessions", "observations", "handoffs", "pages"] {
+        conn.execute(
+            &format!("UPDATE {table} SET project_id = ?2 WHERE project_id = ?1"),
+            params![from, into],
+        )?;
+    }
+    conn.execute("DELETE FROM projects WHERE id = ?1", params![from])?;
     Ok(())
 }
 
@@ -184,7 +290,7 @@ pub fn list_projects(conn: &Connection) -> anyhow::Result<Vec<ProjectRow>> {
 }
 
 const SESSION_COLS: &str =
-    "id, project_id, agent, cwd, source, started_at, ended_at, status, root_path";
+    "id, project_id, agent, cwd, source, started_at, ended_at, status, root_path, lane";
 
 fn session_from_row(r: &Row<'_>) -> rusqlite::Result<Session> {
     let status: String = r.get(7)?;
@@ -202,16 +308,18 @@ fn session_from_row(r: &Row<'_>) -> rusqlite::Result<Session> {
             SessionStatus::Open
         },
         root_path: r.get(8)?,
+        lane: r.get(9)?,
     })
 }
 
-/// Creates a session, or reopens an existing one (resume) keeping its project and start time.
+/// Creates a session, or reopens an existing one (resume) keeping its project and start time;
+/// the lane follows the latest start (the branch may have changed).
 pub fn upsert_session(conn: &Connection, s: &Session) -> anyhow::Result<()> {
     conn.execute(
-        "INSERT INTO sessions(id, project_id, agent, cwd, source, started_at, ended_at, status, root_path)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 'open', ?7)
+        "INSERT INTO sessions(id, project_id, agent, cwd, source, started_at, ended_at, status, root_path, lane)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 'open', ?7, ?8)
          ON CONFLICT(id) DO UPDATE SET status = 'open', ended_at = NULL, source = excluded.source,
-           root_path = COALESCE(excluded.root_path, sessions.root_path)",
+           root_path = COALESCE(excluded.root_path, sessions.root_path), lane = excluded.lane",
         params![
             s.id,
             s.project_id,
@@ -219,7 +327,8 @@ pub fn upsert_session(conn: &Connection, s: &Session) -> anyhow::Result<()> {
             s.cwd,
             s.source,
             s.started_at,
-            s.root_path
+            s.root_path,
+            s.lane
         ],
     )?;
     Ok(())
@@ -442,7 +551,7 @@ pub fn session_counts(conn: &Connection, session_id: &str) -> anyhow::Result<Ses
 }
 
 const HANDOFF_SELECT: &str = "SELECT h.id, h.project_id, h.session_id, h.source, h.content_md,
-    h.created_at, h.accepted_at, h.accepted_by, s.agent, h.updated_at
+    h.created_at, h.accepted_at, h.accepted_by, s.agent, h.updated_at, h.lane
     FROM handoffs h LEFT JOIN sessions s ON s.id = h.session_id";
 
 /// Newest first; on equal `created_at` an agent-written handoff wins over a rules one.
@@ -462,14 +571,15 @@ fn handoff_from_row(r: &Row<'_>) -> rusqlite::Result<Handoff> {
         accepted_by: r.get(7)?,
         agent: r.get(8)?,
         updated_at: r.get(9)?,
+        lane: r.get(10)?,
     })
 }
 
 /// Inserts a handoff; `seq_at` = the session's highest observation seq at that moment.
 pub fn insert_handoff(conn: &Connection, h: &Handoff, seq_at: Option<i64>) -> anyhow::Result<()> {
     conn.execute(
-        "INSERT INTO handoffs(id, project_id, session_id, source, content_md, created_at, accepted_at, accepted_by, updated_at, seq_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT INTO handoffs(id, project_id, session_id, source, content_md, created_at, accepted_at, accepted_by, updated_at, seq_at, lane)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             h.id,
             h.project_id,
@@ -480,7 +590,8 @@ pub fn insert_handoff(conn: &Connection, h: &Handoff, seq_at: Option<i64>) -> an
             h.accepted_at,
             h.accepted_by,
             h.updated_at,
-            seq_at
+            seq_at,
+            h.lane
         ],
     )?;
     Ok(())
@@ -512,10 +623,12 @@ pub fn get_handoff(conn: &Connection, id: &str) -> anyhow::Result<Option<Handoff
         .optional()?)
 }
 
-/// Newest handoff of a project (`unaccepted_only` restricts to pending ones).
+/// Newest handoff of a project on one lane (`None` = the project lane);
+/// `unaccepted_only` restricts to pending ones.
 pub fn newest_handoff(
     conn: &Connection,
     project: &str,
+    lane: Option<&str>,
     unaccepted_only: bool,
 ) -> anyhow::Result<Option<Handoff>> {
     let cond = if unaccepted_only {
@@ -525,8 +638,10 @@ pub fn newest_handoff(
     };
     Ok(conn
         .query_row(
-            &format!("{HANDOFF_SELECT} WHERE h.project_id = ?1 {cond} {HANDOFF_ORDER}"),
-            params![project],
+            &format!(
+                "{HANDOFF_SELECT} WHERE h.project_id = ?1 AND h.lane IS ?2 {cond} {HANDOFF_ORDER}"
+            ),
+            params![project, lane],
             handoff_from_row,
         )
         .optional()?)
@@ -571,17 +686,19 @@ pub fn newest_handoff_accepted_by(
         .optional()?)
 }
 
-/// Marks every pending handoff of a project as accepted by `by` (consume + supersede).
+/// Marks every pending handoff of a project on one lane (`None` = the project lane) as
+/// accepted by `by` (consume + supersede); other lanes are untouched.
 pub fn accept_pending_handoffs(
     conn: &Connection,
     project: &str,
+    lane: Option<&str>,
     by: &str,
     now: &str,
 ) -> anyhow::Result<usize> {
     Ok(conn.execute(
         "UPDATE handoffs SET accepted_at = ?3, accepted_by = ?2
-         WHERE project_id = ?1 AND accepted_at IS NULL",
-        params![project, by, now],
+         WHERE project_id = ?1 AND lane IS ?4 AND accepted_at IS NULL",
+        params![project, by, now, lane],
     )?)
 }
 

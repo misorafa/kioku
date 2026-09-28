@@ -103,13 +103,16 @@ pub struct Frontmatter {
     /// Agent name (session pages only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// Handoff lane of the session (session pages only, when not the project lane).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<String>,
     /// Unknown keys, preserved verbatim.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
 
-const KNOWN_KEYS: [&str; 9] = [
-    "title", "project", "scope", "kind", "tags", "created", "updated", "session", "agent",
+const KNOWN_KEYS: [&str; 10] = [
+    "title", "project", "scope", "kind", "tags", "created", "updated", "session", "agent", "lane",
 ];
 
 impl Frontmatter {
@@ -146,6 +149,7 @@ impl Frontmatter {
                 "updated" => fm.updated = scalar_string(&v).unwrap_or_default(),
                 "session" => fm.session = scalar_string(&v),
                 "agent" => fm.agent = scalar_string(&v),
+                "lane" => fm.lane = scalar_string(&v),
                 _ => {
                     fm.extra.insert(key, v);
                 }
@@ -177,6 +181,9 @@ impl Frontmatter {
         }
         if let Some(a) = &self.agent {
             put("agent", Value::String(a.clone()));
+        }
+        if let Some(l) = &self.lane {
+            put("lane", Value::String(l.clone()));
         }
         for (k, v) in &self.extra {
             if !KNOWN_KEYS.contains(&k.as_str()) {

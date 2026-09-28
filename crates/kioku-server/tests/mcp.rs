@@ -189,6 +189,83 @@ async fn mcp_tools_over_streamable_http() {
 }
 
 #[tokio::test]
+async fn mcp_handoff_pending_reads_a_lane() {
+    let srv = spawn().await;
+    let mut body = start_body("wt-a");
+    body["lane"] = json!("feature/検索");
+    let (status, _) = srv.post("/api/v1/sessions/start", body).await;
+    assert_eq!(status, 200);
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(srv.url("/mcp")).auth_header(TOKEN),
+    );
+    let client = ().serve(transport).await.expect("initialize");
+    let call = |args_v: serde_json::Value| {
+        CallToolRequestParams::new("kioku_handoff_pending").with_arguments(args(args_v))
+    };
+
+    let wrote = client
+        .call_tool(
+            CallToolRequestParams::new("kioku_handoff_write").with_arguments(args(json!({
+                "project": PROJECT, "session": "wt-a", "summary": "検索のレーンで作業した"
+            }))),
+        )
+        .await
+        .unwrap();
+    assert_eq!(text(&wrote), format!("handoff recorded for {PROJECT}"));
+
+    // without session / lane: the main line, which has nothing
+    let out = text(
+        &client
+            .call_tool(call(json!({"project": PROJECT})))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(out, "none");
+    // by lane and by session
+    for a in [
+        json!({"project": PROJECT, "lane": "feature/検索"}),
+        json!({"project": PROJECT, "session": "wt-a"}),
+    ] {
+        let out = text(&client.call_tool(call(a)).await.unwrap());
+        assert!(out.contains("検索のレーンで作業した"), "{out}");
+    }
+
+    // a main-line handoff is a reference on another lane, never accepted there
+    srv.store
+        .write_handoff(&kioku_core::HandoffInput {
+            project: PROJECT.into(),
+            summary: "メインの引き継ぎ".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let out = text(
+        &client
+            .call_tool(call(
+                json!({"project": PROJECT, "lane": "task-b", "accept": true}),
+            ))
+            .await
+            .unwrap(),
+    );
+    assert!(out.starts_with("no handoff on this lane."), "{out}");
+    assert!(
+        out.contains("メインの引き継ぎ") && !out.contains("accepted: "),
+        "{out}"
+    );
+    let out = text(
+        &client
+            .call_tool(call(json!({"project": PROJECT})))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        out.contains("メインの引き継ぎ"),
+        "still pending on the main line: {out}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
 async fn mcp_rejects_missing_token() {
     let srv = spawn().await;
     let transport = StreamableHttpClientTransport::from_config(

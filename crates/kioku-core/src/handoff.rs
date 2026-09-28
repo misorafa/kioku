@@ -57,6 +57,20 @@ pub struct Handoff {
     /// RFC 3339 time of the last in-place refresh (rules handoffs), if any.
     #[serde(default)]
     pub updated_at: Option<String>,
+    /// Lane it lives on (the producing session's branch, M2.4 §1.3); `None` = project lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<String>,
+}
+
+/// Result of a pending-handoff lookup routed by lane (M2.4 §1.4).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingHandoff {
+    /// The newest pending handoff on the requested lane (accepted when asked to).
+    pub handoff: Option<Handoff>,
+    /// Only on a branch lane without its own handoff: the project lane's pending handoff,
+    /// for reference, never accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_handoff: Option<Handoff>,
 }
 
 /// Input of `kioku_handoff_write` / `POST /api/v1/handoffs` (spec §7.5).

@@ -13,15 +13,17 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::db::{self, PageRow, ProjectRow};
+use crate::db::{self, PageRow, ProjectAlias, ProjectRow};
 use crate::digest::{SessionDigest, aggregate_files};
 use crate::error::{Error, Result};
 use crate::git::Git;
-use crate::handoff::{Handoff, HandoffInput, HandoffSource, render_agent_handoff};
+use crate::handoff::{Handoff, HandoffInput, HandoffSource, PendingHandoff, render_agent_handoff};
 use crate::index::{Hit, INDEX_SCHEMA_VERSION, IndexDoc, SearchIndex, SearchScope};
 use crate::layout::DataDir;
 use crate::page::{Frontmatter, Page, PageKind, PageScope, resolve_write_path, validate_rel_path};
-use crate::project::{ProjectIdentity, is_valid_id};
+use crate::project::{
+    ProjectIdentity, comparable_root, is_derived_id, is_remote_derived, is_valid_id, normalize_lane,
+};
 use crate::render::{
     StateSession, session_body, session_page_path, session_title, state_body, state_title,
 };
@@ -90,6 +92,31 @@ pub struct StatusReport {
     /// server).
     #[serde(default)]
     pub index_schema_expected: u32,
+    /// Project aliases `alias → project_id` (M2.4 §2.2; empty from an older server).
+    #[serde(default)]
+    pub aliases: Vec<ProjectAlias>,
+}
+
+/// Output of `Store::merge_projects` (`kioku project merge`, M2.4 §2.3).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeReport {
+    /// The project that was folded in (now an alias).
+    pub from: String,
+    /// The project that received everything.
+    pub into: String,
+    /// True when nothing was changed (`--dry-run`).
+    pub dry_run: bool,
+    /// True when `from` was already an alias of `into` (nothing left to move).
+    pub already_merged: bool,
+    /// Sessions moved.
+    pub sessions: u64,
+    /// Observations moved.
+    pub observations: u64,
+    /// Handoffs moved.
+    pub handoffs: u64,
+    /// Pages moved, as `(old path, new path)`; `from`'s STATE.md is dropped (the target's is
+    /// rewritten).
+    pub pages: Vec<(String, String)>,
 }
 
 /// The kioku store. `Send + Sync`; share it as `Arc<Store>`.
@@ -189,10 +216,22 @@ impl Store {
         Ok(())
     }
 
-    /// Fetches a registered project.
+    /// Fetches a registered project (an alias resolves to its canonical project).
     pub fn project(&self, id: &str) -> Result<ProjectRow> {
-        db::get_project(&self.db.lock(), id)?
-            .ok_or_else(|| Error::not_found(format!("project {id}")))
+        let conn = self.db.lock();
+        let id = resolve_id(&conn, id)?;
+        db::get_project(&conn, &id)?.ok_or_else(|| Error::not_found(format!("project {id}")))
+    }
+
+    /// The canonical id for a project id coming from outside (M2.4 §2.2): an alias resolves
+    /// to its project, anything else is returned unchanged.
+    pub fn resolve_project_id(&self, id: &str) -> Result<String> {
+        resolve_id(&self.db.lock(), id)
+    }
+
+    /// All project aliases, ordered by alias.
+    pub fn list_aliases(&self) -> Result<Vec<ProjectAlias>> {
+        Ok(db::list_aliases(&self.db.lock())?)
     }
 
     /// All registered projects, ordered by id.
@@ -217,12 +256,17 @@ impl Store {
                 req.project.id
             )));
         }
-        let project_id = req.project.id.clone();
+        let lane = req.lane.as_deref().and_then(normalize_lane);
         let now = now_ts();
-        let (pending_handoff, recent) = {
+        let (project_id, routed, recent) = {
             let mut conn = self.db.lock();
             let tx = conn.transaction().context("starting transaction")?;
-            db::upsert_project(&tx, &req.project, &now)?;
+            let project_id = canonical_for_start(&tx, &req.project, &now)?;
+            let project = ProjectIdentity {
+                id: project_id.clone(),
+                ..req.project.clone()
+            };
+            db::upsert_project(&tx, &project, &now)?;
             db::upsert_session(
                 &tx,
                 &Session {
@@ -235,25 +279,21 @@ impl Store {
                     ended_at: None,
                     status: SessionStatus::Open,
                     root_path: Some(req.project.root.clone()).filter(|r| !r.is_empty()),
+                    lane: lane.clone(),
                 },
             )?;
-            let pending = db::newest_handoff(&tx, &project_id, true)?;
-            if pending.is_some() {
-                db::accept_pending_handoffs(&tx, &project_id, &req.session_id, &now)?;
-            }
-            let pending = match pending {
-                Some(h) => db::get_handoff(&tx, &h.id)?,
-                None => None,
-            };
+            let routed = route_pending(&tx, &project_id, lane.as_deref(), &req.session_id, &now)?;
             let recent = recent_sessions(&tx, &project_id, None, RECENT_SESSIONS)?;
             tx.commit().context("committing session start")?;
-            (pending, recent)
+            (project_id, routed, recent)
         };
         Ok(SessionStartResponse {
             project_id: project_id.clone(),
-            pending_handoff,
+            pending_handoff: routed.handoff,
             state_excerpt: self.state_excerpt(&project_id),
             recent_sessions: recent.into_iter().map(recent_entry).collect(),
+            lane,
+            reference_handoff: routed.reference_handoff,
         })
     }
 
@@ -261,24 +301,32 @@ impl Store {
     /// the handoff that session accepted (newest), the STATE.md excerpt and the project's
     /// recent session pages (the session's own page excluded).
     pub fn session_context(&self, id: &str) -> Result<SessionStartResponse> {
-        let (session, pending_handoff, recent) = {
+        let (session, pending_handoff, reference_handoff, recent) = {
             let conn = self.db.lock();
             let session = db::get_session(&conn, id)?
                 .ok_or_else(|| Error::not_found(format!("session {id}")))?;
             let pending = db::newest_handoff_accepted_by(&conn, id)?;
+            // A branch lane without a handoff of its own sees the project lane's pending one
+            // for reference (§1.4 rule 2), without consuming it.
+            let reference = match (&pending, &session.lane) {
+                (None, Some(_)) => db::newest_handoff(&conn, &session.project_id, None, true)?,
+                _ => None,
+            };
             let recent: Vec<(Session, String)> =
                 recent_sessions(&conn, &session.project_id, None, RECENT_SESSIONS + 1)?
                     .into_iter()
                     .filter(|(s, _)| s.id != session.id)
                     .take(RECENT_SESSIONS)
                     .collect();
-            (session, pending, recent)
+            (session, pending, reference, recent)
         };
         Ok(SessionStartResponse {
             state_excerpt: self.state_excerpt(&session.project_id),
             project_id: session.project_id,
             pending_handoff,
             recent_sessions: recent.into_iter().map(recent_entry).collect(),
+            lane: session.lane,
+            reference_handoff,
         })
     }
 
@@ -456,6 +504,7 @@ impl Store {
             tags: vec![session.agent.clone()],
             session: Some(session.id.clone()),
             agent: Some(session.agent.clone()),
+            lane: session.lane.clone(),
             ..Frontmatter::default()
         };
         self.put_page(
@@ -496,6 +545,7 @@ impl Store {
                             accepted_by: None,
                             agent: Some(session.agent.clone()),
                             updated_at: None,
+                            lane: session.lane.clone(),
                         };
                         db::insert_handoff(&conn, &h, Some(max_seq))?;
                         h.id
@@ -527,13 +577,14 @@ impl Store {
             return Err(Error::invalid("summary must not be empty"));
         }
         let conn = self.db.lock();
-        db::get_project(&conn, &input.project)?
+        let project_id = resolve_id(&conn, &input.project)?;
+        db::get_project(&conn, &project_id)?
             .ok_or_else(|| Error::not_found(format!("project {}", input.project)))?;
         let session = match &input.session {
             Some(id) => {
                 let s = db::get_session(&conn, id)?
                     .ok_or_else(|| Error::not_found(format!("session {id}")))?;
-                if s.project_id != input.project {
+                if s.project_id != project_id {
                     return Err(Error::invalid(format!(
                         "session {id} belongs to project {}",
                         s.project_id
@@ -541,7 +592,12 @@ impl Store {
                 }
                 Some(s)
             }
-            None => db::newest_open_session(&conn, &input.project)?,
+            None => db::newest_open_session(&conn, &project_id)?,
+        };
+        // The lane of the session the agent named; without one, the project lane (§1.3).
+        let lane = match (&input.session, &session) {
+            (Some(_), Some(s)) => s.lane.clone(),
+            _ => None,
         };
         let now = now_ts();
         let agent = session
@@ -552,7 +608,7 @@ impl Store {
             render_agent_handoff(self.config.lang(), &agent, &display_minute(&now), input);
         let h = Handoff {
             id: util::new_id(),
-            project_id: input.project.clone(),
+            project_id,
             session_id: session.as_ref().map(|s| s.id.clone()),
             source: HandoffSource::Agent,
             content_md: content,
@@ -561,6 +617,7 @@ impl Store {
             accepted_by: None,
             agent: session.as_ref().map(|s| s.agent.clone()),
             updated_at: None,
+            lane,
         };
         let seq_at = match &session {
             Some(s) => Some(db::max_seq(&conn, &s.id)?),
@@ -570,31 +627,64 @@ impl Store {
         Ok(h)
     }
 
-    /// Newest pending handoff of a project. With `accept`, it is consumed by `session`
-    /// (or `"api"`) and older pending ones are superseded; without, it is only peeked.
+    /// Newest pending handoff of a project on the lane of `session` (the project lane when
+    /// `session` is absent or unknown). With `accept`, it is consumed by `session` (or
+    /// `"api"`) and older pending ones of that lane are superseded; without, it is only
+    /// peeked. See [`Store::pending_handoff_routed`] for the reference handoff.
     pub fn pending_handoff(
         &self,
         project: &str,
         accept: bool,
         session: Option<&str>,
     ) -> Result<Option<Handoff>> {
-        let mut conn = self.db.lock();
-        let tx = conn.transaction().context("starting transaction")?;
-        let Some(h) = db::newest_handoff(&tx, project, true)? else {
-            return Ok(None);
-        };
-        if !accept {
-            return Ok(Some(h));
-        }
-        db::accept_pending_handoffs(&tx, project, session.unwrap_or("api"), &now_ts())?;
-        let h = db::get_handoff(&tx, &h.id)?;
-        tx.commit().context("committing handoff acceptance")?;
-        Ok(h)
+        Ok(self
+            .pending_handoff_routed(project, accept, session, None)?
+            .handoff)
     }
 
-    /// Newest handoff of a project, accepted or not.
+    /// The pending handoff routed by lane (M2.4 §1.4). The lane is `lane` when given (`""` =
+    /// the project lane), else the lane of `session`, else the project lane. On a branch
+    /// lane without a pending handoff of its own, the project lane's is returned as
+    /// `reference_handoff` and never accepted.
+    pub fn pending_handoff_routed(
+        &self,
+        project: &str,
+        accept: bool,
+        session: Option<&str>,
+        lane: Option<&str>,
+    ) -> Result<PendingHandoff> {
+        let mut conn = self.db.lock();
+        let tx = conn.transaction().context("starting transaction")?;
+        let project = resolve_id(&tx, project)?;
+        let lane = match lane {
+            Some(l) => normalize_lane(l),
+            None => match session {
+                Some(id) => db::get_session(&tx, id)?
+                    .filter(|s| s.project_id == project)
+                    .and_then(|s| s.lane),
+                None => None,
+            },
+        };
+        let routed = if accept {
+            route_pending(
+                &tx,
+                &project,
+                lane.as_deref(),
+                session.unwrap_or("api"),
+                &now_ts(),
+            )?
+        } else {
+            peek_pending(&tx, &project, lane.as_deref())?
+        };
+        tx.commit().context("committing handoff acceptance")?;
+        Ok(routed)
+    }
+
+    /// Newest handoff of a project on the project lane, accepted or not.
     pub fn latest_handoff(&self, project: &str) -> Result<Option<Handoff>> {
-        Ok(db::newest_handoff(&self.db.lock(), project, false)?)
+        let conn = self.db.lock();
+        let project = resolve_id(&conn, project)?;
+        Ok(db::newest_handoff(&conn, &project, None, false)?)
     }
 
     // ---------------------------------------------------------------- pages
@@ -617,8 +707,7 @@ impl Store {
                     .project
                     .as_deref()
                     .ok_or_else(|| Error::invalid("scope=project requires a project"))?;
-                self.project(id)?;
-                Some(id.to_string())
+                Some(self.project(id)?.id)
             }
         };
         let path = resolve_write_path(title, scope, project.as_deref(), req.path.as_deref())?;
@@ -654,13 +743,23 @@ impl Store {
     }
 
     /// Full-text search (spec §6.3).
+    /// A `project` scope naming an alias searches its canonical project.
     pub fn search(&self, query: &str, scope: &SearchScope, limit: usize) -> Result<Vec<Hit>> {
-        Ok(self.index.search(query, scope, limit)?)
+        let scope = match scope {
+            SearchScope::Project(id) => SearchScope::Project(self.resolve_project_id(id)?),
+            other => other.clone(),
+        };
+        Ok(self.index.search(query, &scope, limit)?)
     }
 
     /// Clears and rebuilds `pages` + the index from `wiki/`; returns the number of pages.
     pub fn reindex(&self) -> Result<usize> {
         let _write = self.write_lock.lock();
+        self.reindex_locked()
+    }
+
+    /// [`Store::reindex`] body; the caller holds the write lock.
+    fn reindex_locked(&self) -> Result<usize> {
         let wiki = self.dirs.wiki();
         let mut rows = Vec::new();
         let mut docs = Vec::new();
@@ -712,7 +811,98 @@ impl Store {
             version: crate::VERSION.to_string(),
             index_schema_version: self.index_version_on_disk(),
             index_schema_expected: INDEX_SCHEMA_VERSION,
+            aliases: db::list_aliases(&conn)?,
         })
+    }
+
+    /// `kioku project merge` (M2.4 §2.3): moves sessions, observations, handoffs, raw logs
+    /// and pages of `from` into `into` (pages go to `into`'s wiki directory, with a git
+    /// commit), records `from` as an alias of `into`, reindexes and rewrites `into`'s
+    /// STATE.md. `dry_run` only reports. Refuses unknown or identical ids; merging again once
+    /// `from` is already an alias of `into` changes nothing (`already_merged`).
+    pub fn merge_projects(&self, from: &str, into: &str, dry_run: bool) -> Result<MergeReport> {
+        let from = from.trim();
+        if !is_valid_id(from) {
+            return Err(Error::invalid(format!("invalid project id: {from}")));
+        }
+        let _write = self.write_lock.lock();
+        let (into_row, counts, from_existed) = {
+            let conn = self.db.lock();
+            let into_id = resolve_id(&conn, into.trim())?;
+            let into_row = db::get_project(&conn, &into_id)?
+                .ok_or_else(|| Error::not_found(format!("project {into}")))?;
+            if from == into_row.id {
+                return Err(Error::invalid(format!(
+                    "cannot merge project {from} into itself"
+                )));
+            }
+            if db::get_project(&conn, from)?.is_none() {
+                if db::resolve_alias(&conn, from)?.as_deref() == Some(into_row.id.as_str()) {
+                    return Ok(MergeReport {
+                        from: from.to_string(),
+                        into: into_row.id,
+                        dry_run,
+                        already_merged: true,
+                        ..MergeReport::default()
+                    });
+                }
+                return Err(Error::not_found(format!("project {from}")));
+            }
+            let counts = db::project_row_counts(&conn, from)?;
+            (into_row, counts, self.dirs.wiki().join(from).is_dir())
+        };
+        let wiki = self.dirs.wiki();
+        let moves = plan_page_moves(&wiki, from, &into_row.id)?;
+        let report = MergeReport {
+            from: from.to_string(),
+            into: into_row.id.clone(),
+            dry_run,
+            already_merged: false,
+            sessions: counts.sessions,
+            observations: counts.observations,
+            handoffs: counts.handoffs,
+            pages: moves.clone(),
+        };
+        if dry_run {
+            return Ok(report);
+        }
+
+        for (old, new) in &moves {
+            move_page(&wiki, old, new, from, &into_row.id)?;
+        }
+        let from_dir = wiki.join(from);
+        let state = from_dir.join("STATE.md");
+        if state.exists() {
+            std::fs::remove_file(&state)
+                .with_context(|| format!("removing {}", state.display()))?;
+        }
+        remove_empty_dirs(&from_dir);
+        move_raw_logs(
+            &self.dirs.raw().join(from),
+            &self.dirs.raw().join(&into_row.id),
+        )?;
+        {
+            let mut conn = self.db.lock();
+            let tx = conn.transaction().context("starting transaction")?;
+            db::move_project_rows(&tx, from, &into_row.id)?;
+            db::repoint_aliases(&tx, from, &into_row.id)?;
+            db::upsert_alias(&tx, from, &into_row.id, &now_ts())?;
+            tx.commit().context("committing project merge")?;
+        }
+        let mut paths = Vec::new();
+        if from_existed {
+            paths.push(from.to_string());
+        }
+        if wiki.join(&into_row.id).is_dir() {
+            paths.push(into_row.id.clone());
+        }
+        self.git.commit(
+            &paths,
+            &format!("kioku: merge project {from} into {}", into_row.id),
+        );
+        self.reindex_locked()?;
+        self.write_state(&into_row, None)?;
+        Ok(report)
     }
 
     // ---------------------------------------------------------------- internals
@@ -757,7 +947,9 @@ impl Store {
         let lang = self.config.lang();
         let (latest, recent, digests) = {
             let conn = self.db.lock();
-            let latest = db::newest_handoff(&conn, &project.id, false)?;
+            // The project lane's handoff: STATE.md is shown to every session, and a branch
+            // lane's handoff must not reach the default branch (M2.4 §1.4).
+            let latest = db::newest_handoff(&conn, &project.id, None, false)?;
             let recent = recent_sessions(&conn, &project.id, include, STATE_SESSIONS)?;
             let mut digests = Vec::new();
             for (s, _) in &recent {
@@ -773,6 +965,7 @@ impl Store {
                 StateSession {
                     date: display_date(&s.started_at),
                     agent: s.agent.clone(),
+                    lane: s.lane.clone(),
                     title,
                     rel_path: path.strip_prefix(&prefix).unwrap_or(&path).to_string(),
                 }
@@ -800,6 +993,68 @@ impl Store {
         let excerpt: Vec<&str> = page.body.lines().take(STATE_EXCERPT_LINES).collect();
         Some(excerpt.join("\n"))
     }
+}
+
+/// An alias resolved to its canonical project id; any other id unchanged.
+fn resolve_id(conn: &Connection, id: &str) -> Result<String> {
+    Ok(db::resolve_alias(conn, id)?.unwrap_or_else(|| id.to_string()))
+}
+
+/// The project id a session start is recorded under (M2.4 §2.1): an alias resolves to its
+/// project; an unknown remote-derived id whose root is the root of a known path-derived
+/// project (no remote) becomes an alias of that project (the checkout just gained a remote).
+fn canonical_for_start(conn: &Connection, identity: &ProjectIdentity, now: &str) -> Result<String> {
+    let id = resolve_id(conn, &identity.id)?;
+    if db::get_project(conn, &id)?.is_some() || !is_remote_derived(identity) {
+        return Ok(id);
+    }
+    let root = comparable_root(&identity.root);
+    let existing = db::list_projects(conn)?.into_iter().find(|p| {
+        p.remote_url.is_none()
+            && is_derived_id(&p.id)
+            && p.root_path
+                .as_deref()
+                .is_some_and(|r| comparable_root(r) == root)
+    });
+    match existing {
+        Some(p) => {
+            db::upsert_alias(conn, &identity.id, &p.id, now)?;
+            tracing::info!(alias = %identity.id, project = %p.id, "project gained a remote; recorded an alias");
+            Ok(p.id)
+        }
+        None => Ok(id),
+    }
+}
+
+/// Peeks at the pending handoff for `lane` (§1.4) without accepting anything.
+fn peek_pending(conn: &Connection, project: &str, lane: Option<&str>) -> Result<PendingHandoff> {
+    let handoff = db::newest_handoff(conn, project, lane, true)?;
+    let reference_handoff = match (&handoff, lane) {
+        (None, Some(_)) => db::newest_handoff(conn, project, None, true)?,
+        _ => None,
+    };
+    Ok(PendingHandoff {
+        handoff,
+        reference_handoff,
+    })
+}
+
+/// §1.4 routing with acceptance: the newest pending handoff on `lane` is accepted by `by`
+/// (older pending ones of that lane are superseded); on a branch lane without one, the
+/// project lane's pending handoff is returned as a reference and left pending.
+fn route_pending(
+    conn: &Connection,
+    project: &str,
+    lane: Option<&str>,
+    by: &str,
+    now: &str,
+) -> Result<PendingHandoff> {
+    let mut routed = peek_pending(conn, project, lane)?;
+    if let Some(h) = routed.handoff.take() {
+        db::accept_pending_handoffs(conn, project, lane, by, now)?;
+        routed.handoff = db::get_handoff(conn, &h.id)?;
+    }
+    Ok(routed)
 }
 
 /// Recent substantive sessions with their page titles (sessions without a page are skipped).
@@ -911,6 +1166,105 @@ fn list_wiki_pages(wiki: &Path) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// Where each page of `from` goes in a merge: `from/<rest>` → `into/<rest>`, or
+/// `into/<dir>/<stem>-<from>[-N].md` when that name is taken. `from/STATE.md` is not moved.
+fn plan_page_moves(wiki: &Path, from: &str, into: &str) -> Result<Vec<(String, String)>> {
+    let prefix = format!("{from}/");
+    let mut taken: Vec<String> = Vec::new();
+    let mut out = Vec::new();
+    for rel in list_wiki_pages(wiki)? {
+        let Some(rest) = rel.strip_prefix(&prefix) else {
+            continue;
+        };
+        if rest == "STATE.md" {
+            continue;
+        }
+        let free = |p: &str| !wiki.join(p).exists() && !taken.iter().any(|t| t == p);
+        let mut new = format!("{into}/{rest}");
+        if !free(&new) {
+            let stem = rest.strip_suffix(".md").unwrap_or(rest);
+            new = format!("{into}/{stem}-{from}.md");
+            let mut n = 2;
+            while !free(&new) {
+                new = format!("{into}/{stem}-{from}-{n}.md");
+                n += 1;
+            }
+        }
+        taken.push(new.clone());
+        out.push((rel, new));
+    }
+    Ok(out)
+}
+
+/// Moves one page file, rewriting `project: <from>` in its frontmatter to `into`.
+fn move_page(wiki: &Path, old: &str, new: &str, from: &str, into: &str) -> Result<()> {
+    let src = wiki.join(old);
+    let text =
+        std::fs::read_to_string(&src).with_context(|| format!("reading {}", src.display()))?;
+    let text = match Page::parse(old, &text) {
+        Ok(mut page) => {
+            if page
+                .frontmatter
+                .project
+                .as_deref()
+                .is_none_or(|p| p == from)
+                && page.frontmatter.scope == PageScope::Project
+            {
+                page.frontmatter.project = Some(into.to_string());
+            }
+            page.path = new.to_string();
+            page.render()?
+        }
+        Err(_) => text,
+    };
+    write_atomic(&wiki.join(new), &text)?;
+    std::fs::remove_file(&src).with_context(|| format!("removing {}", src.display()))?;
+    Ok(())
+}
+
+/// Moves `raw/<from>/*.jsonl` to `raw/<into>/` (appending when a file exists on both sides).
+fn move_raw_logs(from: &Path, into: &Path) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(from) else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(into).with_context(|| format!("creating {}", into.display()))?;
+    for entry in entries.flatten() {
+        let src = entry.path();
+        if !src.is_file() {
+            continue;
+        }
+        let dst = into.join(entry.file_name());
+        if dst.exists() {
+            let text = std::fs::read_to_string(&src)
+                .with_context(|| format!("reading {}", src.display()))?;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&dst)
+                .with_context(|| format!("opening {}", dst.display()))?;
+            f.write_all(text.as_bytes())
+                .with_context(|| format!("appending to {}", dst.display()))?;
+            std::fs::remove_file(&src).with_context(|| format!("removing {}", src.display()))?;
+        } else {
+            std::fs::rename(&src, &dst)
+                .with_context(|| format!("moving {} to {}", src.display(), dst.display()))?;
+        }
+    }
+    remove_empty_dirs(from);
+    Ok(())
+}
+
+/// Removes `dir` and its subdirectories as far as they are empty (errors are ignored).
+fn remove_empty_dirs(dir: &Path) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                remove_empty_dirs(&entry.path());
+            }
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
+}
+
 fn write_atomic(file: &Path, text: &str) -> Result<()> {
     let parent = file.parent().context("page path has no parent")?;
     std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
@@ -972,6 +1326,7 @@ mod tests {
                 cwd: "/home/u/kioku".into(),
                 source: "startup".into(),
                 project: project(),
+                lane: None,
             })
             .unwrap()
     }
@@ -1016,6 +1371,443 @@ mod tests {
             next_steps: vec!["テストを書く".into()],
             open_questions: vec![],
             decisions: vec!["lindera を採用".into()],
+        }
+    }
+
+    fn start_on(store: &Store, session: &str, lane: Option<&str>) -> SessionStartResponse {
+        store
+            .start_session(&SessionStartRequest {
+                session_id: session.into(),
+                agent: "claude-code".into(),
+                cwd: "/home/u/kioku".into(),
+                source: "startup".into(),
+                project: project(),
+                lane: lane.map(str::to_string),
+            })
+            .unwrap()
+    }
+
+    fn handoff_row(store: &Store, id: &str) -> Handoff {
+        db::get_handoff(&store.db.lock(), id).unwrap().unwrap()
+    }
+
+    #[test]
+    fn handoffs_are_routed_per_lane() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path());
+        let pid = project().id;
+
+        // Two worktrees on two branches plus the default branch.
+        start_on(&store, "a-1", Some("task-a"));
+        start_on(&store, "b-1", Some("task-b"));
+        start_on(&store, "main-1", None);
+        let ha = store
+            .write_handoff(&agent_handoff(&pid, Some("a-1"), "A の作業"))
+            .unwrap();
+        assert_eq!(ha.lane.as_deref(), Some("task-a"));
+        let hb = store
+            .write_handoff(&agent_handoff(&pid, Some("b-1"), "B の作業"))
+            .unwrap();
+        let hm = store
+            .write_handoff(&agent_handoff(&pid, Some("main-1"), "メインの作業"))
+            .unwrap();
+        assert_eq!(hm.lane, None);
+        // without a session the handoff goes to the project lane, even though it attaches
+        // to the newest open session
+        let loose = store
+            .write_handoff(&agent_handoff(&pid, None, "セッションなし"))
+            .unwrap();
+        assert_eq!(loose.lane, None);
+
+        // same lane: accepted; another lane's handoff is untouched
+        let a2 = start_on(&store, "a-2", Some("task-a"));
+        assert_eq!(a2.lane.as_deref(), Some("task-a"));
+        assert_eq!(a2.pending_handoff.unwrap().id, ha.id);
+        assert!(a2.reference_handoff.is_none());
+        assert!(handoff_row(&store, &hb.id).accepted_at.is_none());
+        assert!(handoff_row(&store, &loose.id).accepted_at.is_none());
+
+        // the project lane gets the newest project-lane handoff and supersedes only its lane
+        let m2 = start_on(&store, "main-2", None);
+        assert_eq!(m2.lane, None);
+        assert_eq!(m2.pending_handoff.unwrap().id, loose.id);
+        assert_eq!(
+            handoff_row(&store, &hm.id).accepted_by.as_deref(),
+            Some("main-2")
+        );
+        assert!(handoff_row(&store, &hb.id).accepted_at.is_none());
+        assert!(start_on(&store, "main-3", None).pending_handoff.is_none());
+
+        let b2 = start_on(&store, "b-2", Some("task-b"));
+        assert_eq!(b2.pending_handoff.unwrap().id, hb.id);
+
+        // a new branch without its own handoff sees the project lane's as a reference only
+        let main_next = store
+            .write_handoff(&agent_handoff(&pid, Some("main-3"), "次はリリース"))
+            .unwrap();
+        let c1 = start_on(&store, "c-1", Some("task-c"));
+        assert!(c1.pending_handoff.is_none());
+        let reference = c1.reference_handoff.unwrap();
+        assert_eq!(reference.id, main_next.id);
+        assert!(reference.accepted_at.is_none());
+        assert!(handoff_row(&store, &main_next.id).accepted_at.is_none());
+        // ... and the context of that session repeats it, still without consuming it
+        let ctx = store.session_context("c-1").unwrap();
+        assert_eq!(ctx.lane.as_deref(), Some("task-c"));
+        assert_eq!(ctx.reference_handoff.unwrap().id, main_next.id);
+        // the default branch still receives it
+        let m4 = start_on(&store, "main-4", None);
+        assert_eq!(m4.pending_handoff.unwrap().id, main_next.id);
+        assert!(m4.reference_handoff.is_none());
+        let c2 = start_on(&store, "c-2", Some("task-c"));
+        assert!(c2.pending_handoff.is_none() && c2.reference_handoff.is_none());
+
+        // pending lookups: project lane by default, a lane by name or by session
+        let hb2 = store
+            .write_handoff(&agent_handoff(&pid, Some("b-2"), "B の続き"))
+            .unwrap();
+        assert!(store.pending_handoff(&pid, false, None).unwrap().is_none());
+        let by_lane = store
+            .pending_handoff_routed(&pid, false, None, Some("task-b"))
+            .unwrap();
+        assert_eq!(by_lane.handoff.unwrap().id, hb2.id);
+        let by_session = store
+            .pending_handoff_routed(&pid, true, Some("b-2"), None)
+            .unwrap();
+        assert_eq!(
+            by_session.handoff.unwrap().accepted_by.as_deref(),
+            Some("b-2")
+        );
+        let main_again = store
+            .write_handoff(&agent_handoff(&pid, Some("main-4"), "メイン"))
+            .unwrap();
+        let routed = store
+            .pending_handoff_routed(&pid, true, None, Some("task-z"))
+            .unwrap();
+        assert!(routed.handoff.is_none());
+        assert_eq!(routed.reference_handoff.unwrap().id, main_again.id);
+        assert!(
+            handoff_row(&store, &main_again.id).accepted_at.is_none(),
+            "a reference is never accepted, even with accept=true"
+        );
+        let explicit_main = store
+            .pending_handoff_routed(&pid, false, Some("b-2"), Some(""))
+            .unwrap();
+        assert_eq!(explicit_main.handoff.unwrap().id, main_again.id);
+    }
+
+    #[test]
+    fn lanes_show_in_session_pages_and_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path());
+        start_on(&store, "lane-s", Some("feature/検索"));
+        work(&store, "lane-s");
+        let r = store.finalize_session("lane-s").unwrap();
+        let rules = handoff_row(&store, r.handoff_id.as_deref().unwrap());
+        assert_eq!(rules.lane.as_deref(), Some("feature/検索"));
+        let page = store.read_page(r.session_page.as_deref().unwrap()).unwrap();
+        assert_eq!(page.frontmatter.lane.as_deref(), Some("feature/検索"));
+        let raw = std::fs::read_to_string(
+            tmp.path()
+                .join("wiki")
+                .join(r.session_page.as_deref().unwrap()),
+        )
+        .unwrap();
+        assert!(raw.contains("lane: feature/検索"), "{raw}");
+        let state = store.read_page("kioku-3f9a1c2e/STATE.md").unwrap();
+        assert!(
+            state
+                .body
+                .contains(" claude-code [feature/検索] — 検索のテストを追加して"),
+            "{}",
+            state.body
+        );
+        // the branch's handoff is not STATE.md's "latest handoff" (every lane reads STATE.md)
+        assert!(!state.body.contains("source: rules"), "{}", state.body);
+        // lanes never hide memory
+        let hits = store
+            .search("検索のテスト", &SearchScope::Project(project().id), 10)
+            .unwrap();
+        assert!(
+            hits.iter()
+                .any(|h| Some(&h.path) == r.session_page.as_ref())
+        );
+
+        // a project-lane session page has no lane key
+        start_on(&store, "main-s", None);
+        work(&store, "main-s");
+        let r = store.finalize_session("main-s").unwrap();
+        let page = store.read_page(r.session_page.as_deref().unwrap()).unwrap();
+        assert_eq!(page.frontmatter.lane, None);
+        let state = store.read_page("kioku-3f9a1c2e/STATE.md").unwrap();
+        assert!(state.body.contains("source: rules"), "{}", state.body);
+    }
+
+    fn identity(id: &str, root: &str, remote: Option<&str>) -> ProjectIdentity {
+        ProjectIdentity {
+            id: id.into(),
+            name: crate::project::root_basename(root),
+            root: root.into(),
+            remote: remote.map(str::to_string),
+        }
+    }
+
+    fn start_with(store: &Store, session: &str, p: ProjectIdentity) -> SessionStartResponse {
+        store
+            .start_session(&SessionStartRequest {
+                session_id: session.into(),
+                agent: "codex".into(),
+                cwd: p.root.clone(),
+                source: "startup".into(),
+                project: p,
+                lane: None,
+            })
+            .unwrap()
+    }
+
+    fn path_identity(root: &str) -> ProjectIdentity {
+        let name = crate::project::root_basename(root);
+        identity(
+            &crate::project::id_from_path(&name, Path::new(root)),
+            root,
+            None,
+        )
+    }
+
+    fn remote_identity(root: &str, remote: &str) -> ProjectIdentity {
+        let name = crate::project::root_basename(root);
+        identity(
+            &crate::project::id_from_remote(&name, remote),
+            root,
+            Some(remote),
+        )
+    }
+
+    #[test]
+    fn a_checkout_that_gains_a_remote_keeps_its_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path());
+        let root = "/Users/u/AI_agents_shared_memory";
+        let old = path_identity(root);
+        start_with(&store, "before", old.clone());
+        work(&store, "before");
+        store.finalize_session("before").unwrap();
+        let page = store
+            .write_page(&WritePageRequest {
+                title: "設計メモ".into(),
+                content: "引き継ぎのレーンを設計した".into(),
+                project: Some(old.id.clone()),
+                ..WritePageRequest::default()
+            })
+            .unwrap();
+
+        // `origin` is added: the client now computes a remote-derived id
+        let new = remote_identity(&format!("{root}/"), "github.com/misorafa/kioku");
+        assert_ne!(new.id, old.id);
+        let resp = start_with(&store, "after", new.clone());
+        assert_eq!(resp.project_id, old.id, "the canonical id is reported back");
+        assert!(
+            resp.pending_handoff.is_some(),
+            "the old handoff is delivered"
+        );
+        assert_eq!(resp.recent_sessions.len(), 1);
+        let row = store.project(&old.id).unwrap();
+        assert_eq!(row.remote_url.as_deref(), Some("github.com/misorafa/kioku"));
+        assert_eq!(store.session("after").unwrap().project_id, old.id);
+        assert_eq!(store.list_projects().unwrap().len(), 1);
+        assert_eq!(
+            store.status().unwrap().aliases,
+            vec![ProjectAlias {
+                alias: new.id.clone(),
+                project_id: old.id.clone()
+            }]
+        );
+
+        // another machine's clone (only ever the remote id) lands in the same project
+        let clone = remote_identity(r"C:\src\kioku", "github.com/misorafa/kioku");
+        assert_eq!(clone.id, new.id);
+        assert_eq!(start_with(&store, "win", clone).project_id, old.id);
+
+        // the alias resolves in search, pages, handoffs and project lookups
+        assert_eq!(store.project(&new.id).unwrap().id, old.id);
+        let hits = store
+            .search("レーン", &SearchScope::Project(new.id.clone()), 10)
+            .unwrap();
+        assert!(hits.iter().any(|h| h.path == page), "{hits:?}");
+        let p2 = store
+            .write_page(&WritePageRequest {
+                title: "別名で書く".into(),
+                content: "エイリアス経由".into(),
+                project: Some(new.id.clone()),
+                ..WritePageRequest::default()
+            })
+            .unwrap();
+        assert!(p2.starts_with(&format!("{}/pages/", old.id)), "{p2}");
+        let h = store
+            .write_handoff(&agent_handoff(&new.id, Some("win"), "別名の引き継ぎ"))
+            .unwrap();
+        assert_eq!(h.project_id, old.id);
+        assert_eq!(
+            store
+                .pending_handoff(&new.id, false, None)
+                .unwrap()
+                .unwrap()
+                .id,
+            h.id
+        );
+        assert_eq!(store.latest_handoff(&new.id).unwrap().unwrap().id, h.id);
+    }
+
+    #[test]
+    fn aliases_are_only_made_for_the_same_root_and_a_git_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path());
+        let old = path_identity(r"\\?\C:\work\notes");
+        start_with(&store, "s1", old.clone());
+
+        // a different root → a new project
+        let elsewhere = remote_identity(r"C:\work\other", "github.com/u/notes");
+        assert_eq!(
+            start_with(&store, "s2", elsewhere.clone()).project_id,
+            elsewhere.id
+        );
+
+        // `.kioku.toml` id on the same root → no alias, its own project
+        let toml = identity("my-notes", r"C:\work\notes", Some("github.com/u/notes"));
+        assert_eq!(start_with(&store, "s3", toml).project_id, "my-notes");
+        assert!(store.list_aliases().unwrap().is_empty());
+
+        // same root (verbatim prefix and trailing separator ignored) → alias
+        let gained = remote_identity(r"C:\work\notes\", "github.com/u/notes2");
+        assert_eq!(start_with(&store, "s4", gained.clone()).project_id, old.id);
+        assert_eq!(store.resolve_project_id(&gained.id).unwrap(), old.id);
+
+        // a project that already has a remote is never aliased again
+        let changed = remote_identity(r"C:\work\notes", "gitlab.com/u/notes3");
+        assert_eq!(
+            start_with(&store, "s5", changed.clone()).project_id,
+            changed.id
+        );
+        assert_eq!(store.list_aliases().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn merge_moves_everything_and_is_safe_to_repeat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path());
+        let from = path_identity("/Users/u/kioku");
+        let into = remote_identity("/Users/u/AI_agents_shared_memory", "github.com/u/ai-agents");
+        start_with(&store, "old-s", from.clone());
+        work(&store, "old-s");
+        store.finalize_session("old-s").unwrap();
+        store
+            .write_page(&WritePageRequest {
+                title: "Design Notes".into(),
+                content: "古いプロジェクトの設計メモ".into(),
+                project: Some(from.id.clone()),
+                ..WritePageRequest::default()
+            })
+            .unwrap();
+        start_with(&store, "new-s", into.clone());
+        store
+            .write_page(&WritePageRequest {
+                title: "Design Notes".into(),
+                content: "新しい方".into(),
+                project: Some(into.id.clone()),
+                ..WritePageRequest::default()
+            })
+            .unwrap();
+
+        // errors
+        for (a, b) in [
+            ("unknown-00000000", into.id.as_str()),
+            (from.id.as_str(), "unknown-00000000"),
+            (into.id.as_str(), into.id.as_str()),
+            ("../x", into.id.as_str()),
+        ] {
+            assert!(store.merge_projects(a, b, false).is_err(), "{a} → {b}");
+        }
+
+        // dry run lists without changing
+        let dry = store.merge_projects(&from.id, &into.id, true).unwrap();
+        assert!(dry.dry_run && !dry.already_merged);
+        assert_eq!((dry.sessions, dry.handoffs), (1, 1));
+        assert_eq!(dry.observations, 3);
+        assert_eq!(dry.pages.len(), 2, "{:?}", dry.pages);
+        assert!(dry.pages.contains(&(
+            format!("{}/pages/design-notes.md", from.id),
+            format!("{}/pages/design-notes-{}.md", into.id, from.id)
+        )));
+        assert!(store.project(&from.id).is_ok());
+        assert!(tmp.path().join("wiki").join(&from.id).is_dir());
+
+        let report = store.merge_projects(&from.id, &into.id, false).unwrap();
+        assert_eq!(report.pages, dry.pages);
+        assert!(!report.dry_run);
+        assert!(!tmp.path().join("wiki").join(&from.id).exists());
+        assert!(!tmp.path().join("raw").join(&from.id).exists());
+        assert!(
+            tmp.path()
+                .join("raw")
+                .join(&into.id)
+                .join("old-s.jsonl")
+                .is_file()
+        );
+        assert_eq!(store.session("old-s").unwrap().project_id, into.id);
+        assert_eq!(store.observations("old-s").unwrap()[0].project_id, into.id);
+        assert_eq!(
+            store.latest_handoff(&into.id).unwrap().unwrap().project_id,
+            into.id
+        );
+        assert_eq!(store.resolve_project_id(&from.id).unwrap(), into.id);
+        assert_eq!(store.list_projects().unwrap().len(), 1);
+        let moved = store
+            .read_page(&format!("{}/pages/design-notes-{}.md", into.id, from.id))
+            .unwrap();
+        assert_eq!(moved.frontmatter.project.as_deref(), Some(into.id.as_str()));
+        // reindexed: the moved pages are found under the target project, in Japanese
+        let hits = store
+            .search("設計メモ", &SearchScope::Project(into.id.clone()), 10)
+            .unwrap();
+        assert!(hits.iter().any(|h| h.path == moved.path), "{hits:?}");
+        assert!(hits.iter().all(|h| !h.path.starts_with(&from.id)));
+        // STATE.md of the target now lists the moved session
+        let state = store.read_page(&format!("{}/STATE.md", into.id)).unwrap();
+        assert!(
+            state.body.contains("検索のテストを追加して"),
+            "{}",
+            state.body
+        );
+        // the old id keeps working for clients that still send it
+        assert_eq!(start_with(&store, "late", from.clone()).project_id, into.id);
+
+        // repeating is harmless
+        let again = store.merge_projects(&from.id, &into.id, false).unwrap();
+        assert!(again.already_merged);
+        assert!(again.pages.is_empty());
+
+        if crate::git::git_available() {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(tmp.path().join("wiki"))
+                .args(["status", "--porcelain"])
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                "",
+                "wiki is committed"
+            );
+            let log = std::process::Command::new("git")
+                .arg("-C")
+                .arg(tmp.path().join("wiki"))
+                .args(["log", "--format=%s"])
+                .output()
+                .unwrap();
+            assert!(String::from_utf8_lossy(&log.stdout).contains(&format!(
+                "kioku: merge project {} into {}",
+                from.id, into.id
+            )));
         }
     }
 
@@ -1199,6 +1991,7 @@ mod tests {
                 cwd: root.into(),
                 source: "startup".into(),
                 project: p,
+                lane: None,
             })
             .unwrap();
     }
@@ -1432,6 +2225,7 @@ mod tests {
                 cwd: "/home/u/kioku".into(),
                 source: source.into(),
                 project: project(),
+                lane: None,
             })
             .unwrap()
     }
@@ -1590,8 +2384,21 @@ mod tests {
             )
             .unwrap();
         }
+        {
+            // an old row: NULL lane = the project lane
+            let conn = Connection::open(&file).unwrap();
+            conn.execute_batch(
+                "INSERT INTO handoffs(id, project_id, session_id, source, content_md, created_at)
+                 VALUES ('old-h', 'kioku-3f9a1c2e', NULL, 'agent', '## 引き継ぎ\n古い', '2026-01-01T00:00:00.000Z');",
+            )
+            .unwrap();
+        }
         let store = open_store(tmp.path());
-        start(&store, "after-migration");
+        let branch = start_on(&store, "on-a-branch", Some("feature/x"));
+        assert!(branch.pending_handoff.is_none());
+        assert_eq!(branch.reference_handoff.unwrap().id, "old-h");
+        let resp = start(&store, "after-migration");
+        assert_eq!(resp.pending_handoff.unwrap().id, "old-h");
         work(&store, "after-migration");
         assert!(
             store
@@ -1599,6 +2406,11 @@ mod tests {
                 .unwrap()
                 .substantive
         );
+        assert_eq!(
+            store.session("on-a-branch").unwrap().lane.as_deref(),
+            Some("feature/x")
+        );
+        assert!(store.list_aliases().unwrap().is_empty());
     }
 
     #[test]

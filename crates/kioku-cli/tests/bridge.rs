@@ -208,6 +208,32 @@ async fn bridge_serves_the_server_tools_over_rest() {
         .unwrap();
     assert_eq!(text(&after), "none");
 
+    // lanes (M2.4 §1.4): a branch without its own handoff gets the main line's as a
+    // reference, which stays pending
+    bridge
+        .call_tool(call(
+            "kioku_handoff_write",
+            json!({"project": PROJECT, "summary": "メインの引き継ぎ"}),
+        ))
+        .await
+        .unwrap();
+    let lane = bridge
+        .call_tool(call(
+            "kioku_handoff_pending",
+            json!({"project": PROJECT, "lane": "feature/検索", "accept": true}),
+        ))
+        .await
+        .unwrap();
+    let out = text(&lane);
+    assert!(out.starts_with("no handoff on this lane."), "{out}");
+    assert!(out.contains("メインの引き継ぎ"), "{out}");
+    let main = bridge
+        .call_tool(call("kioku_handoff_pending", json!({"project": PROJECT})))
+        .await
+        .unwrap();
+    assert!(text(&main).contains("メインの引き継ぎ"));
+    assert!(!text(&main).contains("accepted: "));
+
     bridge.cancel().await.unwrap();
 }
 

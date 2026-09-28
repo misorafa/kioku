@@ -119,6 +119,8 @@ pub struct StateSession {
     pub date: String,
     /// Agent name.
     pub agent: String,
+    /// Handoff lane of the session (`None` = project lane), shown as `[<lane>]`.
+    pub lane: Option<String>,
     /// Session page title.
     pub title: String,
     /// Path relative to the project directory (`sessions/…md`).
@@ -161,8 +163,13 @@ pub fn state_body(
             .split_once(" — ")
             .map(|(_, t)| t)
             .unwrap_or(&r.title);
+        let lane = r
+            .lane
+            .as_deref()
+            .map(|l| format!(" [{l}]"))
+            .unwrap_or_default();
         out.push(format!(
-            "- {} {} — {} ({})",
+            "- {} {}{lane} — {} ({})",
             r.date, r.agent, summary, r.rel_path
         ));
     }
@@ -215,6 +222,7 @@ mod tests {
             ended_at: Some("2026-09-25T03:40:11.000Z".into()),
             status: SessionStatus::Open,
             root_path: None,
+            lane: None,
         }
     }
 
@@ -269,13 +277,24 @@ mod tests {
             accepted_by: None,
             agent: Some("claude-code".into()),
             updated_at: None,
+            lane: None,
         };
-        let recent = vec![StateSession {
-            date: "2026-09-25".into(),
-            agent: "claude-code".into(),
-            title: "2026-09-25 02:14 claude-code — 設計".into(),
-            rel_path: "sessions/2026-09-25-0c2f1a2b.md".into(),
-        }];
+        let recent = vec![
+            StateSession {
+                date: "2026-09-25".into(),
+                agent: "claude-code".into(),
+                lane: None,
+                title: "2026-09-25 02:14 claude-code — 設計".into(),
+                rel_path: "sessions/2026-09-25-0c2f1a2b.md".into(),
+            },
+            StateSession {
+                date: "2026-09-25".into(),
+                agent: "codex".into(),
+                lane: Some("feature/検索".into()),
+                title: "2026-09-25 03:00 codex — 検索".into(),
+                rel_path: "sessions/2026-09-25-11111111.md".into(),
+            },
+        ];
         let body = state_body(
             Lang::Ja,
             Some(&h),
@@ -286,7 +305,7 @@ mod tests {
             }],
         );
         assert!(body.starts_with("## 最新の引き継ぎ\n_2026-09-25 03:40 / claude-code / source: rules_\n\n### 引き継ぎ（自動生成）\n"));
-        assert!(body.contains("## 最近のセッション\n- 2026-09-25 claude-code — 設計 (sessions/2026-09-25-0c2f1a2b.md)\n"));
+        assert!(body.contains("## 最近のセッション\n- 2026-09-25 claude-code — 設計 (sessions/2026-09-25-0c2f1a2b.md)\n- 2026-09-25 codex [feature/検索] — 検索 (sessions/2026-09-25-11111111.md)\n"));
         assert!(body.ends_with("## よく触るファイル（直近10セッション）\n- a.rs (3)\n"));
     }
 }

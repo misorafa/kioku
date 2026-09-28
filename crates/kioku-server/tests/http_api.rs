@@ -40,6 +40,7 @@ async fn everything_else_requires_the_token() {
         (Method::POST, "/api/v1/handoffs"),
         (Method::GET, "/api/v1/status"),
         (Method::POST, "/api/v1/reindex"),
+        (Method::POST, "/api/v1/projects/merge"),
         (Method::POST, "/api/v1/invites"),
         (Method::POST, "/mcp"),
         (Method::GET, "/mcp"),
@@ -581,6 +582,154 @@ async fn session_context_is_read_only() {
     let (status, ctx) = srv.get("/api/v1/sessions/codex-0001/context").await;
     assert_eq!(status, 200);
     assert!(ctx["pending_handoff"].is_null(), "{ctx}");
+}
+
+#[tokio::test]
+async fn lanes_route_handoffs_over_http() {
+    let srv = spawn().await;
+    // an old client's payload (no `lane`) still works and gets no lane back
+    let (status, body) = srv
+        .post("/api/v1/sessions/start", start_body("main-1"))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.get("lane").is_none(), "{body}");
+    assert!(body.get("reference_handoff").is_none(), "{body}");
+
+    let mut a = start_body("wt-a");
+    a["lane"] = json!("feature/検索");
+    let (status, body) = srv.post("/api/v1/sessions/start", a).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["lane"], "feature/検索");
+
+    // the branch's handoff stays on its lane
+    let (_, h) = srv
+        .post(
+            "/api/v1/handoffs",
+            json!({"project": PROJECT, "session": "wt-a", "summary": "検索を直した"}),
+        )
+        .await;
+    let (_, p) = srv
+        .get(&format!("/api/v1/handoffs/pending?project={PROJECT}"))
+        .await;
+    assert!(p["handoff"].is_null(), "project lane is empty: {p}");
+    let (_, p) = srv
+        .get(&format!(
+            "/api/v1/handoffs/pending?project={PROJECT}&lane={}",
+            enc("feature/検索")
+        ))
+        .await;
+    assert_eq!(p["handoff"]["id"], h["id"]);
+    assert_eq!(p["handoff"]["lane"], "feature/検索");
+
+    // a main-line handoff is only a reference for another branch, and is not consumed
+    let (_, main) = srv
+        .post(
+            "/api/v1/handoffs",
+            json!({"project": PROJECT, "session": "main-1", "summary": "メインの作業"}),
+        )
+        .await;
+    let mut b = start_body("wt-b");
+    b["lane"] = json!("task-b");
+    let (_, body) = srv.post("/api/v1/sessions/start", b).await;
+    assert!(body["pending_handoff"].is_null(), "{body}");
+    assert_eq!(body["reference_handoff"]["id"], main["id"]);
+    let (_, p) = srv
+        .get(&format!(
+            "/api/v1/handoffs/pending?project={PROJECT}&session=wt-b&accept=true"
+        ))
+        .await;
+    assert!(p["handoff"].is_null(), "{p}");
+    assert_eq!(p["reference_handoff"]["id"], main["id"]);
+    let (_, ctx) = srv.get("/api/v1/sessions/wt-b/context").await;
+    assert_eq!(ctx["lane"], "task-b");
+    assert_eq!(ctx["reference_handoff"]["id"], main["id"]);
+    let (_, body) = srv
+        .post("/api/v1/sessions/start", start_body("main-2"))
+        .await;
+    assert_eq!(body["pending_handoff"]["id"], main["id"]);
+}
+
+#[tokio::test]
+async fn aliases_and_merge_over_http() {
+    let srv = spawn().await;
+    let path_id = "notes-0a1b2c3d";
+    let remote = "github.com/u/notes";
+    let remote_id = kioku_core::project::id_from_remote("notes", remote);
+    let start = |sid: &str, id: &str, remote: Option<&str>| {
+        json!({
+            "session_id": sid, "agent": "codex", "cwd": "/home/u/notes", "source": "startup",
+            "project": {"id": id, "name": "notes", "root": "/home/u/notes", "remote": remote}
+        })
+    };
+    let (status, _) = srv
+        .post("/api/v1/sessions/start", start("n-1", path_id, None))
+        .await;
+    assert_eq!(status, 200);
+    let (status, body) = srv
+        .post(
+            "/api/v1/sessions/start",
+            start("n-2", &remote_id, Some(remote)),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["project_id"], path_id);
+    let (_, st) = srv.get("/api/v1/status").await;
+    assert_eq!(
+        st["aliases"],
+        json!([{"alias": remote_id, "project_id": path_id}])
+    );
+    assert_eq!(st["project_ids"], json!([path_id]));
+
+    // writes and searches through the alias land in the canonical project
+    let (status, body) = srv
+        .send(
+            Method::PUT,
+            "/api/v1/pages",
+            json!({"title": "議事録", "content": "エイリアスで保存した議事録", "project": remote_id}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body["path"].as_str().unwrap().starts_with(path_id));
+    let (_, hits) = srv
+        .get(&format!(
+            "/api/v1/search?q={}&project={remote_id}",
+            enc("議事録")
+        ))
+        .await;
+    assert_eq!(hits["hits"][0]["path"], body["path"]);
+
+    // merge: another project folded into the canonical one
+    let (status, _) = srv.post("/api/v1/sessions/start", start_body("k-1")).await;
+    assert_eq!(status, 200);
+    let merge = |dry: bool| json!({"from": PROJECT, "into": remote_id, "dry_run": dry});
+    let (status, dry) = srv.post("/api/v1/projects/merge", merge(true)).await;
+    assert_eq!(status, 200, "{dry}");
+    assert_eq!(dry["dry_run"], true);
+    assert_eq!(dry["into"], path_id);
+    assert_eq!(dry["sessions"], 1);
+    let (_, st) = srv.get("/api/v1/status").await;
+    assert_eq!(st["projects"], 2);
+    let (status, done) = srv.post("/api/v1/projects/merge", merge(false)).await;
+    assert_eq!(status, 200, "{done}");
+    assert_eq!(srv.store.session("k-1").unwrap().project_id, path_id);
+    let (_, st) = srv.get("/api/v1/status").await;
+    assert_eq!(st["projects"], 1);
+    let (_, again) = srv.post("/api/v1/projects/merge", merge(false)).await;
+    assert_eq!(again["already_merged"], true);
+    let (status, _) = srv
+        .post(
+            "/api/v1/projects/merge",
+            json!({"from": "nope-00000000", "into": path_id}),
+        )
+        .await;
+    assert_eq!(status, 404);
+    let (status, _) = srv
+        .post(
+            "/api/v1/projects/merge",
+            json!({"from": path_id, "into": remote_id}),
+        )
+        .await;
+    assert_eq!(status, 400);
 }
 
 /// Percent-encodes a query-string value.

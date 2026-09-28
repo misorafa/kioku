@@ -262,16 +262,20 @@ impl Handler<'_> {
         Ok(HookResult::Context(self.start(&source)?))
     }
 
-    /// `POST /sessions/start` for the resolved cwd; returns the `<kioku>` block.
+    /// `POST /sessions/start` for the resolved cwd (with its handoff lane, M2.4 §1.1);
+    /// returns the `<kioku>` block.
     fn start(&self, source: &str) -> anyhow::Result<String> {
         let cwd = self.cwd()?;
         let project = identify(&cwd)?;
+        let deadline = hook_deadline_ms(self.agent, self.ev.event, self.cfg.client.timeout_ms);
+        let lane = kioku_core::project::lane(&cwd, Duration::from_millis(deadline));
         let req = SessionStartRequest {
             session_id: self.ev.session_id.clone(),
             agent: self.ev.agent.clone(),
             cwd: cwd.display().to_string(),
             source: source.to_string(),
             project: project.clone(),
+            lane,
         };
         let resp = self
             .client
@@ -287,7 +291,9 @@ impl Handler<'_> {
             project_id: resp.project_id,
             session_id: self.ev.session_id.clone(),
             server_url: self.cfg.client.server_url.clone(),
+            lane: resp.lane,
             handoff: resp.pending_handoff.map(|h| h.content_md),
+            reference: resp.reference_handoff.map(|h| h.content_md),
             state: resp.state_excerpt,
         };
         render_session_start(self.cfg.client.lang, &ctx)

@@ -1275,3 +1275,129 @@ fn hook_binary_survives_a_non_utf8_environment() {
         .unwrap_or_default();
     assert!(ctx.contains(PROJECT), "{stdout}");
 }
+
+/// Runs git in `dir` (with a throwaway identity); false when it fails or is missing.
+fn git(dir: &Path, args: &[&str]) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "user.name=e2e",
+            "-c",
+            "user.email=e2e@example.com",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn start_in(cfg: &Config, sid: &str, cwd: &Path) -> String {
+    let out = hook(
+        cfg,
+        HookEventKind::SessionStart,
+        with(
+            base_payload(sid, cwd, HookEventKind::SessionStart),
+            json!({"source": "startup"}),
+        ),
+    );
+    assert_eq!(out.exit_code, 0);
+    out.stdout
+}
+
+fn write_handoff(base: &str, project: &str, sid: &str, summary: &str) {
+    let resp = http()
+        .post(format!("{base}/api/v1/handoffs"))
+        .bearer_auth(TOKEN)
+        .json(&json!({"project": project, "session": sid, "summary": summary}))
+        .send()
+        .unwrap();
+    assert!(resp.status().is_success());
+}
+
+#[test]
+fn parallel_worktrees_keep_their_handoffs_apart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("lanes");
+    std::fs::create_dir_all(&main).unwrap();
+    if !git(&main, &["-c", "init.defaultBranch=main", "init", "-q"]) {
+        eprintln!("git not available; skipping");
+        return;
+    }
+    assert!(git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]));
+    // the remote makes every worktree resolve to the same project id
+    assert!(git(
+        &main,
+        &["remote", "add", "origin", "git@github.com:acme/lanes.git"]
+    ));
+    let wt = |name: &str, branch: &str| {
+        let dir = tmp.path().join(name);
+        assert!(git(
+            &main,
+            &["worktree", "add", "-q", "-b", branch, dir.to_str().unwrap()]
+        ));
+        dir
+    };
+    let wt_a = wt("wt-a", "task-a");
+    let wt_b = wt("wt-b", "feature/検索");
+
+    let server = start_server();
+    let client_dir = tempfile::tempdir().unwrap();
+    let cfg = client_config(client_dir.path(), &server.base, TOKEN, &[]);
+    let project = kioku_core::identify(&main).unwrap().id;
+    assert_eq!(kioku_core::identify(&wt_a).unwrap().id, project);
+
+    // worktree A and B start; each shows its lane and the shared project id
+    let out = start_in(&cfg, "a-1", &wt_a);
+    assert!(out.contains(&format!("(id: {project})")), "{out}");
+    assert!(out.contains("\nlane: task-a  ←"), "{out}");
+    let out = start_in(&cfg, "b-1", &wt_b);
+    assert!(out.contains("\nlane: feature/検索  ←"), "{out}");
+    write_handoff(&server.base, &project, "a-1", "タスクAの途中経過");
+    write_handoff(&server.base, &project, "b-1", "タスクBの途中経過");
+
+    // the default branch is the project lane: no lane line, and no branch's handoff
+    let out = start_in(&cfg, "main-1", &main);
+    assert!(!out.contains("\nlane: "), "{out}");
+    assert!(
+        !out.contains("タスクA") && !out.contains("タスクB"),
+        "{out}"
+    );
+    assert!(!out.contains("## 前回からの引き継ぎ"), "{out}");
+    write_handoff(&server.base, &project, "main-1", "メインラインの作業");
+
+    // each worktree gets only its own lane's handoff
+    let out = start_in(&cfg, "a-2", &wt_a);
+    assert!(out.contains("## 前回からの引き継ぎ"), "{out}");
+    assert!(out.contains("タスクAの途中経過"), "{out}");
+    assert!(
+        !out.contains("タスクB") && !out.contains("メインライン"),
+        "{out}"
+    );
+    let out = start_in(&cfg, "b-2", &wt_b);
+    assert!(out.contains("タスクBの途中経過"), "{out}");
+    assert!(!out.contains("タスクA"), "{out}");
+
+    // a new worktree without its own handoff sees the main line's, for reference only
+    let wt_c = wt("wt-c", "task-c");
+    let out = start_in(&cfg, "c-1", &wt_c);
+    assert!(out.contains("## メインの引き継ぎ（参考）"), "{out}");
+    assert!(out.contains("メインラインの作業"), "{out}");
+    assert!(!out.contains("## 前回からの引き継ぎ"), "{out}");
+    let pending = api_get(&server.base, &format!("handoffs/pending?project={project}"));
+    assert!(pending["handoff"]["accepted_at"].is_null(), "{pending}");
+
+    // ... so the default branch still receives it
+    let out = start_in(&cfg, "main-2", &main);
+    assert!(out.contains("## 前回からの引き継ぎ"), "{out}");
+    assert!(out.contains("メインラインの作業"), "{out}");
+
+    // a detached HEAD works on the project lane
+    assert!(git(&wt_c, &["checkout", "-q", "--detach"]));
+    let out = start_in(&cfg, "c-detached", &wt_c);
+    assert!(!out.contains("\nlane: "), "{out}");
+    assert!(!client_dir.path().join("logs/hook.log").exists());
+}
