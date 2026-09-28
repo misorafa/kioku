@@ -20,6 +20,7 @@ pub mod hook;
 pub mod install;
 pub mod logfile;
 pub mod render;
+pub mod rotate;
 pub mod service;
 pub mod setup;
 pub mod update;

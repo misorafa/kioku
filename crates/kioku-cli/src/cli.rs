@@ -181,6 +181,13 @@ pub enum Command {
     Reindex,
     /// Show server status and counts.
     Status,
+    /// Replace the server's auth token (run on the server machine), restart the service and
+    /// print the command for the other machines.
+    RotateToken {
+        /// Show what would change; write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Serve the kioku MCP tools on stdin/stdout for an agent, relaying to the server in
     /// [client] (what `kioku install` registers as the agents' MCP server).
     Mcp,

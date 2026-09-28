@@ -253,7 +253,7 @@ pub fn tilde(path: &Path, home: &Path) -> String {
     }
 }
 
-fn has_server_section(path: &Path) -> bool {
+pub(crate) fn has_server_section(path: &Path) -> bool {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|t| toml::from_str::<toml::Table>(&t).ok())
@@ -261,7 +261,7 @@ fn has_server_section(path: &Path) -> bool {
 }
 
 /// Authenticated `GET /api/v1/status`.
-fn check_status(client: &ClientConfig, timeout: Duration) -> anyhow::Result<()> {
+pub(crate) fn check_status(client: &ClientConfig, timeout: Duration) -> anyhow::Result<()> {
     ApiClient::new(client, timeout)?.get(&["status"], &[])?;
     Ok(())
 }
@@ -372,7 +372,7 @@ fn backup_config(config_path: &Path, backup: &Path) -> anyhow::Result<()> {
 }
 
 /// True when `url` is this machine's own server: a loopback host on `[server] port`.
-fn points_at_own_server(url: &str, cfg: &Config) -> bool {
+pub(crate) fn points_at_own_server(url: &str, cfg: &Config) -> bool {
     let Ok(u) = reqwest::Url::parse(url) else {
         return false;
     };
@@ -971,47 +971,79 @@ fn client_command(state: &ConfigState) -> Vec<String> {
         .or_else(|| cfg.server.auth_token.clone())
         .unwrap_or_else(|| "<token>".into());
     let mut out = vec![String::new()];
-    let mut mdns_name = None;
     let url = if state.client_only {
-        cfg.client.server_url.trim_end_matches('/').to_string()
-    } else {
-        let bind = cfg.server.bind.trim();
-        let wildcard = matches!(bind, "0.0.0.0" | "::" | "[::]" | "");
-        let host = if wildcard || cfg.is_loopback_bind() {
-            if wildcard {
-                mdns_name = local_host_name();
-            }
-            first_non_loopback_ip().unwrap_or_else(|| "<this-host>".into())
-        } else {
-            bind.to_string()
-        };
-        if cfg.is_loopback_bind() {
-            out.push(format!(
-                "note: this server listens on {bind} only; set [server] bind = \"0.0.0.0\" in {} and restart it (kioku service stop && kioku service start) so other machines can reach it",
-                cfg.config_file.display()
-            ));
+        ClientUrl {
+            url: cfg.client.server_url.trim_end_matches('/').to_string(),
+            mdns_alternative: None,
+            loopback_note: None,
         }
-        let host = if host.contains(':') && !host.starts_with('[') {
-            format!("[{host}]")
-        } else {
-            host
-        };
-        format!("http://{host}:{}", cfg.server.port)
+    } else {
+        client_url(cfg)
     };
+    out.extend(url.loopback_note.clone());
     out.push("On another machine (this line contains the auth token - keep it private):".into());
     out.push(format!(
-        "  curl -fsSL {} | sh -s -- --client-only {url} {token}",
-        install_sh_url()
+        "  curl -fsSL {} | sh -s -- --client-only {} {token}",
+        install_sh_url(),
+        url.url
     ));
-    if let Some(name) = mdns_name {
+    out.extend(url.alternative_line());
+    out
+}
+
+/// The URL other machines should use for this server (SPEC-M2 §11, §19.3).
+#[derive(Clone, Debug)]
+pub struct ClientUrl {
+    /// `http://<LAN IP or bind>:<port>`.
+    pub url: String,
+    /// `http://<host>.local:<port>` when the server binds every interface.
+    pub mdns_alternative: Option<String>,
+    /// A note when the server only listens on loopback.
+    pub loopback_note: Option<String>,
+}
+
+impl ClientUrl {
+    /// The "(the IP also works over a VPN …)" line, if there is an mDNS alternative.
+    pub fn alternative_line(&self) -> Option<String> {
         // SPEC-M2 §19.3: the IP also works over a VPN that routes this LAN; the mDNS name
         // survives address changes but only resolves on the LAN itself.
-        out.push(format!(
-            "  (the IP also works over a VPN that routes this network; machines that stay on this LAN can use http://{name}:{} instead, which survives an address change)",
-            cfg.server.port
-        ));
+        self.mdns_alternative.as_ref().map(|alt| {
+            format!(
+                "  (the IP also works over a VPN that routes this network; machines that stay on this LAN can use {alt} instead, which survives an address change)"
+            )
+        })
     }
-    out
+}
+
+/// [`ClientUrl`] for a server machine's config.
+pub fn client_url(cfg: &Config) -> ClientUrl {
+    let bind = cfg.server.bind.trim();
+    let wildcard = matches!(bind, "0.0.0.0" | "::" | "[::]" | "");
+    let mut mdns_alternative = None;
+    let host = if wildcard || cfg.is_loopback_bind() {
+        if wildcard {
+            mdns_alternative = local_host_name().map(|n| format!("http://{n}:{}", cfg.server.port));
+        }
+        first_non_loopback_ip().unwrap_or_else(|| "<this-host>".into())
+    } else {
+        bind.to_string()
+    };
+    let loopback_note = cfg.is_loopback_bind().then(|| {
+        format!(
+            "note: this server listens on {bind} only; set [server] bind = \"0.0.0.0\" in {} and restart it (kioku service stop && kioku service start) so other machines can reach it",
+            cfg.config_file.display()
+        )
+    });
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host
+    };
+    ClientUrl {
+        url: format!("http://{host}:{}", cfg.server.port),
+        mdns_alternative,
+        loopback_note,
+    }
 }
 
 /// This machine's mDNS name (`<host>.local`), from `hostname`; `None` if unavailable.

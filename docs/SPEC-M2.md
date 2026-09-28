@@ -1613,3 +1613,36 @@ agent:
 
 The server keeps serving `/mcp` over streamable HTTP, for `--mcp-http`
 agents and for clients without the binary.
+
+## 21. `kioku rotate-token` (added 2026-09-28, v0.4.2)
+
+Replaces the server's auth token, e.g. after it leaked into a log. Since
+v0.4.0 (§20) agents hold no token, so the only places to update are the
+server's config.toml and each client's config.toml.
+
+`kioku rotate-token [--dry-run]`, run on the **server machine**:
+
+1. **Refusals**, each with a message and nothing written:
+   - config.toml has no `[server]` section: "run it on the server machine";
+   - `KIOKU_AUTH_TOKEN` is set in the environment (Docker/k3s): env beats
+     the file, so the message says to change the variable instead.
+2. **New token.** A fresh `util::generate_token()` value becomes
+   `[server] auth_token`. When `[client]` points at this machine's own
+   server (a loopback host on `[server] port`), or its token equals the old
+   server token, `[client] auth_token` gets the new token too. The file is
+   written 0600 through `Config::save`, and its other keys are kept.
+3. **Restart.** If kioku's service is installed it is restarted (launchd
+   `kickstart -k` / `systemctl --user restart`). kioku then polls health and
+   checks `GET /status` with the new token (up to 15 s). Without a service
+   the message says to restart `kioku serve` by hand; `--dry-run` skips this.
+4. **Output.** The old token is rejected from now on. It prints, on its own
+   lines and marked as containing the token, the command for every other
+   machine:
+   `kioku setup --client-only <url> <new token>` (same URL rule as
+   `--print-client-command`: the LAN IP, with the `.local` alternative).
+   That command already verifies the token before writing (§11 step 2), and
+   re-registers agents, so any `--mcp-http` URL entry picks up the new
+   token.
+
+Clients that are not updated get HTTP 401. Hooks stay fail-open and log it,
+and `kioku doctor` shows `auth` FAIL with the fix "kioku setup --client-only".

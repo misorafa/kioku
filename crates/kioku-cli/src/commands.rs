@@ -120,6 +120,7 @@ pub fn run(cli: Cli) -> i32 {
         },
         Command::Reindex => reindex(),
         Command::Status => status(),
+        Command::RotateToken { dry_run } => return rotate_token(dry_run),
         Command::Mcp => Config::load()
             .map_err(anyhow::Error::from)
             .and_then(|cfg| crate::bridge::run(cfg.client)),
@@ -439,6 +440,26 @@ fn setup(opts: &crate::setup::SetupOptions) -> i32 {
     let report = crate::setup::run_setup(opts, &env);
     print!("{}", report.render());
     report.exit_code()
+}
+
+/// `kioku rotate-token [--dry-run]` (M2 §21); returns the exit code.
+fn rotate_token(dry_run: bool) -> i32 {
+    let env = match current_binary().and_then(crate::setup::SetupEnv::from_process) {
+        Ok(e) => e,
+        Err(err) => {
+            eprintln!("kioku: error: {err:#}");
+            return 1;
+        }
+    };
+    let report = crate::rotate::run_rotate(dry_run, &env);
+    for line in &report.lines {
+        if line.starts_with("kioku: error") {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
+    }
+    report.exit_code
 }
 
 /// `kioku doctor [--json] [--agent <name>]` (M2 §12); returns the exit code.

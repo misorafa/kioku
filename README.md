@@ -514,6 +514,10 @@ becomes `proj`). Use `.kioku.toml` to merge or rename projects.
   requires `Authorization: Bearer <token>`, including `/mcp`, whose Host-header
   allowlist is disabled so the token is the guard. The default bind is
   `127.0.0.1`.
+- **Rotating the token**: `kioku rotate-token` on the server machine writes a
+  new token, restarts the service (the old token is rejected from then on) and
+  prints `kioku setup --client-only <url> <new token>` to run on every other
+  machine. Agents hold no token since v0.4 (`kioku mcp`), so that is all.
 - Agent files that hold the token (`~/.claude.json`, `~/.codex/config.toml`,
   `~/.cursor/mcp.json`, `~/.gemini/settings.json`) are created 0600; an
   existing one that others could read is set to 0600 when kioku adds the token
