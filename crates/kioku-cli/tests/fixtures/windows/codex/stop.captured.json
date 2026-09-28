@@ -1,0 +1,11 @@
+{
+  "session_id": "01a0e772-4257-7553-aeb1-697345cbd8cb",
+  "turn_id": "01a0e791-d41f-71a3-bda5-eb14df55ee2e",
+  "transcript_path": "C:\\Users\\me\\AppData\\Roaming\\orca\\codex-runtime-home\\home\\sessions\\2026\\09\\28\\rollout-2026-09-28T18-57-00-01a0e772-4257-7553-aeb1-697345cbd8cb.jsonl",
+  "cwd": "C:\\Users\\me\\src\\kioku",
+  "hook_event_name": "Stop",
+  "model": "gpt-6-sol",
+  "permission_mode": "default",
+  "stop_hook_active": false,
+  "last_assistant_message": "README を要約しました。"
+}

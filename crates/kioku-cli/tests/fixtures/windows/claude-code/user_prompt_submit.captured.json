@@ -1,0 +1,10 @@
+{
+  "session_id": "10aa6ae4-b99a-4697-bf96-a954cbd40a66",
+  "transcript_path": "C:\\Users\\me\\.claude\\projects\\C--Users-me-src-kioku\\10aa6ae4-b99a-4697-bf96-a954cbd40a66.jsonl",
+  "cwd": "C:\\Users\\me\\src\\kioku",
+  "scratchpad_dir": "C:\\Users\\me\\AppData\\Local\\Temp\\claude\\C--Users-me-src-kioku\\10aa6ae4-b99a-4697-bf96-a954cbd40a66\\scratchpad",
+  "prompt_id": "80d4de1f-8086-4401-ab1a-667f878dd8b9",
+  "permission_mode": "auto",
+  "hook_event_name": "UserPromptSubmit",
+  "prompt": "README を要約して"
+}

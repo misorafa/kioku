@@ -1,0 +1,9 @@
+{
+  "session_id": "01a0e772-4257-7553-aeb1-697345cbd8cb",
+  "transcript_path": "C:\\Users\\me\\AppData\\Roaming\\orca\\codex-runtime-home\\home\\sessions\\2026\\09\\28\\rollout-2026-09-28T18-57-00-01a0e772-4257-7553-aeb1-697345cbd8cb.jsonl",
+  "cwd": "C:\\Users\\me\\src\\kioku",
+  "hook_event_name": "SessionStart",
+  "model": "gpt-6-sol",
+  "permission_mode": "default",
+  "source": "resume"
+}

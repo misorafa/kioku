@@ -1,0 +1,15 @@
+{
+  "session_id": "01a0e772-4257-7553-aeb1-697345cbd8cb",
+  "turn_id": "01a0e791-d41f-71a3-bda5-eb14df55ee2e",
+  "transcript_path": "C:\\Users\\me\\AppData\\Roaming\\orca\\codex-runtime-home\\home\\sessions\\2026\\09\\28\\rollout-2026-09-28T18-57-00-01a0e772-4257-7553-aeb1-697345cbd8cb.jsonl",
+  "cwd": "C:\\Users\\me\\src\\kioku",
+  "hook_event_name": "PostToolUse",
+  "model": "gpt-6-sol",
+  "permission_mode": "default",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "Get-Content README.md"
+  },
+  "tool_response": "# kioku\r\n\r\n日本語の README です。\r\n",
+  "tool_use_id": "exec-3877466a-b17e-4877-a275-fd7705d3b3c5"
+}

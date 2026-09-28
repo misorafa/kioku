@@ -925,3 +925,58 @@ fn relative_patch_paths_join_with_the_payload_os_separator() {
         r"C:\Users\山田\repo\src\検索.rs"
     );
 }
+
+/// Real Windows 11 payloads (SPEC-M2.2 §10, 2026-09-28): the Claude desktop app's Code tab
+/// (exec-form hooks) and Codex for Windows run from Orca (PowerShell tools). Windows paths
+/// stay as given, Japanese survives, CRLF inside tool output is kept.
+#[test]
+fn windows_captured_payloads() {
+    use HookEventKind::*;
+    let read = |agent: &str, name: &str| {
+        std::fs::read_to_string(format!(
+            "{}/tests/fixtures/windows/{agent}/{name}.captured.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+    };
+    let cwd = r"C:\Users\me\src\kioku";
+    for (agent, kind, name) in [
+        (Agent::ClaudeCode, SessionStart, "session_start"),
+        (Agent::ClaudeCode, UserPromptSubmit, "user_prompt_submit"),
+        (Agent::ClaudeCode, Stop, "stop"),
+        (Agent::ClaudeCode, SessionEnd, "session_end"),
+        (Agent::Codex, SessionStart, "session_start"),
+        (Agent::Codex, UserPromptSubmit, "user_prompt_submit"),
+        (Agent::Codex, PostToolUse, "post_tool_use_shell"),
+        (Agent::Codex, Stop, "stop"),
+        (Agent::Codex, SessionEnd, "session_end"),
+    ] {
+        let dir = if agent == Agent::ClaudeCode {
+            "claude-code"
+        } else {
+            "codex"
+        };
+        let ev = parse_event(agent, kind, &read(dir, name))
+            .unwrap_or_else(|e| panic!("{dir}/{name}: {e:#}"));
+        assert_eq!(ev.cwd, cwd, "{dir}/{name}");
+        assert!(!ev.session_id.is_empty());
+        if kind == UserPromptSubmit {
+            assert_eq!(ev.prompt.as_deref(), Some("README を要約して"), "{dir}");
+        }
+    }
+    let ev = parse_event(
+        Agent::Codex,
+        PostToolUse,
+        &read("codex", "post_tool_use_shell"),
+    )
+    .unwrap();
+    assert_eq!(ev.tool_name.as_deref(), Some("Bash"));
+    assert_eq!(
+        ev.tool_input,
+        Some(json!({"command": "Get-Content README.md"}))
+    );
+    assert_eq!(
+        ev.tool_response,
+        Some(json!("# kioku\r\n\r\n日本語の README です。\r\n"))
+    );
+}

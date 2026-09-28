@@ -148,11 +148,13 @@ All paths are the absolute path of `kioku.exe`, with backslashes, JSON-escaped.
     to a real executable such as a `.exe`" and that absolute paths with spaces
     are fine. The `shell` field is ignored when `args` is set. The shape above
     is what kioku writes.
-  - Still UNVERIFIED (needs the real app, §10): the Claude Code version that
-    introduced `args`, which the doc does not give. An older build that ignores
-    `args` would run the bare `kioku.exe` path through a shell. clap then exits
-    with code 2, which Claude Code treats as a blocking hook error. Check
-    `claude --version` on the Windows machine against a capture.
+  - **Resolved 2026-09-28** (real Windows 11, Claude desktop app, Code tab,
+    model claude-opus-5-5): the exec form runs. The dump shows
+    `argv = ["hook", "<event>"]` for SessionStart, UserPromptSubmit, Stop and
+    SessionEnd, every exit 0, the `<kioku>` block delivered on SessionStart,
+    and the Japanese prompt intact. Fixtures:
+    `tests/fixtures/windows/claude-code/*.captured.json`. How much older a
+    build can be and still honour `args` remains unknown.
   - The desktop app's Code tab reads the same files. VERIFIED from
     https://code.claude.com/docs/en/desktop ("Shared configuration"): "Hooks …
     defined in settings apply to both" and "MCP servers configured in
@@ -199,9 +201,15 @@ All paths are the absolute path of `kioku.exe`, with backslashes, JSON-escaped.
   fields. Whether `& "C:\…\kioku.exe" …` also works under the rare cmd.exe
   fallback is UNVERIFIED.
 
-  Still UNVERIFIED, because it needs the real app (§10): whether the Codex
-  **desktop app**'s released build behaves like `main` (it runs `commandWindows`
-  through PowerShell).
+  **Resolved 2026-09-28** (real Windows 11, Codex for Windows run from **Orca**;
+  its rollout lives under `%APPDATA%\orca\codex-runtime-home`): all six
+  registered events fire, with `argv = ["hook", "<event>", "--agent",
+  "codex"]` and exit 0, and the agent's shell tool is PowerShell
+  (`Get-Content README.md`, CRLF output). Orca's Codex runtime home therefore
+  still picks up `%USERPROFILE%\.codex\hooks.json`, at least natively on
+  Windows. Fixtures: `tests/fixtures/windows/codex/*.captured.json`. Whether
+  `commandWindows` or `command` was the field that ran is not visible in the
+  dump; both are written and both work.
 - **MCP:** the managed block in `config.toml` with
   `command = 'C:\…\kioku.exe'` (TOML literal string, so backslashes survive)
   and `args = ["mcp"]`.
@@ -236,7 +244,14 @@ Windows clients (same URL and token rule; marked as containing the token).
   which already works. Orca's isolated Codex home under WSL may not see
   `~/.codex/hooks.json`, which is a known limitation.
 
-## 10. Verification on the user's Windows (after CI is green)
+## 10. Verification on the user's Windows (after CI is green) — done 2026-09-28
+
+Result: install.ps1 with `-ClientOnly` installed v0.5.0 and ran setup, which
+registered claude-code, codex and cursor. `doctor` reported 0 failures. The
+one false WARN ("kioku is not on PATH": Windows names the variable `Path`)
+is fixed in eca84c4. A repository cloned from GitHub got the remote-based id
+(`github.com/ShinichiroGoto/room_kabu_com` → `room-kabu-com-…`), and its
+root was stored as a plain `C:\Users\…` path. Steps as run:
 
 1. Install with `install.ps1 -ClientOnly http://<server>:7391 <token>`.
 2. `kioku doctor` shows no FAIL.
