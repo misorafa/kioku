@@ -67,11 +67,41 @@ pub enum Command {
         /// the `kioku mcp` stdio bridge.
         #[arg(long)]
         mcp_http: bool,
-        /// Also print the command for other machines (`curl -fsSL
+        /// Also print the manual command for other machines (`curl -fsSL
         /// https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh -s --
-        /// --client-only <url> <token>`); it contains the token.
+        /// --client-only <url> <token>`); it contains the token. `kioku invite` is easier.
         #[arg(long)]
         print_client_command: bool,
+    },
+    /// On the server machine: print one line to paste on a new machine (installs kioku there
+    /// and joins this server; valid 10 minutes, once).
+    Invite {
+        /// Minutes the line stays valid (at most 60).
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..))]
+        ttl: u32,
+        /// How many machines may use it (at most 20).
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        uses: u32,
+    },
+    /// Join the server with a code from `kioku invite`: fetch its token, write a client-only
+    /// config and set up every detected agent (what the pasted invite line runs).
+    Join {
+        /// Server URL (`http://<host>:<port>`).
+        url: String,
+        /// Invite code.
+        code: String,
+        /// Only these agents (comma-separated).
+        #[arg(long, value_enum, value_delimiter = ',')]
+        agents: Vec<Agent>,
+        /// Do not install hooks / MCP for any agent.
+        #[arg(long)]
+        no_agents: bool,
+        /// Do not write the instruction snippets (AGENTS.md, GEMINI.md).
+        #[arg(long)]
+        no_instructions: bool,
+        /// Register the server URL + token as the agents' MCP server instead of `kioku mcp`.
+        #[arg(long)]
+        mcp_http: bool,
     },
     /// Manage the user-level background service (launchd / systemd --user) running `kioku serve`.
     Service {
@@ -441,6 +471,23 @@ mod tests {
             }
         ));
         assert!(p(&["reindex"]).is_ok());
+        assert!(matches!(
+            p(&["invite"]).unwrap().command,
+            Command::Invite { ttl: 10, uses: 1 }
+        ));
+        assert!(matches!(
+            p(&["invite", "--ttl", "30", "--uses", "3"])
+                .unwrap()
+                .command,
+            Command::Invite { ttl: 30, uses: 3 }
+        ));
+        assert!(p(&["invite", "--uses", "0"]).is_err());
+        assert!(matches!(
+            p(&["join", "http://192.168.1.240:7391", "K7Q2M9XD", "--agents", "codex"]).unwrap().command,
+            Command::Join { url, code, agents, .. }
+                if url == "http://192.168.1.240:7391" && code == "K7Q2M9XD" && agents == [Agent::Codex]
+        ));
+        assert!(p(&["join", "http://h:7391"]).is_err());
         assert!(p(&["status"]).is_ok());
     }
 }

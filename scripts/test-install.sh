@@ -1,6 +1,6 @@
 #!/bin/sh
 # shellcheck disable=SC2016,SC2034  # checks are eval'd strings; RC is read inside them
-# Tests for install.sh (docs/SPEC-M2.md §16.11). POSIX sh; run under dash and macOS sh:
+# Tests for install.sh (docs/SPEC-M2.md §16.11, SPEC-M2.3 §6). POSIX sh; run under dash and macOS sh:
 #
 #   scripts/test-install.sh                 # install.sh run with `sh`
 #   KIOKU_TEST_SH=dash scripts/test-install.sh
@@ -247,12 +247,18 @@ inst Linux x86_64 --no-setup
 check "latest resolves via redirect; Linux x86_64 -> musl" \
     eval '[ "$RC" = 0 ] && installed_is "9.9.9 (x86_64-unknown-linux-musl)" && has "installing kioku v9.9.9"'
 check "--no-setup does not run kioku setup" eval 'lacks STUB-ARGV && has "done (--no-setup)"'
-check "PATH hint for zsh" eval "has \"echo 'export PATH=\\\"\\\$HOME/.local/bin:\\\$PATH\\\"' >> ~/.zshrc\""
+RCLINE='export PATH="$HOME/.local/bin:$PATH" # added by the kioku installer'
+check "PATH added to ~/.zshrc (zsh)" \
+    eval 'has "added \$HOME/.local/bin to PATH in ~/.zshrc" && [ "$(cat "$H/.zshrc")" = "$RCLINE" ]'
+check "the rc line puts ~/.local/bin on PATH" \
+    eval '[ "$(env HOME="$H" PATH=/usr/bin /bin/sh -c ". \"\$HOME/.zshrc\"; printf %s \"\$PATH\"")" = "$H/.local/bin:/usr/bin" ]'
 check "no temp files left in the install dir" eval '[ -z "$(find "$H/.local/bin" -name ".kioku.new.*")" ]'
 
 inst Linux x86_64 --no-setup --version 9.9.8
 check "reinstall over an existing binary; musl does not run -> gnu" \
     eval '[ "$RC" = 0 ] && installed_is "9.9.8 (x86_64-unknown-linux-gnu)" && has "does not run here"'
+check "PATH line written exactly once" \
+    eval '[ "$(grep -c "added by the kioku installer" "$H/.zshrc")" = 1 ] && has "already on PATH in ~/.zshrc"'
 
 newhome
 inst Linux aarch64 --no-setup --version v9.9.9
@@ -269,16 +275,29 @@ check "Darwin arm64 -> aarch64-apple-darwin" eval '[ "$RC" = 0 ] && installed_is
 
 newhome
 T_SHELL=/bin/bash inst Darwin x86_64 --no-setup --version v9.9.9
-check "Darwin x86_64 -> x86_64-apple-darwin, bash hint uses .bash_profile" \
-    eval '[ "$RC" = 0 ] && installed_is x86_64-apple-darwin && has ">> ~/.bash_profile"'
+check "Darwin x86_64 -> x86_64-apple-darwin, bash on macOS -> ~/.bash_profile" \
+    eval '[ "$RC" = 0 ] && installed_is x86_64-apple-darwin && grep -F -x "$RCLINE" "$H/.bash_profile" >/dev/null && [ ! -e "$H/.bashrc" ]'
+
+newhome
+printf 'alias ll="ls -l"' >"$H/.bashrc"
+T_SHELL=/bin/bash inst Linux x86_64 --no-setup --version v9.9.9
+check "bash on Linux -> ~/.bashrc, appended after a last line without newline" \
+    eval '[ "$RC" = 0 ] && [ "$(sed -n 1p "$H/.bashrc")" = "alias ll=\"ls -l\"" ] && [ "$(sed -n 2p "$H/.bashrc")" = "$RCLINE" ]'
+
+newhome
+inst Linux x86_64 --no-setup --version v9.9.9 --no-modify-path
+check "--no-modify-path: only a hint, no rc file" \
+    eval '[ "$RC" = 0 ] && has "not on your PATH" && has ">> ~/.zshrc" && [ ! -e "$H/.zshrc" ]'
 
 newhome
 T_SHELL=/usr/bin/fish inst Linux x86_64 --no-setup --version v9.9.9
-check "fish PATH hint" eval 'has "fish_add_path \$HOME/.local/bin"'
+check "fish -> conf.d/kioku.fish" \
+    eval 'grep -F "set -gx PATH \"\$HOME/.local/bin\" \$PATH" "$H/.config/fish/conf.d/kioku.fish" >/dev/null'
 
 newhome
 T_PATH="$H/.local/bin:$FAKEBIN:$PATH0" inst Linux x86_64 --no-setup --version v9.9.9
-check "no PATH hint when the dir is on PATH" eval '[ "$RC" = 0 ] && lacks "not on your PATH"'
+check "PATH left alone when the dir is on PATH" \
+    eval '[ "$RC" = 0 ] && lacks "not on your PATH" && lacks "to PATH in" && [ ! -e "$H/.zshrc" ]'
 
 newhome
 mkdir -p "$H/.local/bin/kioku"
@@ -306,8 +325,8 @@ check "no checksum at all aborts, nothing installed" \
 
 newhome
 inst MINGW64_NT-10.0 x86_64 --no-setup
-check "Git Bash on Windows -> points at install.ps1, nothing installed" \
-    eval '[ "$RC" = 1 ] && has "use install.ps1 in PowerShell" && nothing_installed'
+check "Git Bash on Windows -> points at kioku invite / install.ps1, nothing installed" \
+    eval '[ "$RC" = 1 ] && has "use PowerShell: run kioku invite on the server" && has "install.ps1" && nothing_installed'
 
 # ---------------------------------------------------------------- source fallback
 
@@ -377,6 +396,39 @@ inst Linux x86_64 --version v9.9.9 --client-only http://h:7391 --no-setup
 check "--client-only takes the next two args verbatim" \
     eval '[ "$RC" = 0 ] && has "STUB-ARGV: [setup] [--client-only] [http://h:7391] [--no-setup]"'
 
+# ---------------------------------------------------------------- join mode (SPEC-M2.3 §4.1)
+
+# The script `GET /i/<code>` serves: install.sh with the two variables after the shebang.
+{
+    head -n 1 "$ROOT/install.sh"
+    printf "KIOKU_JOIN_URL='%s'\nKIOKU_JOIN_CODE='%s'\n" http://192.168.1.240:7391 K7Q2M9XD
+    tail -n +2 "$ROOT/install.sh"
+} >"$WORK/served.sh"
+newhome
+RC=0
+OUT=$(cd "$H" && env HOME="$H" SHELL=/bin/zsh PATH="$FAKEBIN:$PATH0" KIOKU_DOWNLOAD_BASE="$BASE" \
+    KIOKU_UNAME_S=Linux KIOKU_UNAME_M=x86_64 "$TEST_SH" <"$WORK/served.sh" 2>&1) || RC=$?
+check "served script piped to sh (curl … | sh) runs kioku join with the url and code" \
+    eval '[ "$RC" = 0 ] && has "STUB-ARGV: [join] [http://192.168.1.240:7391] [K7Q2M9XD]" && lacks "[setup]"'
+check "join mode puts kioku on PATH and says so in ja + en" \
+    eval 'grep -F -x "$RCLINE" "$H/.zshrc" >/dev/null && has "新しいターミナルを開くと kioku コマンドが使えます" && has "Open a new terminal"'
+
+newhome
+RC=0
+OUT=$(cd "$H" && env HOME="$H" SHELL=/bin/zsh PATH="$FAKEBIN:$PATH0" KIOKU_DOWNLOAD_BASE="$BASE" \
+    KIOKU_UNAME_S=Linux KIOKU_UNAME_M=x86_64 KIOKU_VERSION=v9.9.9 \
+    KIOKU_JOIN_URL=http://mini.local:7391 KIOKU_JOIN_CODE=ABCD2345 \
+    "$TEST_SH" "$ROOT/install.sh" --no-modify-path --agents codex 2>&1) || RC=$?
+check "KIOKU_JOIN_URL / KIOKU_JOIN_CODE env; extra args go to kioku join; --no-modify-path" \
+    eval '[ "$RC" = 0 ] && has "STUB-ARGV: [join] [http://mini.local:7391] [ABCD2345] [--agents] [codex]" &&
+        [ ! -e "$H/.zshrc" ] && lacks "新しいターミナル"'
+
+newhome
+inst Linux x86_64 --version v9.9.9 --join http://h:7391 CODE2345
+check "--join <url> <code>" eval '[ "$RC" = 0 ] && has "STUB-ARGV: [join] [http://h:7391] [CODE2345]"'
+inst Linux x86_64 --version v9.9.9 --join http://h:7391
+check "--join without a code is refused" eval '[ "$RC" = 1 ] && has "--join needs <url> <code>"'
+
 # ---------------------------------------------------------------- root, env, downloader
 
 newhome
@@ -384,15 +436,16 @@ FAKE_UID=0 inst Linux x86_64 --no-setup --version v9.9.9
 check "root without --install-dir is refused" eval '[ "$RC" = 1 ] && has "refusing to run as root" && nothing_installed'
 FAKE_UID=0 inst Linux x86_64 --no-setup --version v9.9.9 --install-dir "$H/opt bin"
 check "root with an explicit --install-dir is allowed" \
-    eval '[ "$RC" = 0 ] && [ -x "$H/opt bin/kioku" ] && has "$H/opt bin is not on your PATH"'
+    eval '[ "$RC" = 0 ] && [ -x "$H/opt bin/kioku" ] && has "added \$HOME/opt bin to PATH in ~/.zshrc"'
 
 newhome
 RC=0
 OUT=$(cd "$H" && env HOME="$H" SHELL=/bin/sh PATH="$FAKEBIN:$PATH0" KIOKU_DOWNLOAD_BASE="$BASE" \
     KIOKU_UNAME_S=Linux KIOKU_UNAME_M=x86_64 KIOKU_VERSION=v9.9.6 KIOKU_INSTALL_DIR="$H/envdir" \
     "$TEST_SH" "$ROOT/install.sh" --no-setup 2>&1) || RC=$?
-check "KIOKU_VERSION / KIOKU_INSTALL_DIR env, ~/.profile hint" \
-    eval '[ "$RC" = 0 ] && "$H/envdir/kioku" --version | grep -F 9.9.6 >/dev/null && has ">> ~/.profile"'
+check "KIOKU_VERSION / KIOKU_INSTALL_DIR env, sh -> ~/.profile" \
+    eval '[ "$RC" = 0 ] && "$H/envdir/kioku" --version | grep -F 9.9.6 >/dev/null && has "to PATH in ~/.profile" &&
+        grep -F -x "export PATH=\"\$HOME/envdir:\$PATH\" # added by the kioku installer" "$H/.profile" >/dev/null'
 
 if command -v wget >/dev/null 2>&1; then
     NOCURL="$WORK/nocurl"

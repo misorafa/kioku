@@ -1,30 +1,37 @@
-# kioku installer for Windows (docs/SPEC-M2.2.md section 6). Windows PowerShell 5.1 or PowerShell 7.
+# kioku installer for Windows (docs/SPEC-M2.2.md section 6, docs/SPEC-M2.3.md section 4).
+# Windows PowerShell 5.1 or PowerShell 7, normal or elevated.
 #
+#   irm http://192.168.1.240:7391/i/K7Q2M9XD.ps1 | iex     # the line `kioku invite` prints
 #   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/misorafa/kioku/main/install.ps1))) -ClientOnly http://192.168.1.240:7391 <token>
 #   & ([scriptblock]::Create((irm .../install.ps1))) -Version v0.5.0 -NoSetup
-#   powershell -ExecutionPolicy Bypass -File install.ps1 -ClientOnly http://home.lan:7391 <token>
+#   powershell -ExecutionPolicy Bypass -File install.ps1 -Join http://home.lan:7391 <code>
 #
 # Downloads kioku.exe (x86_64-pc-windows-msvc) from the GitHub release, verifies its
 # SHA-256 against the release's SHA256SUMS, installs it to
-# %LOCALAPPDATA%\Programs\kioku\kioku.exe and runs `kioku setup --client-only <url> <token>`.
+# %LOCALAPPDATA%\Programs\kioku\kioku.exe, adds that directory to the user PATH (and to this
+# window's $env:Path), then runs `kioku join <url> <code>` (join mode: $KiokuJoinUrl and
+# $KiokuJoinCode set, as the `/i/<code>.ps1` script of a kioku server does, or -Join) or
+# `kioku setup --client-only <url> <token>`.
 # Windows machines are kioku clients only: the server runs on macOS or Linux.
-# Never needs administrator rights and never edits PATH unless -AddToPath is given.
+# Never needs administrator rights; it always installs for the user who runs it.
 #
 # Options (an option wins over its environment variable):
 #   -Version <tag>        KIOKU_VERSION      release tag (default: latest)
 #   -InstallDir <dir>     KIOKU_INSTALL_DIR  destination (default: %LOCALAPPDATA%\Programs\kioku)
 #   -Repo <owner/name>    KIOKU_REPO         GitHub repository (default: misorafa/kioku)
+#   -Join <url> <code>                       run `kioku join <url> <code>` (an invite code)
 #   -ClientOnly <url> <token>                run `kioku setup --client-only <url> <token>`
-#   -NoSetup                                 install only, do not run `kioku setup`
-#   -AddToPath                               add the install directory to the user PATH
-#   anything else is passed to `kioku setup`, e.g. --agents codex,claude-code, --dry-run.
+#   -NoSetup                                 install only, do not run `kioku setup` / `join`
+#   -NoPath                                  do not add the install directory to PATH
+#   anything else is passed to `kioku setup` / `kioku join`, e.g. --agents codex,claude-code.
 # Test-only overrides: KIOKU_DOWNLOAD_BASE (replaces https://github.com/<repo>/releases),
 # KIOKU_ARCH (replaces PROCESSOR_ARCHITECTURE), KIOKU_USER_PATH_FILE (a file standing in
 # for the user PATH in the registry).
 #
 # Errors are thrown (never `exit`), so running it in an open PowerShell window never
 # closes the window. The body lives in functions called on the last line, so a truncated
-# download runs nothing.
+# download runs nothing. This file stays ASCII (Windows PowerShell 5.1 reads a BOM-less
+# -File script as ANSI): Japanese text is written with \u escapes (see Ja).
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -39,6 +46,21 @@ function Warn([string]$Message) {
 
 function Die([string]$Message) {
     throw "kioku-install: error: $Message"
+}
+
+# Japanese text from \u escapes (keeps this file ASCII).
+function Ja([string]$Escaped) {
+    return [regex]::Unescape($Escaped)
+}
+
+# True in an elevated ("Run as administrator") PowerShell.
+function Test-Elevated {
+    try {
+        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+        return ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        return $false
+    }
 }
 
 # The release target for this machine; dies on anything but x64.
@@ -236,23 +258,37 @@ function Set-UserPath([string]$Value) {
     [Environment]::SetEnvironmentVariable('Path', $Value, 'User')
 }
 
-# Tells how to put $Dir on the user PATH, or does it with -AddToPath.
-function Update-PathHint([string]$Dir, [bool]$Add) {
+# Puts $Dir on the user PATH (SPEC-M2.3 section 4.2) and on this window's $env:Path, or with
+# -NoPath only tells how. Returns $true when $Dir is on the user PATH afterwards.
+function Update-UserPath([string]$Dir, [bool]$NoPath) {
     $norm = { param($p) $p.Trim().TrimEnd('\').ToLowerInvariant() }
     $user = Get-UserPath
     $entries = @($user -split ';' | Where-Object { $_.Trim() -ne '' })
+    $present = $false
     foreach ($e in $entries) {
-        if ((& $norm $e) -eq (& $norm $Dir)) { return }
+        if ((& $norm $e) -eq (& $norm $Dir)) { $present = $true }
     }
-    if ($Add) {
+    if ($NoPath) {
+        if (-not $present) {
+            Say "$Dir is not on your user PATH; to use the kioku command, add it:"
+            Say "  [Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path', 'User') + ';$Dir', 'User')"
+            Say "(kioku setup and the agent hooks use the absolute path, so they work either way)"
+        }
+        return $present
+    }
+    if (-not $present) {
         $entries += $Dir
         Set-UserPath ($entries -join ';')
-        Say "added $Dir to your user PATH (open a new terminal to use it)"
-        return
+        Say "added $Dir to your user PATH / $(Ja '\u30e6\u30fc\u30b6\u30fc\u306e PATH \u306b\u8ffd\u52a0\u3057\u307e\u3057\u305f') (-NoPath skips this)"
     }
-    Say "$Dir is not on your user PATH; add it (this installer never edits it unless you pass -AddToPath):"
-    Say "  [Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path', 'User') + ';$Dir', 'User')"
-    Say "(kioku setup and the agent hooks use the absolute path, so they work either way)"
+    # This window too: after `irm ... | iex` the kioku command works right away.
+    $session = @($env:Path -split ';' | Where-Object { $_.Trim() -ne '' })
+    $inSession = $false
+    foreach ($e in $session) {
+        if ((& $norm $e) -eq (& $norm $Dir)) { $inSession = $true }
+    }
+    if (-not $inSession) { $env:Path = (($session + $Dir) -join ';') }
+    return $true
 }
 
 function Invoke-KiokuInstall([object[]]$Arguments) {
@@ -262,7 +298,12 @@ function Invoke-KiokuInstall([object[]]$Arguments) {
     $repo = $env:KIOKU_REPO
     if (-not $repo) { $repo = 'misorafa/kioku' }
     $setup = $true
-    $addToPath = $false
+    $noPath = $false
+    # Join mode (SPEC-M2.3 section 4.1): the server's /i/<code>.ps1 sets these two variables.
+    $joinUrl = ''
+    $joinCode = ''
+    if ($KiokuJoinUrl) { $joinUrl = [string]$KiokuJoinUrl }
+    if ($KiokuJoinCode) { $joinCode = [string]$KiokuJoinCode }
     $pass = New-Object System.Collections.Generic.List[string]
 
     $i = 0
@@ -290,10 +331,19 @@ function Invoke-KiokuInstall([object[]]$Arguments) {
             }
             continue
         }
+        if ($a -eq '-Join' -or $a -eq '--join') {
+            if ($i + 2 -ge $Arguments.Count) { Die "$a needs <url> <code>" }
+            $joinUrl = [string]$Arguments[$i + 1]
+            $joinCode = [string]$Arguments[$i + 2]
+            $i += 3
+            continue
+        }
         if ($a -eq '-NoSetup' -or $a -eq '--no-setup') { $setup = $false; $i += 1; continue }
-        if ($a -eq '-AddToPath') { $addToPath = $true; $i += 1; continue }
+        if ($a -eq '-NoPath' -or $a -eq '--no-modify-path') { $noPath = $true; $i += 1; continue }
+        # -AddToPath (before v0.6) is the default now.
+        if ($a -eq '-AddToPath') { $i += 1; continue }
         if ($a -eq '-Help' -or $a -eq '-h' -or $a -eq '--help') {
-            Say 'usage: install.ps1 [-Version <tag>] [-InstallDir <dir>] [-Repo <owner/name>] [-ClientOnly <url> <token>] [-NoSetup] [-AddToPath] [kioku setup options...]'
+            Say 'usage: install.ps1 [-Version <tag>] [-InstallDir <dir>] [-Repo <owner/name>] [-Join <url> <code> | -ClientOnly <url> <token>] [-NoSetup] [-NoPath] [kioku setup options...]'
             return
         }
         if ($a -eq '--') {
@@ -304,6 +354,10 @@ function Invoke-KiokuInstall([object[]]$Arguments) {
         $i += 1
     }
 
+    if ($joinUrl -and -not $joinCode) { Die 'join mode needs both $KiokuJoinUrl and $KiokuJoinCode (or -Join <url> <code>)' }
+    if (Test-Elevated) {
+        Say "this PowerShell runs as administrator, which is not needed: kioku is installed for $env:USERNAME only / $(Ja '\u7ba1\u7406\u8005\u3068\u3057\u3066\u5b9f\u884c\u3059\u308b\u5fc5\u8981\u306f\u3042\u308a\u307e\u305b\u3093\u3002\u3053\u306e\u30e6\u30fc\u30b6\u30fc\u306b\u3060\u3051\u30a4\u30f3\u30b9\u30c8\u30fc\u30eb\u3057\u307e\u3059\u3002')"
+    }
     if (-not $env:LOCALAPPDATA -and -not $dir) { Die 'LOCALAPPDATA is not set; pass -InstallDir' }
     if (-not $dir) { $dir = Join-Path $env:LOCALAPPDATA 'Programs\kioku' }
     $dir = [System.IO.Path]::GetFullPath($dir)
@@ -325,10 +379,26 @@ function Invoke-KiokuInstall([object[]]$Arguments) {
     Say "installing kioku $tag ($target)"
     $exe = Install-Kioku $base $tag $target $dir
 
-    Update-PathHint $dir $addToPath
+    $onPath = Update-UserPath $dir $noPath
 
     if (-not $setup) {
-        Say "done (-NoSetup). Next: & `"$exe`" setup --client-only <url> <token>"
+        if ($joinUrl) {
+            Say "done (-NoSetup). Next: & `"$exe`" join $joinUrl $joinCode"
+        } else {
+            Say "done (-NoSetup). Next: & `"$exe`" setup --client-only <url> <token>"
+        }
+        return
+    }
+    if ($joinUrl) {
+        # `kioku join` fetches the token itself and never prints it.
+        Say "running: $exe join $joinUrl"
+        $joinArgs = @('join', $joinUrl, $joinCode) + $pass.ToArray()
+        & $exe @joinArgs
+        $code = $LASTEXITCODE
+        if ($code -ne 0) { Die "kioku join did not finish (exit $code); see the message above" }
+        if ($onPath) {
+            Say "$(Ja 'kioku \u30b3\u30de\u30f3\u30c9\u306f\u65b0\u3057\u3044 PowerShell \u30a6\u30a3\u30f3\u30c9\u30a6\u3067\u4f7f\u3048\u307e\u3059\u3002') / The kioku command works in new PowerShell windows."
+        }
         return
     }
     # The arguments may hold the token: never echo them.

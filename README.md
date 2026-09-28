@@ -88,14 +88,20 @@ curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh
 musl build first, then the glibc one), verifies it against the release's
 `SHA256SUMS` (it refuses to install anything it cannot verify), installs it to
 `~/.local/bin/kioku` (atomic rename) and runs `kioku setup` (next section). If
-`~/.local/bin` is not on your `PATH` it prints the line to add for your shell
-(zsh / bash / fish); it never edits your shell files. Options:
+`~/.local/bin` is not on your `PATH` it adds one marked line,
+`export PATH="$HOME/.local/bin:$PATH" # added by the kioku installer`, to your
+shell's rc file (`~/.zshrc`; bash: `~/.bashrc`, on macOS `~/.bash_profile`;
+fish: `~/.config/fish/conf.d/kioku.fish`; otherwise `~/.profile`), once, so the
+`kioku` command works in new terminals. `--no-modify-path` only prints the line
+instead. Options:
 
 | option | env | default | |
 |--------|-----|---------|-|
 | `--version <tag>` | `KIOKU_VERSION` | `latest` | release to install |
 | `--install-dir <dir>` | `KIOKU_INSTALL_DIR` | `~/.local/bin` | destination |
 | `--repo <owner/name>` | `KIOKU_REPO` | `misorafa/kioku` | GitHub repository |
+| `--join <url> <code>` | `KIOKU_JOIN_URL`, `KIOKU_JOIN_CODE` | | run `kioku join` (see below) instead of `kioku setup` |
+| `--no-modify-path` | | | do not touch shell rc files |
 | `--from-source` | | | build with cargo instead of downloading |
 | `--no-setup` | | | install the binary only |
 
@@ -111,8 +117,36 @@ source build. By hand:
 `cargo install --locked --path crates/kioku-cli` in a checkout. `git` is
 optional at runtime (without it the wiki is not versioned).
 
-**Other machines** (laptop, desktop) talk to one server. On the server,
-`kioku setup --print-client-command` prints the exact command, token included:
+### Adding another machine: `kioku invite`
+
+Other machines (laptop, desktop, Windows PC) talk to one server. To add one, run
+this **on the server**:
+
+```
+$ kioku invite
+追加するマシンで、次のどちらか 1 行を貼り付けてください（10 分間・1 回だけ有効）:
+Paste ONE of these on the machine to add (valid 10 minutes, once):
+
+  Windows (PowerShell):  irm http://192.168.1.240:7391/i/K7Q2M9XD.ps1 | iex
+  macOS / Linux:         curl -sSL http://192.168.1.240:7391/i/K7Q2M9XD | sh
+
+(On this LAN you can also use http://mini-M2.local:7391/…; over a VPN use the IP.)
+```
+
+and paste the matching line on the new machine. That one line installs kioku
+(verified download, as above), puts it on `PATH`, fetches the server's token
+with the one-time code (the token is never shown or copied), writes a
+client-only `config.toml`, sets up every detected agent and ends with
+"kioku の準備ができました … / kioku is ready - restart Claude Code, …". A line
+that is expired or already used fails with one sentence saying to run
+`kioku invite` again. `--ttl <minutes>` (up to 60) and `--uses <n>` (up to 20)
+make one line work for several machines. On the new machine the same step is
+`kioku join <url> <code>` if kioku is already installed. After
+`kioku rotate-token`, run `kioku invite --uses <n>` and paste the new line on
+each machine: `join` replaces the old client config.
+
+The manual alternative still works: `kioku setup --print-client-command` on the
+server prints a command with the token in it,
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh -s -- --client-only http://<server>:7391 <token>
@@ -135,23 +169,30 @@ then `kioku service stop && kioku service start`. `kioku update` and
 
 On Windows 11 (x64) kioku runs natively as a **client**: hooks for Claude Code
 (the CLI and the Claude desktop app's Code tab) and the Codex desktop app / CLI,
-plus the `kioku mcp` bridge. The server stays on a Mac or Linux machine. On the
-server, `kioku setup --print-client-command` prints the PowerShell line after the
-`install.sh` one; run it in PowerShell (5.1 or 7, no administrator rights):
+plus the `kioku mcp` bridge. The server stays on a Mac or Linux machine. Run
+`kioku invite` on the server and paste its Windows line in PowerShell (5.1 or 7,
+normal or administrator — it always installs for your own user):
+
+```powershell
+irm http://192.168.1.240:7391/i/K7Q2M9XD.ps1 | iex
+```
+
+`install.ps1` downloads `kioku-<tag>-x86_64-pc-windows-msvc.tar.gz`, verifies it
+against `SHA256SUMS` (`Get-FileHash`), installs `kioku.exe` to
+`%LOCALAPPDATA%\Programs\kioku`, adds that directory to your user `PATH` (and to
+the open window, so `kioku` works right away; `-NoPath` opts out) and runs
+`kioku join`. The manual alternative, with the token from
+`kioku setup --print-client-command`:
 
 ```powershell
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/misorafa/kioku/main/install.ps1))) -ClientOnly http://<server>:7391 <token>
 ```
 
-`install.ps1` downloads `kioku-<tag>-x86_64-pc-windows-msvc.tar.gz`, verifies it
-against `SHA256SUMS` (`Get-FileHash`), installs `kioku.exe` to
-`%LOCALAPPDATA%\Programs\kioku` and runs `kioku setup --client-only <url> <token>`.
 Options: `-Version <tag>`, `-InstallDir <dir>`, `-Repo <owner/name>` (same
-environment variables as `install.sh`), `-NoSetup`, and `-AddToPath`: without it
-the installer only prints the command that adds the directory to your user
-`PATH` (the hooks use the absolute path, so they work either way). Other
-arguments go to `kioku setup`. `kioku setup` without `--client-only` refuses to
-run on Windows, and `kioku service` is not available there.
+environment variables as `install.sh`), `-Join <url> <code>`, `-ClientOnly <url>
+<token>`, `-NoSetup` and `-NoPath`. Other arguments go to `kioku setup` /
+`kioku join`. `kioku setup` without `--client-only` refuses to run on Windows,
+and `kioku service` is not available there.
 
 - **Hooks:** Claude Code gets the exec form (`"command": "C:\\…\\kioku.exe",
   "args": ["hook", "stop"]`), so no shell is involved; Codex gets a `command`
@@ -167,7 +208,7 @@ run on Windows, and `kioku service` is not available there.
   ACL (only you and administrators); the unix 0600/0700 modes do not apply.
 - **WSL and Orca:** an agent running inside WSL (Codex's "Agent environment =
   WSL", Orca's WSL terminals) runs Linux processes; install the Linux kioku
-  inside WSL with `install.sh --client-only …`. Orca gives a WSL-hosted Codex its
+  inside WSL by pasting the macOS / Linux line of `kioku invite`. Orca gives a WSL-hosted Codex its
   own isolated home, which may not see `~/.codex/hooks.json` (known limitation).
   A native Windows agent working in a `\\wsl.localhost\<distro>\…` repository
   should get the same project id through the git remote, but this is untested.
@@ -382,10 +423,11 @@ Run one server for all your machines. On a fresh server,
 `curl -fsSL …/install.sh | sh -s -- --bind 0.0.0.0` writes `[server] bind =
 "0.0.0.0"` into the new `config.toml` (an existing config is kept: edit `bind`
 there, then `kioku service stop && kioku service start`). Then run
-`kioku setup --print-client-command` and the printed command on every other
-machine.
+`kioku invite` for every other machine (see Install).
 
-**Which URL to use.** `--print-client-command` prints the server's LAN IP.
+**Which URL to use.** `kioku invite` (like `--print-client-command`) prints the
+server's LAN IP. The pasted line hands the new machine exactly the address it
+used to download the script, so whichever you choose is what it keeps.
 - The IP also works over a VPN that routes the LAN (WireGuard), but breaks if the server's address changes.
 - `<host>.local` survives address changes, but it is mDNS, so it only resolves on the LAN itself.
 - With `bind = "0.0.0.0"` the server listens on IPv4 and IPv6, so a name that resolves to IPv6 still reaches it.
@@ -436,7 +478,9 @@ The image runs `kioku serve` as a non-root user (uid 10001) with
 `KIOKU_DATA_DIR=/data` and `KIOKU_BIND=0.0.0.0`. No `config.toml` is needed:
 with `KIOKU_AUTH_TOKEN` set, the data directory is created on first start. Keep
 the token — clients need it for `install.sh … --client-only <url> <token>` (or
-`kioku setup --client-only`). On the Docker host itself, `kioku setup` sees the
+`kioku setup --client-only`). `docker exec kioku kioku invite` also works; it
+prints the container's address, so replace it with the Docker host's in the
+pasted line. On the Docker host itself, `kioku setup` sees the
 running server and does not install a service. A bind-mounted host
 directory must be writable by uid 10001. Extra arguments go to `kioku serve`
 (e.g. `--port 8000`), and `docker exec kioku kioku status` works inside the
@@ -552,13 +596,23 @@ becomes `proj`). Use `.kioku.toml` to merge or rename projects.
 
 - **Auth**: one bearer token, one user. `kioku serve` refuses to start without
   a token, whatever the bind address. Every route except `GET /api/v1/health`
-  requires `Authorization: Bearer <token>`, including `/mcp`, whose Host-header
-  allowlist is disabled so the token is the guard. The default bind is
-  `127.0.0.1`.
+  and the invite routes below requires `Authorization: Bearer <token>`,
+  including `/mcp`, whose Host-header allowlist is disabled so the token is the
+  guard. The default bind is `127.0.0.1`.
+- **Invites**: `kioku invite` (bearer-authenticated `POST /api/v1/invites`)
+  creates an 8-character code, held in the server's memory only, valid 10
+  minutes and once by default. `GET /i/<code>` and `GET /i/<code>.ps1` serve the
+  installer (no token in it) and `POST /api/v1/join` trades the code for the
+  token; these three need no token. More than 10 failed code lookups a minute
+  from one address (30 from all) get HTTP 429 for 60 seconds. Anyone who sees
+  an unused invite line can join, so treat it like the token for its 10
+  minutes; over plain HTTP the token crosses the network once, as it does with
+  every hook request.
 - **Rotating the token**: `kioku rotate-token` on the server machine writes a
-  new token, restarts the service (the old token is rejected from then on) and
-  prints `kioku setup --client-only <url> <new token>` to run on every other
-  machine. Agents hold no token since v0.4 (`kioku mcp`), so that is all.
+  new token, restarts the service (the old token is rejected from then on).
+  Then run `kioku invite --uses <n>` and paste its line on every other machine
+  (it also prints the manual `kioku setup --client-only <url> <new token>`).
+  Agents hold no token since v0.4 (`kioku mcp`), so that is all.
 - Agent files that hold the token (`~/.claude.json`, `~/.codex/config.toml`,
   `~/.cursor/mcp.json`, `~/.gemini/settings.json`) are created 0600; an
   existing one that others could read is set to 0600 when kioku adds the token

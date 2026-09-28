@@ -38,7 +38,7 @@ pub fn install_ps1_url() -> String {
 }
 
 /// Why `kioku setup` without `--client-only` stops on Windows (SPEC-M2.2 §4.7).
-pub const WINDOWS_CLIENT_ONLY: &str = "Windows runs kioku as a client: kioku setup --client-only <url> <token> (the server runs on macOS/Linux)";
+pub const WINDOWS_CLIENT_ONLY: &str = "Windows runs kioku as a client: kioku setup --client-only <url> <token> (the server runs on macOS/Linux; easiest: run kioku invite there and paste its Windows line here)";
 
 /// Version of this binary.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1006,7 +1006,17 @@ fn client_command(state: &ConfigState) -> Vec<String> {
         client_url(cfg)
     };
     out.extend(url.loopback_note.clone());
-    out.push("On another machine (this line contains the auth token - keep it private):".into());
+    if !state.client_only {
+        // SPEC-M2.3 §5: the invite line is the recommended way; this one is the manual path.
+        out.push(
+            "Easiest: run `kioku invite` here and paste the line it prints on the other machine (no token to copy)."
+                .into(),
+        );
+    }
+    out.push(
+        "Manually, on another machine (this line contains the auth token - keep it private):"
+            .into(),
+    );
     out.push(format!(
         "  curl -fsSL {} | sh -s -- --client-only {} {token}",
         install_sh_url(),

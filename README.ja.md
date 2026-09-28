@@ -81,14 +81,19 @@ curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh
 `install.sh` はこのマシン用のリリースバイナリをダウンロードし（Linux ではまず静的リンクの musl 版、
 次に glibc 版）、リリースの `SHA256SUMS` で検証し（検証できないものは決してインストールしません）、
 `~/.local/bin/kioku` にインストールして（アトミックな rename）、`kioku setup`（次の節）を実行します。
-`~/.local/bin` が `PATH` に無ければ、使っているシェル（zsh / bash / fish）用に追加する行を表示します。
-シェルの設定ファイルを書き換えることはありません。オプション:
+`~/.local/bin` が `PATH` に無ければ、シェルの設定ファイル（`~/.zshrc`、bash は `~/.bashrc`（macOS では
+`~/.bash_profile`）、fish は `~/.config/fish/conf.d/kioku.fish`、それ以外は `~/.profile`）に目印付きの
+1 行 `export PATH="$HOME/.local/bin:$PATH" # added by the kioku installer` を一度だけ追加し、新しい
+ターミナルで `kioku` コマンドが使えるようにします。`--no-modify-path` を付けると、追加する行を表示するだけです。
+オプション:
 
 | オプション | 環境変数 | 既定値 | |
 |------------|----------|--------|-|
 | `--version <tag>` | `KIOKU_VERSION` | `latest` | インストールするリリース |
 | `--install-dir <dir>` | `KIOKU_INSTALL_DIR` | `~/.local/bin` | インストール先 |
 | `--repo <owner/name>` | `KIOKU_REPO` | `misorafa/kioku` | GitHub リポジトリ |
+| `--join <url> <code>` | `KIOKU_JOIN_URL`、`KIOKU_JOIN_CODE` | | `kioku setup` の代わりに `kioku join`（後述）を実行する |
+| `--no-modify-path` | | | シェルの設定ファイルに触れない |
 | `--from-source` | | | ダウンロードせず cargo でビルドする |
 | `--no-setup` | | | バイナリのインストールだけ行う |
 
@@ -102,8 +107,33 @@ curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh
 `cargo install --locked --path crates/kioku-cli` です。実行時の `git` は任意です（無い場合 wiki は
 バージョン管理されません）。
 
-**ほかのマシン**（ノート PC、デスクトップ）は 1 台のサーバーに接続します。サーバーで
-`kioku setup --print-client-command` を実行すると、トークン入りの正確なコマンドが表示されます:
+### マシンを追加する: `kioku invite`
+
+ほかのマシン（ノート PC、デスクトップ、Windows PC）は 1 台のサーバーに接続します。追加するときは、
+**サーバーで**次を実行します:
+
+```
+$ kioku invite
+追加するマシンで、次のどちらか 1 行を貼り付けてください（10 分間・1 回だけ有効）:
+Paste ONE of these on the machine to add (valid 10 minutes, once):
+
+  Windows (PowerShell):  irm http://192.168.1.240:7391/i/K7Q2M9XD.ps1 | iex
+  macOS / Linux:         curl -sSL http://192.168.1.240:7391/i/K7Q2M9XD | sh
+
+(On this LAN you can also use http://mini-M2.local:7391/…; over a VPN use the IP.)
+```
+
+追加するマシンで、合う方の 1 行を貼り付けるだけです。この 1 行が kioku をインストールし（上と同じ検証付き
+ダウンロード）、`PATH` に追加し、使い捨てのコードでサーバーのトークンを受け取り（トークンは表示も
+コピーもされません）、クライアント用の `config.toml` を書き、見つかったすべてのエージェントを設定して、
+「kioku の準備ができました。Claude Code … を再起動してください。」で終わります。期限切れや使用済みの行は、
+`kioku invite` をもう一度実行するよう 1 文で伝えて終了します。`--ttl <分>`（最大 60）と `--uses <台数>`
+（最大 20）で、1 行を複数台に使えます。kioku が入っているマシンなら、同じことを `kioku join <url> <code>`
+で行えます。`kioku rotate-token` の後は、`kioku invite --uses <台数>` の行を各マシンに貼り付けてください
+（`join` は古いクライアント設定を置き換えます）。
+
+手動の方法も使えます。サーバーで `kioku setup --print-client-command` を実行すると、トークン入りの
+コマンドが表示されます:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh -s -- --client-only http://<server>:7391 <token>
@@ -125,20 +155,26 @@ macOS では、インストール済みのバイナリに `cp` で上書きし�
 Windows 11（x64）では、kioku は WSL を使わずネイティブの**クライアント**として動きます。対象は
 Claude Code（CLI と Claude デスクトップアプリの Code タブ）と Codex デスクトップアプリ / CLI のフック、
 それに `kioku mcp` ブリッジです。サーバーは Mac か Linux のマシンに置いたままにします。サーバーで
-`kioku setup --print-client-command` を実行すると、`install.sh` の行に続いて PowerShell 用の行が
-表示されます。PowerShell（5.1 または 7、管理者権限は不要）で実行します:
+`kioku invite` を実行し、Windows 用の行を PowerShell に貼り付けます（5.1 でも 7 でも、通常でも管理者でも
+構いません。いつも自分のユーザーにインストールします）:
+
+```powershell
+irm http://192.168.1.240:7391/i/K7Q2M9XD.ps1 | iex
+```
+
+`install.ps1` は `kioku-<tag>-x86_64-pc-windows-msvc.tar.gz` をダウンロードして `SHA256SUMS` で
+検証し（`Get-FileHash`）、`kioku.exe` を `%LOCALAPPDATA%\Programs\kioku` にインストールし、そのフォルダを
+ユーザーの `PATH`（と開いているウィンドウ。すぐに `kioku` が使えます）に追加して（`-NoPath` で無効）、
+`kioku join` を実行します。手動の方法（`kioku setup --print-client-command` が表示するトークン入りの行）:
 
 ```powershell
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/misorafa/kioku/main/install.ps1))) -ClientOnly http://<server>:7391 <token>
 ```
 
-`install.ps1` は `kioku-<tag>-x86_64-pc-windows-msvc.tar.gz` をダウンロードして `SHA256SUMS` で
-検証し（`Get-FileHash`）、`kioku.exe` を `%LOCALAPPDATA%\Programs\kioku` にインストールして
-`kioku setup --client-only <url> <token>` を実行します。オプションは `-Version <tag>`、
-`-InstallDir <dir>`、`-Repo <owner/name>`（環境変数は `install.sh` と同じ）、`-NoSetup`、`-AddToPath`
-です。`-AddToPath` が無ければ、ユーザーの `PATH` にディレクトリを追加するコマンドを表示するだけです
-（フックは絶対パスを使うので、どちらでも動きます）。それ以外の引数は `kioku setup` に渡されます。
-Windows では `--client-only` なしの `kioku setup` は実行を拒否し、`kioku service` も使えません。
+オプションは `-Version <tag>`、`-InstallDir <dir>`、`-Repo <owner/name>`（環境変数は `install.sh` と同じ）、
+`-Join <url> <code>`、`-ClientOnly <url> <token>`、`-NoSetup`、`-NoPath` です。それ以外の引数は
+`kioku setup` / `kioku join` に渡されます。Windows では `--client-only` なしの `kioku setup` は実行を拒否し、
+`kioku service` も使えません。
 
 - **フック:** Claude Code には exec 形式（`"command": "C:\\…\\kioku.exe", "args": ["hook", "stop"]`）
   を登録するので、シェルを経由しません。Codex には `command` と PowerShell 用の `commandWindows`
@@ -153,7 +189,7 @@ Windows では `--client-only` なしの `kioku setup` は実行を拒否し、`
 - **アクセス権:** `%USERPROFILE%\.kioku` 以下のファイルはユーザープロファイルの ACL（本人と管理者のみ）
   を引き継ぎます。unix の 0600 / 0700 は適用されません。
 - **WSL と Orca:** WSL の中で動くエージェント（Codex の「Agent environment = WSL」、Orca の WSL
-  ターミナル）は Linux のプロセスです。WSL の中に Linux 版の kioku を `install.sh --client-only …` で
+  ターミナル）は Linux のプロセスです。WSL の中に Linux 版の kioku を `kioku invite` の macOS / Linux 用の行で
   入れてください。Orca は WSL 上の Codex に専用のホームを与えるため、`~/.codex/hooks.json` が
   見えないことがあります（既知の制限）。ネイティブの Windows エージェントが
   `\\wsl.localhost\<distro>\…` のリポジトリで作業した場合も git のリモートから同じプロジェクト ID に
@@ -346,10 +382,12 @@ kioku status
 すべてのマシンで 1 台のサーバーを共有します。新しいサーバーでは
 `curl -fsSL …/install.sh | sh -s -- --bind 0.0.0.0` が新しい `config.toml` に `[server] bind =
 "0.0.0.0"` を書きます（既存の設定はそのまま残るので、そこで `bind` を編集してから
-`kioku service stop && kioku service start`）。続いて `kioku setup --print-client-command` を実行し、
-表示されたコマンドをほかのすべてのマシンで実行します。
+`kioku service stop && kioku service start`）。続いて、ほかのマシンごとに `kioku invite` を実行します
+（「インストール」を参照）。
 
-**接続先の選び方。** `--print-client-command` はサーバーの LAN の IP を表示します。
+**接続先の選び方。** `kioku invite`（と `--print-client-command`）はサーバーの LAN の IP を表示します。
+貼り付けた行は、スクリプトのダウンロードに使ったアドレスをそのまま新しいマシンに渡すので、選んだ
+アドレスがそのまま使われます。
 - IP は、LAN を経由させる VPN（WireGuard など）の先からも使えます。ただしサーバーの IP が変わると、つながらなくなります。
 - `<ホスト名>.local` は、IP が変わっても使えます。ただし mDNS なので、同じ LAN の中でしか名前が引けません。
 - kioku のサーバーは `bind = "0.0.0.0"` のとき IPv4 と IPv6 の両方で待ち受けます。そのため、名前が IPv6 に解決されても届きます。
@@ -394,6 +432,8 @@ docker run -d --name kioku -p 7391:7391 \
 `KIOKU_BIND=0.0.0.0` が設定されています。`config.toml` は不要です。`KIOKU_AUTH_TOKEN` が設定されていれば、
 初回起動時にデータディレクトリが作られます。トークンは控えておいてください（クライアントの
 `install.sh … --client-only <url> <token>`（または `kioku setup --client-only`）に必要です）。
+`docker exec kioku kioku invite` も使えますが、表示されるのはコンテナのアドレスなので、貼り付ける行では
+Docker ホストのアドレスに置き換えてください。
 Docker ホスト自身で `kioku setup` を実行すると、動いているサーバーを検出してサービスはインストールしません。ホストのディレクトリをバインドマウントする場合は、
 uid 10001 が書き込めるようにしてください。追加の引数は `kioku serve` に渡されます（例: `--port 8000`）。
 コンテナ内では `docker exec kioku kioku status` が使えます。
@@ -502,12 +542,19 @@ slug 部分では非 ASCII 文字が落とされます（日本語だけの名�
 ## セキュリティ
 
 - **認証**: トークン 1 つ、ユーザー 1 人。トークンが無いと、バインドアドレスに関係なく
-  `kioku serve` は起動しません。`GET /api/v1/health` 以外のすべてのルートで
+  `kioku serve` は起動しません。`GET /api/v1/health` と下の招待用ルート以外のすべてのルートで
   `Authorization: Bearer <token>` が必要です。`/mcp` も同様で、Host ヘッダの許可リストは無効に
   してあるため、トークンが唯一の防御です。既定のバインドは `127.0.0.1` です。
+- **招待**: `kioku invite`（トークン認証付きの `POST /api/v1/invites`）は 8 文字のコードを作ります。
+  コードはサーバーのメモリにだけあり、既定では 10 分間・1 回だけ有効です。`GET /i/<code>` と
+  `GET /i/<code>.ps1` はインストーラー（トークンは含みません）を返し、`POST /api/v1/join` がコードと
+  トークンを交換します。この 3 つはトークン不要です。1 つのアドレスから 1 分に 10 回（全体で 30 回）を
+  超えてコードの照合に失敗すると、60 秒間 HTTP 429 を返します。未使用の招待の行を見た人は参加できるので、
+  その 10 分間はトークンと同じように扱ってください。
 - **トークンの作り直し**: サーバーのマシンで `kioku rotate-token` を実行すると、新しいトークンを書き込み、
-  サービスを再起動します（以後、古いトークンは拒否されます）。ほかのマシンで実行する
-  `kioku setup --client-only <url> <新しいトークン>` が表示されるので、それを各マシンで実行します。
+  サービスを再起動します（以後、古いトークンは拒否されます）。続いて `kioku invite --uses <台数>` を
+  実行し、表示された行を各マシンに貼り付けます（手動用の `kioku setup --client-only <url> <新しいトークン>`
+  も表示されます）。
   v0.4 からエージェントはトークンを持たない（`kioku mcp`）ので、作業はこれだけです。
 - トークンを含むエージェントのファイル（`~/.claude.json`、`~/.codex/config.toml`、`~/.cursor/mcp.json`、
   `~/.gemini/settings.json`）は 0600 で作成します。ほかのユーザーが読める既存のファイルに kioku が

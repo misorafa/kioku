@@ -40,6 +40,7 @@ async fn everything_else_requires_the_token() {
         (Method::POST, "/api/v1/handoffs"),
         (Method::GET, "/api/v1/status"),
         (Method::POST, "/api/v1/reindex"),
+        (Method::POST, "/api/v1/invites"),
         (Method::POST, "/mcp"),
         (Method::GET, "/mcp"),
         (Method::GET, "/api/v1/nonexistent"),
