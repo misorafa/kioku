@@ -701,8 +701,10 @@ fn agent_lifecycle(agent: Agent) {
     assert!(body.contains(&format!("エージェント: {label}")), "{body}");
     match agent {
         Agent::Codex => {
-            assert!(body.contains("crates/kioku-cli/src/event.rs"), "{body}");
-            assert!(body.contains("docs/notes/codex.md"), "{body}");
+            // Relative patch paths are joined onto the cwd with its OS's separator.
+            let slashed = body.replace('\\', "/");
+            assert!(slashed.contains("crates/kioku-cli/src/event.rs"), "{body}");
+            assert!(slashed.contains("docs/notes/codex.md"), "{body}");
             assert!(body.contains("cargo test -p kioku-core"), "{body}");
         }
         Agent::Cursor => {
