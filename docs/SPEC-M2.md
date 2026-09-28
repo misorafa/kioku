@@ -1492,14 +1492,21 @@ it falls back to `0.0.0.0`. Any other bind value is used as given. The
 `ApiClient` (hooks, `search`, `status`, `reindex`, `doctor`):
 
 1. **Connect timeout split across addresses.** The reqwest client gets
-   `connect_timeout` = ⅔ of the invocation deadline. hyper divides it across
+   `connect_timeout` = ⅔ of the invocation deadline, capped at 4 s. Without the
+   cap, a 600 s command deadline let one dead address stall `kioku status` for
+   4 s. hyper divides it across
    the addresses a name resolves to, and races IPv6 against IPv4 (Happy
    Eyeballs, 300 ms), so one dead address cannot eat the whole budget.
 2. **Last-good addresses.** When `server_url` has a host *name* (not an IP
    literal), every successful response records the peer address
    (`Response::remote_addr`) in `~/.kioku/state/server-addrs.json`:
    `{"<host>:<port>": ["<ip>:<port>", …]}`, most recent first, at most 4, and
-   written only when the list changes.
+   written only when the list changes. A v4-mapped peer is stored as IPv4.
+   If the peer is an IPv6 link-local address (`fe80::/10`), which only works
+   on that LAN, the name's IPv4 addresses are resolved once and kept behind
+   it, as long as the list holds no IPv4 yet, so the VPN case still has a
+   routable address. This came up in the field: over the new dual-stack
+   server, the first address learned was `fe80::…%14`.
 3. **Try the last-good address first.** A request to a named host with a
    cached address first goes straight to those addresses: DNS is skipped via
    `resolve_to_addrs`, and the attempt gets ⅓ of the remaining time. If that

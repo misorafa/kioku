@@ -39,6 +39,10 @@ impl std::error::Error for HttpError {}
 /// File under `~/.kioku/state/` holding named servers' last-good addresses (SPEC-M2 §19.2).
 pub const ADDR_CACHE_FILE: &str = "server-addrs.json";
 
+/// Upper bound of the connect timeout: a LAN or VPN connect never needs longer, and a long
+/// command deadline must not let one dead address stall it (SPEC-M2 §19.2).
+const CONNECT_TIMEOUT_CAP: Duration = Duration::from_secs(4);
+
 /// Addresses kept per server in [`ADDR_CACHE_FILE`].
 const ADDR_CACHE_MAX: usize = 4;
 
@@ -89,7 +93,7 @@ impl ApiClient {
             }
             b
         };
-        let http = builder(total * 2 / 3)
+        let http = builder((total * 2 / 3).min(CONNECT_TIMEOUT_CAP))
             .build()
             .context("building HTTP client")?;
         let cache_key = named_host_key(&base);
@@ -179,7 +183,7 @@ impl ApiClient {
         if let (Some(key), Some(path), Some(addr)) =
             (&self.cache_key, &self.cache_path, resp.remote_addr())
         {
-            remember_addr(path, key, addr);
+            remember_addr(path, key, addr, self.base.host_str().unwrap_or_default());
         }
         let status = resp.status();
         let text = resp.text().context("reading response body")?;
@@ -231,24 +235,24 @@ fn read_addr_cache(path: &std::path::Path) -> BTreeMap<String, Vec<SocketAddr>> 
 }
 
 /// Puts `addr` first in `key`'s list (at most [`ADDR_CACHE_MAX`]); writes only on change.
+/// A link-local IPv6 peer only works on this LAN, so the name's IPv4 addresses are kept
+/// behind it (resolved once, while the list holds no IPv4) for use over a VPN.
 /// Best effort: errors are ignored.
-fn remember_addr(path: &std::path::Path, key: &str, addr: SocketAddr) {
-    // IPv4-mapped IPv6 peers (dual-stack servers) are stored as plain IPv4.
-    let addr = match addr {
-        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
-            Some(v4) => SocketAddr::new(v4.into(), v6.port()),
-            None => addr,
-        },
-        v4 => v4,
-    };
+fn remember_addr(path: &std::path::Path, key: &str, addr: SocketAddr, host: &str) {
     let mut cache = read_addr_cache(path);
-    let list = cache.entry(key.to_string()).or_default();
-    if list.first() == Some(&addr) {
+    let old = cache.get(key).cloned().unwrap_or_default();
+    let mut new_addrs = vec![unmap(addr)];
+    if is_link_local(&new_addrs[0]) && !old.iter().any(SocketAddr::is_ipv4) {
+        use std::net::ToSocketAddrs;
+        if let Ok(resolved) = (host, addr.port()).to_socket_addrs() {
+            new_addrs.extend(resolved.filter(SocketAddr::is_ipv4));
+        }
+    }
+    let merged = merge_addrs(&old, &new_addrs);
+    if merged == old {
         return;
     }
-    list.retain(|a| *a != addr);
-    list.insert(0, addr);
-    list.truncate(ADDR_CACHE_MAX);
+    cache.insert(key.to_string(), merged);
     let text: BTreeMap<&String, Vec<String>> = cache
         .iter()
         .map(|(k, v)| (k, v.iter().map(ToString::to_string).collect()))
@@ -259,6 +263,36 @@ fn remember_addr(path: &std::path::Path, key: &str, addr: SocketAddr) {
     if let Ok(json) = serde_json::to_string_pretty(&text) {
         let _ = kioku_core::util::write_private_file(path, &(json + "\n"));
     }
+}
+
+/// IPv4-mapped IPv6 peers (dual-stack servers) as plain IPv4.
+fn unmap(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(v4) => SocketAddr::new(v4.into(), v6.port()),
+            None => addr,
+        },
+        v4 => v4,
+    }
+}
+
+/// `fe80::/10`: reachable on this link only.
+fn is_link_local(addr: &SocketAddr) -> bool {
+    matches!(addr, SocketAddr::V6(v6) if (v6.ip().segments()[0] & 0xffc0) == 0xfe80)
+}
+
+/// `new` (in order, deduplicated) ahead of the old entries not in it, at most
+/// [`ADDR_CACHE_MAX`] — but a new IPv4 address is never dropped for an old one.
+fn merge_addrs(old: &[SocketAddr], new: &[SocketAddr]) -> Vec<SocketAddr> {
+    let mut out: Vec<SocketAddr> = Vec::new();
+    for a in new.iter().chain(old) {
+        if !out.contains(a) {
+            out.push(*a);
+        }
+    }
+    let keep = ADDR_CACHE_MAX.max(new.len().min(ADDR_CACHE_MAX + 2));
+    out.truncate(keep);
+    out
 }
 
 /// True when the URL's host is `localhost` or a loopback IP.
@@ -400,6 +434,34 @@ mod tests {
             2,
             "the old address is kept behind: {now:?}"
         );
+    }
+
+    #[test]
+    fn link_local_peers_keep_the_ipv4_addresses_for_vpn_use() {
+        let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let ll = a("[fe80::1%14]:7391");
+        assert!(is_link_local(&ll));
+        assert!(!is_link_local(&a("192.168.1.240:7391")));
+        assert_eq!(
+            unmap(a("[::ffff:192.168.1.240]:7391")),
+            a("192.168.1.240:7391")
+        );
+        // Link-local first, the name's IPv4 addresses kept behind it, old entries after.
+        let merged = merge_addrs(
+            &[a("10.0.0.9:7391")],
+            &[ll, a("192.168.1.240:7391"), a("192.168.1.57:7391")],
+        );
+        assert_eq!(
+            merged,
+            [
+                ll,
+                a("192.168.1.240:7391"),
+                a("192.168.1.57:7391"),
+                a("10.0.0.9:7391")
+            ]
+        );
+        // Re-learning the same first address changes nothing.
+        assert_eq!(merge_addrs(&merged, &[ll]), merged);
     }
 
     #[test]
