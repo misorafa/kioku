@@ -258,7 +258,7 @@ fn binary_check(env: &DoctorEnv) -> Check {
     let exe = canonical(Path::new(&env.bin));
     let mut warnings = Vec::new();
     let mut fix = None;
-    match find_on_path(env.vars.get("PATH").map(String::as_str).unwrap_or("")) {
+    match find_on_path(path_var(&env.vars)) {
         None => {
             warnings.push("`kioku` is not on PATH".to_string());
             fix = Path::new(&env.bin)
@@ -313,6 +313,19 @@ fn is_executable(p: &Path) -> bool {
     }
     #[cfg(not(unix))]
     true
+}
+
+/// The `PATH` value. Windows spells the variable `Path` and treats names case-insensitively,
+/// so any casing matches (found on a real Windows 11: `PATH` alone was missing).
+pub fn path_var(vars: &std::collections::HashMap<String, String>) -> &str {
+    vars.get("PATH")
+        .or_else(|| {
+            vars.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+                .map(|(_, v)| v)
+        })
+        .map(String::as_str)
+        .unwrap_or("")
 }
 
 /// The first `kioku` executable in `path_var` (split the platform's way: `;` and quoted
@@ -1340,6 +1353,18 @@ fn hook_dump_check(cfg: &Config, env: &DoctorEnv) -> Check {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_variable_is_found_in_any_casing() {
+        let vars = |k: &str| {
+            [(k.to_string(), "/a;/b".to_string())]
+                .into_iter()
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        assert_eq!(path_var(&vars("PATH")), "/a;/b");
+        assert_eq!(path_var(&vars("Path")), "/a;/b", "Windows spells it Path");
+        assert_eq!(path_var(&std::collections::HashMap::new()), "");
+    }
 
     #[test]
     fn loopback_binds_skip_the_lan_check() {
