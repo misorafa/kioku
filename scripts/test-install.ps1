@@ -316,13 +316,13 @@ try {
     Check '-NoPath: the user PATH is not edited, the exact command is shown' ($script:Rc -eq 0 -and (Has 'is not on your user PATH') -and (Has "SetEnvironmentVariable('Path'") -and (Get-Content -LiteralPath $PathFile -Raw) -eq 'C:\Windows\system32;C:\Tools')
 
     # Join mode (SPEC-M2.3 section 4.1): the pasted `irm .../i/<code>.ps1 | iex`.
-    Invoke-Install @('http://192.168.1.240:7391', 'K7Q2M9XD') 'iex' @{ KIOKU_VERSION = 'v9.9.9'; KIOKU_INSTALL_DIR = $Dir }
+    Invoke-Install @('http://192.168.1.240:7391', 'K7Q2M9XD') 'iex' @{ KIOKU_VERSION = 'v9.9.8'; KIOKU_INSTALL_DIR = $Dir }
     Check 'iex join mode: kioku.exe join <url> <code>, no setup' ($script:Rc -eq 0 -and (Has 'STUB-ARGV: [join] [http://192.168.1.240:7391] [K7Q2M9XD]') -and -not (Has '[setup]'))
     Check 'iex join mode: user PATH and this window''s $env:Path both get the dir' ((Get-Content -LiteralPath $PathFile -Raw) -eq "C:\Windows\system32;C:\Tools;$Dir" -and ($script:Out -split "`r?`n" | Where-Object { $_ -like 'SESSION-PATH=*' -and $_.Contains($Dir) }))
     Check 'iex join mode: bilingual end message, no variables left in the window' ((Has 'The kioku command works in new PowerShell windows') -and (Has 'LEAK=False'))
-    Invoke-Install @('-InstallDir', $Dir, '-Version', 'v9.9.9', '-Join', 'http://h:7391', 'CODE2345', '--agents', 'codex')
+    Invoke-Install @('-InstallDir', $Dir, '-Version', 'v9.9.8', '-Join', 'http://h:7391', 'CODE2345', '--agents', 'codex')
     Check '-Join <url> <code> plus args for kioku join' ($script:Rc -eq 0 -and (Has 'STUB-ARGV: [join] [http://h:7391] [CODE2345] [--agents] [codex]'))
-    Invoke-Install @('-InstallDir', $Dir, '-Version', 'v9.9.9', '-Join', 'http://h:7391')
+    Invoke-Install @('-InstallDir', $Dir, '-Version', 'v9.9.8', '-Join', 'http://h:7391')
     Check '-Join without a code is refused' ($script:Rc -ne 0 -and (Has '-Join needs <url> <code>'))
 
     Invoke-Install @('-InstallDir', $Dir, '-Version', 'v9.9.7', '-NoSetup')

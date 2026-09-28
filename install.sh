@@ -307,7 +307,7 @@ ensure_path() {
         return 0
     fi
     case "$DIR" in
-        *'"'* | *'\'* | *'`'* | *'$'*)
+        *'"'* | *\\* | *'`'* | *'$'*)
             path_hint
             return 0
             ;;

@@ -276,7 +276,11 @@ fn valid_port(p: &str) -> bool {
 
 /// install.sh with `KIOKU_JOIN_URL` / `KIOKU_JOIN_CODE` set right after the shebang.
 pub fn sh_script(url: &str, code: &str) -> String {
-    let body = INSTALL_SH.trim_start_matches('\u{feff}');
+    // LF only: a checkout with CRLF endings (Windows, autocrlf) must still serve a valid sh script.
+    let body = INSTALL_SH
+        .trim_start_matches('\u{feff}')
+        .replace("\r\n", "\n");
+    let body = body.as_str();
     let (first, rest) = match body.split_once('\n') {
         Some((f, r)) if f.starts_with("#!") => (format!("{f}\n"), r),
         _ => (String::new(), body),
@@ -602,6 +606,7 @@ mod tests {
         let sh = sh_script("http://192.168.1.240:7391", "K7Q2M9XD");
         let mut lines = sh.lines();
         assert_eq!(lines.next(), Some("#!/bin/sh"));
+        assert!(!sh.contains('\r'), "LF only, whatever the checkout");
         assert!(sh.contains("\nKIOKU_JOIN_URL='http://192.168.1.240:7391'\n"));
         assert!(sh.contains("\nKIOKU_JOIN_CODE='K7Q2M9XD'\n"));
         assert!(sh.trim_end().ends_with("main \"$@\""));
