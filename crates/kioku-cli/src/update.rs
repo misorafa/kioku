@@ -165,6 +165,16 @@ fn get(http: &reqwest::blocking::Client, url: &str) -> anyhow::Result<Option<Vec
     Ok(Some(resp.bytes()?.to_vec()))
 }
 
+/// True when `exe` lives in winget's portable package store
+/// (`…\\WinGet\\Packages\\misorafa.kioku_…\\kioku.exe`).
+pub fn is_winget_install(exe: &Path) -> bool {
+    let s = exe
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .replace('/', "\\");
+    s.contains("\\winget\\packages\\") || s.contains("\\winget\\links\\")
+}
+
 /// `kioku update [--version <tag>] [--check]`; returns the exit code (10 = `--check` found
 /// a newer release).
 pub fn run_update(version: Option<String>, check: bool) -> anyhow::Result<i32> {
@@ -189,6 +199,16 @@ pub fn run_update(version: Option<String>, check: bool) -> anyhow::Result<i32> {
     if check {
         println!("current: v{VERSION}\nlatest:  {tag} ({TARGET})");
         return Ok(if is_newer(&tag, VERSION) { 10 } else { 0 });
+    }
+    // A winget-managed install (packaging/winget): replacing the exe behind winget's back
+    // would leave winget believing the old version is installed.
+    if let Ok(exe) = std::env::current_exe()
+        && is_winget_install(&exe)
+    {
+        println!(
+            "kioku was installed with winget; update it with: winget upgrade misorafa.kioku (latest release: {tag})"
+        );
+        return Ok(0);
     }
     if !should_install(&tag, VERSION, explicit) {
         if explicit {
@@ -397,6 +417,20 @@ mod tests {
             });
         });
         format!("http://{}/releases", rx.recv().unwrap())
+    }
+
+    #[test]
+    fn winget_installs_are_recognised() {
+        assert!(is_winget_install(Path::new(
+            r"C:\Users\me\AppData\Local\Microsoft\WinGet\Packages\misorafa.kioku_Microsoft.Winget.Source_8wekyb3d8bbwe\kioku.exe"
+        )));
+        assert!(is_winget_install(Path::new(
+            r"C:\Users\me\AppData\Local\Microsoft\WinGet\Links\kioku.exe"
+        )));
+        assert!(!is_winget_install(Path::new(
+            r"C:\Users\me\AppData\Local\Programs\kioku\kioku.exe"
+        )));
+        assert!(!is_winget_install(Path::new("/Users/me/.local/bin/kioku")));
     }
 
     /// Regression (real Windows 11, 2026-09-29): a `kioku.exe.old` that cannot be deleted

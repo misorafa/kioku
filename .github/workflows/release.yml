@@ -87,11 +87,19 @@ jobs:
           fi
           # `<hex>  <file>` on every OS (Git Bash's sha256sum may mark binary mode with `*`).
           printf '%s  %s\n' "$sum" "$name.tar.gz" > "$name.tar.gz.sha256"
+          # winget accepts zip, not tar.gz: Windows also ships a zip with kioku.exe at its root
+          # (manifest: InstallerType zip, NestedInstallerType portable; packaging/winget/).
+          if [ "${{ runner.os }}" = Windows ]; then
+            pwsh -NoProfile -Command "Compress-Archive -Path '$name/*' -DestinationPath '$name.zip'"
+            zsum=$(sha256sum "$name.zip" | cut -d' ' -f1)
+            printf '%s  %s\n' "$zsum" "$name.zip" > "$name.zip.sha256"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: kioku-${{ matrix.target }}
           path: |
             dist/*.tar.gz
+            dist/*.zip
             dist/*.sha256
 
   release:
