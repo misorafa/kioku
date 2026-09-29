@@ -144,9 +144,7 @@ pub fn run(cli: Cli) -> i32 {
         Command::Reindex => reindex(),
         Command::Status => status(),
         Command::RotateToken { dry_run } => return rotate_token(dry_run),
-        Command::Mcp => Config::load()
-            .map_err(anyhow::Error::from)
-            .and_then(|cfg| crate::bridge::run(cfg.client)),
+        Command::Mcp => crate::bridge::run(kioku_core::util::env_vars()),
     };
     match result {
         Ok(()) => 0,

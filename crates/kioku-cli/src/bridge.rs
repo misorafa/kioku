@@ -1,12 +1,17 @@
 //! `kioku mcp` (M2 §20): a local MCP server on stdin/stdout that serves the same six tools
 //! as the server's `/mcp`, each backed by one REST request through [`ApiClient`] — so MCP
 //! gets the same connection robustness as hooks (§19.2), and agent config files hold
-//! neither the server URL nor the token.
+//! neither the server URL nor the token. The bridge lives as long as the agent session, so it
+//! re-reads config.toml before every call: a token rotated (or a server re-pointed) by
+//! `kioku rotate-token`, `setup` or `invite` mid-session must not leave it sending a stale
+//! token and failing every call with 401 until the agent restarts.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use kioku_core::{ClientConfig, Handoff, Hit, Page, StatusReport};
+use kioku_core::{ClientConfig, Config, Handoff, Hit, Page, StatusReport};
 use kioku_server::mcp::{
     HANDOFF_PENDING_DESC, HANDOFF_WRITE_DESC, HandoffPendingParams, HandoffWriteParams,
     INSTRUCTIONS, QUERY_DESC, QueryParams, READ_DESC, ReadParams, STATUS_DESC, WRITE_PAGE_DESC,
@@ -31,16 +36,46 @@ const QUERY_DEFAULT_LIMIT: usize = 8;
 /// The stdio MCP handler: the server's six tools, over REST.
 #[derive(Clone)]
 pub struct KiokuBridge {
+    /// The `[client]` section in use when config is not re-read (or a re-read fails).
     client: ClientConfig,
+    /// Environment to re-read config.toml with before each call (`KIOKU_*` overrides still
+    /// apply); `None` = always use `client`.
+    env: Option<Arc<HashMap<String, String>>>,
     tool_router: ToolRouter<KiokuBridge>,
 }
 
 impl KiokuBridge {
-    /// A bridge to the server in `client` (`[client] server_url` + token).
+    /// A bridge to the server in `client` (`[client] server_url` + token), fixed for its life.
     pub fn new(client: ClientConfig) -> KiokuBridge {
         KiokuBridge {
             client,
+            env: None,
             tool_router: Self::tool_router(),
+        }
+    }
+
+    /// A bridge that loads config with `env` now and re-reads it before every call.
+    pub fn from_env(env: HashMap<String, String>) -> anyhow::Result<KiokuBridge> {
+        let client = Config::load_with_env(&env)?.client;
+        Ok(KiokuBridge {
+            env: Some(Arc::new(env)),
+            ..KiokuBridge::new(client)
+        })
+    }
+
+    /// The `[client]` config for the next call: config.toml as it is now, else the last copy.
+    fn current_client(&self) -> ClientConfig {
+        let Some(env) = &self.env else {
+            return self.client.clone();
+        };
+        match Config::load_with_env(env) {
+            Ok(cfg) => cfg.client,
+            Err(e) => {
+                tracing::warn!(
+                    "kioku mcp: re-reading config failed, using the startup copy: {e:#}"
+                );
+                self.client.clone()
+            }
         }
     }
 
@@ -49,18 +84,19 @@ impl KiokuBridge {
         &self,
         f: impl FnOnce(&ApiClient) -> anyhow::Result<Value> + Send + 'static,
     ) -> Result<Value, String> {
-        let client = self.client.clone();
-        let url = client.server_url.clone();
+        let bridge = self.clone();
         tokio::task::spawn_blocking(move || {
-            let api = ApiClient::new(&client, CALL_TIMEOUT)?;
-            f(&api)
+            let client = bridge.current_client();
+            let url = client.server_url.clone();
+            ApiClient::new(&client, CALL_TIMEOUT)
+                .and_then(|api| f(&api))
+                .map_err(|e| match e.downcast_ref::<HttpError>() {
+                    Some(h) => h.message.clone(),
+                    None => format!("kioku server {url} unreachable: {e:#}"),
+                })
         })
         .await
         .map_err(|e| format!("kioku mcp: {e}"))?
-        .map_err(|e| match e.downcast_ref::<HttpError>() {
-            Some(h) => h.message.clone(),
-            None => format!("kioku server {url} unreachable: {e:#}"),
-        })
     }
 }
 
@@ -192,18 +228,71 @@ impl ServerHandler for KiokuBridge {
     }
 }
 
-/// `kioku mcp`: serves the bridge on stdin/stdout until the agent closes it.
-pub fn run(client: ClientConfig) -> anyhow::Result<()> {
+/// `kioku mcp`: serves the bridge (re-reading config with `env`) on stdin/stdout until the
+/// agent closes it.
+pub fn run(env: HashMap<String, String>) -> anyhow::Result<()> {
+    let bridge = KiokuBridge::from_env(env)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("starting the async runtime")?;
     runtime.block_on(async move {
-        let service = KiokuBridge::new(client)
+        let service = bridge
             .serve(rmcp::transport::stdio())
             .await
             .context("starting the MCP stdio server")?;
         service.waiting().await.context("serving MCP on stdio")?;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_config(dir: &std::path::Path, token: &str) {
+        std::fs::write(
+            dir.join("config.toml"),
+            format!("[client]\nserver_url = \"http://mini:7391\"\nauth_token = \"{token}\"\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn picks_up_a_token_rotated_mid_session() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), "old");
+        let env = HashMap::from([(
+            "KIOKU_DATA_DIR".to_string(),
+            dir.path().display().to_string(),
+        )]);
+        let bridge = KiokuBridge::from_env(env).unwrap();
+        assert_eq!(bridge.current_client().auth_token.as_deref(), Some("old"));
+
+        write_config(dir.path(), "new");
+        assert_eq!(bridge.current_client().auth_token.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn a_fixed_bridge_never_re_reads() {
+        let bridge = KiokuBridge::new(ClientConfig {
+            auth_token: Some("fixed".into()),
+            ..ClientConfig::default()
+        });
+        assert_eq!(bridge.current_client().auth_token.as_deref(), Some("fixed"));
+    }
+
+    #[test]
+    fn falls_back_to_the_startup_config_when_the_file_is_broken() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), "old");
+        let env = HashMap::from([(
+            "KIOKU_DATA_DIR".to_string(),
+            dir.path().display().to_string(),
+        )]);
+        let bridge = KiokuBridge::from_env(env).unwrap();
+
+        std::fs::write(dir.path().join("config.toml"), "[client\n").unwrap();
+        assert_eq!(bridge.current_client().auth_token.as_deref(), Some("old"));
+    }
 }
