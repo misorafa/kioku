@@ -99,6 +99,21 @@ fn http() -> reqwest::blocking::Client {
         .unwrap()
 }
 
+/// The session's info once the server has finalized it. A Stop hook gives up after
+/// `[client] timeout_ms` (3 s by default) while the server finishes the finalize on its own
+/// (digest, git commits); on a loaded Windows runner that outlives the hook, so a single
+/// read right after the hook raced it.
+fn wait_finalized(base: &str, sid: &str) -> Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let info = api_get(base, &format!("sessions/{sid}"));
+        if info["status"] == "finalized" || std::time::Instant::now() > deadline {
+            return info;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 fn api_get(base: &str, path: &str) -> Value {
     http()
         .get(format!("{base}/api/v1/{path}"))
@@ -213,7 +228,7 @@ fn full_session_lifecycle_with_nudge_and_handoff() {
     // 5. Stop again (even with stop_hook_active=false) → finalize, silent exit 0.
     let out = hook(&cfg, HookEventKind::Stop, stop_payload.clone());
     assert_eq!(out, HookOutcome::ok());
-    let info = api_get(&server.base, &format!("sessions/{sid}"));
+    let info = wait_finalized(&server.base, sid);
     assert_eq!(info["status"], "finalized");
     assert_eq!(info["has_agent_handoff"], true);
     assert_eq!(info["tool_uses_since_handoff"], 0);
@@ -337,10 +352,7 @@ fn stop_without_nudge_finalizes_and_failures_are_logged() {
         ),
     );
     assert_eq!(out, HookOutcome::ok(), "nudge disabled → finalize");
-    assert_eq!(
-        api_get(&server.base, &format!("sessions/{sid}"))["status"],
-        "finalized"
-    );
+    assert_eq!(wait_finalized(&server.base, sid)["status"], "finalized");
     // Rules handoff was produced for the next session.
     let pending = api_get(&server.base, &format!("handoffs/pending?project={PROJECT}"));
     assert_eq!(pending["handoff"]["source"], "rules");
@@ -682,7 +694,7 @@ fn agent_lifecycle(agent: Agent) {
     // 5. stop again → finalize, silent
     let out = run(&cfg, &env, agent, HookEventKind::Stop, &stop);
     assert_silent(agent, HookEventKind::Stop, &out);
-    let info = api_get(&server.base, &format!("sessions/{sid}"));
+    let info = wait_finalized(&server.base, &sid);
     assert_eq!(info["status"], "finalized", "{info}");
     // the session page carries the agent label and the normalized digest
     let fin: Value = http()
@@ -848,7 +860,7 @@ fn antigravity_lifecycle() {
         &with(stop.clone(), json!({"executionNum": 1})),
     );
     assert_silent(a, HookEventKind::Stop, &out);
-    assert_eq!(info()["status"], "finalized");
+    assert_eq!(wait_finalized(&server.base, sid)["status"], "finalized");
 
     // 5. A new prompt in the same conversation is recorded once more.
     transcript_step(
@@ -1071,7 +1083,7 @@ fn cursor_late_context_once_per_session_and_toggle() {
         &run(&cfg, &env, a, HookEventKind::Stop, &stop),
     );
     assert_eq!(
-        api_get(&server.base, "sessions/late-1")["status"],
+        wait_finalized(&server.base, "late-1")["status"],
         "finalized"
     );
     // loop_count > 0 (a follow-up already triggered): no nudge either.
