@@ -126,6 +126,9 @@ pub struct Session {
     /// Project root on the machine that ran this session (digest paths are relative to it).
     #[serde(default)]
     pub root_path: Option<String>,
+    /// Handoff lane (the git branch, M2.4 §1.1); `None` = the project lane.
+    #[serde(default)]
+    pub lane: Option<String>,
 }
 
 /// Input of `Store::start_session` (`POST /api/v1/sessions/start`).
@@ -144,6 +147,10 @@ pub struct SessionStartRequest {
     pub source: String,
     /// Project identity computed client-side.
     pub project: ProjectIdentity,
+    /// Handoff lane captured by the client (M2.4 §1.1); absent from older clients and on the
+    /// default branch = the project lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<String>,
 }
 
 fn default_agent() -> String {
@@ -172,6 +179,13 @@ pub struct SessionStartResponse {
     pub state_excerpt: Option<String>,
     /// Latest session pages of the project, newest first.
     pub recent_sessions: Vec<RecentSession>,
+    /// The session's lane (M2.4 §1.5); `None` = the project lane (or an older server).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<String>,
+    /// On a branch lane without a handoff of its own: the project lane's pending handoff,
+    /// shown for reference and NOT accepted (M2.4 §1.4 rule 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_handoff: Option<Handoff>,
 }
 
 /// Prompt / tool-use counts of a session.

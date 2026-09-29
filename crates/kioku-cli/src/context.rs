@@ -21,8 +21,13 @@ pub struct StartContext {
     pub session_id: String,
     /// Server URL shown to the agent.
     pub server_url: String,
+    /// The session's handoff lane (a branch), if not the project lane.
+    pub lane: Option<String>,
     /// Markdown of the handoff consumed by this session, if any.
     pub handoff: Option<String>,
+    /// Markdown of the main line's handoff shown for reference (not accepted) on a branch
+    /// lane without a handoff of its own (M2.4 §1.4); ignored when `handoff` is set.
+    pub reference: Option<String>,
     /// STATE.md excerpt (first 60 lines), if any.
     pub state: Option<String>,
 }
@@ -40,8 +45,15 @@ pub fn render_with_cap(lang: Lang, ctx: &StartContext, cap: usize) -> String {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
-    let mut handoff = clean(&ctx.handoff);
+    let reference = clean(&ctx.handoff).is_none() && clean(&ctx.reference).is_some();
+    let mut handoff = clean(&ctx.handoff).or_else(|| clean(&ctx.reference));
     let mut state = clean(&ctx.state);
+    let t = strings(lang);
+    let heading = if reference {
+        t.start_reference_heading
+    } else {
+        t.start_handoff_heading
+    };
     if handoff.is_some() {
         // STATE.md's first section repeats the pending handoff verbatim; print it once.
         state = state
@@ -49,7 +61,7 @@ pub fn render_with_cap(lang: Lang, ctx: &StartContext, cap: usize) -> String {
             .filter(|s| !s.is_empty());
     }
 
-    let mut out = assemble(lang, ctx, handoff.as_deref(), state.as_deref());
+    let mut out = assemble(lang, ctx, heading, handoff.as_deref(), state.as_deref());
     if len(&out) <= cap {
         return out;
     }
@@ -57,7 +69,7 @@ pub fn render_with_cap(lang: Lang, ctx: &StartContext, cap: usize) -> String {
     if let Some(s) = state.take() {
         let over = len(&out) - cap;
         state = shrink(&s, len(&s).saturating_sub(over));
-        out = assemble(lang, ctx, handoff.as_deref(), state.as_deref());
+        out = assemble(lang, ctx, heading, handoff.as_deref(), state.as_deref());
         if len(&out) <= cap {
             return out;
         }
@@ -65,7 +77,7 @@ pub fn render_with_cap(lang: Lang, ctx: &StartContext, cap: usize) -> String {
     if let Some(h) = handoff.take() {
         let over = len(&out) - cap;
         handoff = shrink(&h, len(&h).saturating_sub(over));
-        out = assemble(lang, ctx, handoff.as_deref(), state.as_deref());
+        out = assemble(lang, ctx, heading, handoff.as_deref(), state.as_deref());
         if len(&out) <= cap {
             return out;
         }
@@ -75,7 +87,13 @@ pub fn render_with_cap(lang: Lang, ctx: &StartContext, cap: usize) -> String {
     format!("{body}\n{CLOSE}")
 }
 
-fn assemble(lang: Lang, ctx: &StartContext, handoff: Option<&str>, state: Option<&str>) -> String {
+fn assemble(
+    lang: Lang,
+    ctx: &StartContext,
+    handoff_heading: &str,
+    handoff: Option<&str>,
+    state: Option<&str>,
+) -> String {
     let t = strings(lang);
     let mut out = String::from("<kioku>\n");
     out.push_str(&fill(
@@ -87,9 +105,13 @@ fn assemble(lang: Lang, ctx: &StartContext, handoff: Option<&str>, state: Option
         out.push_str(&fill(t.start_session_line, &[("id", &ctx.session_id)]));
         out.push('\n');
     }
+    if let Some(lane) = ctx.lane.as_deref().filter(|l| !l.trim().is_empty()) {
+        out.push_str(&fill(t.start_lane_line, &[("lane", lane)]));
+        out.push('\n');
+    }
     out.push_str(&format!("server: {}\n", ctx.server_url));
     if let Some(h) = handoff {
-        out.push_str(&format!("\n{}\n{h}\n", t.start_handoff_heading));
+        out.push_str(&format!("\n{handoff_heading}\n{h}\n"));
     }
     if let Some(s) = state {
         out.push_str(&format!("\n{}\n{s}\n", t.start_state_heading));
@@ -162,7 +184,38 @@ mod tests {
             server_url: "http://127.0.0.1:7391".into(),
             handoff,
             state,
+            ..StartContext::default()
         }
+    }
+
+    #[test]
+    fn lane_line_and_reference_handoff() {
+        let mut c = ctx(None, Some(STATE.into()));
+        c.lane = Some("feature/検索".into());
+        c.reference = Some("## 引き継ぎ（codex, 2026-09-29）\n### 要約\nメインの作業".into());
+        let out = render_session_start(Lang::Ja, &c);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[3].starts_with("lane: feature/検索  ← "), "{out}");
+        assert_eq!(lines[4], "server: http://127.0.0.1:7391");
+        assert!(
+            out.contains("\n## メインの引き継ぎ（参考）\n（このブランチ宛ての引き継ぎはまだない。"),
+            "{out}"
+        );
+        assert!(!out.contains("## 前回からの引き継ぎ"));
+        assert_eq!(out.matches("メインの作業").count(), 1, "{out}");
+        // STATE's latest-handoff section is the same main-line handoff: printed once
+        assert!(!out.contains("## 最新の引き継ぎ"), "{out}");
+
+        // an own handoff wins over the reference
+        c.handoff = Some("自分のレーンの引き継ぎ".into());
+        let out = render_session_start(Lang::En, &c);
+        assert!(out.contains("## Handoff from the previous session\n自分のレーン"));
+        assert!(!out.contains("Main line handoff"));
+        assert!(out.contains("\nlane: feature/検索  ← only this branch"));
+
+        // no lane → no lane line
+        let out = render_session_start(Lang::Ja, &ctx(None, None));
+        assert!(!out.contains("\nlane: "));
     }
 
     #[test]

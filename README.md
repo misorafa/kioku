@@ -500,7 +500,7 @@ the container speaks plain HTTP.
 | `kioku_read` | `path` | reads a page by its wiki-relative path (as shown in query results) |
 | `kioku_write_page` | `title`, `content`, `project?`, `scope?` (`project`/`global`), `tags?`, `path?` | saves a searchable Markdown page; the same title/path replaces it |
 | `kioku_handoff_write` | `project`, `session?` (from the SessionStart block), `summary`, `next_steps`, `open_questions`, `decisions` | records the handoff the next session of the project receives |
-| `kioku_handoff_pending` | `project`, `accept?` (default false) | peeks at (or consumes) the pending handoff |
+| `kioku_handoff_pending` | `project`, `accept?` (default false), `session?`, `lane?` | peeks at (or consumes) the pending handoff of the main line, or of a session's / named branch lane |
 | `kioku_status` | — | counts, data dir and known project ids |
 
 The server's MCP `instructions` tell the agent to query before exploring and to
@@ -592,7 +592,37 @@ prints it):
    sha256(canonical path)>` — tied to that path on that machine.
 
 Non-ASCII characters are dropped from the slug part (a Japanese-only name
-becomes `proj`). Use `.kioku.toml` to merge or rename projects.
+becomes `proj`). Use `.kioku.toml` to rename projects.
+
+**Adding a remote later is fine.** When a repository that had no remote gets
+`origin`, its id would change from the path form to the remote form. kioku
+notices that it is the same checkout (same root, the old project has no
+remote), keeps the old project and records the new id as an **alias** of it.
+Clones on other machines, which only ever compute the remote id, land in the
+same project. `kioku status` lists the aliases.
+
+**Merging two projects that split earlier:**
+
+```sh
+kioku project merge <from-id> <into-id> --dry-run   # what would move
+kioku project merge <from-id> <into-id>             # move sessions, handoffs, pages
+```
+
+Everything of `<from-id>` moves into `<into-id>` (pages into its wiki
+directory, with a git commit), and `<from-id>` keeps working as an alias.
+Running it again is harmless.
+
+### Parallel worktrees (Orca, `git worktree`)
+
+Several agents can work on one repository at once, one branch per worktree.
+They share the project (same id), but **handoffs are kept per branch**
+("lanes"): a session on branch `task-a` receives only handoffs written on
+`task-a`. The default branch (`main` / `master`, or `origin/HEAD`) is the
+main line, where every handoff lived before; it never receives a branch's
+handoff. A branch that has no handoff yet is shown the main line's handoff
+for reference, without consuming it. The `<kioku>` block shows `lane: <branch>`
+on a branch; nothing needs to be configured. Search, pages and STATE.md stay
+shared across branches.
 
 ## Security notes
 

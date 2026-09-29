@@ -78,8 +78,13 @@ pub struct Strings {
     pub start_project_line: &'static str,
     /// `{id}`: SessionStart context: line naming the session id.
     pub start_session_line: &'static str,
+    /// `{lane}`: SessionStart context: the session's handoff lane (a branch, M2.4 §1.5).
+    pub start_lane_line: &'static str,
     /// SessionStart context: heading of the pending handoff.
     pub start_handoff_heading: &'static str,
+    /// SessionStart context: heading of the main line's handoff shown for reference on a
+    /// branch lane without its own (M2.4 §1.4).
+    pub start_reference_heading: &'static str,
     /// SessionStart context: heading of the STATE.md excerpt.
     pub start_state_heading: &'static str,
     /// SessionStart context: closing instructions.
@@ -128,7 +133,9 @@ pub const JA: Strings = Strings {
     state_hot_files: "## よく触るファイル（直近10セッション）",
     start_project_line: "project: {name} (id: {id})  ← kioku_* ツールの project 引数にはこの id を渡すこと",
     start_session_line: "session: {id}  ← kioku_handoff_write の session 引数にはこの id を渡すこと",
+    start_lane_line: "lane: {lane}  ← このブランチの引き継ぎだけを受け取る（kioku_handoff_write に session を渡せばこのレーンに残る）",
     start_handoff_heading: "## 前回からの引き継ぎ",
+    start_reference_heading: "## メインの引き継ぎ（参考）\n（このブランチ宛ての引き継ぎはまだない。既定ブランチ向けのものを参考として表示しており、受領はしていない）",
     start_state_heading: "## 現在の状態（STATE.md 抜粋）",
     start_footer: "セッション終了前に kioku_handoff_write（上の project と session を渡す）で要約・次の一手・未解決点を書くこと。\n関連する過去の記録は kioku_query で検索できる。",
     stop_nudge: "kioku: このセッションの引き継ぎがまだ書かれていないか、最後の引き継ぎ以降に作業が進んでいます。kioku_handoff_write（project={project}, session={session}）で 要約 / 次にやること / 未解決の質問 / 決定事項 を記録してから終了してください。記録済みなら stop_hook_active により再度この確認は出ません。",
@@ -169,7 +176,9 @@ pub const EN: Strings = Strings {
     state_hot_files: "## Frequently touched files (last 10 sessions)",
     start_project_line: "project: {name} (id: {id})  ← pass this id as `project` to kioku_* tools",
     start_session_line: "session: {id}  ← pass this id as `session` to kioku_handoff_write",
+    start_lane_line: "lane: {lane}  ← only this branch's handoffs are delivered here (pass `session` to kioku_handoff_write to keep yours on this lane)",
     start_handoff_heading: "## Handoff from the previous session",
+    start_reference_heading: "## Main line handoff (for reference)\n(No handoff for this branch yet. This one belongs to the default branch; it is shown for reference and was not accepted.)",
     start_state_heading: "## Current state (STATE.md excerpt)",
     start_footer: "Before ending the session, record a summary, next steps and open questions with kioku_handoff_write (pass the project and session above).\nSearch past records with kioku_query.",
     stop_nudge: "kioku: no handoff has been written for this session yet, or work continued after the last one. Record summary / next steps / open questions / decisions with kioku_handoff_write (project={project}, session={session}) before stopping. If you already did, stop_hook_active prevents this check from repeating.",

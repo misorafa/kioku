@@ -302,6 +302,17 @@ pub enum ProjectCommand {
         /// Directory to identify.
         path: Option<std::path::PathBuf>,
     },
+    /// Fold project <FROM> into <INTO> on the server: sessions, handoffs and pages move,
+    /// <FROM> becomes an alias of <INTO> (M2.4 §2.3).
+    Merge {
+        /// Project id to fold in (it stops existing; its id keeps working as an alias).
+        from: String,
+        /// Project id that receives everything.
+        into: String,
+        /// Only list what would move.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// `--scope` values of `kioku search`.
@@ -459,6 +470,21 @@ mod tests {
         ));
         assert!(p(&["doctor", "--agent", "all"]).is_err());
         assert!(p(&["project", "id", "/tmp"]).is_ok());
+        assert!(matches!(
+            p(&[
+                "project",
+                "merge",
+                "kioku-71002b89",
+                "ai-agents-shared-memory-02036d30",
+                "--dry-run"
+            ])
+            .unwrap()
+            .command,
+            Command::Project {
+                command: ProjectCommand::Merge { dry_run: true, .. }
+            }
+        ));
+        assert!(p(&["project", "merge", "only-one"]).is_err());
         assert!(matches!(
             p(&["update", "--version", "v0.2.0"]).unwrap().command,
             Command::Update { version: Some(v), check: false } if v == "v0.2.0"

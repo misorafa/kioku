@@ -209,9 +209,70 @@ pub fn quiet_command(program: &str) -> std::process::Command {
     cmd
 }
 
+/// Runs `cmd` (stdin closed, stdout/stderr captured) and waits at most `deadline`; a child
+/// still running then is killed and `None` is returned (as when it cannot be spawned).
+/// Meant for small outputs (git plumbing): the pipes are read after the child exits.
+pub fn output_with_deadline(
+    mut cmd: std::process::Command,
+    deadline: std::time::Duration,
+) -> Option<std::process::Output> {
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if start.elapsed() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_with_deadline_returns_output_or_gives_up() {
+        let out = output_with_deadline(
+            {
+                let mut c = quiet_command("git");
+                c.arg("--version");
+                c
+            },
+            std::time::Duration::from_secs(10),
+        );
+        let Some(out) = out else {
+            return; // no git on this machine
+        };
+        assert!(String::from_utf8_lossy(&out.stdout).contains("git"));
+        assert!(
+            output_with_deadline(
+                quiet_command("kioku-no-such-binary"),
+                std::time::Duration::from_secs(1)
+            )
+            .is_none()
+        );
+        #[cfg(unix)]
+        {
+            let mut c = quiet_command("sleep");
+            c.arg("5");
+            let t = std::time::Instant::now();
+            assert!(output_with_deadline(c, std::time::Duration::from_millis(100)).is_none());
+            assert!(t.elapsed() < std::time::Duration::from_secs(3));
+        }
+    }
 
     #[test]
     fn plain_path_strips_the_verbatim_prefix() {

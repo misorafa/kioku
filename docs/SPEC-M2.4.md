@@ -142,3 +142,63 @@ Branch `m2.4-lanes-aliases`, draft PR against `main`, CI green on every job (ubu
 macOS, Windows, install scripts). README / README.ja: a short "parallel worktrees
 (Orca)" note and the `project merge` command. Update this spec with anything that
 turned out different. Do not merge, tag or change secrets.
+
+## 5. Implementation notes (2026-09-29, branch `m2.4-lanes-aliases`)
+
+Where the spec was silent or had to be made concrete. Each choice keeps
+today's single-branch behaviour unchanged.
+
+1. **§1.1 capture:** `kioku_core::project::lane(cwd, deadline)`. It runs
+   `current_branch` first and stops on a detached HEAD, then `default_branch`.
+   That is at most four `git` spawns per session start, each through
+   `util::output_with_deadline` (the `quiet_command` helper, so CREATE_NO_WINDOW
+   on Windows) with the hook's per-event deadline. It uses the hook's cwd, not
+   the project root, so a `.kioku.toml` project inside git also gets lanes.
+   `identify()`'s own git calls are unchanged. Truncation: 191 chars + `-` +
+   8 hex = 200 (`normalize_lane`, also applied by the server).
+2. **§1.3 resume:** a restarted session (resume / implicit start) takes the
+   lane of its latest start: the branch may have changed. An agent handoff
+   without `session` still attaches to the newest open session (M1), but it
+   goes to the project lane as §1.3 says.
+3. **§1.4 API shapes (additive):** `SessionStartResponse` and
+   `GET /sessions/{id}/context` gain `lane` and `reference_handoff`. Both are
+   omitted when unset, so an old client's payloads and replies are byte-for-byte
+   what they were. `GET /handoffs/pending` gains `lane` (an empty value means
+   the project lane). Without `lane`, the lane of `session` is used, else the
+   project lane. The reply gains `reference_handoff`, which is never accepted,
+   not even with `accept=true`. The MCP `kioku_handoff_pending` got both
+   `session` and `lane`, because §1.4 routes by session. Its text for a
+   reference starts with `no handoff on this lane. Main line handoff (for
+   reference, not accepted)`.
+4. **STATE.md (not in the spec):** every lane reads STATE.md, so its "latest
+   handoff" is now the newest handoff **on the project lane**. Otherwise a
+   branch's handoff would reach the default branch through the STATE excerpt,
+   which §1.4 forbids. "Recent sessions" and "hot files" still cover all
+   lanes. The `<kioku>` block drops STATE's latest-handoff section whenever a
+   handoff or a reference is printed, since it is the same text.
+5. **§1.5 block:** the lane line comes right after `session:`. Its text is
+   localized (`strings.rs` `start_lane_line`). The reference heading is
+   followed by one line explaining that it was not accepted.
+6. **§2.1 "same checkout":** the server needs to tell a git id apart from a
+   `.kioku.toml` id without changing the protocol. So an alias is made only
+   when the requested id **equals `id_from_remote(basename(root), remote)`**.
+   The existing project must have no `remote_url` and an id of the form
+   `<slug>-<8 hex>`. Roots are compared after stripping `\\?\` and trailing
+   `/` or `\`. If several projects match, the first by id wins. The canonical
+   project's name, root and remote then follow the new identity, as every
+   session start already did.
+7. **§2.2 resolution** happens in `Store` (so the HTTP API and MCP share it):
+   session start, `project()`, `write_page`, `write_handoff`,
+   `pending_handoff*`, `latest_handoff` and `search` with a project scope.
+   Status: `StatusReport.aliases` (`[{alias, project_id}]`), printed by
+   `kioku status` and `kioku_status`.
+8. **§2.3 merge:** new route `POST /api/v1/projects/merge {from, into,
+   dry_run}`. It returns a `MergeReport` of counts plus `(old, new)` page
+   paths. The CLI always goes through it, so it works from any client. The
+   `from` project row is deleted, observations and raw logs move too, and
+   aliases that pointed at `from` are re-pointed. `into` may itself be given
+   as an alias. `from`'s STATE.md is dropped and `into`'s is rewritten after
+   the reindex. A page name already taken in `into` becomes
+   `<stem>-<from>[-N].md`. Running the merge again once `from` is an alias of
+   `into` returns `already_merged: true` and changes nothing. An unknown `from`
+   gives 404, and `from == into` gives 400.

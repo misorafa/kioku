@@ -1,5 +1,5 @@
 //! Implementations of the commands: the `hook` entry point (config / stdin / dump
-//! plumbing around the handlers), init, serve, search, status, reindex, project id,
+//! plumbing around the handlers), init, serve, search, status, reindex, project id / merge,
 //! install / uninstall, `hook-dump extract`, and the machine-setup commands `setup`,
 //! `service` and `doctor` (M2 §10–§12).
 
@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use kioku_core::util::home_dir;
-use kioku_core::{Config, Hit, StatusReport, Store, identify};
+use kioku_core::{Config, Hit, MergeReport, StatusReport, Store, identify};
 use serde_json::Value;
 
 use crate::cli::{
@@ -137,6 +137,14 @@ pub fn run(cli: Cli) -> i32 {
         Command::Project {
             command: ProjectCommand::Id { path },
         } => project_id(path),
+        Command::Project {
+            command:
+                ProjectCommand::Merge {
+                    from,
+                    into,
+                    dry_run,
+                },
+        } => project_merge(&from, &into, dry_run),
         Command::Update { version, check } => match crate::update::run_update(version, check) {
             Ok(code) => return code,
             Err(err) => Err(err),
@@ -427,6 +435,12 @@ fn status() -> anyhow::Result<()> {
         "git          : {}",
         if s.git_enabled { "enabled" } else { "disabled" }
     );
+    if !s.aliases.is_empty() {
+        println!(
+            "aliases      : {}",
+            kioku_server::mcp::format_aliases(&s.aliases)
+        );
+    }
     Ok(())
 }
 
@@ -436,6 +450,51 @@ fn reindex() -> anyhow::Result<()> {
     let docs = body.get("docs").and_then(Value::as_u64).unwrap_or(0);
     println!("reindexed {docs} pages");
     Ok(())
+}
+
+/// `kioku project merge <from> <into> [--dry-run]` → `POST /projects/merge`.
+fn project_merge(from: &str, into: &str, dry_run: bool) -> anyhow::Result<()> {
+    let (_, client) = command_client()?;
+    let body = client.post(
+        &["projects", "merge"],
+        &serde_json::json!({"from": from, "into": into, "dry_run": dry_run}),
+    )?;
+    let report: MergeReport =
+        serde_json::from_value(body).context("unexpected projects/merge response")?;
+    print!("{}", format_merge(&report));
+    Ok(())
+}
+
+/// Human-readable `kioku project merge` report.
+pub fn format_merge(r: &MergeReport) -> String {
+    if r.already_merged {
+        return format!(
+            "{} is already merged into {} (it is an alias); nothing to do\n",
+            r.from, r.into
+        );
+    }
+    let mut out = format!(
+        "{} {} into {}: {} sessions, {} observations, {} handoffs, {} pages\n",
+        if r.dry_run { "would merge" } else { "merged" },
+        r.from,
+        r.into,
+        r.sessions,
+        r.observations,
+        r.handoffs,
+        r.pages.len()
+    );
+    for (old, new) in &r.pages {
+        out.push_str(&format!("  {old} → {new}\n"));
+    }
+    if r.dry_run {
+        out.push_str("(dry run: nothing changed)\n");
+    } else {
+        out.push_str(&format!(
+            "{} now resolves to {} everywhere (alias)\n",
+            r.from, r.into
+        ));
+    }
+    out
 }
 
 fn project_id(path: Option<PathBuf>) -> anyhow::Result<()> {
@@ -752,6 +811,44 @@ fn uninstall_cmd(target: InstallTarget, project: bool, dry_run: bool) -> anyhow:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_report_text() {
+        let r = MergeReport {
+            from: "kioku-71002b89".into(),
+            into: "ai-agents-shared-memory-02036d30".into(),
+            dry_run: true,
+            sessions: 3,
+            observations: 40,
+            handoffs: 2,
+            pages: vec![(
+                "kioku-71002b89/pages/設計.md".into(),
+                "ai-agents-shared-memory-02036d30/pages/設計.md".into(),
+            )],
+            ..MergeReport::default()
+        };
+        let out = format_merge(&r);
+        assert!(out.starts_with(
+            "would merge kioku-71002b89 into ai-agents-shared-memory-02036d30: 3 sessions, 40 observations, 2 handoffs, 1 pages\n"
+        ));
+        assert!(out.contains(
+            "  kioku-71002b89/pages/設計.md → ai-agents-shared-memory-02036d30/pages/設計.md\n"
+        ));
+        assert!(out.ends_with("(dry run: nothing changed)\n"));
+        let done = format_merge(&MergeReport {
+            dry_run: false,
+            ..r.clone()
+        });
+        assert!(done.starts_with("merged "));
+        assert!(
+            done.ends_with("now resolves to ai-agents-shared-memory-02036d30 everywhere (alias)\n")
+        );
+        let again = format_merge(&MergeReport {
+            already_merged: true,
+            ..r
+        });
+        assert!(again.contains("already merged"));
+    }
 
     #[test]
     fn hits_formatting() {

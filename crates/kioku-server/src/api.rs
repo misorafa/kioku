@@ -102,6 +102,7 @@ pub fn protected_routes(store: Arc<Store>) -> Router {
         .route("/api/v1/handoffs/pending", get(pending_handoff))
         .route("/api/v1/handoffs", post(write_handoff))
         .route("/api/v1/status", get(status))
+        .route("/api/v1/projects/merge", post(merge_projects))
         .route("/api/v1/reindex", post(reindex))
         .with_state(store)
 }
@@ -219,19 +220,28 @@ struct PendingParams {
     accept: bool,
     #[serde(default)]
     session: Option<String>,
+    #[serde(default)]
+    lane: Option<String>,
 }
 
-/// `GET /api/v1/handoffs/pending?project=&accept=&session=` → `{handoff}` (null when none).
+/// `GET /api/v1/handoffs/pending?project=&accept=&session=&lane=` → `{handoff}` (null when
+/// none), plus `reference_handoff` on a branch lane without its own (M2.4 §1.4). The lane is
+/// `lane` (empty = the project lane), else the session's, else the project lane.
 async fn pending_handoff(
     State(store): State<Arc<Store>>,
     params: Result<Query<PendingParams>, QueryRejection>,
 ) -> ApiResult {
     let Query(p) = params?;
-    let handoff = blocking(&store, move |s| {
-        s.pending_handoff(&p.project, p.accept, p.session.as_deref())
+    let routed = blocking(&store, move |s| {
+        s.pending_handoff_routed(
+            &p.project,
+            p.accept,
+            p.session.as_deref(),
+            p.lane.as_deref(),
+        )
     })
     .await?;
-    Ok(Json(json!({ "handoff": handoff })))
+    to_json(routed)
 }
 
 /// `POST /api/v1/handoffs` → `{id, project_id}`.
@@ -263,6 +273,29 @@ async fn status(State(store): State<Arc<Store>>) -> ApiResult {
         serde_json::to_value(report).map_err(|e| Error::Internal(anyhow::Error::from(e)))?;
     v["project_ids"] = json!(projects);
     Ok(Json(v))
+}
+
+/// Body of `POST /api/v1/projects/merge`.
+#[derive(Debug, Deserialize)]
+struct MergeBody {
+    from: String,
+    into: String,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// `POST /api/v1/projects/merge {from, into, dry_run?}` → the merge report (M2.4 §2.3).
+async fn merge_projects(
+    State(store): State<Arc<Store>>,
+    body: Result<Json<MergeBody>, JsonRejection>,
+) -> ApiResult {
+    let Json(b) = body?;
+    to_json(
+        blocking(&store, move |s| {
+            s.merge_projects(&b.from, &b.into, b.dry_run)
+        })
+        .await?,
+    )
 }
 
 /// `POST /api/v1/reindex` → `{docs}` (planner addition: remote CLIs have no data dir).

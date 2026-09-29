@@ -5,7 +5,10 @@
 
 use std::sync::Arc;
 
-use kioku_core::{Error, Handoff, HandoffInput, Hit, Page, PageScope, Store, VERSION};
+use kioku_core::{
+    Error, Handoff, HandoffInput, Hit, Page, PageScope, PendingHandoff, ProjectAlias, Store,
+    VERSION,
+};
 use kioku_core::{StatusReport, WritePageRequest};
 use rmcp::{
     ServerHandler,
@@ -37,7 +40,7 @@ pub const WRITE_PAGE_DESC: &str = "後で役に立つ知見・設計判断・手
 pub const HANDOFF_WRITE_DESC: &str = "このセッションの引き継ぎを記録する。このプロジェクトで次に始まるセッション（別のエージェントや別マシンでも）の冒頭に自動で渡される。作業を終える前、区切りがついたとき、コンテキストが尽きそうなときに必ず呼ぶこと。project と session には SessionStart の <kioku> ブロックに書かれた project の id と session の id を渡すこと（session を省略すると、そのプロジェクトで最後に観測のあった開いているセッションに紐づく）。summary=何をしたか・今どういう状態か、next_steps=次の一手（ファイル名やコマンドまで具体的に）、open_questions=未解決の点、decisions=決めたこととその理由。\nRecord a handoff for the next session of this project; always call it before you stop. Pass `project` and `session` from the SessionStart <kioku> block.";
 
 /// Tool description of `handoff_pending` (shared with the `kioku mcp` bridge).
-pub const HANDOFF_PENDING_DESC: &str = "プロジェクトの未受領の引き継ぎ（最新のもの）を取得する。既定の accept=false では覗くだけで消費しない。accept=true にすると受領済みにして、同じプロジェクトの古い未受領の引き継ぎもまとめて受領済みにする（通常は SessionStart フックが自動で行うので不要）。\nPeek at (or accept) the pending handoff of a project.";
+pub const HANDOFF_PENDING_DESC: &str = "プロジェクトの未受領の引き継ぎ（最新のもの）を取得する。既定の accept=false では覗くだけで消費しない。accept=true にすると受領済みにして、同じレーンの古い未受領の引き継ぎもまとめて受領済みにする（通常は SessionStart フックが自動で行うので不要）。引き継ぎはブランチごとのレーンに分かれる: session を渡すとそのセッションのレーン、lane（ブランチ名）を渡すとそのレーン、どちらも無ければ既定ブランチ（メインライン）のレーンを読む。自分のレーンに引き継ぎが無いときは、メインラインの引き継ぎが参考として返る（受領はされない）。\nPeek at (or accept) the pending handoff of a project; handoffs are routed per branch lane (session or lane; default = main line).";
 
 /// Tool description of `status` (shared with the `kioku mcp` bridge).
 pub const STATUS_DESC: &str = "kioku サーバーの状態を返す: データディレクトリ、プロジェクト・ページ・セッション・観測・引き継ぎの件数、検索索引の文書数、登録済みプロジェクトの id 一覧。\nShow kioku server status, counts and known project ids.";
@@ -159,6 +162,14 @@ pub struct HandoffPendingParams {
     /// true で受領済みにする（既定 false = 覗くだけ）/ mark as accepted (default: peek only).
     #[serde(default)]
     pub accept: bool,
+    /// セッション id（任意。そのセッションのレーンを読み、accept 時の受領者になる）/ optional
+    /// session id: reads its lane and is recorded as the acceptor.
+    #[serde(default)]
+    pub session: Option<String>,
+    /// レーン＝ブランチ名（任意。省略時は session のレーン、無ければメインライン）/ optional lane
+    /// (branch name); defaults to the session's lane, else the main line.
+    #[serde(default)]
+    pub lane: Option<String>,
 }
 
 /// The rmcp server handler exposing the six kioku tools.
@@ -257,15 +268,13 @@ impl KiokuMcp {
         &self,
         Parameters(p): Parameters<HandoffPendingParams>,
     ) -> Result<String, String> {
-        let handoff = blocking(&self.store, move |s| {
-            s.pending_handoff(&p.project, p.accept, None)
+        let session = p.session.filter(|s| !s.trim().is_empty());
+        let routed = blocking(&self.store, move |s| {
+            s.pending_handoff_routed(&p.project, p.accept, session.as_deref(), p.lane.as_deref())
         })
         .await
         .map_err(err_text)?;
-        Ok(match handoff {
-            Some(h) => format_handoff(&h),
-            None => "none".to_string(),
-        })
+        Ok(format_pending(&routed))
     }
 
     /// `kioku_status`: counts and data dir.
@@ -390,6 +399,19 @@ pub fn format_handoff(h: &Handoff) -> String {
     format!("{header}\n\n{}", h.content_md.trim_end())
 }
 
+/// `kioku_handoff_pending` output: the handoff, else the main line's as a marked reference
+/// (M2.4 §1.4), else `none`.
+pub fn format_pending(p: &PendingHandoff) -> String {
+    match (&p.handoff, &p.reference_handoff) {
+        (Some(h), _) => format_handoff(h),
+        (None, Some(r)) => format!(
+            "no handoff on this lane. Main line handoff (for reference, not accepted) / メインの引き継ぎ（参考・未受領）:\n\n{}",
+            format_handoff(r)
+        ),
+        (None, None) => "none".to_string(),
+    }
+}
+
 /// `kioku_status` output.
 pub fn format_status(s: &StatusReport, projects: &[String]) -> String {
     let mut out = format!(
@@ -406,5 +428,17 @@ pub fn format_status(s: &StatusReport, projects: &[String]) -> String {
     if !projects.is_empty() {
         out.push_str(&format!("\nproject ids: {}", projects.join(", ")));
     }
+    if !s.aliases.is_empty() {
+        out.push_str(&format!("\naliases: {}", format_aliases(&s.aliases)));
+    }
     out
+}
+
+/// `alias → project, …` (M2.4 §2.2).
+pub fn format_aliases(aliases: &[ProjectAlias]) -> String {
+    aliases
+        .iter()
+        .map(|a| format!("{} → {}", a.alias, a.project_id))
+        .collect::<Vec<_>>()
+        .join(", ")
 }

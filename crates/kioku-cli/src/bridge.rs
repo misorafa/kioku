@@ -11,11 +11,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use kioku_core::{ClientConfig, Config, Handoff, Hit, Page, StatusReport};
+use kioku_core::{ClientConfig, Config, Hit, Page, PendingHandoff, StatusReport};
 use kioku_server::mcp::{
     HANDOFF_PENDING_DESC, HANDOFF_WRITE_DESC, HandoffPendingParams, HandoffWriteParams,
     INSTRUCTIONS, QUERY_DESC, QueryParams, READ_DESC, ReadParams, STATUS_DESC, WRITE_PAGE_DESC,
-    WritePageParams, WriteScope, format_handoff, format_hits, format_page, format_status,
+    WritePageParams, WriteScope, format_hits, format_page, format_pending, format_status,
 };
 use rmcp::{
     ServerHandler, ServiceExt,
@@ -192,15 +192,19 @@ impl KiokuBridge {
         &self,
         Parameters(p): Parameters<HandoffPendingParams>,
     ) -> Result<String, String> {
-        let query = vec![("project", p.project), ("accept", p.accept.to_string())];
+        let mut query = vec![("project", p.project), ("accept", p.accept.to_string())];
+        if let Some(s) = p.session.filter(|s| !s.trim().is_empty()) {
+            query.push(("session", s));
+        }
+        if let Some(l) = p.lane {
+            query.push(("lane", l));
+        }
         let v = self
             .call(move |c| c.get(&["handoffs", "pending"], &query))
             .await?;
-        let handoff: Option<Handoff> = decode(v.get("handoff").cloned().unwrap_or(Value::Null))?;
-        Ok(match handoff {
-            Some(h) => format_handoff(&h),
-            None => "none".to_string(),
-        })
+        // `reference_handoff` is additive (M2.4 §1.4); an older server sends `handoff` only.
+        let routed: PendingHandoff = decode(v)?;
+        Ok(format_pending(&routed))
     }
 
     /// `kioku_status` → `GET /status`.

@@ -451,7 +451,7 @@ Compose の場合（`docker-compose.yml` 参照）は、同じ場所の `.env` �
 | `kioku_read` | `path` | wiki 内の相対パス（検索結果に表示されるもの）でページを読む |
 | `kioku_write_page` | `title`、`content`、`project?`、`scope?`（`project`/`global`）、`tags?`、`path?` | 検索可能な Markdown ページを保存する。同じ title/path なら置き換える |
 | `kioku_handoff_write` | `project`、`session?`（SessionStart のブロックにある id）、`summary`、`next_steps`、`open_questions`、`decisions` | そのプロジェクトの次のセッションが受け取る引き継ぎを記録する |
-| `kioku_handoff_pending` | `project`、`accept?`（既定 false） | 未受領の引き継ぎを覗く（または受領する） |
+| `kioku_handoff_pending` | `project`、`accept?`（既定 false）、`session?`、`lane?` | 未受領の引き継ぎを覗く（または受領する）。既定はメインライン、`session` / `lane` でブランチのレーンを読む |
 | `kioku_status` | — | 件数、データディレクトリ、登録済みプロジェクト id |
 
 サーバーが MCP の `instructions` で、探索の前に検索し、終了の前に引き継ぎを書くようエージェントに伝えます。
@@ -539,7 +539,34 @@ lang = "ja"             # ja | en — SessionStart のブロックと Stop の�
    そのマシンのそのパスに結びつきます。
 
 slug 部分では非 ASCII 文字が落とされます（日本語だけの名前は `proj` になります）。
-プロジェクトをまとめたり名前を変えたりするには `.kioku.toml` を使ってください。
+プロジェクトの名前を変えるには `.kioku.toml` を使ってください。
+
+**あとからリモートを追加しても大丈夫です。** リモートの無かったリポジトリに `origin` を足すと、
+id はパス由来の形からリモート由来の形に変わります。kioku は同じチェックアウト（同じルートで、
+元のプロジェクトにリモートが無い）であることに気づき、元のプロジェクトをそのまま使い、新しい id を
+その **別名（エイリアス）** として記録します。リモート由来の id しか計算しない他のマシンのクローンも
+同じプロジェクトに入ります。別名は `kioku status` に表示されます。
+
+**以前に分かれてしまった 2 つのプロジェクトをまとめる:**
+
+```sh
+kioku project merge <from-id> <into-id> --dry-run   # 何が移るかを表示するだけ
+kioku project merge <from-id> <into-id>             # セッション・引き継ぎ・ページを移す
+```
+
+`<from-id>` のすべてが `<into-id>` に移り（ページはその wiki ディレクトリへ git コミット付きで）、
+`<from-id>` は別名として引き続き使えます。もう一度実行しても害はありません。
+
+### 並行する worktree（Orca、`git worktree`）
+
+1 つのリポジトリで複数のエージェントが、worktree ごとに別のブランチで同時に作業できます。
+プロジェクト（id）は共通ですが、**引き継ぎはブランチごと（レーン）に分かれます**。ブランチ
+`task-a` のセッションは `task-a` で書かれた引き継ぎだけを受け取ります。既定ブランチ（`main` /
+`master`、または `origin/HEAD`）がメインラインで、これまでどおりの引き継ぎはここに入り、ブランチの
+引き継ぎがここに届くことはありません。まだ引き継ぎの無いブランチには、メインラインの引き継ぎが
+「メインの引き継ぎ（参考）」として表示されますが、受領はされません。ブランチ上では `<kioku>`
+ブロックに `lane: <ブランチ名>` が出ます。設定は不要です。検索・ページ・STATE.md はブランチを
+またいで共有されます。
 
 ## セキュリティ
 
