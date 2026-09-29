@@ -36,6 +36,38 @@ impl std::fmt::Display for HttpError {
 
 impl std::error::Error for HttpError {}
 
+/// The request reached the server but no response arrived before the deadline: the server
+/// may still be working on it (a finalize runs to the end on its own).
+#[derive(Debug)]
+pub struct TimedOut {
+    /// The transport error, with its cause.
+    pub message: String,
+}
+
+impl std::fmt::Display for TimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "request failed: {}", self.message)
+    }
+}
+
+impl std::error::Error for TimedOut {}
+
+/// Turns a transport error into [`TimedOut`] (sent, no answer in time) or a plain error,
+/// keeping the cause (`operation timed out`, `connection refused`, …) in the message.
+fn transport_error(e: reqwest::Error) -> anyhow::Error {
+    let mut message = e.to_string();
+    let mut source = std::error::Error::source(&e);
+    while let Some(s) = source {
+        message.push_str(&format!(": {s}"));
+        source = s.source();
+    }
+    if e.is_timeout() && !e.is_connect() {
+        TimedOut { message }.into()
+    } else {
+        anyhow!("request failed: {message}")
+    }
+}
+
 /// File under `~/.kioku/state/` holding named servers' last-good addresses (SPEC-M2 §19.2).
 pub const ADDR_CACHE_FILE: &str = "server-addrs.json";
 
@@ -176,12 +208,12 @@ impl ApiClient {
                 Ok(resp) => return self.finish(resp),
                 // Moved server or a different network: fall through to normal resolution.
                 Err(e) if e.is_connect() || e.is_timeout() => {}
-                Err(e) => return Err(anyhow!("request failed: {e}")),
+                Err(e) => return Err(transport_error(e)),
             }
         }
         let resp = prepare(&self.http, Duration::MAX)?
             .send()
-            .map_err(|e| anyhow!("request failed: {e}"))?;
+            .map_err(transport_error)?;
         self.finish(resp)
     }
 
@@ -342,6 +374,11 @@ pub fn is_local_url(url: &Url) -> bool {
     }
 }
 
+/// Whether an [`ApiClient`] error is a [`TimedOut`] (sent, no answer before the deadline).
+pub fn timed_out(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<TimedOut>().is_some()
+}
+
 /// The HTTP status of an error produced by [`ApiClient`], if it was a server response.
 pub fn http_status(err: &anyhow::Error) -> Option<u16> {
     err.downcast_ref::<HttpError>().map(|e| e.status)
@@ -381,6 +418,47 @@ mod tests {
             server_url: url,
             ..ClientConfig::default()
         }
+    }
+
+    /// A server that accepts and reads the request but never answers.
+    fn silent_server() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for s in listener.incoming().flatten() {
+                held.push(s);
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn a_request_the_server_never_answers_is_timed_out() {
+        let c = ApiClient::new(
+            &cfg(format!("http://127.0.0.1:{}", silent_server())),
+            Duration::from_millis(300),
+        )
+        .unwrap();
+        let err = c
+            .post(&["sessions", "s", "finalize"], &Value::Null)
+            .unwrap_err();
+        assert!(timed_out(&err), "{err:#}");
+        assert!(format!("{err}").contains("timed out"), "{err}");
+    }
+
+    #[test]
+    fn a_refused_connection_is_not_timed_out() {
+        let c = ApiClient::new(
+            &cfg(format!("http://127.0.0.1:{}", dead_port())),
+            Duration::from_millis(300),
+        )
+        .unwrap();
+        let err = c
+            .post(&["sessions", "s", "finalize"], &Value::Null)
+            .unwrap_err();
+        assert!(!timed_out(&err), "{err:#}");
+        assert!(format!("{err}").starts_with("request failed: "), "{err}");
     }
 
     fn write_cache(path: &std::path::Path, key: &str, addrs: &[String]) {

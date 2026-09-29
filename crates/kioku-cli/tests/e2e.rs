@@ -1227,8 +1227,12 @@ fn codex_session_end_deadline_is_capped() {
         took < std::time::Duration::from_millis(3000),
         "{took:?}: Codex kills SessionEnd at 3 s"
     );
-    let log = std::fs::read_to_string(client_dir.path().join("logs/hook.log")).unwrap();
-    assert!(log.contains("session-end session=slow error: "), "{log}");
+    // A finalize the server accepted but did not answer in time is not a failure (M2 §3.9).
+    assert!(
+        !client_dir.path().join("logs/hook.log").exists(),
+        "{:?}",
+        std::fs::read_to_string(client_dir.path().join("logs/hook.log"))
+    );
 }
 
 /// A non-UTF-8 environment (variable value and name) must never panic the hook binary:

@@ -284,6 +284,12 @@ session is `Silent` and **not** logged: there is nothing to finalize, and it is
 the normal case for Codex, whose SessionStart only fires with the first turn —
 opening Codex and quitting without a prompt sends SessionEnd alone (seen in real
 captures 2026-09-27; it used to put a 404 in `hook.log` and a doctor WARN).
+A finalize (Stop or SessionEnd) whose request was sent but got no answer before the
+hook's deadline is `Silent` and **not** logged either: the server finishes it on its
+own (digest, git commits) and the session ends up finalized. On Windows that work
+regularly outlives the default 3 s `timeout_ms` (CI runners, 2026-09-28/29), which put
+an error in `hook.log` — and a doctor WARN — for every such Stop. A connection that
+fails, or an error response, is still logged.
 
 ### 3.10 Per-agent deadlines
 

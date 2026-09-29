@@ -23,7 +23,7 @@ use kioku_core::{
 };
 use serde_json::{Map, Value, json};
 
-use crate::client::{ApiClient, http_status};
+use crate::client::{ApiClient, http_status, timed_out};
 use crate::context::{StartContext, render_session_start};
 use crate::event::{Agent, HookEnv, HookEvent, HookEventKind, hook_deadline_ms, parse_value};
 use crate::render::{HookResult, render};
@@ -556,11 +556,15 @@ impl Handler<'_> {
     }
 
     fn finalize(&self, reason: &str) -> anyhow::Result<()> {
-        self.client.post(
+        match self.client.post(
             &["sessions", &self.ev.session_id, "finalize"],
             &json!({ "reason": reason }),
-        )?;
-        Ok(())
+        ) {
+            // The server got it and finishes the finalize (digest, git commits) on its own;
+            // on a slow disk that outlives the hook's deadline, which is not a failure.
+            Err(err) if timed_out(&err) => Ok(()),
+            other => other.map(|_| ()),
+        }
     }
 }
 
