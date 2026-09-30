@@ -18,8 +18,9 @@ use crate::client::{ApiClient, http_status, is_local_url};
 use crate::dump::{dump_enabled, dump_path};
 use crate::event::{ALL_AGENTS, Agent, HookEnv};
 use crate::install::agents::{
-    GEMINI_EVENTS, InstallCtx, InstallOptions, hook_commands, hook_specs, hooks_map, hooks_path,
-    instruction_files, is_detected, mcp_path, unstable_binary_warning, wants_instructions,
+    GEMINI_EVENTS, InstallCtx, InstallOptions, claude_desktop_configs, hook_commands, hook_specs,
+    hooks_map, hooks_path, instruction_files, is_detected, mcp_path, unstable_binary_warning,
+    wants_instructions,
 };
 use crate::install::block::{self, MD_MARKERS};
 use crate::install::{mcp_url, read_settings};
@@ -1072,6 +1073,42 @@ fn mcp_agent_check(agent: Agent, ctx: &InstallCtx) -> Check {
     }
 }
 
+/// `agent.claude-code.desktop` (SPEC-M2.2 §7.3a): the Claude app's chat / Cowork config at
+/// `path` registers the kioku mcp bridge.
+fn desktop_check(path: &Path, ctx: &InstallCtx) -> Check {
+    let id = "agent.claude-code.desktop";
+    let fix = Some("kioku install claude-code, then restart the Claude app".to_string());
+    match mcp_entry(Agent::ClaudeCode, path) {
+        Ok(Some(McpFound::Stdio { command, args })) => {
+            stdio_mcp_check(id, path, &command, &args, ctx, fix)
+        }
+        Ok(Some(McpFound::Url { .. })) => check(
+            id,
+            Status::Warn,
+            format!(
+                "{}: `kioku` is not the kioku mcp bridge (the Claude app runs local commands only)",
+                path.display()
+            ),
+            fix,
+        ),
+        Ok(None) => check(
+            id,
+            Status::Warn,
+            format!(
+                "no `kioku` MCP server in {}: the Claude app's chat and Cowork cannot use kioku",
+                path.display()
+            ),
+            fix,
+        ),
+        Err(_) => check(
+            id,
+            Status::Warn,
+            format!("{} could not be parsed", path.display()),
+            Some("fix the file, then kioku install claude-code".to_string()),
+        ),
+    }
+}
+
 /// `agent.<a>.mcp` for the stdio bridge: `args == ["mcp"]`, an existing executable, and
 /// this binary (M2 §20.2).
 fn stdio_mcp_check(
@@ -1275,6 +1312,13 @@ fn cursor_duplicate_check(ctx: &InstallCtx) -> Option<Check> {
 
 fn agent_checks(agent: Agent, ctx: &InstallCtx, env: &DoctorEnv) -> Vec<Check> {
     let mut out = vec![hooks_check(agent, ctx), mcp_agent_check(agent, ctx)];
+    if agent == Agent::ClaudeCode {
+        out.extend(
+            claude_desktop_configs(ctx)
+                .iter()
+                .map(|p| desktop_check(p, ctx)),
+        );
+    }
     match agent {
         Agent::Codex => out.extend(codex_checks(ctx, env)),
         Agent::GeminiCli => out.push(gemini_enabled_check(ctx)),
@@ -1434,6 +1478,45 @@ mod tests {
         let c = hooks_check(Agent::ClaudeCode, &ctx);
         assert_eq!(c.status, Status::Fail, "{}", c.message);
         assert!(c.message.contains("kioku.exe"), "{}", c.message);
+    }
+
+    #[test]
+    fn desktop_check_reports_the_claude_app_config() {
+        use crate::install::HookPlatform;
+        use crate::install::agents::{InstallOptions, install_agent};
+        let home = tempfile::tempdir().unwrap();
+        let bin_path = home.path().join("bin").join("kioku");
+        std::fs::create_dir_all(bin_path.parent().unwrap()).unwrap();
+        std::fs::write(&bin_path, "").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let ctx = InstallCtx {
+            home: home.path().to_path_buf(),
+            codex_home: home.path().join(".codex"),
+            cwd: home.path().to_path_buf(),
+            bin: bin_path.display().to_string(),
+            client: kioku_core::ClientConfig::default(),
+            platform: HookPlatform::Unix,
+        };
+        // No Claude app: no check at all.
+        assert!(claude_desktop_configs(&ctx).is_empty());
+        let store = home
+            .path()
+            .join("AppData/Local/Packages/Claude_pzs8sxrjxfjjc/LocalCache/Roaming/Claude");
+        std::fs::create_dir_all(&store).unwrap();
+        let path = store.join("claude_desktop_config.json");
+        std::fs::write(&path, r#"{"preferences":{}}"#).unwrap();
+        // The state seen on the user's Windows 2026-09-30: the app, no kioku entry.
+        let c = desktop_check(&path, &ctx);
+        assert_eq!(c.status, Status::Warn, "{}", c.message);
+        assert!(c.fix.as_deref().unwrap().contains("restart the Claude app"));
+        install_agent(Agent::ClaudeCode, &ctx, &InstallOptions::default()).unwrap();
+        let c = desktop_check(&path, &ctx);
+        assert_eq!(c.status, Status::Ok, "{}", c.message);
+        assert_eq!(c.id, "agent.claude-code.desktop");
     }
 
     #[test]

@@ -1141,3 +1141,97 @@ fn gemini_and_antigravity_are_not_detected_on_windows() {
     assert!(!is_detected(Agent::Antigravity, &win));
     assert!(is_detected(Agent::ClaudeCode, &win));
 }
+
+/// SPEC-M2.2 §7.3a: the Claude app's chat / Cowork config gets the stdio bridge in every
+/// existing `Claude` folder (macOS, Windows installer, Microsoft Store package); the app's
+/// own keys survive, a second run changes nothing, `--project` and missing folders are
+/// left alone, uninstall removes only our entry.
+#[test]
+fn claude_desktop_app_configs_get_the_bridge() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    let mac = h.join("Library/Application Support/Claude");
+    let store = h.join("AppData/Local/Packages/Claude_pzs8sxrjxfjjc/LocalCache/Roaming/Claude");
+    std::fs::create_dir_all(&mac).unwrap();
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::create_dir_all(h.join("AppData/Local/Packages/NotClaude_x")).unwrap();
+    let app_keys = json!({
+        "coworkUserFilesPath": "C:\\Users\\Room\\Claude",
+        "preferences": {"coworkBrowserToolsEnabled": true},
+        "mcpServers": {"blender": {"command": "uvx", "args": ["blender-mcp"]}}
+    });
+    std::fs::write(
+        mac.join("claude_desktop_config.json"),
+        serde_json::to_string_pretty(&app_keys).unwrap(),
+    )
+    .unwrap();
+    let c = ctx(h, h, BIN);
+    assert_eq!(
+        claude_desktop_configs(&c),
+        vec![
+            mac.join("claude_desktop_config.json"),
+            store.join("claude_desktop_config.json")
+        ],
+        "only existing Claude folders; %APPDATA%\\Claude does not exist here"
+    );
+
+    // --project touches neither.
+    let proj = tempfile::tempdir().unwrap();
+    install_agent(Agent::ClaudeCode, &ctx(h, proj.path(), BIN), &opts(true)).unwrap();
+    assert!(!store.join("claude_desktop_config.json").exists());
+    assert_eq!(read_json(&mac.join("claude_desktop_config.json")), app_keys);
+
+    let r = install_agent(Agent::ClaudeCode, &c, &opts(false)).unwrap();
+    assert!(
+        r.lines.iter().any(|l| l.contains("restart the Claude app")),
+        "{r:?}"
+    );
+    let entry = json!({"command": BIN, "args": ["mcp"]});
+    let mac_after = read_json(&mac.join("claude_desktop_config.json"));
+    assert_eq!(mac_after["mcpServers"]["kioku"], entry);
+    assert_eq!(
+        mac_after["mcpServers"]["blender"],
+        app_keys["mcpServers"]["blender"]
+    );
+    assert_eq!(mac_after["preferences"], app_keys["preferences"]);
+    assert_eq!(
+        mac_after["coworkUserFilesPath"],
+        app_keys["coworkUserFilesPath"]
+    );
+    assert_eq!(
+        read_json(&store.join("claude_desktop_config.json"))["mcpServers"]["kioku"],
+        entry
+    );
+    assert!(
+        !h.join("AppData/Roaming/Claude").exists(),
+        "no folder created"
+    );
+
+    // --mcp-http does not change the desktop form (the app runs local commands only).
+    let http = InstallOptions {
+        mcp_http: true,
+        ..opts(false)
+    };
+    install_agent(Agent::ClaudeCode, &c, &http).unwrap();
+    assert_eq!(
+        read_json(&store.join("claude_desktop_config.json"))["mcpServers"]["kioku"],
+        entry
+    );
+
+    let before = snapshot(h);
+    let again = install_agent(Agent::ClaudeCode, &c, &http).unwrap();
+    assert_eq!(snapshot(h), before, "second run is byte-identical");
+    assert!(
+        !again.lines.iter().any(|l| l.contains("restart")),
+        "{again:?}"
+    );
+
+    uninstall_agent(Agent::ClaudeCode, &c, false, false).unwrap();
+    let mac_final = read_json(&mac.join("claude_desktop_config.json"));
+    assert!(mac_final["mcpServers"].get("kioku").is_none());
+    assert_eq!(
+        mac_final["mcpServers"]["blender"],
+        app_keys["mcpServers"]["blender"]
+    );
+    assert_eq!(mac_final["preferences"], app_keys["preferences"]);
+}

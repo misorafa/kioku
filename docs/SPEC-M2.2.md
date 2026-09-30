@@ -237,6 +237,34 @@ All paths are the absolute path of `kioku.exe`, with backslashes, JSON-escaped.
 --agent cursor`, and MCP `{"command": …, "args": ["mcp"]}`. How Cursor runs
 hook commands on Windows is UNVERIFIED.
 
+### 7.3a Claude desktop app: chat and Cowork (every OS; added 2026-09-30)
+
+The Code tab reads `~/.claude.json` (§7.1), but the app's chat and Cowork only load
+local MCP servers from `claude_desktop_config.json`. Without an entry there they say
+kioku is missing (seen on the user's Windows 11, Microsoft Store build 2.16120,
+2026-09-30: the file had no `mcpServers` at all).
+
+- **Files** (each only when its `Claude` folder already exists; kioku never creates
+  the folder):
+  - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`;
+  - Windows installer build: `%APPDATA%\Claude\claude_desktop_config.json`;
+  - Windows Microsoft Store (MSIX) build:
+    `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\claude_desktop_config.json`
+    — MSIX redirects the app's AppData writes into its package folder, so the real
+    `%APPDATA%` copy is not the one it reads (VERIFIED on the user's machine: the
+    config lives there and `%APPDATA%\Claude` does not exist).
+- **Entry:** `mcpServers.kioku = {"command": "<absolute kioku binary>", "args": ["mcp"]}`
+  — the stdio bridge (M2 §20), no `type`, no URL, no token; always this form, also
+  with `--mcp-http`. Every other key of the file (the app's own `preferences`, …) is
+  kept.
+- **When:** `kioku install claude-code` at user level (so also `install all`, `setup`)
+  writes it; `kioku uninstall claude-code` removes it; `--project` does neither. The
+  app reads the file at start: the report says to restart the Claude app.
+- **doctor:** `agent.claude-code.desktop`, one check per file found. Stdio bridge →
+  the same rules as `agent.<a>.mcp`; entry missing → WARN (fix: `kioku install
+  claude-code`, then restart the Claude app). No file found → no check.
+- UNVERIFIED: whether Cowork sessions see servers from this file exactly like chat.
+
 ### 7.4 Rendering rule
 
 The hook-command renderers take the platform as a parameter

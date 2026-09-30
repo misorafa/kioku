@@ -208,6 +208,39 @@ pub fn mcp_path(agent: Agent, ctx: &InstallCtx) -> PathBuf {
     }
 }
 
+/// The Claude desktop app's `claude_desktop_config.json` files — where its chat and Cowork
+/// read local MCP servers (SPEC-M2.2 §7.3a) — for every `Claude` folder that exists: macOS,
+/// the Windows installer build (`%APPDATA%`) and the Microsoft Store build (its package
+/// folder). Never creates a folder.
+pub fn claude_desktop_configs(ctx: &InstallCtx) -> Vec<PathBuf> {
+    let mut dirs = vec![
+        ctx.home
+            .join("Library")
+            .join("Application Support")
+            .join("Claude"),
+        ctx.home.join("AppData").join("Roaming").join("Claude"),
+    ];
+    let packages = ctx.home.join("AppData").join("Local").join("Packages");
+    if let Ok(entries) = std::fs::read_dir(&packages) {
+        let mut store: Vec<PathBuf> = entries
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("Claude_"))
+            .map(|e| e.path().join("LocalCache").join("Roaming").join("Claude"))
+            .collect();
+        store.sort();
+        dirs.extend(store);
+    }
+    dirs.into_iter()
+        .filter(|d| d.is_dir())
+        .map(|d| d.join("claude_desktop_config.json"))
+        .collect()
+}
+
+/// The Claude desktop app's `mcpServers.kioku`: the stdio bridge, no `type` (§7.3a).
+pub fn claude_desktop_mcp_entry(ctx: &InstallCtx) -> Value {
+    json!({ "command": ctx.bin, "args": ["mcp"] })
+}
+
 /// `~/.gemini/config`: Antigravity CLI's user hooks, MCP servers and rules (M2.1 §4).
 fn antigravity_config_dir(ctx: &InstallCtx) -> PathBuf {
     ctx.home.join(".gemini").join("config")
@@ -838,6 +871,21 @@ pub fn install_agent(
                 "Claude Code",
                 dry,
             ));
+            if !opts.project {
+                let desktop = claude_desktop_mcp_entry(ctx);
+                let mut changed = false;
+                for path in claude_desktop_configs(ctx) {
+                    let c = register_mcp_entry(&path, &desktop, "the Claude app", dry);
+                    changed |= c.changed;
+                    r.mcp(c);
+                }
+                if changed && !dry {
+                    r.push(
+                        "info: restart the Claude app so its chat and Cowork load kioku"
+                            .to_string(),
+                    );
+                }
+            }
         }
         Agent::Cursor => {
             r.mcp(register_mcp_entry(
@@ -946,6 +994,15 @@ pub fn uninstall_agent(
             r.file("MCP server `kioku`", &path, &outcome, dry_run);
         }
         Agent::GeminiCli if !project => {}
+        Agent::ClaudeCode if !project => {
+            r.mcp(unregister_mcp_entry(&mcp_path(agent, ctx), dry_run));
+            for path in claude_desktop_configs(ctx) {
+                let c = unregister_mcp_entry(&path, dry_run);
+                if c.changed {
+                    r.mcp(c);
+                }
+            }
+        }
         _ => r.mcp(unregister_mcp_entry(&mcp_path(agent, ctx), dry_run)),
     }
     for path in instruction_files(agent, ctx, project) {
