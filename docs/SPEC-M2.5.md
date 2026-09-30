@@ -53,7 +53,11 @@ A task inside `kioku serve` (tokio interval, runs the blocking work in `spawn_bl
    was started by it — env marker `KIOKU_SERVICE=1` set in the plist / unit). A foreground
    `kioku serve` in a terminal never self-updates (it would just exit).
    Existing services were installed without the marker: `restart_service` rewrites the plist / unit when it lacks `KIOKU_SERVICE=1` before
-   restarting, so the one manual update to the first M2.5 release enables it.
+   restarting. **Correction (field, 2026-09-30):** the update *to* the first M2.5 release is
+   run by the pre-M2.5 binary, whose `restart_service` has no such rewrite — so after that
+   one manual `kioku update`, `kioku service install` is needed once. `kioku doctor`'s
+   `update` check warns (fix: `kioku service install`) while an installed definition lacks
+   the marker.
 6. Failures (network, checksum, signature, not writable) are logged and retried at the next
    interval; the running server is never affected.
 

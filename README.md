@@ -173,7 +173,8 @@ auto = false
 
 A winget install is never replaced behind winget's back: it gets the notice
 with `winget upgrade misorafa.kioku`. A service installed before automatic
-updates existed enables them after one manual `kioku update`.
+updates existed needs, once, `kioku update` and then `kioku service install` (the old
+binary that runs the update cannot rewrite the service definition; `kioku doctor` warns).
 
 Update by hand with `kioku update` (same download and checksum verification;
 replaces the binary in place and restarts the service; it only installs a

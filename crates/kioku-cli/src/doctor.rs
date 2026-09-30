@@ -1407,6 +1407,14 @@ pub fn update_check(cfg: &Config, env: &DoctorEnv, health: &Health) -> Check {
             fix.get_or_insert(how);
         }
     }
+    // A service installed before SPEC-M2.5 lacks the marker and never updates itself; the
+    // `kioku update` that brought this version ran the old binary, which could not rewrite it.
+    let manager = env.setup_env().service_manager(&cfg.data_dir);
+    if cfg.update.auto && manager.is_installed() && manager.lacks_service_marker() {
+        status = Status::Warn;
+        parts.push("the service definition predates automatic updates".into());
+        fix = Some("kioku service install".into());
+    }
     check("update", status, parts.join("; "), fix)
 }
 
@@ -1525,6 +1533,42 @@ mod tests {
                 .message
                 .contains("automatic updates off")
         );
+    }
+
+    /// Regression (Mac mini, 2026-09-30): `kioku update` 0.6.5 -> 0.7.0 ran the old binary, so
+    /// the plist kept no `KIOKU_SERVICE=1` and the server could never update itself, while
+    /// doctor said "automatic updates on".
+    #[test]
+    fn update_check_warns_about_a_service_without_the_marker() {
+        let home = tempfile::tempdir().unwrap();
+        let data = home.path().join(".kioku");
+        std::fs::create_dir_all(&data).unwrap();
+        let cfg = Config::for_data_dir(&data);
+        let env = DoctorEnv {
+            vars: HashMap::new(),
+            home: home.path().to_path_buf(),
+            bin: home.path().join("bin/kioku").display().to_string(),
+            runner: Runner::recording(|_| crate::service::CmdOutput::ok("")),
+            platform: Some(crate::service::Platform::Launchd),
+            hook_platform: crate::install::HookPlatform::current(),
+            timeout: Duration::from_secs(1),
+        };
+        let same = Health::Kioku {
+            version: VERSION.to_string(),
+        };
+        let plist = env
+            .setup_env()
+            .service_manager(&cfg.data_dir)
+            .definition_path()
+            .unwrap();
+        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        std::fs::write(&plist, "<plist><dict><key>Label</key></dict></plist>").unwrap();
+        let c = update_check(&cfg, &env, &same);
+        assert_eq!(c.status, Status::Warn, "{}", c.message);
+        assert_eq!(c.fix.as_deref(), Some("kioku service install"));
+
+        std::fs::write(&plist, "<key>KIOKU_SERVICE</key><string>1</string>").unwrap();
+        assert_eq!(update_check(&cfg, &env, &same).status, Status::Ok);
     }
 
     #[test]
