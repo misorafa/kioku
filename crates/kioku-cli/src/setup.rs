@@ -870,20 +870,45 @@ fn agent_text(agent: Agent, ctx: &InstallCtx, iopts: &InstallOptions) -> String 
     text
 }
 
-/// True when Codex's `config.toml` records a trusted hash for an entry mentioning kioku
-/// (heuristic: the key format is unverified, M2 §4.1).
+/// True when Codex's `config.toml` records a trusted hash for kioku's hooks (heuristic; see
+/// [`is_kioku_trust_key`] for the key formats).
 pub fn codex_trust_recorded(codex_config: &Path) -> bool {
     let Some(t) = block::read_codex_config(codex_config) else {
         return false;
     };
+    let hooks_json = codex_config.with_file_name("hooks.json");
     t.get("hooks")
         .and_then(|h| h.get("state"))
         .and_then(toml::Value::as_table)
         .is_some_and(|state| {
             state.iter().any(|(k, v)| {
-                k.contains("kioku") && v.get("trusted_hash").is_some_and(|h| h.is_str())
+                is_kioku_trust_key(k, &hooks_json)
+                    && v.get("trusted_hash").is_some_and(|h| h.is_str())
             })
         })
+}
+
+/// True when a `[hooks.state."<key>"]` key names kioku's hooks. Codex 0.159 keys entries as
+/// `<path of hooks.json>:<event>:<group>:<handler>` (Mac, 2026-09-30); kioku owns the
+/// `session_start` entry of the user-level `hooks.json` next to `config.toml`. Older keys that
+/// mention kioku directly are still accepted.
+fn is_kioku_trust_key(key: &str, hooks_json: &Path) -> bool {
+    if key.contains("kioku") {
+        return true;
+    }
+    // rsplitn: the path itself may contain ':' (`C:\Users\...`).
+    let mut parts = key.rsplitn(4, ':');
+    let (_, _, event, path) = (parts.next(), parts.next(), parts.next(), parts.next());
+    let (Some(event), Some(path)) = (event, path) else {
+        return false;
+    };
+    let norm = |p: &Path| {
+        kioku_core::util::plain_path(p)
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_lowercase()
+    };
+    event == "session_start" && norm(Path::new(path)) == norm(hooks_json)
 }
 
 fn agents_step(opts: &SetupOptions, env: &SetupEnv, client: &ClientConfig, r: &mut SetupReport) {
@@ -1110,6 +1135,38 @@ pub fn first_non_loopback_ip() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Regression (Mac and Windows, 2026-09-30): Codex 0.159 keys trust entries by the
+    /// hooks.json path and event, never mentioning kioku, so doctor warned although the hooks
+    /// were trusted and running.
+    #[test]
+    fn codex_trust_is_found_under_the_hooks_json_path_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        let hooks = dir.path().join("hooks.json").display().to_string();
+        let write = |key: &str| {
+            std::fs::write(
+                &cfg,
+                format!(
+                    "[hooks.state]\n\n[hooks.state.{}]\ntrusted_hash = \"sha256:00\"\n",
+                    toml::Value::String(key.to_string())
+                ),
+            )
+            .unwrap();
+        };
+        write(&format!("{hooks}:session_start:0:0"));
+        assert!(codex_trust_recorded(&cfg));
+        write(&format!("{hooks}:post_tool_use:0:0"));
+        assert!(!codex_trust_recorded(&cfg));
+        write("/elsewhere/hooks.json:session_start:0:0");
+        assert!(!codex_trust_recorded(&cfg));
+        write("kioku hook session-start --agent codex");
+        assert!(codex_trust_recorded(&cfg));
+        assert!(is_kioku_trust_key(
+            r"C:\Users\Room\.codex\hooks.json:session_start:0:0",
+            Path::new(r"\\?\C:\Users\Room\.codex\hooks.json")
+        ));
+    }
     use super::*;
 
     #[test]
