@@ -910,6 +910,7 @@ fn doctor_all_ok_then_warn_and_fail_scenarios() {
     // Expected warnings: the test binary lives in a temp dir; Codex trust is unverifiable.
     expected.insert("binary".into(), Status::Warn);
     expected.insert("agent.codex.trust".into(), Status::Warn);
+    expected.insert("update".into(), Status::Ok);
     assert_eq!(
         statuses(&checks),
         expected,

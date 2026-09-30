@@ -139,7 +139,29 @@ Paste ONE of these on the machine to add (valid 10 minutes, once):
 curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh -s -- --client-only http://<server>:7391 <token>
 ```
 
-あとからの更新は `kioku update`（同じダウンロードとチェックサム検証。バイナリをその場で置き換え、
+### 更新
+
+更新は自動です。サーバー（`kioku service` として動いているもの）は 1 日 1 回 GitHub を確認し、
+新しい安定版リリースがあれば自分でインストールして再起動します（SHA-256 を検証し、macOS では
+kioku の Developer ID で署名されたバイナリだけを受け入れます）。クライアントは GitHub ではなく
+サーバーに追従します。SessionStart フックがサーバーの新しいバージョンに気づくと、クライアントを
+バックグラウンドで更新します（エージェントを待たせず、ダウングレードもしません）。こうしてすべての
+マシンがサーバーと同じバージョンにそろいます。更新の状態は `kioku status` と `kioku doctor` で見られ、
+バックグラウンドの結果は `~/.kioku/logs/update.log` に残ります。
+
+止めたいときは `config.toml` に次を書きます（または `KIOKU_AUTO_UPDATE=0`）。その場合は `<kioku>`
+ブロックに 1 日 1 回、1 行のお知らせが出ます。
+
+```toml
+[update]
+auto = false
+```
+
+winget でインストールしたものは winget に黙って置き換えず、`winget upgrade misorafa.kioku` を
+案内するお知らせだけを出します。自動更新より前に入れたサービスは、一度 `kioku update` を手で
+実行すると自動更新が有効になります。
+
+手動での更新は `kioku update`（同じダウンロードとチェックサム検証。バイナリをその場で置き換え、
 サービスを再起動します。動いているものより新しいリリースだけをインストールし、`--version <tag>` なら
 古いものも含めて任意のタグを入れられます。`kioku update --check` は新しいリリースがあれば終了コード 10
 で終わります）、または 1 行のコマンドをもう一度実行します（古いバージョンのまま動いているサービスは、
@@ -184,7 +206,8 @@ $env:KIOKU_JOIN='192.168.1.240:7391/K7Q2M9XD'; irm https://raw.githubusercontent
   コマンド文字列を登録します。Gemini CLI と Antigravity は Windows では設定しません。フックの入力は
   UTF-8 のバイト列として読む（BOM は無視）ので、日本語ロケールの Windows でも日本語のプロンプトが
   化けません。
-- **更新:** `kioku update` はほかの OS と同じように使えます。実行中の `kioku.exe` は上書きできないため
+- **更新:** 自動更新と `kioku update` はほかの OS と同じように使えます（winget で入れた場合は
+  `winget upgrade misorafa.kioku`）。実行中の `kioku.exe` は上書きできないため
   `kioku.exe.old` に名前を変え、次の実行時に削除します。
 - **SmartScreen:** Windows 版のバイナリはまだコード署名していません。ダウンロードした `kioku.exe` の
   初回実行時に Windows が警告を出すことがあります。
@@ -503,6 +526,10 @@ auth_token = "…"
 timeout_ms = 3000       # フック 1 回あたりの上限時間
 stop_nudge = true
 lang = "ja"             # ja | en — SessionStart のブロックと Stop の催促
+
+[update]                # 任意。値はいずれも既定値
+auto = true             # false = 自動更新せず、お知らせだけを出す
+channel = "stable"      # タグに "-" を含まないリリース
 ```
 
 環境変数（ファイルより優先）:
@@ -515,6 +542,7 @@ lang = "ja"             # ja | en — SessionStart のブロックと Stop の�
 | `KIOKU_AUTH_TOKEN` | `[server]` と `[client]` 両方の `auth_token` |
 | `KIOKU_SERVER_URL` | `[client] server_url` |
 | `KIOKU_STOP_NUDGE` | `0` / `false` / `off` / `no` で Stop の催促を無効化 |
+| `KIOKU_AUTO_UPDATE` | `[update] auto`（`0` で自動更新を止める） |
 | `RUST_LOG` | サーバーのログフィルタ（既定 `info,tantivy=warn`） |
 
 `kioku serve --bind <addr> --port <port>` はそのどちらよりも優先されます。

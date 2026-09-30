@@ -9,6 +9,7 @@ mod auth;
 pub mod invite;
 pub mod mcp;
 mod shared;
+mod update;
 
 use std::sync::Arc;
 
@@ -20,6 +21,7 @@ use rmcp::transport::streamable_http_server::StreamableHttpServerConfig;
 pub use api::ApiError;
 pub use invite::Invites;
 pub use mcp::{INSTRUCTIONS, KiokuMcp};
+pub use update::{SHUTDOWN_GRACE, ServeOptions, SharedUpdateStatus, UpdateStatus};
 
 /// Builds the full router: `/api/v1/*` + `/mcp`, bearer auth on everything but health and
 /// the invite routes `GET /i/<code>` and `POST /api/v1/join` (SPEC-M2.3 §3.2).
@@ -36,20 +38,37 @@ pub fn build_app_with_invites(
     auth_token: String,
     invites: Arc<Invites>,
 ) -> Router {
-    app(store, auth_token, invites, mcp::transport_config())
+    let update = UpdateStatus::shared_for(&store);
+    app(store, auth_token, invites, update, mcp::transport_config())
+}
+
+/// [`build_app`] with a given update status (`GET /api/v1/status` reports it).
+pub fn build_app_with_update(
+    store: Arc<Store>,
+    auth_token: String,
+    update: SharedUpdateStatus,
+) -> Router {
+    app(
+        store,
+        auth_token,
+        Arc::new(Invites::new()),
+        update,
+        mcp::transport_config(),
+    )
 }
 
 fn app(
     store: Arc<Store>,
     auth_token: String,
     invites: Arc<Invites>,
+    update: SharedUpdateStatus,
     mcp_config: StreamableHttpServerConfig,
 ) -> Router {
     let join = invite::JoinState {
         invites,
         token: Arc::from(auth_token.as_str()),
     };
-    let mut protected = api::protected_routes(store.clone())
+    let mut protected = api::protected_routes(store.clone(), update)
         .merge(invite::protected_routes(join.clone()))
         .nest_service("/mcp", mcp::service(store, mcp_config));
     if auth_token.is_empty() {
@@ -69,6 +88,19 @@ fn app(
 /// Binds `bind:port` and serves the app until Ctrl-C / SIGTERM, using the store's
 /// `[server] auth_token`. Refuses to start on a non-loopback bind without a token.
 pub async fn serve(store: Arc<Store>, bind: String, port: u16) -> anyhow::Result<()> {
+    let opts = ServeOptions::new(UpdateStatus::shared_for(&store));
+    serve_with(store, bind, port, opts).await
+}
+
+/// [`serve`] with an update status to report and a shutdown request (SPEC-M2.5 §3.1: a
+/// server that replaced its binary finishes in-flight requests, at most
+/// [`SHUTDOWN_GRACE`], then returns so the caller can exit 75).
+pub async fn serve_with(
+    store: Arc<Store>,
+    bind: String,
+    port: u16,
+    opts: ServeOptions,
+) -> anyhow::Result<()> {
     let token = store
         .config()
         .server
@@ -82,23 +114,39 @@ pub async fn serve(store: Arc<Store>, bind: String, port: u16) -> anyhow::Result
     }
     let mcp_config = mcp::transport_config();
     let mcp_cancel = mcp_config.cancellation_token.clone();
-    let app = app(store, token, Arc::new(Invites::new()), mcp_config);
+    let app = app(
+        store,
+        token,
+        Arc::new(Invites::new()),
+        opts.update.clone(),
+        mcp_config,
+    );
     let listener = bind_listener(&bind, port).await?;
     let addr = listener.local_addr().context("reading local address")?;
     tracing::info!(%addr, "kioku server listening (API /api/v1, MCP /mcp)");
     // Connect info: the invite routes rate-limit failed lookups per peer (SPEC-M2.3 §3.2).
-    axum::serve(
+    let requested = opts.shutdown.clone();
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .with_graceful_shutdown(async move {
-        shutdown_signal().await;
+        tokio::select! {
+            _ = shutdown_signal() => {},
+            _ = update::requested(requested) => {},
+        }
         tracing::info!("shutting down");
         // Closes open MCP SSE streams so graceful shutdown does not wait on them.
         mcp_cancel.cancel();
-    })
-    .await
-    .context("serving HTTP")?;
+    });
+    let grace = async move {
+        update::requested(opts.shutdown).await;
+        tokio::time::sleep(SHUTDOWN_GRACE).await;
+    };
+    tokio::select! {
+        r = server.into_future() => r.context("serving HTTP")?,
+        _ = grace => tracing::warn!("in-flight requests did not finish in time; exiting anyway"),
+    }
     Ok(())
 }
 

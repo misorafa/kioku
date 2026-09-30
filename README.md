@@ -152,7 +152,30 @@ server prints a command with the token in it,
 curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh -s -- --client-only http://<server>:7391 <token>
 ```
 
-Update later with `kioku update` (same download and checksum verification;
+### Updates
+
+Updates are automatic. The server (when it runs as `kioku service`) checks
+GitHub once a day and installs a newer stable release itself — SHA-256
+verified, and on macOS only a binary signed by kioku's Developer ID — then
+restarts. Clients follow the server, not GitHub: when a SessionStart hook sees
+that the server runs a newer version, it updates the client in the background
+(never blocking the agent, never downgrading), so every machine ends up on the
+server's version. `kioku status` and `kioku doctor` show the update state;
+background results go to `~/.kioku/logs/update.log`.
+
+To turn it off, add this to `config.toml` (or set `KIOKU_AUTO_UPDATE=0`); the
+`<kioku>` block then shows a one-line notice once a day instead:
+
+```toml
+[update]
+auto = false
+```
+
+A winget install is never replaced behind winget's back: it gets the notice
+with `winget upgrade misorafa.kioku`. A service installed before automatic
+updates existed enables them after one manual `kioku update`.
+
+Update by hand with `kioku update` (same download and checksum verification;
 replaces the binary in place and restarts the service; it only installs a
 release newer than the running one — `--version <tag>` installs any tag,
 including an older one; `kioku update --check` exits 10 when a newer release
@@ -202,8 +225,10 @@ and `kioku service` is not available there.
   codex`); Cursor (best effort) a quoted command string. Gemini CLI and
   Antigravity are not set up on Windows. Hook input is read as UTF-8 bytes (a
   BOM is ignored), so Japanese prompts survive on a Japanese-locale Windows.
-- **Updates:** `kioku update` works as elsewhere; a running `kioku.exe` cannot be
-  overwritten, so it is renamed to `kioku.exe.old` and removed by the next run.
+- **Updates:** automatic updates and `kioku update` work as elsewhere (a winget
+  install is updated with `winget upgrade misorafa.kioku`); a running `kioku.exe`
+  cannot be overwritten, so it is renamed to `kioku.exe.old` and removed by the
+  next run.
 - **SmartScreen:** the Windows binary is not code-signed yet; Windows may warn
   the first time the downloaded `kioku.exe` runs.
 - **Permissions:** files under `%USERPROFILE%\.kioku` inherit your profile's
@@ -554,6 +579,10 @@ auth_token = "…"
 timeout_ms = 3000       # hard deadline per hook
 stop_nudge = true
 lang = "ja"             # ja | en — SessionStart block and Stop nudge
+
+[update]                # optional; these are the defaults
+auto = true             # false = never update automatically, only show a notice
+channel = "stable"      # releases without "-" in the tag
 ```
 
 Environment variables (env beats the file):
@@ -566,6 +595,7 @@ Environment variables (env beats the file):
 | `KIOKU_AUTH_TOKEN` | both `[server]` and `[client]` `auth_token` |
 | `KIOKU_SERVER_URL` | `[client] server_url` |
 | `KIOKU_STOP_NUDGE` | `0` / `false` / `off` / `no` disables the Stop nudge |
+| `KIOKU_AUTO_UPDATE` | `[update] auto` (`0` turns automatic updates off) |
 | `RUST_LOG` | server log filter (default `info,tantivy=warn`) |
 
 `kioku serve --bind <addr> --port <port>` overrides both.

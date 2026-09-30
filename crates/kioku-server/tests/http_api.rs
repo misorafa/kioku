@@ -86,6 +86,8 @@ async fn session_lifecycle_round_trip() {
     assert!(start["pending_handoff"].is_null());
     assert!(start["state_excerpt"].is_null());
     assert_eq!(start["recent_sessions"], json!([]));
+    // SPEC-M2.5 §3.2: clients follow the server's version.
+    assert_eq!(start["server_version"], env!("CARGO_PKG_VERSION"));
 
     let observations = [
         json!({"session_id": sid, "kind": "prompt", "payload": {"prompt": "引き継ぎ書の自動生成を実装して"}}),
@@ -497,6 +499,12 @@ async fn status_reports_versions() {
     assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(body["index_schema_version"], 2);
     assert_eq!(body["index_schema_expected"], 2);
+    // SPEC-M2.5 §3.4: the server's auto-update state (defaults: auto on, nothing checked).
+    assert_eq!(body["update"]["auto"], true);
+    assert_eq!(body["update"]["managed"], false);
+    assert!(body["update"]["latest_seen"].is_null(), "{body}");
+    assert!(body["update"]["last_check"].is_null(), "{body}");
+    assert!(body["update"]["last_error"].is_null(), "{body}");
     let file = srv.dir.path().join("index/schema-version");
     std::fs::remove_file(&file).unwrap();
     let (_, body) = srv.get("/api/v1/status").await;
@@ -743,4 +751,65 @@ fn enc(s: &str) -> String {
         }
     }
     out
+}
+
+/// SPEC-M2.5 §3.4: `update` reflects what the update task recorded.
+#[tokio::test]
+async fn status_reports_the_shared_update_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(
+        kioku_core::Store::open(kioku_core::Config::for_data_dir(dir.path())).unwrap(),
+    );
+    let update = kioku_server::UpdateStatus::shared_for(&store);
+    let app = kioku_server::build_app_with_update(store, TOKEN.to_string(), update.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    {
+        let mut u = update.lock();
+        u.managed = true;
+        u.latest_seen = Some("v9.9.9".into());
+        u.last_check = Some("2026-09-30T00:00:00Z".into());
+        u.last_error = Some("checksum mismatch".into());
+    }
+    let body: serde_json::Value = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(format!("http://{addr}/api/v1/status"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        body["update"],
+        json!({"auto": true, "managed": true, "latest_seen": "v9.9.9",
+               "last_check": "2026-09-30T00:00:00Z", "last_error": "checksum mismatch"})
+    );
+}
+
+/// SPEC-M2.5 §3.1 step 3: a shutdown request stops `serve_with` (graceful, bounded).
+#[tokio::test]
+async fn serve_with_stops_on_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = kioku_core::Config::for_data_dir(dir.path());
+    cfg.server.auth_token = Some(TOKEN.into());
+    let store = std::sync::Arc::new(kioku_core::Store::open(cfg).unwrap());
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let opts = kioku_server::ServeOptions {
+        update: kioku_server::UpdateStatus::shared_for(&store),
+        shutdown: Some(rx),
+    };
+    let task = tokio::spawn(kioku_server::serve_with(store, "127.0.0.1".into(), 0, opts));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!task.is_finished());
+    tx.send(true).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .expect("serve_with returns after a shutdown request")
+        .unwrap()
+        .unwrap();
 }

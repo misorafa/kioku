@@ -25,6 +25,12 @@ pub const LAUNCHD_LABEL: &str = "dev.kioku.serve";
 pub const SYSTEMD_UNIT: &str = "kioku.service";
 /// `PATH` given to the LaunchAgent so `kioku serve` finds Homebrew's `git`.
 pub const LAUNCHD_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+/// Env marker set by the plist / unit: this `kioku serve` runs under the service manager
+/// and may update itself (SPEC-M2.5 §3.1 step 5).
+pub const SERVICE_MARKER_ENV: &str = "KIOKU_SERVICE";
+/// Exit code of a server that replaced its own binary; launchd (`SuccessfulExit=false`) and
+/// systemd (`Restart=on-failure`) both restart it (SPEC-M2.5 §3.1 step 3).
+pub const UPDATE_EXIT_CODE: i32 = 75;
 /// `RUST_LOG` given to the service.
 pub const SERVICE_RUST_LOG: &str = "info,tantivy=warn";
 /// tracing log of the service (`--log-file`), inside `<data_dir>/logs/`.
@@ -99,6 +105,7 @@ pub fn render_plist(spec: &ServiceSpec) -> String {
   <key>EnvironmentVariables</key>
   <dict>
     <key>KIOKU_DATA_DIR</key>{data}
+    <key>KIOKU_SERVICE</key><string>1</string>
     <key>PATH</key>{path}
     <key>RUST_LOG</key>{rust_log}
   </dict>
@@ -193,6 +200,7 @@ StartLimitBurst=5
 Type=simple
 ExecStart={exec}
 {data_env}
+Environment=KIOKU_SERVICE=1
 {log_env}
 WorkingDirectory={workdir}
 Restart=on-failure
@@ -521,6 +529,14 @@ impl ServiceManager {
     /// True when the definition file exists.
     pub fn is_installed(&self) -> bool {
         self.definition_path().is_some_and(|p| p.is_file())
+    }
+
+    /// True when an installed definition predates SPEC-M2.5 (no `KIOKU_SERVICE=1` marker),
+    /// so the service cannot update itself until the definition is rewritten.
+    pub fn lacks_service_marker(&self) -> bool {
+        self.definition_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .is_some_and(|text| !text.contains(SERVICE_MARKER_ENV))
     }
 
     fn unsupported(&self) -> anyhow::Error {

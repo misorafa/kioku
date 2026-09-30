@@ -230,6 +230,7 @@ pub fn run_doctor(env: &DoctorEnv, only: Option<Agent>) -> Vec<Check> {
     if server_machine {
         out.push(service_check(env, &cfg, &health));
     }
+    out.push(update_check(&cfg, env, &health));
 
     // Agents.
     let ctx = senv.install_ctx(&cfg.client);
@@ -1342,6 +1343,73 @@ fn log_dir(cfg: &Config, env: &DoctorEnv) -> PathBuf {
     }
 }
 
+/// SPEC-M2.5 §3.4: effective `[update]`, server vs client version (warn after 24 h of a
+/// mismatch), and the last automatic update from `state/auto-update.json`.
+pub fn update_check(cfg: &Config, env: &DoctorEnv, health: &Health) -> Check {
+    use crate::auto_update::{AutoUpdateState, MISMATCH_WARN, unix_now, within};
+    use crate::update::{is_newer, is_winget_install};
+    let state = AutoUpdateState::load(&log_dir(cfg, env).with_file_name("state"));
+    let winget = is_winget_install(Path::new(&env.bin));
+    let mut parts = vec![format!(
+        "automatic updates {} (channel {})",
+        if cfg.update.auto { "on" } else { "off" },
+        cfg.update.channel
+    )];
+    let mut status = Status::Ok;
+    let mut fix = None;
+    let how = if winget {
+        "winget upgrade misorafa.kioku".to_string()
+    } else {
+        "kioku update".to_string()
+    };
+    if winget {
+        parts.push("installed with winget (updates via winget)".into());
+    }
+    if let Health::Kioku { version } = health
+        && !version.is_empty()
+    {
+        if version == VERSION {
+            parts.push(format!("server and client both v{VERSION}"));
+        } else {
+            if is_newer(VERSION, version) {
+                parts.push(format!(
+                    "this client (v{VERSION}) is newer than the server (v{version}); clients never downgrade, update the server"
+                ));
+            } else {
+                parts.push(format!("server v{version}, this client v{VERSION}"));
+            }
+            let since = state.mismatch_since.as_deref();
+            if since.is_some() && !within(since, MISMATCH_WARN, unix_now()) {
+                status = Status::Warn;
+                parts.push(format!(
+                    "versions differ since {}",
+                    since.unwrap_or_default()
+                ));
+                fix = Some(if is_newer(VERSION, version) {
+                    "on the server machine: kioku update".to_string()
+                } else {
+                    how.clone()
+                });
+            }
+        }
+    }
+    if let Some(r) = &state.last_result {
+        parts.push(format!("last: {r}"));
+    }
+    if let Some(e) = &state.last_error {
+        parts.push(format!("last error: {e}"));
+        if state
+            .target
+            .as_deref()
+            .is_some_and(|t| is_newer(t, VERSION))
+        {
+            status = Status::Warn;
+            fix.get_or_insert(how);
+        }
+    }
+    check("update", status, parts.join("; "), fix)
+}
+
 fn hook_log_check(cfg: &Config, env: &DoctorEnv) -> Check {
     let path = log_dir(cfg, env).join("hook.log");
     let text = std::fs::read_to_string(&path).unwrap_or_default();
@@ -1401,6 +1469,63 @@ fn hook_dump_check(cfg: &Config, env: &DoctorEnv) -> Check {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SPEC-M2.5 §3.4: the `update` check (config, 24 h version mismatch, last result).
+    #[test]
+    fn update_check_reports_config_mismatch_and_last_result() {
+        use crate::auto_update::AutoUpdateState;
+        let home = tempfile::tempdir().unwrap();
+        let data = home.path().join(".kioku");
+        std::fs::create_dir_all(&data).unwrap();
+        let cfg = Config::for_data_dir(&data);
+        let env = DoctorEnv {
+            vars: HashMap::new(),
+            home: home.path().to_path_buf(),
+            bin: home.path().join("bin/kioku").display().to_string(),
+            runner: Runner::recording(|_| crate::service::CmdOutput::ok("")),
+            platform: None,
+            hook_platform: crate::install::HookPlatform::current(),
+            timeout: Duration::from_secs(1),
+        };
+        let same = Health::Kioku {
+            version: VERSION.to_string(),
+        };
+        let c = update_check(&cfg, &env, &same);
+        assert_eq!(c.status, Status::Ok, "{}", c.message);
+        assert!(c.message.contains("automatic updates on (channel stable)"));
+        let newer = Health::Kioku {
+            version: "99.0.0".into(),
+        };
+        // A fresh mismatch is fine; one older than 24 h warns.
+        let state = data.join("state");
+        let ts = |secs: u64| {
+            Some(kioku_core::util::fmt_ts(
+                kioku_core::util::now() - Duration::from_secs(secs),
+            ))
+        };
+        AutoUpdateState::update(&state, |s| s.mismatch_since = ts(3600));
+        assert_eq!(update_check(&cfg, &env, &newer).status, Status::Ok);
+        AutoUpdateState::update(&state, |s| s.mismatch_since = ts(25 * 3600));
+        let c = update_check(&cfg, &env, &newer);
+        assert_eq!(c.status, Status::Warn, "{}", c.message);
+        assert_eq!(c.fix.as_deref(), Some("kioku update"));
+        // The last failed attempt at a newer version warns and is shown.
+        AutoUpdateState::update(&state, |s| {
+            s.mismatch_since = None;
+            s.target = Some("v99.0.0".into());
+            s.last_error = Some("checksum mismatch".into());
+        });
+        let c = update_check(&cfg, &env, &newer);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.message.contains("last error: checksum mismatch"));
+        let mut off = cfg.clone();
+        off.update.auto = false;
+        assert!(
+            update_check(&off, &env, &same)
+                .message
+                .contains("automatic updates off")
+        );
+    }
 
     #[test]
     fn path_variable_is_found_in_any_casing() {

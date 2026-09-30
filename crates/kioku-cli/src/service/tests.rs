@@ -29,6 +29,7 @@ const SPEC_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
   <key>EnvironmentVariables</key>
   <dict>
     <key>KIOKU_DATA_DIR</key><string>/Users/me/.kioku</string>
+    <key>KIOKU_SERVICE</key><string>1</string>
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>RUST_LOG</key><string>info,tantivy=warn</string>
   </dict>
@@ -57,6 +58,7 @@ StartLimitBurst=5
 Type=simple
 ExecStart=/home/me/.local/bin/kioku serve --log-file /home/me/.kioku/logs/serve.log
 Environment=KIOKU_DATA_DIR=/home/me/.kioku
+Environment=KIOKU_SERVICE=1
 Environment=RUST_LOG=info,tantivy=warn
 WorkingDirectory=/home/me/.kioku
 Restart=on-failure
@@ -95,6 +97,7 @@ StartLimitBurst=5
 Type=simple
 ExecStart=\"/home/Jane Doe/.local/bin/kioku\" serve --log-file \"/home/Jane Doe/.kioku/logs/serve.log\"
 Environment=\"KIOKU_DATA_DIR=/home/Jane Doe/.kioku\"
+Environment=KIOKU_SERVICE=1
 Environment=RUST_LOG=info,tantivy=warn
 WorkingDirectory=/home/Jane Doe/.kioku
 Restart=on-failure
@@ -142,6 +145,45 @@ fn xml_and_systemd_escaping() {
     assert!(unit.contains("Environment=\"KIOKU_DATA_DIR=/home/u/100%% kioku\""));
     assert!(unit.contains("WorkingDirectory=/home/u/100%% kioku\n"));
     assert!(unit.contains("--log-file \"/home/u/100%% kioku/logs/serve.log\""));
+}
+
+/// SPEC-M2.5 §3.1: the service marker is set and exit 75 (a self-update) is restarted —
+/// launchd restarts any unsuccessful exit, systemd `on-failure` any non-zero code.
+#[test]
+fn definitions_mark_the_service_and_restart_after_a_self_update() {
+    let plist = render_plist(&spec("/Users/me"));
+    assert!(plist.contains("<key>KIOKU_SERVICE</key><string>1</string>"));
+    assert!(plist.contains("<key>SuccessfulExit</key><false/>"));
+    let unit = render_unit(&spec("/home/me"));
+    assert!(unit.contains("\nEnvironment=KIOKU_SERVICE=1\n"));
+    assert!(unit.contains("\nRestart=on-failure\n"));
+    assert!(!unit.contains("RestartPreventExitStatus"));
+    assert!(!unit.contains("SuccessExitStatus"));
+    assert_ne!(UPDATE_EXIT_CODE, 0);
+}
+
+/// Definitions written before SPEC-M2.5 lack the marker; `restart_service` rewrites them.
+#[test]
+fn old_definitions_are_detected() {
+    let home = tempfile::tempdir().unwrap();
+    let m = ServiceManager::with_platform(
+        Platform::Systemd,
+        Runner::recording(|_| CmdOutput::ok("")),
+        home.path(),
+        &std::collections::HashMap::new(),
+        spec("/home/me"),
+    );
+    assert!(!m.lacks_service_marker(), "not installed");
+    let path = m.definition_path().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        render_unit(&m.spec).replace("Environment=KIOKU_SERVICE=1\n", ""),
+    )
+    .unwrap();
+    assert!(m.lacks_service_marker());
+    std::fs::write(&path, render_unit(&m.spec)).unwrap();
+    assert!(!m.lacks_service_marker());
 }
 
 fn argv(calls: &[Vec<String>]) -> Vec<String> {

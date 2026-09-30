@@ -206,6 +206,13 @@ pub enum Command {
         /// Only compare with the latest release; exit 10 when an update is available.
         #[arg(long)]
         check: bool,
+        /// Run silently as the automatic updater (result in logs/update.log and
+        /// state/auto-update.json); started by the SessionStart hook.
+        #[arg(long, hide = true)]
+        background: bool,
+        /// macOS: refuse a binary that is not signed by kioku's Developer ID team.
+        #[arg(long)]
+        require_signature: bool,
     },
     /// Rebuild the search index from the wiki (via the server).
     Reindex,
@@ -487,13 +494,25 @@ mod tests {
         assert!(p(&["project", "merge", "only-one"]).is_err());
         assert!(matches!(
             p(&["update", "--version", "v0.2.0"]).unwrap().command,
-            Command::Update { version: Some(v), check: false } if v == "v0.2.0"
+            Command::Update { version: Some(v), check: false, background: false, require_signature: false } if v == "v0.2.0"
         ));
         assert!(matches!(
             p(&["update", "--check"]).unwrap().command,
             Command::Update {
                 version: None,
-                check: true
+                check: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            p(&["update", "--version", "v0.7.0", "--background"]).unwrap().command,
+            Command::Update { version: Some(v), background: true, .. } if v == "v0.7.0"
+        ));
+        assert!(matches!(
+            p(&["update", "--require-signature"]).unwrap().command,
+            Command::Update {
+                require_signature: true,
+                ..
             }
         ));
         assert!(p(&["reindex"]).is_ok());

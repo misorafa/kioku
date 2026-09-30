@@ -48,6 +48,9 @@ pub struct HookOutcome {
     pub stderr: String,
     /// Process exit code (0, or 2 for the Claude Code / Codex Stop nudge).
     pub exit_code: i32,
+    /// SessionStart: release tag to install with a detached `kioku update --background`
+    /// once the context has been printed (SPEC-M2.5 §3.3).
+    pub spawn_update: Option<String>,
 }
 
 impl HookOutcome {
@@ -127,7 +130,10 @@ pub fn run_hook_with_env(
             handle(&ev, agent, cfg, env)
         });
     match result {
-        Ok(r) => render(agent, event, r),
+        Ok((r, spawn_update)) => HookOutcome {
+            spawn_update,
+            ..render(agent, event, r)
+        },
         Err(err) => {
             log_failure(cfg, event, &session, &err);
             render(agent, event, HookResult::Silent)
@@ -213,7 +219,13 @@ pub fn cursor_native_hooks_installed(raw: &Value, env: &HookEnv) -> bool {
     })
 }
 
-fn handle(ev: &HookEvent, agent: Agent, cfg: &Config, env: &HookEnv) -> anyhow::Result<HookResult> {
+/// Runs the handler of `ev`; the second value is the release tag to update to (SessionStart).
+fn handle(
+    ev: &HookEvent,
+    agent: Agent,
+    cfg: &Config,
+    env: &HookEnv,
+) -> anyhow::Result<(HookResult, Option<String>)> {
     let deadline = hook_deadline_ms(agent, ev.event, cfg.client.timeout_ms);
     let client = ApiClient::new(&cfg.client, Duration::from_millis(deadline))?;
     let h = Handler {
@@ -223,8 +235,8 @@ fn handle(ev: &HookEvent, agent: Agent, cfg: &Config, env: &HookEnv) -> anyhow::
         env,
         client: &client,
     };
-    match ev.event {
-        HookEventKind::SessionStart => h.session_start(),
+    let result = match ev.event {
+        HookEventKind::SessionStart => return h.session_start(),
         HookEventKind::UserPromptSubmit if agent == Agent::Antigravity => {
             h.antigravity_invocation()
         }
@@ -241,7 +253,8 @@ fn handle(ev: &HookEvent, agent: Agent, cfg: &Config, env: &HookEnv) -> anyhow::
             }
             Ok(HookResult::Silent)
         }
-    }
+    };
+    result.map(|r| (r, None))
 }
 
 /// One invocation's context, shared by the per-event handlers.
@@ -254,17 +267,32 @@ struct Handler<'a> {
 }
 
 impl Handler<'_> {
-    fn session_start(&self) -> anyhow::Result<HookResult> {
+    /// The `<kioku>` block, plus the automatic-update decision against the server's version
+    /// (SPEC-M2.5 §3.3): a notice line in the block, or a tag to update to in the background.
+    fn session_start(&self) -> anyhow::Result<(HookResult, Option<String>)> {
         if let Some(dir) = marker_dir(self.agent, self.cfg, self.env) {
             cleanup_markers(&dir, CURSOR_MARKER_MAX_AGE);
         }
         let source = self.ev.source.clone().unwrap_or_default();
-        Ok(HookResult::Context(self.start(&source)?))
+        let (block, server_version) = self.start_with_version(&source)?;
+        let (notice, spawn) =
+            crate::auto_update::after_session_start(self.cfg, self.env, server_version.as_deref());
+        let block = match notice {
+            Some(line) => crate::auto_update::with_notice(&block, &line),
+            None => block,
+        };
+        Ok((HookResult::Context(block), spawn))
     }
 
     /// `POST /sessions/start` for the resolved cwd (with its handoff lane, M2.4 §1.1);
     /// returns the `<kioku>` block.
     fn start(&self, source: &str) -> anyhow::Result<String> {
+        self.start_with_version(source).map(|(block, _)| block)
+    }
+
+    /// [`Handler::start`], also returning the server's `server_version` (None from a server
+    /// older than SPEC-M2.5).
+    fn start_with_version(&self, source: &str) -> anyhow::Result<(String, Option<String>)> {
         let cwd = self.cwd()?;
         let project = identify(&cwd)?;
         let deadline = hook_deadline_ms(self.agent, self.ev.event, self.cfg.client.timeout_ms);
@@ -280,9 +308,13 @@ impl Handler<'_> {
         let resp = self
             .client
             .post(&["sessions", "start"], &serde_json::to_value(&req)?)?;
+        let server_version = resp
+            .get("server_version")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let resp: SessionStartResponse =
             serde_json::from_value(resp).context("unexpected sessions/start response")?;
-        Ok(self.block(&project.name, resp))
+        Ok((self.block(&project.name, resp), server_version))
     }
 
     fn block(&self, project_name: &str, resp: SessionStartResponse) -> String {
