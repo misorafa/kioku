@@ -41,6 +41,7 @@ pub fn render(agent: Agent, event: HookEventKind, result: HookResult) -> HookOut
                 stdout: String::new(),
                 stderr: format!("{m}\n"),
                 exit_code: NUDGE_EXIT_CODE,
+                spawn_update: None,
             },
         },
         Agent::Cursor => {
@@ -88,6 +89,7 @@ fn json_outcome(body: Value) -> HookOutcome {
         stdout: format!("{body}\n"),
         stderr: String::new(),
         exit_code: 0,
+        spawn_update: None,
     }
 }
 
@@ -102,6 +104,7 @@ mod tests {
             stdout: stdout.into(),
             stderr: stderr.into(),
             exit_code,
+            spawn_update: None,
         }
     }
 

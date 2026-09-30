@@ -23,7 +23,7 @@ pub mod store;
 pub mod strings;
 pub mod util;
 
-pub use config::{ClientConfig, Config, ServerConfig};
+pub use config::{ClientConfig, Config, ServerConfig, UpdateConfig};
 pub use db::{ProjectAlias, ProjectRow};
 pub use digest::{FileCount, SessionDigest};
 pub use error::{Error, Result};

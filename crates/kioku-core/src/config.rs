@@ -82,6 +82,32 @@ impl Default for ClientConfig {
     }
 }
 
+/// `[update]` section (SPEC-M2.5 §2): automatic updates, read by both roles.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdateConfig {
+    /// Update automatically (`false` = notify only). Env override `KIOKU_AUTO_UPDATE`.
+    pub auto: bool,
+    /// Release channel; only `stable` (tags without `-`) exists in M2.5.
+    pub channel: String,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> UpdateConfig {
+        UpdateConfig {
+            auto: true,
+            channel: "stable".to_string(),
+        }
+    }
+}
+
+impl UpdateConfig {
+    /// True when every field has its default (the table is then not written).
+    pub fn is_default(&self) -> bool {
+        *self == UpdateConfig::default()
+    }
+}
+
 /// Full configuration plus the resolved locations it was loaded from.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Config {
@@ -91,6 +117,9 @@ pub struct Config {
     /// `[client]` settings.
     #[serde(default)]
     pub client: ClientConfig,
+    /// `[update]` settings (not written while they are the defaults: setup never adds it).
+    #[serde(default, skip_serializing_if = "UpdateConfig::is_default")]
+    pub update: UpdateConfig,
     /// Resolved data directory (env > file `server.data_dir` > config dir).
     #[serde(skip)]
     pub data_dir: PathBuf,
@@ -103,6 +132,8 @@ pub struct Config {
 #[derive(Serialize)]
 struct ClientOnlyFile<'a> {
     client: &'a ClientConfig,
+    #[serde(skip_serializing_if = "UpdateConfig::is_default")]
+    update: &'a UpdateConfig,
 }
 
 impl Config {
@@ -111,6 +142,7 @@ impl Config {
         Config {
             server: ServerConfig::default(),
             client: ClientConfig::default(),
+            update: UpdateConfig::default(),
             data_dir: dir.to_path_buf(),
             config_file: dir.join(CONFIG_FILE),
         }
@@ -185,6 +217,9 @@ impl Config {
         if let Some(v) = get("KIOKU_STOP_NUDGE") {
             self.client.stop_nudge = !matches!(v.as_str(), "0" | "false" | "off" | "no");
         }
+        if let Some(v) = get("KIOKU_AUTO_UPDATE") {
+            self.update.auto = !matches!(v.as_str(), "0" | "false" | "off" | "no");
+        }
         Ok(())
     }
 
@@ -208,6 +243,7 @@ impl Config {
         } else {
             toml::to_string_pretty(&ClientOnlyFile {
                 client: &config.client,
+                update: &config.update,
             })
             .context("serializing client config")?
         };
@@ -227,6 +263,7 @@ impl Config {
         config.client.auth_token = Some(token.to_string());
         let text = toml::to_string_pretty(&ClientOnlyFile {
             client: &config.client,
+            update: &config.update,
         })
         .context("serializing client config")?;
         write_file(path, &text)?;
@@ -330,6 +367,37 @@ mod tests {
         assert!(!c.client.stop_nudge);
         assert!(
             Config::load_with_env(&env(&[("KIOKU_DATA_DIR", d), ("KIOKU_PORT", "x")])).is_err()
+        );
+    }
+
+    #[test]
+    fn update_table_defaults_file_and_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_str().unwrap();
+        let c = Config::load_with_env(&env(&[("KIOKU_DATA_DIR", d)])).unwrap();
+        assert!(c.update.auto);
+        assert_eq!(c.update.channel, "stable");
+        // Defaults are never written (setup / join do not add the table).
+        assert!(!c.to_toml().unwrap().contains("[update]"));
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            "[client]\nserver_url = \"http://h:1\"\n\n[update]\nauto = false\n",
+        )
+        .unwrap();
+        let c = Config::load_with_env(&env(&[("KIOKU_DATA_DIR", d)])).unwrap();
+        assert!(!c.update.auto);
+        assert_eq!(c.update.channel, "stable");
+        let on = env(&[("KIOKU_DATA_DIR", d), ("KIOKU_AUTO_UPDATE", "1")]);
+        assert!(Config::load_with_env(&on).unwrap().update.auto);
+        let off = env(&[("KIOKU_DATA_DIR", d), ("KIOKU_AUTO_UPDATE", "0")]);
+        assert!(!Config::load_with_env(&off).unwrap().update.auto);
+        // A user's `auto = false` survives rewriting the client-only file.
+        let path = dir.path().join(CONFIG_FILE);
+        Config::write_client_only(&path, "http://h:2", "t").unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("auto = false")
         );
     }
 

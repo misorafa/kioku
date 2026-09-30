@@ -148,3 +148,59 @@ Branch `m2.5-auto-update`, draft PR against `main`, CI green on every job. READM
 README.ja: short "Updates" section (automatic by default, how to turn off, winget).
 Record anything that turned out different in this spec. Do not merge, tag or change
 secrets.
+
+## 8. Implementation notes
+
+Recorded by the implementing session (branch `m2.5-auto-update`); where these differ from
+§1–§7, this section is what the code does.
+
+1. **Client log file.** `kioku update --background` writes to `<kioku dir>/logs/update.log`
+   (rotated at 256 KiB), not `hook.log`: `kioku doctor` counts every recent `hook.log` line
+   as a hook error, so a success line there would raise a false warning. The server logs to
+   `serve.log` via tracing as specified.
+2. **State file fields.** `auto-update.json` holds `{target, last_attempt, last_error}` as
+   specified plus `last_notice` (once-per-day notice, §3.3 step 5), `last_result` (the last
+   successful automatic update, for doctor) and `mismatch_since` (first SessionStart that saw
+   a server of another version; doctor warns 24 h after it). Times are RFC 3339. The server
+   task writes `target` / `last_attempt` / `last_error` / `last_result` to
+   `<data dir>/state/auto-update.json` too, so doctor on the server machine shows its result.
+3. **Who records the attempt.** The SessionStart hook records `target` + `last_attempt` when
+   it decides to spawn, so a burst of SessionStarts spawns one updater even before that
+   updater runs; the updater itself takes `auto-update.lock` (another updater running → exit
+   0) and records `last_error` / `last_result`. The hook decides inside the handler and
+   spawns in `kioku hook` after stdout/stderr are written and flushed (the spec's "after the
+   context has been printed").
+4. **Detaching on Unix** is `Command::process_group(0)` with null stdio, not `setsid`:
+   `setsid` needs `pre_exec`, i.e. `unsafe` (CLAUDE.md rule 2). The child is in its own
+   process group (no terminal signals), is never waited for, and is re-parented when the hook
+   exits. Windows uses the specified creation flags.
+5. **`update` status block** has one more field, `managed` (the server runs with
+   `KIOKU_SERVICE=1`, the only case in which it checks). `kioku status` prints the block as
+   one `update :` line.
+6. **Verification is explicit** (`update::Verify { signature, exact_version }`). Automatic
+   updates use `Verify::automatic()`: signature `Require` on macOS (`Skip` elsewhere) and the
+   exact version. Manual `kioku update` uses `Verify::manual()`: signature `Warn`, or
+   `Require` with the new flag `--require-signature`. The server-task tests pass
+   `Verify::unsigned()` (exact version, no signature) because their dummy binary is a shell
+   script; the macOS-only tests check that `Verify::automatic()` refuses that dummy and that
+   the test executable itself fails `verify_signature` (it is only inspected, never replaced).
+7. **Expected version (§4.4)** is enforced for automatic updates only: the new binary's
+   `--version` output must contain the tag's version as a word, else nothing changes. A
+   manual `kioku update` prints a warning and proceeds — like the signature, so a re-tagged
+   mirror or self-built fork still works, and `scripts/test-install.ps1` (which re-packages
+   the real `kioku.exe` under fixture tags) keeps working.
+8. **Old service definitions (§3.1 step 5).** `restart_service` calls `install()` instead of
+   `restart()` when the plist / unit lacks `KIOKU_SERVICE`, which rewrites the definition and
+   reloads it (launchd: bootout + bootstrap; systemd: daemon-reload + restart).
+9. **Graceful exit.** `kioku_server::serve_with` takes a shutdown request (`watch`
+   channel); after it fires, in-flight requests get up to 10 s, then `kioku serve` returns
+   exit code 75. `auto = false` logs "available" once per new tag per process (not persisted).
+10. **Pre-release tags** from `releases/latest` are ignored and not recorded as
+    `latest_seen` (GitHub never reports a pre-release as latest anyway).
+11. **Proxy.** The update HTTP client skips environment proxies when the release base is on
+    this machine or the local network (a `KIOKU_DOWNLOAD_BASE` mirror, the tests), like the
+    API client already does.
+12. **Notice text** lives in `auto_update.rs` (ja / en), not in `kioku_core::strings`: it is
+    CLI-only. Japanese: `kioku v<server> が利用できます（この端末は v<client>）: <how>`.
+13. **Windows servers** do not exist (no service manager, SPEC-M2.2), so §3.1 is
+    launchd / systemd only; Windows clients follow §3.3 with the rename dance.

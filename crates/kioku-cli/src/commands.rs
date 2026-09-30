@@ -43,7 +43,10 @@ pub fn run(cli: Cli) -> i32 {
             bind,
             port,
             log_file,
-        } => serve(bind, port, log_file),
+        } => match serve(bind, port, log_file) {
+            Ok(code) => return code,
+            Err(err) => Err(err),
+        },
         Command::Setup {
             client_only,
             no_service,
@@ -145,10 +148,23 @@ pub fn run(cli: Cli) -> i32 {
                     dry_run,
                 },
         } => project_merge(&from, &into, dry_run),
-        Command::Update { version, check } => match crate::update::run_update(version, check) {
-            Ok(code) => return code,
-            Err(err) => Err(err),
-        },
+        Command::Update {
+            version,
+            check,
+            background,
+            require_signature,
+        } => {
+            let args = crate::update::UpdateArgs {
+                version,
+                check,
+                background,
+                require_signature,
+            };
+            match crate::update::run_update(args) {
+                Ok(code) => return code,
+                Err(err) => Err(err),
+            }
+        }
         Command::Reindex => reindex(),
         Command::Status => status(),
         Command::RotateToken { dry_run } => return rotate_token(dry_run),
@@ -211,6 +227,15 @@ fn hook(event: HookEventKind, agent: Agent) -> i32 {
     let _ = std::io::stdout().write_all(outcome.stdout.as_bytes());
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().write_all(outcome.stderr.as_bytes());
+    let _ = std::io::stderr().flush();
+    // SPEC-M2.5 §3.3: after the context is out, follow the server's version in a detached
+    // updater (the hook never waits for it).
+    if let Some(tag) = &outcome.spawn_update
+        && let Err(err) = crate::auto_update::spawn_background(tag)
+        && let Ok(cfg) = Config::load()
+    {
+        log_failure(&cfg, event, "-", &err);
+    }
     outcome.exit_code
 }
 
@@ -301,7 +326,12 @@ fn init_client_only(url: &str, token: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn serve(bind: Option<String>, port: Option<u16>, log_file: Option<PathBuf>) -> anyhow::Result<()> {
+/// `kioku serve`; returns the exit code (75 after an automatic update, SPEC-M2.5 §3.1).
+fn serve(
+    bind: Option<String>,
+    port: Option<u16>,
+    log_file: Option<PathBuf>,
+) -> anyhow::Result<i32> {
     let mut cfg = Config::load()?;
     if let Some(bind) = bind {
         cfg.server.bind = bind;
@@ -323,6 +353,7 @@ fn serve(bind: Option<String>, port: Option<u16>, log_file: Option<PathBuf>) -> 
     init_tracing(log_file.as_deref())?;
     let (bind, port) = (cfg.server.bind.clone(), cfg.server.port);
     let data_dir = cfg.data_dir.clone();
+    let auto = cfg.update.auto;
     let store = Arc::new(Store::open(cfg).context("opening the data directory")?);
     let host = if bind.contains(':') && !bind.starts_with('[') {
         format!("[{bind}]")
@@ -335,7 +366,48 @@ fn serve(bind: Option<String>, port: Option<u16>, log_file: Option<PathBuf>) -> 
         .enable_all()
         .build()
         .context("starting the async runtime")?;
-    runtime.block_on(kioku_server::serve(store, bind, port))
+    // Only a server started by the service manager updates itself (§3.1 step 5): a
+    // foreground `kioku serve` would just exit.
+    let managed = std::env::var(crate::service::SERVICE_MARKER_ENV).is_ok_and(|v| v == "1");
+    let update = kioku_server::UpdateStatus::shared_for(&store);
+    update.lock().managed = managed;
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let opts = kioku_server::ServeOptions {
+        update: update.clone(),
+        shutdown: Some(rx.clone()),
+    };
+    runtime.block_on(async move {
+        if managed {
+            let exe = std::env::current_exe().context("locating the kioku binary")?;
+            let exe = kioku_core::util::canonical_plain(&exe).unwrap_or(exe);
+            let check = crate::auto_update::ServerCheck {
+                base: crate::update::release_base(),
+                exe,
+                current: kioku_core::VERSION.to_string(),
+                auto,
+                verify: crate::update::Verify::automatic(),
+                state_dir: Some(data_dir.join("state")),
+            };
+            tokio::spawn(crate::auto_update::server_update_task(
+                check,
+                update,
+                tx,
+                crate::auto_update::FIRST_CHECK,
+            ));
+        } else {
+            // No update task: nothing will request a shutdown.
+            std::mem::drop(tx);
+        }
+        kioku_server::serve_with(store, bind, port, opts).await
+    })?;
+    if *rx.borrow() {
+        tracing::info!(
+            "exiting with {} so the service manager starts the new binary",
+            crate::service::UPDATE_EXIT_CODE
+        );
+        return Ok(crate::service::UPDATE_EXIT_CODE);
+    }
+    Ok(0)
 }
 
 fn init_tracing(log_file: Option<&std::path::Path>) -> anyhow::Result<()> {
@@ -422,7 +494,8 @@ fn status() -> anyhow::Result<()> {
         .and_then(|v| v.get("version").and_then(Value::as_str).map(str::to_string))
         .unwrap_or_else(|| "?".to_string());
     let body = client.get(&["status"], &[])?;
-    let s: StatusReport = serde_json::from_value(body).context("unexpected status response")?;
+    let s: StatusReport =
+        serde_json::from_value(body.clone()).context("unexpected status response")?;
     println!("server       : {} (kioku {version})", cfg.client.server_url);
     println!("data dir     : {}", s.data_dir);
     println!("projects     : {}", s.projects);
@@ -441,7 +514,32 @@ fn status() -> anyhow::Result<()> {
             kioku_server::mcp::format_aliases(&s.aliases)
         );
     }
+    if let Some(u) = body.get("update") {
+        println!("update       : {}", format_update_status(u));
+    }
     Ok(())
+}
+
+/// One line for the server's `update` status block (SPEC-M2.5 §3.4).
+pub fn format_update_status(u: &Value) -> String {
+    let s = |k: &str| u.get(k).and_then(Value::as_str);
+    let auto = u.get("auto").and_then(Value::as_bool).unwrap_or(true);
+    let managed = u.get("managed").and_then(Value::as_bool).unwrap_or(false);
+    let mut out = match (auto, managed) {
+        (true, true) => "automatic".to_string(),
+        (false, _) => "automatic updates off".to_string(),
+        (true, false) => "automatic (inactive: not running under `kioku service`)".to_string(),
+    };
+    if let Some(tag) = s("latest_seen") {
+        out.push_str(&format!(", latest release {tag}"));
+    }
+    if let Some(t) = s("last_check") {
+        out.push_str(&format!(", last check {t}"));
+    }
+    if let Some(e) = s("last_error") {
+        out.push_str(&format!(", last error: {e}"));
+    }
+    out
 }
 
 fn reindex() -> anyhow::Result<()> {

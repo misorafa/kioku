@@ -2,13 +2,14 @@
 //! for Claude Code, Codex, Cursor and Gemini CLI (M1 §8, M2 §3–§6), the per-agent
 //! installers (M1 §8.5, M2 §8), HTTP-client commands (§11) and machine setup (M2 §10–§12):
 //! `serve --log-file`, `service`, `setup` and `doctor`, plus `update` (§13.3), and the
-//! one-command join `invite` / `join` (SPEC-M2.3).
+//! one-command join `invite` / `join` (SPEC-M2.3) and automatic updates (SPEC-M2.5).
 //!
 //! Hooks and `search` / `status` / `reindex` talk to the server over HTTP using the
 //! `[client]` config; only `init`, `setup` and `serve` touch the data directory.
 
 #![warn(missing_docs)]
 
+pub mod auto_update;
 pub mod bridge;
 pub mod cli;
 pub mod client;

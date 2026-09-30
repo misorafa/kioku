@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::Bytes,
     extract::{
         Path, Query, State,
@@ -21,6 +21,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::shared::{DEFAULT_HTTP_LIMIT, blocking, clamp_limit, resolve_scope, with_project_hint};
+use crate::update::SharedUpdateStatus;
 
 /// Version of the kioku-server crate, reported by `GET /api/v1/status`.
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -89,7 +90,7 @@ fn to_json<T: serde::Serialize>(value: T) -> ApiResult {
 }
 
 /// Routes that require the bearer token (everything except health).
-pub fn protected_routes(store: Arc<Store>) -> Router {
+pub fn protected_routes(store: Arc<Store>, update: SharedUpdateStatus) -> Router {
     Router::new()
         .route("/api/v1/sessions/start", post(start_session))
         .route("/api/v1/sessions/{id}", get(session_info))
@@ -104,6 +105,7 @@ pub fn protected_routes(store: Arc<Store>) -> Router {
         .route("/api/v1/status", get(status))
         .route("/api/v1/projects/merge", post(merge_projects))
         .route("/api/v1/reindex", post(reindex))
+        .layer(Extension(update))
         .with_state(store)
 }
 
@@ -117,13 +119,15 @@ async fn health() -> Json<Value> {
     Json(json!({ "ok": true, "version": VERSION }))
 }
 
-/// `POST /api/v1/sessions/start`.
+/// `POST /api/v1/sessions/start` (+ `server_version`, SPEC-M2.5 §3.2: clients follow it).
 async fn start_session(
     State(store): State<Arc<Store>>,
     body: Result<Json<SessionStartRequest>, JsonRejection>,
 ) -> ApiResult {
     let Json(req) = body?;
-    to_json(blocking(&store, move |s| s.start_session(&req)).await?)
+    let Json(mut v) = to_json(blocking(&store, move |s| s.start_session(&req)).await?)?;
+    v["server_version"] = json!(SERVER_VERSION);
+    Ok(Json(v))
 }
 
 /// `GET /api/v1/sessions/{id}`.
@@ -260,8 +264,12 @@ async fn write_handoff(
     ))
 }
 
-/// `GET /api/v1/status` (M2 §9.2: `version` is this server crate's version).
-async fn status(State(store): State<Arc<Store>>) -> ApiResult {
+/// `GET /api/v1/status` (M2 §9.2: `version` is this server crate's version; SPEC-M2.5 §3.4:
+/// `update` is the server's auto-update state).
+async fn status(
+    State(store): State<Arc<Store>>,
+    Extension(update): Extension<SharedUpdateStatus>,
+) -> ApiResult {
     let (mut report, projects) = blocking(&store, |s| {
         let projects: Vec<String> = s.list_projects()?.into_iter().map(|p| p.id).collect();
         Ok((s.status()?, projects))
@@ -272,6 +280,7 @@ async fn status(State(store): State<Arc<Store>>) -> ApiResult {
     let mut v =
         serde_json::to_value(report).map_err(|e| Error::Internal(anyhow::Error::from(e)))?;
     v["project_ids"] = json!(projects);
+    v["update"] = json!(update.lock().clone());
     Ok(Json(v))
 }
 
