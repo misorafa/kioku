@@ -131,3 +131,14 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
             --generate-notes
+
+  winget:
+    name: winget
+    needs: release
+    # Pre-release tags (`v1.2.3-rc1`) never go to winget.
+    if: ${{ !contains(github.ref_name, '-') }}
+    uses: ./.github/workflows/winget.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets:
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}

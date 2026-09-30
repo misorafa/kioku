@@ -1,0 +1,52 @@
+name: winget
+
+# Submits a release to microsoft/winget-pkgs as misorafa.kioku (packaging/winget/README.md):
+# winget-releaser (komac) derives the manifests from the previous version in winget-pkgs,
+# updates the zip URL and its SHA-256, and opens a PR from the ShinichiroGoto/winget-pkgs
+# fork. Called by release.yml after each GitHub Release; run it by hand to submit an
+# existing tag. Skipped while the WINGET_TOKEN secret (a classic PAT with `public_repo`,
+# owned by ShinichiroGoto) is not set. The first version must already be in winget-pkgs.
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag to submit (e.g. v0.6.5)
+        required: true
+        type: string
+    secrets:
+      WINGET_TOKEN:
+        required: false
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to submit (e.g. v0.6.5)
+        required: true
+        type: string
+
+jobs:
+  winget:
+    name: winget-pkgs PR
+    runs-on: windows-latest
+    steps:
+      - name: Check for WINGET_TOKEN
+        id: token
+        shell: pwsh
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          if ($env:WINGET_TOKEN) {
+            "present=true" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Output "::notice::WINGET_TOKEN is not set: skipping the winget submission"
+            "present=false" >> $env:GITHUB_OUTPUT
+          }
+      - if: steps.token.outputs.present == 'true'
+        uses: vedantmgoyal9/winget-releaser@4ffc7888bffd451b357355dc214d43bb9f23917e # v2
+        with:
+          identifier: misorafa.kioku
+          release-tag: ${{ inputs.tag }}
+          installers-regex: 'x86_64-pc-windows-msvc\.zip$'
+          release-notes-url: https://github.com/misorafa/kioku/releases/tag/${{ inputs.tag }}
+          fork-user: ShinichiroGoto
+          token: ${{ secrets.WINGET_TOKEN }}
