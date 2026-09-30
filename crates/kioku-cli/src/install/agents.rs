@@ -881,7 +881,7 @@ pub fn install_agent(
                 }
                 if changed && !dry {
                     r.push(
-                        "info: restart the Claude app so its chat and Cowork load kioku"
+                        "info: the Claude app rewrites this file while it runs and can drop the entry: quit it completely (also from the tray / menu bar), run this command again if it was running, then start it so its chat and Cowork load kioku"
                             .to_string(),
                     );
                 }

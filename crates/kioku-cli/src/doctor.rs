@@ -1077,7 +1077,9 @@ fn mcp_agent_check(agent: Agent, ctx: &InstallCtx) -> Check {
 /// `path` registers the kioku mcp bridge.
 fn desktop_check(path: &Path, ctx: &InstallCtx) -> Check {
     let id = "agent.claude-code.desktop";
-    let fix = Some("kioku install claude-code, then restart the Claude app".to_string());
+    let fix = Some(
+        "quit the Claude app completely, kioku install claude-code, then start the app".to_string(),
+    );
     match mcp_entry(Agent::ClaudeCode, path) {
         Ok(Some(McpFound::Stdio { command, args })) => {
             stdio_mcp_check(id, path, &command, &args, ctx, fix)
@@ -1512,7 +1514,7 @@ mod tests {
         // The state seen on the user's Windows 2026-09-30: the app, no kioku entry.
         let c = desktop_check(&path, &ctx);
         assert_eq!(c.status, Status::Warn, "{}", c.message);
-        assert!(c.fix.as_deref().unwrap().contains("restart the Claude app"));
+        assert!(c.fix.as_deref().unwrap().contains("quit the Claude app"));
         install_agent(Agent::ClaudeCode, &ctx, &InstallOptions::default()).unwrap();
         let c = desktop_check(&path, &ctx);
         assert_eq!(c.status, Status::Ok, "{}", c.message);

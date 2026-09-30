@@ -259,10 +259,13 @@ kioku is missing (seen on the user's Windows 11, Microsoft Store build 2.16120,
   kept.
 - **When:** `kioku install claude-code` at user level (so also `install all`, `setup`)
   writes it; `kioku uninstall claude-code` removes it; `--project` does neither. The
-  app reads the file at start: the report says to restart the Claude app.
+  app reads the file at start **and rewrites it from its in-memory copy while it
+  runs** — VERIFIED 2026-09-30 on the user's Windows: an entry added while the app
+  was running was gone again before the next install. So the report says: quit the
+  app completely, run the install again if it was running, then start it.
 - **doctor:** `agent.claude-code.desktop`, one check per file found. Stdio bridge →
   the same rules as `agent.<a>.mcp`; entry missing → WARN (fix: `kioku install
-  claude-code`, then restart the Claude app). No file found → no check.
+  claude-code` with the Claude app quit, then start it). No file found → no check.
 - UNVERIFIED: whether Cowork sessions see servers from this file exactly like chat.
 
 ### 7.4 Rendering rule

@@ -1183,7 +1183,7 @@ fn claude_desktop_app_configs_get_the_bridge() {
 
     let r = install_agent(Agent::ClaudeCode, &c, &opts(false)).unwrap();
     assert!(
-        r.lines.iter().any(|l| l.contains("restart the Claude app")),
+        r.lines.iter().any(|l| l.contains("quit it completely")),
         "{r:?}"
     );
     let entry = json!({"command": BIN, "args": ["mcp"]});
