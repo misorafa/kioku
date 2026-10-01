@@ -108,7 +108,12 @@ fn snapshot(dir: &Path, skip: &[&str]) -> BTreeMap<PathBuf, Vec<u8>> {
         for e in entries.flatten() {
             let p = e.path();
             let rel = p.strip_prefix(root).unwrap().to_path_buf();
-            if skip.iter().any(|s| rel.starts_with(s)) {
+            // `kioku.lock` is held by a running server (unreadable on Windows) and only
+            // carries a pid (SPEC-M2.7 §6).
+            if skip.iter().any(|s| rel.starts_with(s))
+                || p.file_name()
+                    .is_some_and(|n| n == kioku_core::store::LOCK_FILE)
+            {
                 continue;
             }
             if p.is_dir() {
