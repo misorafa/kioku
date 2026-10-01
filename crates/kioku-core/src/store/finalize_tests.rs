@@ -17,6 +17,7 @@ fn project() -> ProjectIdentity {
 fn start(store: &Store, session: &str) {
     store
         .start_session(&SessionStartRequest {
+            machine: None,
             session_id: session.into(),
             agent: "claude-code".into(),
             cwd: "/home/u/検索".into(),
@@ -66,6 +67,11 @@ fn nth(session: &str, i: usize) -> NewObservation {
                    "tool_input": {"file_paths": [format!("{root}/src/a.rs"), "src/日本語.rs"]},
                    "tool_response": {"is_error": i.is_multiple_of(2)}}),
         ),
+        // SPEC-M3.0 §3: the agent's replies are folded too (last one kept).
+        _ if i % 14 == 6 => (
+            ObservationKind::Assistant,
+            json!({"text": format!("返答 {}: 検索を直しました", i % 5)}),
+        ),
         _ => (ObservationKind::Stop, json!({"stop_hook_active": false})),
     };
     NewObservation {
@@ -106,6 +112,8 @@ fn incremental_digest_equals_from_scratch_at_every_step() {
         if i == 95 || i == 211 {
             store
                 .write_handoff(&HandoffInput {
+                    gotchas: Vec::new(),
+                    verified: Vec::new(),
                     project: project().id,
                     session: Some("step".into()),
                     summary: format!("途中経過 {i}"),
@@ -242,6 +250,8 @@ fn one_commit_per_turn_and_none_without_changes() {
     // (agent handoff, titles, edited files) does not and is left alone.
     store
         .write_handoff(&HandoffInput {
+            gotchas: Vec::new(),
+            verified: Vec::new(),
             project: project().id,
             session: Some("turns".into()),
             summary: "検索の索引を直した".into(),

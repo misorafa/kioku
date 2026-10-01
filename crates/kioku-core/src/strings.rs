@@ -55,6 +55,9 @@ pub struct Strings {
     pub auto_errors: &'static str,
     /// Fixed "next steps unknown" line.
     pub auto_next_unknown: &'static str,
+    /// `{reply}`: the start of the agent's last reply in the auto-generated handoff
+    /// (SPEC-M3.0 §3).
+    pub auto_last_reply: &'static str,
     /// `{agent}`, `{date}`: heading of an agent-written handoff.
     pub agent_handoff_heading: &'static str,
     /// Sub-heading: summary.
@@ -65,6 +68,10 @@ pub struct Strings {
     pub handoff_open_questions: &'static str,
     /// Sub-heading: decisions.
     pub handoff_decisions: &'static str,
+    /// Sub-heading: verified facts (SPEC-M3.0 §2).
+    pub handoff_verified: &'static str,
+    /// Sub-heading: gotchas (SPEC-M3.0 §2).
+    pub handoff_gotchas: &'static str,
     /// Placeholder for an empty list or missing value.
     pub none: &'static str,
     /// Placeholder title when the session had no prompt.
@@ -83,6 +90,8 @@ pub struct Strings {
     pub session_commands: &'static str,
     /// Session page: commits heading.
     pub session_commits: &'static str,
+    /// Session page: the agent's last reply (SPEC-M3.0 §3).
+    pub session_last_reply: &'static str,
     /// `{name}`: STATE.md title.
     pub state_title: &'static str,
     /// STATE.md: latest handoff heading.
@@ -95,6 +104,16 @@ pub struct Strings {
     pub state_recent_sessions: &'static str,
     /// STATE.md: frequently touched files heading.
     pub state_hot_files: &'static str,
+    /// STATE.md and `<kioku>` block: decisions (and verified facts) carried from earlier
+    /// handoffs (SPEC-M3.0 §1 section 3).
+    pub carried_decisions: &'static str,
+    /// STATE.md and `<kioku>` block: open questions (and gotchas) carried from earlier
+    /// handoffs (SPEC-M3.0 §1 section 4).
+    pub carried_open_questions: &'static str,
+    /// STATE.md and `<kioku>` block: pages tagged `pinned` (SPEC-M3.0 §1 section 5).
+    pub pinned_pages: &'static str,
+    /// `{n}`: marker for lines a section had no room for (SPEC-M3.0 §1).
+    pub more_items: &'static str,
     /// `{name}`, `{id}`: SessionStart context: first line naming the project id.
     pub start_project_line: &'static str,
     /// `{id}`: SessionStart context: line naming the session id.
@@ -108,6 +127,8 @@ pub struct Strings {
     pub start_reference_heading: &'static str,
     /// SessionStart context: heading of the STATE.md excerpt.
     pub start_state_heading: &'static str,
+    /// SessionStart context: the last reply of the previous session (SPEC-M3.0 §1 section 7).
+    pub start_last_reply_heading: &'static str,
     /// SessionStart context: closing instructions.
     pub start_footer: &'static str,
     /// `{project}`, `{session}`: Stop hook nudge paragraph (Claude Code, M1 §8.4).
@@ -132,11 +153,14 @@ pub const JA: Strings = Strings {
     auto_commits: "コミット: {commits}",
     auto_errors: "エラーの兆候: {n} 件のツール実行がエラーを返した",
     auto_next_unknown: "次にやること: （エージェントが明示的に書かなかったため不明。上記を手がかりに再開すること）",
+    auto_last_reply: "最後の回答（要約）: {reply}",
     agent_handoff_heading: "## 引き継ぎ（{agent}, {date}）",
     handoff_summary: "### 要約",
     handoff_next_steps: "### 次にやること",
     handoff_open_questions: "### 未解決の質問",
     handoff_decisions: "### 決定事項",
+    handoff_verified: "### 確認済みの事実",
+    handoff_gotchas: "### 落とし穴・注意点",
     none: "（なし）",
     no_prompt: "（指示なし）",
     session_overview: "## 概要",
@@ -146,21 +170,27 @@ pub const JA: Strings = Strings {
     session_files: "## 変更したファイル",
     session_commands: "## 実行したコマンド",
     session_commits: "## コミット",
+    session_last_reply: "## 最後の回答",
     state_title: "{name} — 現在の状態",
     state_latest_handoff: "## 最新の引き継ぎ",
     state_handoff_meta: "_{date} / {agent} / source: {source}_",
     state_no_handoff: "（まだ引き継ぎはありません）",
     state_recent_sessions: "## 最近のセッション",
     state_hot_files: "## よく触るファイル（直近10セッション）",
+    carried_decisions: "## 決定事項（これまでの引き継ぎ）",
+    carried_open_questions: "## 未解決（これまでの引き継ぎ）",
+    pinned_pages: "## ピン留め",
+    more_items: "…（ほか {n} 件）",
     start_project_line: "project: {name} (id: {id})  ← kioku_* ツールの project 引数にはこの id を渡すこと",
     start_session_line: "session: {id}  ← kioku_handoff_write の session 引数にはこの id を渡すこと",
     start_lane_line: "lane: {lane}  ← このブランチの引き継ぎだけを受け取る（kioku_handoff_write に session を渡せばこのレーンに残る）",
     start_handoff_heading: "## 前回からの引き継ぎ",
     start_reference_heading: "## メインの引き継ぎ（参考）\n（このブランチ宛ての引き継ぎはまだない。既定ブランチ向けのものを参考として表示しており、受領はしていない）",
     start_state_heading: "## 現在の状態（STATE.md 抜粋）",
+    start_last_reply_heading: "## 最後の回答（前回のセッション）",
     start_footer: "セッション終了前に kioku_handoff_write（上の project と session を渡す）で要約・次の一手・未解決点を書くこと。\n関連する過去の記録は kioku_query で検索できる。",
-    stop_nudge: "kioku: このセッションの引き継ぎがまだ書かれていないか、最後の引き継ぎ以降に作業が進んでいます。kioku_handoff_write（project={project}, session={session}）で 要約 / 次にやること / 未解決の質問 / 決定事項 を記録してから終了してください。記録済みなら stop_hook_active により再度この確認は出ません。",
-    stop_nudge_generic: "kioku: このセッションの引き継ぎがまだ書かれていないか、最後の引き継ぎ以降に作業が進んでいます。kioku_handoff_write（project={project}, session={session}）で 要約 / 次にやること / 未解決の質問 / 決定事項 を記録してから終了してください。記録済みなら、そのまま終了してください。",
+    stop_nudge: "kioku: このセッションの引き継ぎがまだ書かれていないか、最後の引き継ぎ以降に作業が進んでいます。kioku_handoff_write（project={project}, session={session}）で 要約 / 次にやること / 未解決の質問 / 決定事項（あれば 確認済みの事実 / 落とし穴）を記録してください。ユーザーへの回答を先に済ませ、次の自然な区切りで書いてもかまいません。記録済みなら stop_hook_active により再度この確認は出ません。",
+    stop_nudge_generic: "kioku: このセッションの引き継ぎがまだ書かれていないか、最後の引き継ぎ以降に作業が進んでいます。kioku_handoff_write（project={project}, session={session}）で 要約 / 次にやること / 未解決の質問 / 決定事項（あれば 確認済みの事実 / 落とし穴）を記録してください。ユーザーへの回答を先に済ませ、次の自然な区切りで書いてもかまいません。記録済みなら、そのまま終了してください。",
     instructions_body: "## kioku（共有メモリ）\n- kioku の MCP ツール（kioku_*）はこのマシンと他のエージェントで共有される記憶。\n- セッション開始時に `<kioku>` ブロックがあれば、その project / session を使う。無ければ作業前に\n  `kioku_read` で `<project>/STATE.md` を読む（project id: {project_line}）。\n- 調べる前に `kioku_query` で過去の記録を検索する。\n- タスクを終える前に必ず `kioku_handoff_write`（project, session, summary, next_steps,\n  open_questions, decisions）で引き継ぎを書く。session が分からなければ省略してよい。\n",
     instructions_global_project: "`kioku project id` の出力",
 };
@@ -175,11 +205,14 @@ pub const EN: Strings = Strings {
     auto_commits: "Commits: {commits}",
     auto_errors: "Error signals: {n} tool calls returned an error",
     auto_next_unknown: "Next steps: (unknown — the agent did not write them; resume from the clues above)",
+    auto_last_reply: "Last reply (excerpt): {reply}",
     agent_handoff_heading: "## Handoff ({agent}, {date})",
     handoff_summary: "### Summary",
     handoff_next_steps: "### Next steps",
     handoff_open_questions: "### Open questions",
     handoff_decisions: "### Decisions",
+    handoff_verified: "### Verified",
+    handoff_gotchas: "### Gotchas",
     none: "(none)",
     no_prompt: "(no instruction)",
     session_overview: "## Overview",
@@ -189,21 +222,27 @@ pub const EN: Strings = Strings {
     session_files: "## Changed files",
     session_commands: "## Commands run",
     session_commits: "## Commits",
+    session_last_reply: "## Last reply",
     state_title: "{name} — current state",
     state_latest_handoff: "## Latest handoff",
     state_handoff_meta: "_{date} / {agent} / source: {source}_",
     state_no_handoff: "(no handoff yet)",
     state_recent_sessions: "## Recent sessions",
     state_hot_files: "## Frequently touched files (last 10 sessions)",
+    carried_decisions: "## Decisions (carried)",
+    carried_open_questions: "## Open questions (carried)",
+    pinned_pages: "## Pinned pages",
+    more_items: "…({n} more)",
     start_project_line: "project: {name} (id: {id})  ← pass this id as `project` to kioku_* tools",
     start_session_line: "session: {id}  ← pass this id as `session` to kioku_handoff_write",
     start_lane_line: "lane: {lane}  ← only this branch's handoffs are delivered here (pass `session` to kioku_handoff_write to keep yours on this lane)",
     start_handoff_heading: "## Handoff from the previous session",
     start_reference_heading: "## Main line handoff (for reference)\n(No handoff for this branch yet. This one belongs to the default branch; it is shown for reference and was not accepted.)",
     start_state_heading: "## Current state (STATE.md excerpt)",
+    start_last_reply_heading: "## Last reply (previous session)",
     start_footer: "Before ending the session, record a summary, next steps and open questions with kioku_handoff_write (pass the project and session above).\nSearch past records with kioku_query.",
-    stop_nudge: "kioku: no handoff has been written for this session yet, or work continued after the last one. Record summary / next steps / open questions / decisions with kioku_handoff_write (project={project}, session={session}) before stopping. If you already did, stop_hook_active prevents this check from repeating.",
-    stop_nudge_generic: "kioku: no handoff has been written for this session yet, or work continued after the last one. Record summary / next steps / open questions / decisions with kioku_handoff_write (project={project}, session={session}) before stopping. If you already did, just stop.",
+    stop_nudge: "kioku: no handoff has been written for this session yet, or work continued after the last one. Record summary / next steps / open questions / decisions (and verified facts / gotchas, if any) with kioku_handoff_write (project={project}, session={session}). You may answer the user first and write it at the next natural pause. If you already did, stop_hook_active prevents this check from repeating.",
+    stop_nudge_generic: "kioku: no handoff has been written for this session yet, or work continued after the last one. Record summary / next steps / open questions / decisions (and verified facts / gotchas, if any) with kioku_handoff_write (project={project}, session={session}). You may answer the user first and write it at the next natural pause. If you already did, just stop.",
     instructions_body: "## kioku (shared memory)\n- The kioku MCP tools (kioku_*) are memory shared by this machine and other agents.\n- If a `<kioku>` block was given at session start, use its project / session. Otherwise, before\n  working, read `<project>/STATE.md` with `kioku_read` (project id: {project_line}).\n- Search past records with `kioku_query` before investigating.\n- Before finishing a task, always write a handoff with `kioku_handoff_write` (project, session,\n  summary, next_steps, open_questions, decisions). Omit session if you do not know it.\n",
     instructions_global_project: "the output of `kioku project id`",
 };

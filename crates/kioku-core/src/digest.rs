@@ -13,8 +13,9 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::carry::HANDOFF_REPLY_MAX;
 use crate::handoff::Handoff;
-use crate::session::{Observation, ObservationKind};
+use crate::session::{ASSISTANT_MAX, Observation, ObservationKind};
 use crate::strings::{Lang, fill, strings};
 use crate::util::{one_line, parse_ts, truncate_chars};
 
@@ -91,7 +92,16 @@ pub struct SessionDigest {
     /// Running totals the lists above are derived from.
     #[serde(default)]
     pub tally: DigestTally,
+    /// The agent's last reply (`assistant` observation, SPEC-M3.0 §3), ≤ 2,000 chars.
+    #[serde(default)]
+    pub last_reply: Option<String>,
+    /// Number of `assistant` observations.
+    #[serde(default)]
+    pub reply_count: u32,
 }
+
+/// Tool uses that make a change worth a new rules handoff on their own (SPEC-M3.0 §4).
+pub const MEANINGFUL_TOOL_USES: u32 = 5;
 
 /// What the digest reads from one tool use, from a full payload or a stub alike.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -159,6 +169,16 @@ fn tool_facts(payload: &Value) -> ToolFacts {
     facts
 }
 
+/// The reply text the digest keeps for an `assistant` observation (stub or full payload).
+fn reply_text(obs: &Observation) -> String {
+    let text = obs
+        .payload
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or(&obs.text);
+    truncate_chars(text.trim(), ASSISTANT_MAX)
+}
+
 /// The prompt text the digest keeps for a `prompt` observation.
 fn prompt_text(obs: &Observation) -> String {
     let text = obs
@@ -207,6 +227,19 @@ pub fn stub_payload(kind: ObservationKind, payload: &Value, text: &str) -> Value
                 out["git_commit"] = json!(m);
             }
             out
+        }
+        ObservationKind::Assistant => {
+            let obs = Observation {
+                id: 0,
+                session_id: String::new(),
+                project_id: String::new(),
+                seq: 0,
+                kind,
+                ts: String::new(),
+                payload: payload.clone(),
+                text: text.to_string(),
+            };
+            json!({"stub": true, "text": reply_text(&obs)})
         }
         ObservationKind::Stop | ObservationKind::Compact | ObservationKind::Note => {
             json!({"stub": true})
@@ -280,6 +313,13 @@ impl SessionDigest {
                     self.errors += 1;
                 }
             }
+            ObservationKind::Assistant => {
+                let text = reply_text(obs);
+                if !text.is_empty() {
+                    self.reply_count += 1;
+                    self.last_reply = Some(text);
+                }
+            }
             ObservationKind::Stop | ObservationKind::Compact | ObservationKind::Note => {}
         }
     }
@@ -315,6 +355,17 @@ impl SessionDigest {
     /// True when the session had at least one prompt or tool use (spec §7.1 step 2).
     pub fn is_substantive(&self) -> bool {
         self.prompt_count >= 1 || self.tool_use_count >= 1
+    }
+
+    /// For a digest of the observations since a rules handoff was issued: whether they
+    /// warrant a new one (SPEC-M3.0 §4) — a prompt, a file edit, a commit, a reply, or at
+    /// least [`MEANINGFUL_TOOL_USES`] tool uses.
+    pub fn is_meaningful_change(&self) -> bool {
+        self.prompt_count > 0
+            || !self.files.is_empty()
+            || !self.git_commits.is_empty()
+            || self.reply_count > 0
+            || self.tool_use_count >= MEANINGFUL_TOOL_USES
     }
 
     /// The auto-generated "Handoff" section (used when the agent wrote none).
@@ -370,7 +421,15 @@ impl SessionDigest {
         if self.errors > 0 {
             lines.push(fill(s.auto_errors, &[("n", &self.errors.to_string())]));
         }
-        lines.push(s.auto_next_unknown.to_string());
+        // SPEC-M3.0 §3: the agent's last reply says where it got to; "next steps unknown"
+        // only when there is not even that.
+        match &self.last_reply {
+            Some(reply) => {
+                let reply = truncate_chars(&one_line(reply), HANDOFF_REPLY_MAX);
+                lines.push(fill(s.auto_last_reply, &[("reply", &reply)]));
+            }
+            None => lines.push(s.auto_next_unknown.to_string()),
+        }
         let mut text = lines.join("\n");
         text.push('\n');
         text

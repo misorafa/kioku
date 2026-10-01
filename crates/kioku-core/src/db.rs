@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS sessions(
     root_path TEXT,
     lane TEXT,
     digest_json TEXT,
-    digest_seq INTEGER
+    digest_seq INTEGER,
+    machine TEXT
 );
 CREATE INDEX IF NOT EXISTS sessions_project ON sessions(project_id, started_at);
 CREATE TABLE IF NOT EXISTS observations(
@@ -115,9 +116,9 @@ pub struct PageRow {
 }
 
 /// Schema version this binary writes into `PRAGMA user_version` (SPEC-M2.7 §5): M1 = 1,
-/// M2.4 = 2, M2.6 = 3, M2.8 = 4 (cached session digests). A database stamped with a
-/// higher version is refused.
-pub const SCHEMA_VERSION: u32 = 4;
+/// M2.4 = 2, M2.6 = 3, M2.8 = 4 (cached session digests), M3.0 = 5 (`sessions.machine`). A
+/// database stamped with a higher version is refused.
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// A database written by a newer kioku (its `user_version` is above [`SCHEMA_VERSION`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -184,7 +185,7 @@ pub fn newer_schema_on_disk(path: &Path) -> Option<NewerSchema> {
 
 /// Columns added after the first M1 schema; `CREATE TABLE IF NOT EXISTS` does not add them
 /// to an existing database, so they are added here.
-const ADDED_COLUMNS: [(&str, &str, &str); 7] = [
+const ADDED_COLUMNS: [(&str, &str, &str); 8] = [
     ("sessions", "root_path", "TEXT"),
     ("handoffs", "updated_at", "TEXT"),
     ("handoffs", "seq_at", "INTEGER"),
@@ -192,6 +193,7 @@ const ADDED_COLUMNS: [(&str, &str, &str); 7] = [
     ("handoffs", "lane", "TEXT"),
     ("sessions", "digest_json", "TEXT"),
     ("sessions", "digest_seq", "INTEGER"),
+    ("sessions", "machine", "TEXT"),
 ];
 
 fn migrate(conn: &Connection) -> anyhow::Result<()> {
@@ -353,7 +355,7 @@ pub fn list_projects(conn: &Connection) -> anyhow::Result<Vec<ProjectRow>> {
 }
 
 const SESSION_COLS: &str =
-    "id, project_id, agent, cwd, source, started_at, ended_at, status, root_path, lane";
+    "id, project_id, agent, cwd, source, started_at, ended_at, status, root_path, lane, machine";
 
 fn session_from_row(r: &Row<'_>) -> rusqlite::Result<Session> {
     let status: String = r.get(7)?;
@@ -372,17 +374,20 @@ fn session_from_row(r: &Row<'_>) -> rusqlite::Result<Session> {
         },
         root_path: r.get(8)?,
         lane: r.get(9)?,
+        machine: r.get(10)?,
     })
 }
 
 /// Creates a session, or reopens an existing one (resume) keeping its project and start time;
-/// the lane follows the latest start (the branch may have changed).
+/// the lane follows the latest start (the branch may have changed), the machine is kept when
+/// the new start does not name one.
 pub fn upsert_session(conn: &Connection, s: &Session) -> anyhow::Result<()> {
     conn.execute(
-        "INSERT INTO sessions(id, project_id, agent, cwd, source, started_at, ended_at, status, root_path, lane)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 'open', ?7, ?8)
+        "INSERT INTO sessions(id, project_id, agent, cwd, source, started_at, ended_at, status, root_path, lane, machine)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 'open', ?7, ?8, ?9)
          ON CONFLICT(id) DO UPDATE SET status = 'open', ended_at = NULL, source = excluded.source,
-           root_path = COALESCE(excluded.root_path, sessions.root_path), lane = excluded.lane",
+           root_path = COALESCE(excluded.root_path, sessions.root_path), lane = excluded.lane,
+           machine = COALESCE(excluded.machine, sessions.machine)",
         params![
             s.id,
             s.project_id,
@@ -391,7 +396,8 @@ pub fn upsert_session(conn: &Connection, s: &Session) -> anyhow::Result<()> {
             s.source,
             s.started_at,
             s.root_path,
-            s.lane
+            s.lane,
+            s.machine
         ],
     )?;
     Ok(())
@@ -481,6 +487,47 @@ pub fn recent_substantive_sessions(
     ))?;
     let rows = stmt.query_map(params![project, include, limit as i64], session_from_row)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// The newest session of a project on `lane` other than `exclude` that has a prompt or a
+/// tool use (the "previous session" of SPEC-M3.0 §1 section 7).
+pub fn previous_session(
+    conn: &Connection,
+    project: &str,
+    lane: Option<&str>,
+    exclude: &str,
+) -> anyhow::Result<Option<Session>> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT {SESSION_COLS} FROM sessions s
+                 WHERE s.project_id = ?1 AND s.lane IS ?2 AND s.id != ?3
+                   AND EXISTS (SELECT 1 FROM observations o WHERE o.session_id = s.id
+                               AND o.kind IN ('prompt', 'tool_use'))
+                 ORDER BY s.started_at DESC, s.rowid DESC LIMIT 1"
+            ),
+            params![project, lane, exclude],
+            session_from_row,
+        )
+        .optional()?)
+}
+
+/// The text and seq of the newest `assistant` observation of a session (SPEC-M3.0 §3).
+pub fn last_assistant(conn: &Connection, session: &str) -> anyhow::Result<Option<(i64, String)>> {
+    let row: Option<(i64, String, String)> = conn
+        .query_row(
+            "SELECT seq, payload, text FROM observations WHERE session_id = ?1 AND kind = 'assistant'
+             ORDER BY seq DESC LIMIT 1",
+            params![session],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    Ok(row.map(|(seq, payload, text)| {
+        let from_payload = serde_json::from_str::<serde_json::Value>(&payload)
+            .ok()
+            .and_then(|p| p.get("text").and_then(serde_json::Value::as_str).map(str::to_string));
+        (seq, from_payload.unwrap_or(text))
+    }))
 }
 
 /// Appends an observation with the next seq for its session; returns the seq.
@@ -727,6 +774,51 @@ pub fn update_handoff_content(
         params![id, content, now],
     )?;
     Ok(())
+}
+
+/// `seq_at` of a handoff (the session's highest observation seq when it was written).
+pub fn handoff_seq_at(conn: &Connection, id: &str) -> anyhow::Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT seq_at FROM handoffs WHERE id = ?1",
+            params![id],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// The newest agent-written handoffs of a project on every lane, newest first (the sources
+/// of carried items, SPEC-M3.0 §1).
+pub fn recent_agent_handoffs(
+    conn: &Connection,
+    project: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<Handoff>> {
+    let mut stmt = conn.prepare(&format!(
+        "{HANDOFF_SELECT} WHERE h.project_id = ?1 AND h.source = 'agent'
+         ORDER BY h.created_at DESC, h.rowid DESC LIMIT ?2"
+    ))?;
+    let rows = stmt.query_map(params![project, limit as i64], handoff_from_row)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Pages tagged `tag` (case-insensitive) of a project or global scope, newest update first
+/// (SPEC-M3.0 §1 section 5).
+pub fn tagged_pages(
+    conn: &Connection,
+    project: &str,
+    tag: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<PageRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {PAGE_COLS} FROM pages
+         WHERE (scope = 'global' OR (scope = 'project' AND project_id = ?1))
+           AND EXISTS (SELECT 1 FROM json_each(pages.tags) WHERE lower(json_each.value) = lower(?2))
+         ORDER BY updated_at DESC, rowid DESC LIMIT ?3"
+    ))?;
+    let rows = stmt.query_map(params![project, tag, limit as i64], page_from_row)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// Fetches a handoff by id.

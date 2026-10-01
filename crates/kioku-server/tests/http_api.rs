@@ -89,6 +89,10 @@ async fn session_lifecycle_round_trip() {
     assert!(start["pending_handoff"].is_null());
     assert!(start["state_excerpt"].is_null());
     assert_eq!(start["recent_sessions"], json!([]));
+    // SPEC-M3.0 §1: the new sections are computed (empty for a new project)
+    assert_eq!(start["context_version"], 1);
+    assert_eq!(start["decisions"], json!([]));
+    assert_eq!(start["pinned"], json!([]));
     // SPEC-M2.5 §3.2: clients follow the server's version.
     assert_eq!(start["server_version"], env!("CARGO_PKG_VERSION"));
 
@@ -139,8 +143,23 @@ async fn session_lifecycle_round_trip() {
         .unwrap();
     assert_eq!(resp.status(), 400);
 
-    let (status, info) = srv.get(&format!("/api/v1/sessions/{sid}")).await;
+    // SPEC-M3.0 §3: the agent's reply; the same text again is not stored twice
+    for _ in 0..2 {
+        let (status, body) = srv
+            .post(
+                "/api/v1/observations",
+                json!({"session_id": sid, "kind": "assistant", "payload": {"text": "引き継ぎ書の生成を実装しました。"}}),
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["seq"], 4);
+    }
+
+    let (status, mut info) = srv.get(&format!("/api/v1/sessions/{sid}")).await;
     assert_eq!(status, 200);
+    // SPEC-M3.0 §4: seconds since the start (no handoff yet), by the server's clock
+    assert!(info["secs_since_handoff"].as_u64().is_some_and(|s| s < 60), "{info}");
+    info.as_object_mut().unwrap().remove("secs_since_handoff");
     assert_eq!(
         info,
         json!({

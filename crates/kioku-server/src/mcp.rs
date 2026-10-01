@@ -35,10 +35,10 @@ pub const QUERY_DESC: &str = "kioku の記憶（過去のセッション要約�
 pub const READ_DESC: &str = "kioku のページを path（kioku_query の結果に出る wiki 内の相対パス。例: <project_id>/STATE.md, <project_id>/sessions/2026-09-25-0c2f1a2b-3f9a1c2e4b5d.md, _global/<slug>.md）で読み、frontmatter の要約、本文、更新競合の検出に使う revision を返す。\nRead one kioku page by its wiki-relative path.";
 
 /// Tool description of `write_page` (shared with the `kioku mcp` bridge).
-pub const WRITE_PAGE_DESC: &str = "後で役に立つ知見・設計判断・手順・調査結果を Markdown ページとして kioku に保存する（検索対象になり、git に履歴が残る）。同じ title（または path）で書くと本文を置き換える。既存ページの更新前には kioku_read で読み、返された revision を expected_revision に渡す。競合（エラー）したら再読込して変更を統合してから書き直す。省略または空文字なら無条件に上書きする。scope=project（project を渡した場合の既定）はそのプロジェクト専用、scope=global はプロジェクトを横断する個人的なメモ。セッションの引き継ぎには使わず kioku_handoff_write を使うこと。\nSave durable knowledge as a searchable page; writing the same title/path replaces it.";
+pub const WRITE_PAGE_DESC: &str = "後で役に立つ知見・設計判断・手順・調査結果を Markdown ページとして kioku に保存する（検索対象になり、git に履歴が残る）。同じ title（または path）で書くと本文を置き換える。tags に pinned を付けたページは、そのプロジェクト（scope=global なら全プロジェクト）の SessionStart の <kioku> ブロックに毎回表示される（新しい順に 3 件まで、本文の先頭 400 字）— 常に守ってほしいルールや前提に使う。既存ページの更新前には kioku_read で読み、返された revision を expected_revision に渡す。競合（エラー）したら再読込して変更を統合してから書き直す。省略または空文字なら無条件に上書きする。scope=project（project を渡した場合の既定）はそのプロジェクト専用、scope=global はプロジェクトを横断する個人的なメモ。セッションの引き継ぎには使わず kioku_handoff_write を使うこと。\nSave durable knowledge as a searchable page; writing the same title/path replaces it. Tag it `pinned` to show it at every session start.";
 
 /// Tool description of `handoff_write` (shared with the `kioku mcp` bridge).
-pub const HANDOFF_WRITE_DESC: &str = "このセッションの引き継ぎを記録する。このプロジェクトで次に始まるセッション（別のエージェントや別マシンでも）の冒頭に自動で渡される。作業を終える前、区切りがついたとき、コンテキストが尽きそうなときに必ず呼ぶこと。project と session には SessionStart の <kioku> ブロックに書かれた project の id と session の id を渡すこと（session を省略すると、そのプロジェクトで最後に観測のあった開いているセッションに紐づく）。summary=何をしたか・今どういう状態か、next_steps=次の一手（ファイル名やコマンドまで具体的に）、open_questions=未解決の点、decisions=決めたこととその理由。\nRecord a handoff for the next session of this project; always call it before you stop. Pass `project` and `session` from the SessionStart <kioku> block.";
+pub const HANDOFF_WRITE_DESC: &str = "このセッションの引き継ぎを記録する。このプロジェクトで次に始まるセッション（別のエージェントや別マシンでも）の冒頭に自動で渡される。作業を終える前、区切りがついたとき、コンテキストが尽きそうなときに必ず呼ぶこと。project と session には SessionStart の <kioku> ブロックに書かれた project の id と session の id を渡すこと（session を省略すると、そのプロジェクトで最後に観測のあった開いているセッションに紐づく）。summary=何をしたか・今どういう状態か、next_steps=次の一手（ファイル名やコマンドまで具体的に）、open_questions=未解決の点、decisions=決めたこととその理由、verified=確認済みの事実（実際に試して確かめたこと）、gotchas=落とし穴・注意点（次のセッションが踏みそうな罠）。decisions / verified / open_questions / gotchas は次回以降のセッション開始時にも引き継がれて表示されるので、1 項目 1 行で簡潔に書くこと。\nRecord a handoff for the next session of this project; always call it before you stop. Pass `project` and `session` from the SessionStart <kioku> block. decisions, verified facts, open questions and gotchas are carried into later sessions too: one short line each.";
 
 /// Tool description of `handoff_pending` (shared with the `kioku mcp` bridge).
 pub const HANDOFF_PENDING_DESC: &str = "プロジェクトの未受領の引き継ぎ（最新のもの）を取得する。既定の accept=false では覗くだけで消費しない。accept=true にすると受領済みにして、同じレーンの古い未受領の引き継ぎもまとめて受領済みにする（通常は SessionStart フックが自動で行うので不要）。引き継ぎはブランチごとのレーンに分かれる: session を渡すとそのセッションのレーン、lane（ブランチ名）を渡すとそのレーン、どちらも無ければ既定ブランチ（メインライン）のレーンを読む。自分のレーンに引き継ぎが無いときは、メインラインの引き継ぎが参考として返る（受領はされない）。\nPeek at (or accept) the pending handoff of a project; handoffs are routed per branch lane (session or lane; default = main line).";
@@ -155,6 +155,12 @@ pub struct HandoffWriteParams {
     /// 決定事項（理由も）/ decisions made, with reasons.
     #[serde(default)]
     pub decisions: Vec<String>,
+    /// 確認済みの事実（実際に確かめたこと）/ facts that were checked and hold.
+    #[serde(default)]
+    pub verified: Vec<String>,
+    /// 落とし穴・注意点 / pitfalls the next session should know about.
+    #[serde(default)]
+    pub gotchas: Vec<String>,
 }
 
 /// Input of `kioku_handoff_pending`.
@@ -257,6 +263,8 @@ impl KiokuMcp {
             next_steps: p.next_steps,
             open_questions: p.open_questions,
             decisions: p.decisions,
+            gotchas: p.gotchas,
+            verified: p.verified,
         };
         let handoff = blocking(&self.store, move |s| {
             s.write_handoff(&input)
@@ -332,7 +340,7 @@ fn err_text(err: Error) -> String {
 }
 
 /// `kioku_query` output: the untrusted-memory note, then numbered hits
-/// `path — title (score) [global]` + indented snippet.
+/// `path — title (kind, YYYY-MM-DD) [global]` (SPEC-M3.0 §5) + indented snippet.
 pub fn format_hits(hits: &[Hit]) -> String {
     let mut out = memory_note();
     if hits.is_empty() {
@@ -341,11 +349,11 @@ pub fn format_hits(hits: &[Hit]) -> String {
     }
     for (i, h) in hits.iter().enumerate() {
         out.push_str(&format!(
-            "{}. {} — {} ({:.2}){}\n",
+            "{}. {} — {} ({}){}\n",
             i + 1,
             h.path,
             h.title,
-            h.score,
+            hit_meta(h),
             if h.global { " [global]" } else { "" }
         ));
         let snippet = h.snippet.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -354,6 +362,17 @@ pub fn format_hits(hits: &[Hit]) -> String {
         }
     }
     out.trim_end().to_string()
+}
+
+/// `kind, YYYY-MM-DD` of a hit (SPEC-M3.0 §5); just the kind when the date is unknown.
+pub fn hit_meta(h: &Hit) -> String {
+    let date: String = h.updated.chars().take(10).collect();
+    match (h.kind.is_empty(), date.len() == 10) {
+        (false, true) => format!("{}, {date}", h.kind),
+        (false, false) => h.kind.clone(),
+        (true, true) => date,
+        (true, false) => "-".to_string(),
+    }
 }
 
 /// `kioku_read` output: the untrusted-memory note, frontmatter summary, blank line, body.

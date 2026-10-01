@@ -15,6 +15,7 @@ fn project() -> ProjectIdentity {
 fn start(store: &Store, session: &str) {
     store
         .start_session(&SessionStartRequest {
+            machine: None,
             session_id: session.into(),
             agent: "claude-code".into(),
             cwd: "/home/u/記憶".into(),
@@ -40,6 +41,8 @@ fn session_at(store: &Store, id: &str, ts: &str, prompt: &str) {
             json!({"tool_name": "Bash", "tool_input": {"command": "git commit -m \"feat: 記憶の整理\"\nbody"},
                    "tool_response": {"stdout": "x".repeat(400), "exit_code": 1}}),
         ),
+        // SPEC-M3.0 §3: a reply's stub keeps the text the digest reads
+        (ObservationKind::Assistant, json!({"text": "記憶を整理しました。"})),
     ];
     for (kind, payload) in obs {
         store
@@ -126,7 +129,7 @@ fn prune_applies_retention_to_old_data_only() {
     assert_eq!(dry.raw_gzipped.count, 1);
     assert_eq!(dry.raw_deleted.count, 1);
     assert_eq!(dry.sessions_reduced.count, 1);
-    assert_eq!(dry.observations_reduced, 3);
+    assert_eq!(dry.observations_reduced, 4);
     assert!(dry.sessions_reduced.bytes > 0);
     assert_eq!(dry.backups_removed.count, 1);
     assert_eq!(dry.hook_dumps_removed.count, 1);
@@ -150,7 +153,7 @@ fn prune_applies_retention_to_old_data_only() {
             real.backups_removed.count,
             real.hook_dumps_removed.count
         ),
-        (1, 1, 1, 3, 1, 1)
+        (1, 1, 1, 4, 1, 1)
     );
     // raw: the old log is gzipped (same content), the ancient one gone, the new one kept
     assert!(!raw("old").exists());
@@ -189,6 +192,7 @@ fn prune_applies_retention_to_old_data_only() {
     assert_eq!(after_digest.prompts, vec!["古いセッションの指示"]);
     assert_eq!(after_digest.git_commits, vec!["feat: 記憶の整理"]);
     assert_eq!(after_digest.errors, 1);
+    assert_eq!(after_digest.last_reply.as_deref(), Some("記憶を整理しました。"));
     // backups and hook dumps
     assert!(!backups.join("snap0").exists() && backups.join("snap1").is_dir());
     assert!(!logs.join("hook-dump.jsonl.1").exists());
@@ -226,6 +230,8 @@ fn forget_session_removes_everything_of_it() {
     session_at(&store, "drop", &days_ago(1), "忘れるべき秘密の作業");
     store
         .write_handoff(&HandoffInput {
+            gotchas: Vec::new(),
+            verified: Vec::new(),
             project: project().id,
             session: Some("drop".into()),
             summary: "忘れるべき引き継ぎ".into(),
@@ -252,7 +258,7 @@ fn forget_session_removes_everything_of_it() {
             .any(|h| h.path == page)
     );
     let dry = store.forget_session("drop", true).unwrap();
-    assert_eq!(dry.observations, 4);
+    assert_eq!(dry.observations, 5);
     assert_eq!(dry.receipts, 1);
     assert_eq!(dry.handoffs, 2, "the rules and the agent handoff");
     assert_eq!(dry.pages, vec![page.clone()]);

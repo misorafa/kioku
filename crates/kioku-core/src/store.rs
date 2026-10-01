@@ -5,6 +5,8 @@
 //! write lock; lock order is always write lock → db → index writer.
 
 #[cfg(test)]
+mod context_tests;
+#[cfg(test)]
 mod finalize_tests;
 mod maintenance;
 mod reliability;
@@ -24,6 +26,10 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+use crate::carry::{
+    CARRY_HANDOFFS, Carried, LAST_REPLY_MAX, MAX_PINNED, PINNED_EXCERPT, PINNED_TAG, SourceHandoff,
+    carry, handoff_items,
+};
 use crate::config::Config;
 use crate::db::{self, PageRow, ProjectAlias, ProjectRow};
 use crate::digest::{SessionDigest, aggregate_files};
@@ -39,13 +45,15 @@ use crate::project::{
     ProjectIdentity, comparable_root, is_derived_id, is_remote_derived, is_valid_id, normalize_lane,
 };
 use crate::render::{
-    StateSession, session_body, session_page_path, session_title, state_body, state_title,
+    StateSession, agent_label, session_body, session_page_path, session_title, state_body,
+    state_title,
 };
 use crate::sanitize::{redact, sanitize_payload};
 use crate::session::{
-    FinalizeResult, HANDOFF_STALE_TOOL_USES, NewObservation, Observation, ObservationKind,
-    RecentSession, Session, SessionInfo, SessionStartRequest, SessionStartResponse, SessionStatus,
-    is_valid_session_id, observation_text,
+    ASSISTANT_MAX, CONTEXT_VERSION, FinalizeResult, HANDOFF_STALE_TOOL_USES, NewObservation,
+    Observation, ObservationKind, PinnedPage, RecentSession, Session, SessionInfo,
+    SessionStartRequest, SessionStartResponse, SessionStatus, is_valid_session_id,
+    normalize_machine, observation_text,
 };
 use crate::util::{self, display_date, display_minute, now_ts, sha256_hex};
 
@@ -387,6 +395,7 @@ impl Store {
             )));
         }
         let lane = req.lane.as_deref().and_then(normalize_lane);
+        let machine = req.machine.as_deref().and_then(normalize_machine);
         let now = now_ts();
         let (project_id, routed, recent) = {
             let mut conn = self.db.lock();
@@ -410,6 +419,7 @@ impl Store {
                     status: SessionStatus::Open,
                     root_path: Some(req.project.root.clone()).filter(|r| !r.is_empty()),
                     lane: lane.clone(),
+                    machine,
                 },
             )?;
             // A session re-created by an offline replay is not a person starting work: it
@@ -422,18 +432,84 @@ impl Store {
             } else {
                 route_pending(&tx, &project_id, lane.as_deref(), &req.session_id, &now)?
             };
-            let recent = recent_sessions(&tx, &project_id, None, RECENT_SESSIONS)?;
+            // The session's own page (a resumed session) is not "recent" context for itself.
+            let recent: Vec<(Session, String)> =
+                recent_sessions(&tx, &project_id, None, RECENT_SESSIONS + 1)?
+                    .into_iter()
+                    .filter(|(s, _)| s.id != req.session_id)
+                    .take(RECENT_SESSIONS)
+                    .collect();
             tx.commit().context("committing session start")?;
             (project_id, routed, recent)
         };
-        Ok(SessionStartResponse {
+        let mut resp = SessionStartResponse {
             project_id: project_id.clone(),
             pending_handoff: routed.handoff,
             state_excerpt: self.state_excerpt(&project_id),
             recent_sessions: recent.into_iter().map(recent_entry).collect(),
             lane,
             reference_handoff: routed.reference_handoff,
-        })
+            ..SessionStartResponse::default()
+        };
+        self.fill_context(&mut resp, &req.session_id)?;
+        Ok(resp)
+    }
+
+    /// The SPEC-M3.0 §1 sections of a SessionStart response: items carried from the last
+    /// [`CARRY_HANDOFFS`] agent handoffs (those of the handoff shown in section 2 left out),
+    /// pinned pages and the previous session's last reply on the same lane (left out when
+    /// the handoff shown in section 2 came from that session, which already holds it).
+    fn fill_context(&self, resp: &mut SessionStartResponse, session_id: &str) -> Result<()> {
+        let shown = resp
+            .pending_handoff
+            .as_ref()
+            .or(resp.reference_handoff.as_ref());
+        let shown_items = shown
+            .map(|h| handoff_items(&h.content_md))
+            .unwrap_or_default();
+        let (sources, pinned, last_reply) = {
+            let conn = self.db.lock();
+            let sources: Vec<SourceHandoff> =
+                db::recent_agent_handoffs(&conn, &resp.project_id, CARRY_HANDOFFS)?
+                    .iter()
+                    .map(SourceHandoff::from_handoff)
+                    .collect();
+            let pinned = db::tagged_pages(&conn, &resp.project_id, PINNED_TAG, MAX_PINNED)?;
+            let previous =
+                db::previous_session(&conn, &resp.project_id, resp.lane.as_deref(), session_id)?
+                    .filter(|p| shown.is_none_or(|h| h.session_id.as_deref() != Some(&p.id)));
+            let last_reply = match previous {
+                Some(p) => db::last_assistant(&conn, &p.id)?
+                    .map(|(_, text)| util::truncate_chars(text.trim(), LAST_REPLY_MAX))
+                    .filter(|t| !t.is_empty()),
+                None => None,
+            };
+            (sources, pinned, last_reply)
+        };
+        let carried = carry(&sources, &shown_items);
+        resp.context_version = CONTEXT_VERSION;
+        resp.decisions = carried.decisions;
+        resp.verified = carried.verified;
+        resp.open_questions = carried.open_questions;
+        resp.gotchas = carried.gotchas;
+        resp.pinned = self.pinned_pages(&pinned);
+        resp.last_reply = last_reply;
+        Ok(())
+    }
+
+    /// Title, path and the start of the body of each pinned page (unreadable files skipped).
+    fn pinned_pages(&self, rows: &[PageRow]) -> Vec<PinnedPage> {
+        rows.iter()
+            .filter_map(|row| {
+                let text = std::fs::read_to_string(self.dirs.wiki().join(&row.path)).ok()?;
+                let page = Page::parse(&row.path, &text).ok()?;
+                Some(PinnedPage {
+                    path: row.path.clone(),
+                    title: row.title.clone(),
+                    excerpt: util::truncate_chars(page.body.trim(), PINNED_EXCERPT),
+                })
+            })
+            .collect()
     }
 
     /// The SessionStart context of an existing session, without side effects (M2 §9.1):
@@ -464,14 +540,17 @@ impl Store {
                     .collect();
             (session, pending, reference, recent)
         };
-        Ok(SessionStartResponse {
+        let mut resp = SessionStartResponse {
             state_excerpt: self.state_excerpt(&session.project_id),
             project_id: session.project_id,
             pending_handoff,
             recent_sessions: recent.into_iter().map(recent_entry).collect(),
             lane: session.lane,
             reference_handoff,
-        })
+            ..SessionStartResponse::default()
+        };
+        self.fill_context(&mut resp, id)?;
+        Ok(resp)
     }
 
     /// Fetches a session row.
@@ -489,12 +568,20 @@ impl Store {
         let has_agent_handoff =
             db::newest_session_handoff(&conn, id, Some(HandoffSource::Agent), false)?.is_some();
         let since = db::tool_uses_since_handoff(&conn, id)?;
+        // SPEC-M3.0 §4: time since the latest agent handoff (since the start without one),
+        // by this server's clock so client clocks do not matter.
+        let mark = db::agent_handoff_mark(&conn, id)?
+            .map(|m| m.created_at)
+            .unwrap_or_else(|| session.started_at.clone());
+        let secs_since_handoff =
+            util::parse_ts(&mark).map(|t| (util::now() - t).num_seconds().max(0) as u64);
         Ok(SessionInfo {
             project_id: session.project_id,
             status: session.status,
             counts,
             has_agent_handoff,
             tool_uses_since_handoff: Some(since),
+            secs_since_handoff,
         })
     }
 
@@ -509,7 +596,20 @@ impl Store {
                 obs.session_id
             )));
         }
-        let payload = sanitize_payload(&obs.payload);
+        let mut payload = sanitize_payload(&obs.payload);
+        if obs.kind == ObservationKind::Assistant {
+            // SPEC-M3.0 §3: `{text}` only, trimmed, at most ASSISTANT_MAX chars.
+            let reply = payload
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if reply.is_empty() {
+                return Err(Error::invalid("an assistant observation needs a non-empty text"));
+            }
+            payload = serde_json::json!({ "text": util::truncate_chars(&reply, ASSISTANT_MAX) });
+        }
         let text = redact(&observation_text(obs.kind, &payload));
         let ts = obs
             .ts
@@ -549,6 +649,14 @@ impl Store {
                     return Ok(seq);
                 }
             }
+            // The same reply twice in a row (a Stop repeated without a new turn) is stored
+            // once (SPEC-M3.0 §3).
+            if obs.kind == ObservationKind::Assistant
+                && let Some((seq, last)) = db::last_assistant(&tx, &session.id)?
+                && payload.get("text").and_then(serde_json::Value::as_str) == Some(last.as_str())
+            {
+                return Ok(seq);
+            }
             let seq = db::insert_observation(
                 &tx,
                 &session.id,
@@ -558,8 +666,10 @@ impl Store {
                 &payload_json,
                 &text,
             )?;
-            let substantive =
-                matches!(obs.kind, ObservationKind::Prompt | ObservationKind::ToolUse);
+            let substantive = matches!(
+                obs.kind,
+                ObservationKind::Prompt | ObservationKind::ToolUse | ObservationKind::Assistant
+            );
             if substantive && session.status == SessionStatus::Finalized {
                 db::set_session_status(&tx, &session.id, SessionStatus::Open, None)?;
             }
@@ -677,6 +787,7 @@ impl Store {
             session: Some(session.id.clone()),
             agent: Some(session.agent.clone()),
             lane: session.lane.clone(),
+            machine: session.machine.clone(),
             ..Frontmatter::default()
         };
         // Written together with STATE.md below: one git commit, one index commit (§2).
@@ -688,7 +799,9 @@ impl Store {
         )?;
 
         // 4. rules handoff: one pending rules handoff per session (or per agent handoff, for
-        // the addendum), refreshed in place on re-finalize with its created_at kept.
+        // the addendum), refreshed in place on re-finalize with its created_at kept. One that
+        // was already accepted is refreshed in place too, unless the digest changed in a way
+        // that matters since it was issued (SPEC-M3.0 §4); only then is a new row issued.
         let handoff_id = match (&digest.agent_handoff, &delta) {
             (Some(h), None) => h.id.clone(),
             (agent, _) => {
@@ -702,6 +815,27 @@ impl Store {
                 // An addendum must be newer than the agent handoff it extends; an older
                 // rules handoff predates it and is left alone (it ranks below the agent's).
                 .filter(|r| agent.as_ref().is_none_or(|a| r.created_at >= a.created_at));
+                let existing = match existing {
+                    Some(pending) => Some(pending),
+                    None => db::newest_session_handoff(
+                        &conn,
+                        session_id,
+                        Some(HandoffSource::Rules),
+                        false,
+                    )?
+                    .filter(|r| agent.as_ref().is_none_or(|a| r.created_at >= a.created_at))
+                    .map(|r| -> Result<Option<Handoff>> {
+                        let Some(at) = db::handoff_seq_at(&conn, &r.id)? else {
+                            return Ok(None);
+                        };
+                        let since = db::list_observations_between(&conn, session_id, at, max_seq)?;
+                        let changed =
+                            SessionDigest::from_observations(&since, None).is_meaningful_change();
+                        Ok((!changed).then_some(r))
+                    })
+                    .transpose()?
+                    .flatten(),
+                };
                 match existing {
                     Some(existing) => {
                         db::update_handoff_content(&conn, &existing.id, &handoff_md, &now)?;
@@ -766,6 +900,8 @@ impl Store {
             next_steps: redact_all(&input.next_steps),
             open_questions: redact_all(&input.open_questions),
             decisions: redact_all(&input.decisions),
+            gotchas: redact_all(&input.gotchas),
+            verified: redact_all(&input.verified),
         };
         let conn = self.db.lock();
         let project_id = resolve_id(&conn, &input.project)?;
@@ -795,8 +931,13 @@ impl Store {
             .as_ref()
             .map(|s| s.agent.clone())
             .unwrap_or_else(|| "unknown".to_string());
+        // `claude-code@mini` in the heading when the session's machine is known (§6).
+        let label = agent_label(
+            &agent,
+            session.as_ref().and_then(|s| s.machine.as_deref()),
+        );
         let content =
-            render_agent_handoff(self.config.lang(), &agent, &display_minute(&now), input);
+            render_agent_handoff(self.config.lang(), &label, &display_minute(&now), input);
         let h = Handoff {
             id: util::new_id(),
             project_id,
@@ -1312,11 +1453,18 @@ impl Store {
         include: Option<(&str, &str)>,
     ) -> Result<Option<PageWrite>> {
         let lang = self.config.lang();
-        let (latest, recent, digests) = {
+        let (latest, recent, digests, sources, pinned) = {
             let conn = self.db.lock();
             // The project lane's handoff: STATE.md is shown to every session, and a branch
             // lane's handoff must not reach the default branch (M2.4 §1.4).
             let latest = db::newest_handoff(&conn, &project.id, None, false)?;
+            // SPEC-M3.0 §1: the same carried sections as the `<kioku>` block.
+            let sources: Vec<SourceHandoff> =
+                db::recent_agent_handoffs(&conn, &project.id, CARRY_HANDOFFS)?
+                    .iter()
+                    .map(SourceHandoff::from_handoff)
+                    .collect();
+            let pinned = db::tagged_pages(&conn, &project.id, PINNED_TAG, MAX_PINNED)?;
             let mut recent = Vec::new();
             for s in db::recent_substantive_sessions(
                 &conn,
@@ -1337,8 +1485,14 @@ impl Store {
             for (s, _) in &recent {
                 digests.push(cached_digest(&conn, s)?);
             }
-            (latest, recent, digests)
+            (latest, recent, digests, sources, pinned)
         };
+        let shown = latest
+            .as_ref()
+            .map(|h| handoff_items(&h.content_md))
+            .unwrap_or_default();
+        let carried: Carried = carry(&sources, &shown);
+        let pinned = self.pinned_pages(&pinned);
         let prefix = format!("{}/", project.id);
         let recent: Vec<StateSession> = recent
             .into_iter()
@@ -1348,6 +1502,7 @@ impl Store {
                     date: display_date(&s.started_at),
                     agent: s.agent.clone(),
                     lane: s.lane.clone(),
+                    machine: s.machine.clone(),
                     title,
                     rel_path: path.strip_prefix(&prefix).unwrap_or(&path).to_string(),
                 }
@@ -1364,7 +1519,7 @@ impl Store {
         self.prepare_page(
             &format!("{}/STATE.md", project.id),
             fm,
-            &state_body(lang, latest.as_ref(), &recent, &hot),
+            &state_body(lang, latest.as_ref(), &carried, &pinned, &recent, &hot),
             true,
         )
     }
@@ -1460,6 +1615,9 @@ fn recent_entry((s, title): (Session, String)) -> RecentSession {
         title,
         path: session_page_path(&s),
         date: display_date(&s.started_at),
+        agent: s.agent,
+        lane: s.lane,
+        machine: s.machine,
     }
 }
 
@@ -1838,6 +1996,7 @@ mod tests {
     fn start(store: &Store, session: &str) -> SessionStartResponse {
         store
             .start_session(&SessionStartRequest {
+                machine: None,
                 session_id: session.into(),
                 agent: "claude-code".into(),
                 cwd: "/home/u/kioku".into(),
@@ -1883,6 +2042,8 @@ mod tests {
 
     fn agent_handoff(project: &str, session: Option<&str>, summary: &str) -> HandoffInput {
         HandoffInput {
+            gotchas: Vec::new(),
+            verified: Vec::new(),
             project: project.into(),
             session: session.map(str::to_string),
             summary: summary.into(),
@@ -1895,6 +2056,7 @@ mod tests {
     fn start_on(store: &Store, session: &str, lane: Option<&str>) -> SessionStartResponse {
         store
             .start_session(&SessionStartRequest {
+                machine: None,
                 session_id: session.into(),
                 agent: "claude-code".into(),
                 cwd: "/home/u/kioku".into(),
@@ -2073,6 +2235,7 @@ mod tests {
     fn start_with(store: &Store, session: &str, p: ProjectIdentity) -> SessionStartResponse {
         store
             .start_session(&SessionStartRequest {
+                machine: None,
                 session_id: session.into(),
                 agent: "codex".into(),
                 cwd: p.root.clone(),
@@ -2507,6 +2670,7 @@ mod tests {
         p.root = root.into();
         store
             .start_session(&SessionStartRequest {
+                machine: None,
                 session_id: session.into(),
                 agent: "claude-code".into(),
                 cwd: root.into(),
@@ -2741,6 +2905,7 @@ mod tests {
     fn start_as(store: &Store, session: &str, agent: &str, source: &str) -> SessionStartResponse {
         store
             .start_session(&SessionStartRequest {
+                machine: None,
                 session_id: session.into(),
                 agent: agent.into(),
                 cwd: "/home/u/kioku".into(),
@@ -2923,6 +3088,8 @@ mod tests {
         assert!(branch.pending_handoff.is_none());
         assert_eq!(branch.reference_handoff.unwrap().id, "old-h");
         let resp = start(&store, "after-migration");
+        // SPEC-M3.0: the new sections (and `sessions.machine`) work on a migrated database
+        assert_eq!(resp.context_version, crate::session::CONTEXT_VERSION);
         assert_eq!(resp.pending_handoff.unwrap().id, "old-h");
         work(&store, "after-migration");
         assert!(
@@ -3228,6 +3395,8 @@ mod tests {
         start(&store, "s-redact");
         let h = store
             .write_handoff(&HandoffInput {
+                gotchas: Vec::new(),
+                verified: Vec::new(),
                 project: project().id,
                 session: Some("s-redact".into()),
                 summary: format!("token は {token}"),
