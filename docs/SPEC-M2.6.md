@@ -3,6 +3,12 @@
 Status: spec, 2026-10-01. Amends SPEC-M1 §§2, 5–7 and SPEC-M2 diagnostics. Read CLAUDE.md,
 SPEC-M1.md, SPEC-M2.md and SPEC-M2.4.md first.
 
+> **Amended by SPEC-M2.7 (v0.9):** the database carries `PRAGMA user_version` = 3 (M1 = 1,
+> M2.4 = 2, M2.6 = 3) and a binary refuses a newer one (§5); one process per data directory
+> (`kioku.lock`, §6); a page write whose index update fails sets
+> `reliability_meta.needs_reindex`, healed at the next start (§6); `/api/v1/backup` keeps
+> `[server] backup_keep` (10) snapshots and refuses a second backup within 60 s (§12).
+
 Origin: a proposal implemented in commit ca8afe5 (not merged). It was reviewed in three
 parts; this spec keeps what held up, fixes what did not, and drops the rest (§6). No new
 dependency, service, model or database.

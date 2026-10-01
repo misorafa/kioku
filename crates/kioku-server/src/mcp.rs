@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use kioku_core::strings::memory_note;
 use kioku_core::{
     Error, Handoff, HandoffInput, Hit, Page, PageScope, PendingHandoff, ProjectAlias, Store,
     VERSION,
@@ -31,7 +32,7 @@ pub const INSTRUCTIONS: &str = "kioku は、このユーザーのすべてのマ
 pub const QUERY_DESC: &str = "kioku の記憶（過去のセッション要約・各プロジェクトの STATE.md・保存済みページ）を全文検索する。日本語・英語どちらのクエリも使える（形態素解析済み）。コードを探索したり同じ調査を繰り返したりする前に、まずこれを呼ぶこと。project を渡すとそのプロジェクトとグローバルのページに絞られる。結果の path は kioku_read で全文を読める。\nSearch kioku's shared memory (past sessions, STATE.md, pages) before exploring; Japanese and English queries both work.";
 
 /// Tool description of `read` (shared with the `kioku mcp` bridge).
-pub const READ_DESC: &str = "kioku のページを path（kioku_query の結果に出る wiki 内の相対パス。例: <project_id>/STATE.md, <project_id>/sessions/2026-09-25-0c2f1a2b.md, _global/<slug>.md）で読み、frontmatter の要約、本文、更新競合の検出に使う revision を返す。\nRead one kioku page by its wiki-relative path.";
+pub const READ_DESC: &str = "kioku のページを path（kioku_query の結果に出る wiki 内の相対パス。例: <project_id>/STATE.md, <project_id>/sessions/2026-09-25-0c2f1a2b-3f9a1c2e4b5d.md, _global/<slug>.md）で読み、frontmatter の要約、本文、更新競合の検出に使う revision を返す。\nRead one kioku page by its wiki-relative path.";
 
 /// Tool description of `write_page` (shared with the `kioku mcp` bridge).
 pub const WRITE_PAGE_DESC: &str = "後で役に立つ知見・設計判断・手順・調査結果を Markdown ページとして kioku に保存する（検索対象になり、git に履歴が残る）。同じ title（または path）で書くと本文を置き換える。既存ページの更新前には kioku_read で読み、返された revision を expected_revision に渡す。競合（エラー）したら再読込して変更を統合してから書き直す。省略または空文字なら無条件に上書きする。scope=project（project を渡した場合の既定）はそのプロジェクト専用、scope=global はプロジェクトを横断する個人的なメモ。セッションの引き継ぎには使わず kioku_handoff_write を使うこと。\nSave durable knowledge as a searchable page; writing the same title/path replaces it.";
@@ -330,12 +331,14 @@ fn err_text(err: Error) -> String {
     err.to_string()
 }
 
-/// `kioku_query` output: numbered hits `path — title (score) [global]` + indented snippet.
+/// `kioku_query` output: the untrusted-memory note, then numbered hits
+/// `path — title (score) [global]` + indented snippet.
 pub fn format_hits(hits: &[Hit]) -> String {
+    let mut out = memory_note();
     if hits.is_empty() {
-        return "no hits".to_string();
+        out.push_str("no hits");
+        return out;
     }
-    let mut out = String::new();
     for (i, h) in hits.iter().enumerate() {
         out.push_str(&format!(
             "{}. {} — {} ({:.2}){}\n",
@@ -353,10 +356,11 @@ pub fn format_hits(hits: &[Hit]) -> String {
     out.trim_end().to_string()
 }
 
-/// `kioku_read` output: frontmatter summary, blank line, body.
+/// `kioku_read` output: the untrusted-memory note, frontmatter summary, blank line, body.
 pub fn format_page(page: &Page) -> String {
     let fm = &page.frontmatter;
-    let mut out = format!("path: {}\ntitle: {}\n", page.path, fm.title);
+    let mut out = memory_note();
+    out.push_str(&format!("path: {}\ntitle: {}\n", page.path, fm.title));
     // An older server sends no revision: print none rather than an empty one to pass back.
     if !page.revision.is_empty() {
         out.push_str(&format!("revision: {}\n", page.revision));
@@ -407,17 +411,18 @@ pub fn format_handoff(h: &Handoff) -> String {
     format!("{header}\n\n{}", h.content_md.trim_end())
 }
 
-/// `kioku_handoff_pending` output: the handoff, else the main line's as a marked reference
-/// (M2.4 §1.4), else `none`.
+/// `kioku_handoff_pending` output: the untrusted-memory note, then the handoff, else the
+/// main line's as a marked reference (M2.4 §1.4), else `none`.
 pub fn format_pending(p: &PendingHandoff) -> String {
-    match (&p.handoff, &p.reference_handoff) {
+    let body = match (&p.handoff, &p.reference_handoff) {
         (Some(h), _) => format_handoff(h),
         (None, Some(r)) => format!(
             "no handoff on this lane. Main line handoff (for reference, not accepted) / メインの引き継ぎ（参考・未受領）:\n\n{}",
             format_handoff(r)
         ),
         (None, None) => "none".to_string(),
-    }
+    };
+    format!("{}{body}", memory_note())
 }
 
 /// `kioku_status` output.

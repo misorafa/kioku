@@ -4,6 +4,14 @@ Status: spec, 2026-09-30. Amends SPEC-M2 (update, service) and SPEC-M2.2 §5 (Wi
 swap). Read CLAUDE.md, SPEC-M2.md (§ update / service), SPEC-M2.2.md §5 and
 `crates/kioku-cli/src/update.rs` first.
 
+> **Amended by SPEC-M2.7 (v0.9):** the order of checks is checksum → extract → signature →
+> `--version` → swap (§2: nothing unverified runs). `KIOKU_DOWNLOAD_BASE` / `KIOKU_REPO`
+> count only with `[update] allow_mirror = true`, and a mirror must be https unless on
+> loopback (§11). `GET /api/v1/health` no longer has `version`; it is in `/status` and the
+> SessionStart answer (§11). Every update keeps the replaced binary as `<exe>.prev`; a
+> managed server that fails to start three times rolls back to it, and `kioku update
+> --rollback` does so by hand (§7).
+
 Field problem: a typical install is one server (a Mac mini running 24/7) and several
 clients (another Mac, a Windows PC). Every release needs `kioku update` on every machine;
 users forget, and a client older or newer than the server is the one combination nobody

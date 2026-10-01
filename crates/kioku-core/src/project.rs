@@ -1,9 +1,12 @@
 //! Project identity (spec §4): `.kioku.toml`, git remote, or path → stable project id; the
 //! handoff lane of a working directory (M2.4 §1) and the root / id helpers behind project
-//! aliases (M2.4 §2).
+//! aliases (M2.4 §2). Every git call of the hook path is bounded by a deadline, and
+//! [`cache`] remembers identities so SessionStart rarely needs git at all (SPEC-M2.7 §8).
+
+pub mod cache;
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -35,19 +38,116 @@ struct ProjectFile {
     name: Option<String>,
 }
 
-/// Identifies the project that `cwd` belongs to (spec §4 priority order).
+/// Deadline of [`identify`] when the caller has none (commands, not hooks).
+pub const IDENTIFY_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Bounded git calls sharing one deadline: each call gets the time that is left.
+#[derive(Clone, Debug)]
+pub struct GitBudget {
+    /// The git program (`git`; a shim in tests).
+    pub program: String,
+    /// When the budget runs out.
+    pub end: Instant,
+}
+
+/// Outcome of one bounded git call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GitOut {
+    /// Success with non-empty (trimmed) stdout.
+    Text(String),
+    /// Failure, empty output or no git at all.
+    Nothing,
+    /// The budget ran out before git answered (it was killed).
+    TimedOut,
+}
+
+impl GitBudget {
+    /// `git` with `budget` from now.
+    pub fn new(budget: Duration) -> GitBudget {
+        GitBudget::with_program("git", budget)
+    }
+
+    /// `program` (a git shim in tests) with `budget` from now.
+    pub fn with_program(program: &str, budget: Duration) -> GitBudget {
+        GitBudget {
+            program: program.to_string(),
+            end: Instant::now() + budget,
+        }
+    }
+
+    /// Time left.
+    pub fn remaining(&self) -> Duration {
+        self.end.saturating_duration_since(Instant::now())
+    }
+
+    /// `git -C <dir> <args>` within the remaining time.
+    pub fn run(&self, dir: &Path, args: &[&str]) -> GitOut {
+        let left = self.remaining();
+        if left.is_zero() {
+            return GitOut::TimedOut;
+        }
+        let mut cmd = crate::util::quiet_command(&self.program);
+        cmd.arg("-C").arg(dir).args(args);
+        let started = Instant::now();
+        match crate::util::output_with_deadline(cmd, left) {
+            Some(out) if out.status.success() => {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if s.is_empty() {
+                    GitOut::Nothing
+                } else {
+                    GitOut::Text(s)
+                }
+            }
+            Some(_) => GitOut::Nothing,
+            None if started.elapsed() >= left => GitOut::TimedOut,
+            None => GitOut::Nothing,
+        }
+    }
+
+    /// [`GitBudget::run`] where a timeout is an error (an identity must never be guessed).
+    fn required(&self, dir: &Path, args: &[&str]) -> Result<Option<String>> {
+        match self.run(dir, args) {
+            GitOut::Text(s) => Ok(Some(s)),
+            GitOut::Nothing => Ok(None),
+            GitOut::TimedOut => Err(anyhow::anyhow!(
+                "git {} did not answer in time in {}",
+                args.join(" "),
+                dir.display()
+            )
+            .into()),
+        }
+    }
+}
+
+/// Identifies the project that `cwd` belongs to (spec §4 priority order), allowing git
+/// [`IDENTIFY_DEADLINE`].
 pub fn identify(cwd: &Path) -> Result<ProjectIdentity> {
+    identify_within(cwd, IDENTIFY_DEADLINE)
+}
+
+/// [`identify`] with every git call inside `deadline` (SPEC-M2.7 §8). When git does not
+/// answer in time this fails rather than fall back to a path-derived id, which would file
+/// the session under a wrong project.
+pub fn identify_within(cwd: &Path, deadline: Duration) -> Result<ProjectIdentity> {
+    identify_with(cwd, &GitBudget::new(deadline))
+}
+
+/// [`identify`] using `git`'s budget.
+pub fn identify_with(cwd: &Path, git: &GitBudget) -> Result<ProjectIdentity> {
     let cwd = crate::util::canonical_plain(cwd)
         .with_context(|| format!("resolving working directory {}", cwd.display()))?;
 
-    if let Some(found) = find_project_file(&cwd)? {
+    if let Some(found) = find_project_file(&cwd, git)? {
         return Ok(found);
     }
 
-    if let Some(root) = git_toplevel(&cwd) {
+    if let Some(root) = git.required(&cwd, &["rev-parse", "--show-toplevel"])? {
+        let root = PathBuf::from(root);
         let root = crate::util::canonical_plain(&root).unwrap_or(root);
         let dir_name = basename(&root);
-        let remote = git_remote(&root).map(|r| normalize_remote(&r));
+        let remote = git
+            .required(&root, &["remote", "get-url", "origin"])?
+            .map(|r| normalize_remote(&r));
         let (id, name) = match &remote {
             Some(r) => (id_from_remote(&dir_name, r), name_from_remote(&dir_name, r)),
             None => (id_from_path(&dir_name, &root), dir_name),
@@ -177,7 +277,15 @@ pub fn is_valid_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
-fn find_project_file(start: &Path) -> Result<Option<ProjectIdentity>> {
+/// The nearest `.kioku.toml` at or above `start` (no git; cache validation).
+pub fn project_file_above(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .map(|d| d.join(PROJECT_FILE))
+        .find(|c| c.is_file())
+}
+
+fn find_project_file(start: &Path, git: &GitBudget) -> Result<Option<ProjectIdentity>> {
     for dir in start.ancestors() {
         let candidate = dir.join(PROJECT_FILE);
         if candidate.is_file() {
@@ -195,7 +303,9 @@ fn find_project_file(start: &Path) -> Result<Option<ProjectIdentity>> {
                 id,
                 name,
                 root: dir.display().to_string(),
-                remote: git_remote(dir).map(|r| normalize_remote(&r)),
+                remote: git
+                    .required(dir, &["remote", "get-url", "origin"])?
+                    .map(|r| normalize_remote(&r)),
             }));
         }
     }
@@ -225,10 +335,6 @@ fn git_output(dir: &Path, args: &[&str]) -> Option<String> {
 /// `git rev-parse --show-toplevel` run in `cwd`; `None` outside a repository or without git.
 pub fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
     git_output(cwd, &["rev-parse", "--show-toplevel"]).map(PathBuf::from)
-}
-
-fn git_remote(root: &Path) -> Option<String> {
-    git_output(root, &["remote", "get-url", "origin"])
 }
 
 /// True when `id` has the shape of a path- or remote-derived id: `<slug>-<8 lowercase hex>`.
@@ -341,10 +447,15 @@ pub fn default_branch(dir: &Path, deadline: Duration) -> Option<String> {
 pub fn lane(dir: &Path, deadline: Duration) -> Option<String> {
     let branch = current_branch(dir, deadline)?;
     let default = default_branch(dir, deadline)?;
+    lane_for(&branch, &default)
+}
+
+/// The lane of `branch` given the repository's default branch.
+pub fn lane_for(branch: &str, default: &str) -> Option<String> {
     if branch == default {
         return None;
     }
-    normalize_lane(&branch)
+    normalize_lane(branch)
 }
 
 #[cfg(test)]

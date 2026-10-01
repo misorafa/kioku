@@ -15,3 +15,9 @@ uses winget-releaser (komac), which starts from the previous version's manifests
 winget-pkgs, so the files here are only needed for the first submission. It needs the
 `WINGET_TOKEN` repository secret: a classic personal access token of ShinichiroGoto (the
 owner of the winget-pkgs fork) with the `public_repo` scope. Without it the job is skipped.
+
+Recommended (SPEC-M2.7 §12): replace it with a **fine-grained** personal access token
+limited to the winget-pkgs **fork** only (Repository access: only `<owner>/winget-pkgs`;
+permissions: Contents read/write, Pull requests read/write, Metadata read), with an
+expiry. A classic `public_repo` token can write to every public repository of its owner,
+which is far more than submitting a manifest needs.

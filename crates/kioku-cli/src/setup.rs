@@ -1061,6 +1061,43 @@ pub fn install_ps1_command(url: &str, token: &str) -> String {
     )
 }
 
+/// The token of `kioku setup --client-only <url> [<token>]` (SPEC-M2.7 §10): the deprecated
+/// argument (with a warning to print), else `KIOKU_CLIENT_TOKEN`, else one line of `stdin`
+/// when it is not a terminal.
+pub fn client_token(
+    arg: Option<&str>,
+    vars: &std::collections::HashMap<String, String>,
+    stdin: &mut dyn std::io::BufRead,
+    stdin_is_tty: bool,
+) -> anyhow::Result<(String, Option<String>)> {
+    if let Some(t) = arg.map(str::trim).filter(|t| !t.is_empty()) {
+        return Ok((
+            t.to_string(),
+            Some("kioku: warning: passing the token as an argument is deprecated (it shows up in the process list and shell history); use KIOKU_CLIENT_TOKEN=… or pipe it on stdin, or better `kioku invite` on the server".into()),
+        ));
+    }
+    if let Some(t) = vars
+        .get("KIOKU_CLIENT_TOKEN")
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+    {
+        return Ok((t.to_string(), None));
+    }
+    if !stdin_is_tty {
+        let mut line = String::new();
+        stdin
+            .read_line(&mut line)
+            .context("reading the token from stdin")?;
+        let t = line.trim();
+        if !t.is_empty() {
+            return Ok((t.to_string(), None));
+        }
+    }
+    anyhow::bail!(
+        "no token: set KIOKU_CLIENT_TOKEN or pipe the token on stdin (`kioku invite` on the server avoids handling it at all)"
+    )
+}
+
 /// The URL other machines should use for this server (SPEC-M2 §11, §19.3).
 #[derive(Clone, Debug)]
 pub struct ClientUrl {
@@ -1135,6 +1172,33 @@ pub fn first_non_loopback_ip() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// SPEC-M2.7 §10: the token from the deprecated argument (with a warning), the
+    /// environment, or stdin; never from a terminal.
+    #[test]
+    fn client_token_sources() {
+        use std::collections::HashMap;
+        let none = HashMap::new();
+        let env: HashMap<String, String> =
+            [("KIOKU_CLIENT_TOKEN".to_string(), " env-tok \n".to_string())].into();
+        let mut empty: &[u8] = b"";
+        let (t, w) = client_token(Some("arg-tok"), &env, &mut empty, false).unwrap();
+        assert_eq!(t, "arg-tok");
+        assert!(w.unwrap().contains("deprecated"));
+        let (t, w) = client_token(None, &env, &mut empty, false).unwrap();
+        assert_eq!((t.as_str(), w), ("env-tok", None));
+        let mut piped: &[u8] = b"stdin-tok\nignored\n";
+        let (t, w) = client_token(None, &none, &mut piped, false).unwrap();
+        assert_eq!((t.as_str(), w), ("stdin-tok", None));
+        let mut piped: &[u8] = b"stdin-tok\n";
+        assert!(
+            client_token(None, &none, &mut piped, true).is_err(),
+            "a terminal is never read"
+        );
+        let mut blank: &[u8] = b"\n";
+        let err = client_token(None, &none, &mut blank, false).unwrap_err();
+        assert!(err.to_string().contains("KIOKU_CLIENT_TOKEN"));
+    }
 
     /// Regression (Mac and Windows, 2026-09-30): Codex 0.159 keys trust entries by the
     /// hooks.json path and event, never mentioning kioku, so doctor warned although the hooks

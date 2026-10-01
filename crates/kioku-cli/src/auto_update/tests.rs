@@ -331,4 +331,105 @@ async fn server_task_swaps_the_binary_and_requests_exit() {
             .starts_with("auto-updated v0.6.5 -> v0.7.0 (server)")
     );
     assert_eq!(crate::service::UPDATE_EXIT_CODE, 75);
+    // SPEC-M2.7 §7: the replaced binary is kept for a rollback.
+    assert_eq!(
+        std::fs::read_to_string(crate::update::sibling(&exe, crate::update::PREV_SUFFIX)).unwrap(),
+        "old binary"
+    );
+}
+
+/// SPEC-M2.7 §7: the boot-failure state machine.
+#[test]
+fn boot_failures_count_per_version_and_trigger_a_rollback() {
+    let now = "2026-10-01T00:00:00Z";
+    let run = |b: Option<&BootFailures>, v: &str| match boot_decision(b, v, now) {
+        BootDecision::Run(b) => b,
+        BootDecision::RollBack => panic!("unexpected rollback"),
+    };
+    let first = run(None, "0.9.0");
+    assert_eq!((first.version.as_str(), first.count), ("0.9.0", 1));
+    let second = run(Some(&first), "0.9.0");
+    let third = run(Some(&second), "0.9.0");
+    assert_eq!(third.count, 3);
+    assert_eq!(
+        boot_decision(Some(&third), "0.9.0", now),
+        BootDecision::RollBack
+    );
+    // Another version starts counting afresh.
+    assert_eq!(run(Some(&third), "0.8.0").count, 1);
+}
+
+/// SPEC-M2.7 §7 end to end with dummy "binaries" (shell scripts, never the test's own
+/// exe): the new version fails every start; after three failed starts the fourth puts the
+/// previous binary back, which then runs and is counted as healthy.
+#[cfg(unix)]
+#[test]
+fn three_failed_starts_roll_the_server_back() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let exe = tmp.path().join("kioku");
+    let prev = crate::update::sibling(&exe, crate::update::PREV_SUFFIX);
+    let script = |version: &str, serve_exit: u8| {
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'kioku {version}' ;;\n  serve) exit {serve_exit} ;;\nesac\n"
+        )
+    };
+    for (path, body) in [(&exe, script("0.9.0", 1)), (&prev, script("0.8.0", 0))] {
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // The service manager's loop: each start runs boot_check, then serves (or dies).
+    let mut failed = 0;
+    let rolled_back = loop {
+        let running = crate::update::binary_version(&exe).unwrap();
+        if let Some(v) = boot_check(&exe, &state, &running) {
+            break v;
+        }
+        let ok = std::process::Command::new(&exe)
+            .arg("serve")
+            .status()
+            .unwrap()
+            .success();
+        assert!(!ok, "the new version fails");
+        failed += 1;
+        assert!(
+            failed <= BOOT_FAILURE_LIMIT,
+            "no rollback after {failed} failures"
+        );
+    };
+    assert_eq!(failed, BOOT_FAILURE_LIMIT);
+    assert_eq!(rolled_back, "0.8.0");
+    assert_eq!(
+        crate::update::binary_version(&exe).as_deref(),
+        Some("0.8.0")
+    );
+    let st = AutoUpdateState::load(&state);
+    assert!(
+        st.last_error
+            .as_deref()
+            .unwrap()
+            .contains("rolled back to v0.8.0 after 3 failed starts"),
+        "{st:?}"
+    );
+    assert_eq!(st.boot_failures, None);
+    // The old binary starts, serves a minute, and is healthy.
+    assert_eq!(boot_check(&exe, &state, "0.8.0"), None);
+    assert!(
+        std::process::Command::new(&exe)
+            .arg("serve")
+            .status()
+            .unwrap()
+            .success()
+    );
+    boot_succeeded(&state, "0.8.0");
+    assert_eq!(AutoUpdateState::load(&state).boot_failures, None);
+    // Without an older .prev there is nothing to roll back to: it keeps counting.
+    for _ in 0..4 {
+        assert_eq!(boot_check(&exe, &state, "0.8.0"), None);
+    }
+    assert_eq!(
+        AutoUpdateState::load(&state).boot_failures.unwrap().count,
+        4
+    );
 }

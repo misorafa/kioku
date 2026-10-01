@@ -3,6 +3,7 @@
 mod common;
 
 use common::{PROJECT, TOKEN, spawn, start_body};
+use kioku_core::strings::memory_note;
 use rmcp::{
     ServiceExt,
     model::{CallToolRequestParams, CallToolResult},
@@ -121,7 +122,7 @@ async fn mcp_tools_over_streamable_http() {
     assert_ne!(query.is_error, Some(true));
     let out = text(&query);
     assert!(
-        out.starts_with(&format!("1. {path} — 引き継ぎの設計 (")),
+        out.starts_with(&format!("{}1. {path} — 引き継ぎの設計 (", memory_note())),
         "{out}"
     );
     assert!(out.contains("【"), "{out}");
@@ -132,7 +133,7 @@ async fn mcp_tools_over_streamable_http() {
         )
         .await
         .unwrap();
-    assert_eq!(text(&none), "no hits");
+    assert_eq!(text(&none), format!("{}no hits", memory_note()));
 
     let read = client
         .call_tool(
@@ -141,6 +142,8 @@ async fn mcp_tools_over_streamable_http() {
         .await
         .unwrap();
     let out = text(&read);
+    // SPEC-M2.7 §3: stored memory is introduced as data.
+    assert!(out.starts_with(&memory_note()), "{out}");
     assert!(out.contains("title: 引き継ぎの設計"), "{out}");
     assert!(out.contains("tags: design"), "{out}");
     assert!(out.ends_with("引き継ぎ書を毎回作るのが手間なので自動化したい"));
@@ -211,7 +214,7 @@ async fn mcp_tools_over_streamable_http() {
         )
         .await
         .unwrap();
-    assert_eq!(text(&after), "none");
+    assert_eq!(text(&after), format!("{}none", memory_note()));
 
     client.cancel().await.unwrap();
 }
@@ -248,7 +251,7 @@ async fn mcp_handoff_pending_reads_a_lane() {
             .await
             .unwrap(),
     );
-    assert_eq!(out, "none");
+    assert_eq!(out, format!("{}none", memory_note()));
     // by lane and by session
     for a in [
         json!({"project": PROJECT, "lane": "feature/検索"}),
@@ -274,7 +277,10 @@ async fn mcp_handoff_pending_reads_a_lane() {
             .await
             .unwrap(),
     );
-    assert!(out.starts_with("no handoff on this lane."), "{out}");
+    assert!(
+        out.starts_with(&format!("{}no handoff on this lane.", memory_note())),
+        "{out}"
+    );
     assert!(
         out.contains("メインの引き継ぎ") && !out.contains("accepted: "),
         "{out}"

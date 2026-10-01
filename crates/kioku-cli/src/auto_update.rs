@@ -66,6 +66,114 @@ pub struct AutoUpdateState {
     pub last_result: Option<String>,
     /// Since when the client has seen a server of another version (cleared when equal).
     pub mismatch_since: Option<String>,
+    /// Server: starts of a version that did not survive [`BOOT_OK_AFTER`] (SPEC-M2.7 §7).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boot_failures: Option<BootFailures>,
+}
+
+/// Consecutive starts of one server version that did not run for [`BOOT_OK_AFTER`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BootFailures {
+    /// Server version (`X.Y.Z`).
+    pub version: String,
+    /// Starts counted so far (the current one included while it has not survived).
+    pub count: u32,
+    /// Time of the last counted start (RFC 3339).
+    pub last: Option<String>,
+}
+
+/// After this many starts that did not survive, a managed server rolls back to `<exe>.prev`.
+pub const BOOT_FAILURE_LIMIT: u32 = 3;
+/// A start that keeps running this long counts as a success (the counter is reset).
+pub const BOOT_OK_AFTER: Duration = Duration::from_secs(60);
+
+/// What a managed `kioku serve` does when it starts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BootDecision {
+    /// Run, with this counter recorded (reset after [`BOOT_OK_AFTER`]).
+    Run(BootFailures),
+    /// [`BOOT_FAILURE_LIMIT`] starts of this version failed: roll back if possible.
+    RollBack,
+}
+
+/// The boot-failure state machine (SPEC-M2.7 §7): `recorded` is the counter on disk,
+/// `running` this binary's version.
+pub fn boot_decision(recorded: Option<&BootFailures>, running: &str, now: &str) -> BootDecision {
+    let count = match recorded {
+        Some(b) if b.version == running && b.count >= BOOT_FAILURE_LIMIT => {
+            return BootDecision::RollBack;
+        }
+        Some(b) if b.version == running => b.count + 1,
+        _ => 1,
+    };
+    BootDecision::Run(BootFailures {
+        version: running.to_string(),
+        count,
+        last: Some(now.to_string()),
+    })
+}
+
+/// Start of a managed server: counts this start, or — after [`BOOT_FAILURE_LIMIT`] failed
+/// starts of `running` — puts `<exe>.prev` back when it reports an older version. Returns
+/// that version after a rollback (the caller exits 75 so the manager starts it).
+pub fn boot_check(exe: &Path, state_dir: &Path, running: &str) -> Option<String> {
+    let mut state = AutoUpdateState::load(state_dir);
+    match boot_decision(state.boot_failures.as_ref(), running, &now_ts()) {
+        BootDecision::Run(b) => {
+            state.boot_failures = Some(b);
+            let _ = state.save(state_dir);
+            None
+        }
+        BootDecision::RollBack => {
+            let prev = crate::update::sibling(exe, crate::update::PREV_SUFFIX);
+            let older = prev.is_file()
+                && crate::update::binary_version(&prev).is_some_and(|v| is_newer(running, &v));
+            let rolled = if older {
+                crate::update::rollback_binary(exe)
+            } else {
+                Err(anyhow::anyhow!(
+                    "no older {} to roll back to",
+                    prev.display()
+                ))
+            };
+            match rolled {
+                Ok(version) => {
+                    let msg = format!(
+                        "kioku: rolled back to v{version} after {BOOT_FAILURE_LIMIT} failed starts of v{running}"
+                    );
+                    state.boot_failures = None;
+                    state.last_error = Some(msg);
+                    let _ = state.save(state_dir);
+                    Some(version)
+                }
+                Err(err) => {
+                    // Keep running and counting; the manager's own backoff applies.
+                    tracing::warn!(
+                        error = format!("{err:#}"),
+                        "repeated failed starts, but no rollback is possible"
+                    );
+                    if let Some(b) = state.boot_failures.as_mut() {
+                        b.count += 1;
+                        b.last = Some(now_ts());
+                    }
+                    let _ = state.save(state_dir);
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// A managed server survived [`BOOT_OK_AFTER`]: forget the failed starts of `running`.
+pub fn boot_succeeded(state_dir: &Path, running: &str) {
+    AutoUpdateState::update(state_dir, |s| {
+        if s.boot_failures
+            .as_ref()
+            .is_some_and(|b| b.version == running)
+        {
+            s.boot_failures = None;
+        }
+    });
 }
 
 impl AutoUpdateState {
@@ -392,7 +500,7 @@ pub fn run_background(version: Option<String>) -> i32 {
             return 1;
         }
     };
-    match background_update(version) {
+    match background_update(&cfg, root.as_deref(), version) {
         Ok(None) => 0,
         Ok(Some((tag, lines))) => {
             let line = format!("kioku: auto-updated v{VERSION} -> {tag} (client)");
@@ -424,8 +532,15 @@ pub fn run_background(version: Option<String>) -> i32 {
 
 /// The work of [`run_background`]: `Ok(None)` when there is nothing to do, else the
 /// installed tag and the service restart report.
-fn background_update(version: Option<String>) -> anyhow::Result<Option<(String, Vec<String>)>> {
-    let base = release_base();
+fn background_update(
+    cfg: &Config,
+    root: Option<&Path>,
+    version: Option<String>,
+) -> anyhow::Result<Option<(String, Vec<String>)>> {
+    let (base, warning) = release_base(cfg)?;
+    if let Some(w) = warning {
+        log_update(root, &w);
+    }
     let http = http_client(&base)?;
     let tag = match version {
         Some(v) if v.starts_with('v') => v,

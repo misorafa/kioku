@@ -7,6 +7,8 @@ use std::time::Duration;
 /// install.ps1 on GitHub (https): what the Windows invite line fetches (SPEC-M2.3 §9).
 pub const WINDOWS_INSTALLER: &str =
     "https://raw.githubusercontent.com/misorafa/kioku/main/install.ps1";
+/// install.sh on GitHub (https): what the macOS / Linux invite line fetches (SPEC-M2.7 §4).
+pub const UNIX_INSTALLER: &str = "https://raw.githubusercontent.com/misorafa/kioku/main/install.sh";
 
 use kioku_core::config::CONFIG_FILE;
 use kioku_core::{ClientConfig, Config};
@@ -23,6 +25,8 @@ pub struct InviteOptions {
     pub ttl_minutes: u32,
     /// `--uses <n>` (the server caps it at 20).
     pub uses: u32,
+    /// `--host <addr[:port]>`: the address the other machine uses (SPEC-M2.7 §4).
+    pub host: Option<String>,
 }
 
 impl Default for InviteOptions {
@@ -30,6 +34,7 @@ impl Default for InviteOptions {
         InviteOptions {
             ttl_minutes: 10,
             uses: 1,
+            host: None,
         }
     }
 }
@@ -131,12 +136,145 @@ pub fn run_invite(opts: &InviteOptions, env: &SetupEnv) -> CommandReport {
     };
     let uses = resp.get("uses").and_then(Value::as_u64).unwrap_or(1);
     let minutes = opts.ttl_minutes.clamp(1, 60);
-    let url = client_url(&cfg);
+    let (url, others) = match opts.host.as_deref() {
+        Some(host) => match host_url(host, cfg.server.port) {
+            Some(u) => (
+                crate::setup::ClientUrl {
+                    url: u,
+                    mdns_alternative: None,
+                    loopback_note: None,
+                },
+                Vec::new(),
+            ),
+            None => {
+                return CommandReport::fail(format!(
+                    "kioku: error: --host {host:?} is not a host name or address (e.g. 192.168.1.5 or mini.local:7391)"
+                ));
+            }
+        },
+        None => {
+            let url = client_url(&cfg);
+            let wildcard = matches!(cfg.server.bind.trim(), "0.0.0.0" | "::" | "[::]" | "");
+            let others = if wildcard {
+                alternative_urls(&url.url, &local_ipv4s(), cfg.server.port)
+            } else {
+                Vec::new()
+            };
+            (url, others)
+        }
+    };
+    let mut stdout = render_invite(code, &url, minutes, uses);
+    if !others.is_empty() {
+        stdout.push_str(
+            "\nこの機械の他のアドレス（上の行のアドレスを置き換えて使う）/ Other addresses of this machine (replace the address in the line above):\n",
+        );
+        for o in &others {
+            stdout.push_str(&format!("  {o}\n"));
+        }
+        stdout.push_str("（kioku invite --host <address> で行そのものを変えられます / kioku invite --host <address> prints the lines for one of them）\n");
+    }
     CommandReport {
-        stdout: render_invite(code, &url, minutes, uses),
+        stdout,
         stderr: String::new(),
         exit_code: 0,
     }
+}
+
+/// `http://<host>[:port]` for `--host` (a name, an IPv4/IPv6 address, optionally with a
+/// port; `http://` may be given); `None` when it is not a plain host.
+pub fn host_url(host: &str, default_port: u16) -> Option<String> {
+    let h = host.trim().trim_end_matches('/');
+    let h = h.strip_prefix("http://").unwrap_or(h);
+    if h.is_empty() || h.contains(['/', '@', ' ', '\'', '"', '`', '$']) {
+        return None;
+    }
+    let with_port = if h.starts_with('[') {
+        if h.contains("]:") {
+            h.to_string()
+        } else {
+            format!("{h}:{default_port}")
+        }
+    } else if h.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{h}]:{default_port}")
+    } else if h.contains(':') {
+        h.to_string()
+    } else {
+        format!("{h}:{default_port}")
+    };
+    let url = format!("http://{with_port}");
+    let parsed = reqwest::Url::parse(&url).ok()?;
+    (parsed.host_str().is_some() && parsed.path() == "/").then_some(url)
+}
+
+/// This machine's IPv4 addresses that other machines might use: no loopback, link-local
+/// or unspecified; private (LAN) ones first, then the rest (e.g. a VPN), each once. Read
+/// from `ip` / `ifconfig` / `ipconfig` output (no crate; empty when none of them runs).
+pub fn local_ipv4s() -> Vec<std::net::Ipv4Addr> {
+    let tries: Vec<(&str, &[&str])> = if cfg!(windows) {
+        vec![("ipconfig", &[])]
+    } else {
+        vec![
+            ("ip", &["-4", "-o", "addr", "show"]),
+            ("ifconfig", &[]),
+            ("/sbin/ifconfig", &[]),
+        ]
+    };
+    for (program, args) in tries {
+        let mut cmd = kioku_core::util::quiet_command(program);
+        cmd.args(args);
+        if let Some(out) = kioku_core::util::output_with_deadline(cmd, Duration::from_secs(3))
+            && out.status.success()
+        {
+            let found = parse_ipv4s(&String::from_utf8_lossy(&out.stdout));
+            if !found.is_empty() {
+                return found;
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// The usable IPv4 addresses in `ip -o addr` / `ifconfig` / `ipconfig` output, LAN first.
+pub fn parse_ipv4s(text: &str) -> Vec<std::net::Ipv4Addr> {
+    let mut found: Vec<std::net::Ipv4Addr> = Vec::new();
+    for line in text.lines() {
+        let words: Vec<&str> = line
+            .split(|c: char| c.is_whitespace() || c == ':')
+            .filter(|w| !w.is_empty())
+            .collect();
+        // `inet 192.168.1.5/24` (ip), `inet 192.168.1.5 netmask …` (ifconfig), or an
+        // `IPv4 …: 192.168.1.5` line of ipconfig (any language; "(Preferred)" is cut).
+        let candidate = if let Some(i) = words.iter().position(|w| *w == "inet") {
+            words.get(i + 1).copied()
+        } else if line.contains("IPv4") {
+            words.last().copied()
+        } else {
+            None
+        };
+        let Some(c) = candidate else { continue };
+        let c = c
+            .split(['/', '('])
+            .next()
+            .unwrap_or(c)
+            .trim_start_matches("addr");
+        let Ok(ip) = c.parse::<std::net::Ipv4Addr>() else {
+            continue;
+        };
+        if ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || found.contains(&ip) {
+            continue;
+        }
+        found.push(ip);
+    }
+    found.sort_by_key(|ip| !ip.is_private());
+    found
+}
+
+/// `http://<ip>:<port>` for every address in `ips` that is not already `current`'s host.
+pub fn alternative_urls(current: &str, ips: &[std::net::Ipv4Addr], port: u16) -> Vec<String> {
+    ips.iter()
+        .map(|ip| format!("http://{ip}:{port}"))
+        .filter(|u| u != current)
+        .collect()
 }
 
 /// The text `kioku invite` prints (SPEC-M2.3 §2).
@@ -166,13 +304,14 @@ pub fn render_invite(code: &str, url: &crate::setup::ClientUrl, minutes: u32, us
     // SPEC-M2.3 §9: the Windows line fetches install.ps1 from GitHub over https and passes the
     // invite in KIOKU_JOIN — Defender flagged `powershell -ExecutionPolicy Bypass -c irm
     // http://<LAN IP>/… | iex` as Trojan:Win32/Commando.A!ml.
+    // SPEC-M2.7 §4: the macOS / Linux line works the same way — the script from GitHub over
+    // https, only the code over the LAN (the server no longer serves a script over http).
     let join = url.url.trim_start_matches("http://");
     out.push_str(&format!(
         "  Windows (PowerShell):  $env:KIOKU_JOIN='{join}/{code}'; irm {WINDOWS_INSTALLER} | iex\n"
     ));
     out.push_str(&format!(
-        "  macOS / Linux / Git Bash:  curl -sSL {}/i/{code} | sh\n",
-        url.url
+        "  macOS / Linux / Git Bash:  KIOKU_JOIN='{join}/{code}' sh -c \"$(curl -fsSL {UNIX_INSTALLER})\"\n"
     ));
     if let Some(alt) = &url.mdns_alternative {
         out.push_str(&format!(
@@ -344,10 +483,13 @@ mod tests {
         ), "{t}");
         assert!(
             t.contains(
-                "  macOS / Linux / Git Bash:  curl -sSL http://192.168.1.240:7391/i/K7Q2M9XD | sh\n"
+                "  macOS / Linux / Git Bash:  KIOKU_JOIN='192.168.1.240:7391/K7Q2M9XD' sh -c \"$(curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh)\"\n"
             ),
             "{t}"
         );
+        // SPEC-M2.7 §4: no script over plain http.
+        assert!(!t.contains("http://192.168.1.240:7391/i/"), "{t}");
+        assert!(!t.contains("/i/"), "{t}");
         assert!(
             !t.contains("Bypass") && !t.contains("/i/K7Q2M9XD.ps1"),
             "{t}"
@@ -357,5 +499,46 @@ mod tests {
         assert!(t.contains("http://mini-M2.local:7391/…"));
         let t = render_invite("K7Q2M9XD", &url, 30, 3);
         assert!(t.contains("valid 30 minutes, up to 3 machines"));
+    }
+
+    /// SPEC-M2.7 §4: `--host` values and the list of this machine's addresses.
+    #[test]
+    fn host_flag_and_address_list() {
+        assert_eq!(
+            host_url("192.168.1.5", 7391).as_deref(),
+            Some("http://192.168.1.5:7391")
+        );
+        assert_eq!(
+            host_url("mini.local:8000", 7391).as_deref(),
+            Some("http://mini.local:8000")
+        );
+        assert_eq!(
+            host_url("http://10.0.0.2:7391/", 7391).as_deref(),
+            Some("http://10.0.0.2:7391")
+        );
+        assert_eq!(
+            host_url("fe80::1", 7391).as_deref(),
+            Some("http://[fe80::1]:7391")
+        );
+        assert_eq!(
+            host_url("[fd00::5]:9", 7391).as_deref(),
+            Some("http://[fd00::5]:9")
+        );
+        for bad in ["", "a b", "h/x", "u@h", "h'; rm", "$(x)"] {
+            assert_eq!(host_url(bad, 7391), None, "{bad}");
+        }
+        let ip = "1: lo    inet 127.0.0.1/8 scope host lo\n2: eth0    inet 100.101.5.6/32 scope global tailscale0\n3: wlan0    inet 192.168.1.240/24 brd 192.168.1.255 scope global wlan0\n";
+        let mac = "lo0: flags=8049<UP,LOOPBACK>\n\tinet 127.0.0.1 netmask 0xff000000\nen0: flags=8863<UP>\n\tinet6 fe80::1%en0 prefixlen 64\n\tinet 192.168.1.57 netmask 0xffffff00 broadcast 192.168.1.255\nbridge0:\n\tinet 169.254.3.4 netmask 0xffff0000\nutun3:\n\tinet 10.8.0.2 --> 10.8.0.1 netmask 0xffffffff\n";
+        let win = "Wireless LAN adapter Wi-Fi:\r\n   IPv4 アドレス . . . . . . . . . . . .: 192.168.0.12(優先)\r\n   サブネット マスク . . . . . . . . . .: 255.255.255.0\r\nEthernet adapter vEthernet:\r\n   IPv4 Address. . . . . . . . . . . : 172.20.1.1\r\n";
+        let s = |v: Vec<std::net::Ipv4Addr>| v.iter().map(|i| i.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            s(parse_ipv4s(ip)),
+            ["192.168.1.240", "100.101.5.6"],
+            "LAN first"
+        );
+        assert_eq!(s(parse_ipv4s(mac)), ["192.168.1.57", "10.8.0.2"]);
+        assert_eq!(s(parse_ipv4s(win)), ["192.168.0.12", "172.20.1.1"]);
+        let alts = alternative_urls("http://192.168.1.240:7391", &parse_ipv4s(ip), 7391);
+        assert_eq!(alts, ["http://100.101.5.6:7391"]);
     }
 }

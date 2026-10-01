@@ -128,12 +128,16 @@ $ kioku invite
 Paste ONE of these on the machine to add (valid 10 minutes, once):
 
   Windows (PowerShell):  $env:KIOKU_JOIN='192.168.1.240:7391/K7Q2M9XD'; irm https://raw.githubusercontent.com/misorafa/kioku/main/install.ps1 | iex
-  macOS / Linux / Git Bash:  curl -sSL http://192.168.1.240:7391/i/K7Q2M9XD | sh
+  macOS / Linux / Git Bash:  KIOKU_JOIN='192.168.1.240:7391/K7Q2M9XD' sh -c "$(curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh)"
 
 (On this LAN you can also use http://mini-M2.local:7391/…; over a VPN use the IP.)
 ```
 
-and paste the matching line on the new machine. That one line installs kioku
+and paste the matching line on the new machine. Both lines fetch the installer
+from GitHub over https; only the one-time code travels over your LAN. When the
+server has several addresses (LAN, a VPN such as Tailscale), `kioku invite` lists
+the others below the lines; `kioku invite --host <address>` prints the lines for
+one of them. That one line installs kioku
 (verified download, as above), puts it on `PATH`, fetches the server's token
 with the one-time code (the token is never shown or copied), writes a
 client-only `config.toml`, sets up every detected agent and ends with
@@ -141,9 +145,9 @@ client-only `config.toml`, sets up every detected agent and ends with
 that is expired or already used fails with one sentence saying to run
 `kioku invite` again. `--ttl <minutes>` (up to 60) and `--uses <n>` (up to 20)
 make one line work for several machines. On the new machine the same step is
-`kioku join <url> <code>` if kioku is already installed. After
-`kioku rotate-token`, run `kioku invite --uses <n>` and paste the new line on
-each machine: `join` replaces the old client config.
+`kioku join <url> <code>` if kioku is already installed. `kioku rotate-token`
+prints a fresh invite line itself (valid 30 minutes); `kioku invite --uses <n>`
+makes one for several machines, and `join` replaces the old client config.
 
 The manual alternative still works: `kioku setup --print-client-command` on the
 server prints a command with the token in it,
@@ -151,6 +155,12 @@ server prints a command with the token in it,
 ```sh
 curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh -s -- --client-only http://<server>:7391 <token>
 ```
+
+On a machine where kioku is installed, give the token without putting it on the
+command line: `KIOKU_CLIENT_TOKEN=<token> kioku setup --client-only http://<server>:7391`
+(or pipe it on stdin). `kioku setup --client-only <url> <token>` still works but is
+deprecated: a token on the command line ends up in the process list and the shell
+history.
 
 ### Updates
 
@@ -182,6 +192,17 @@ release newer than the running one — `--version <tag>` installs any tag,
 including an older one; `kioku update --check` exits 10 when a newer release
 exists), or by re-running the one-liner (the next `kioku setup` restarts a
 service still running the old version).
+
+Every update keeps the binary it replaced next to the new one as `kioku.prev`
+(`kioku.exe.prev`). If an automatically updated server fails to start three
+times in a row, it puts that previous binary back by itself (`kioku doctor`
+then shows the older server version). To go back by hand:
+`kioku update --rollback` (restarts the service; refuses when there is no
+`.prev`). A data directory written by a newer kioku is never opened by an older
+one: `kioku serve` exits 78 and `kioku doctor` says what to do.
+
+Release mirrors and forks (`KIOKU_DOWNLOAD_BASE`, `KIOKU_REPO`) are honoured only
+with `allow_mirror = true` under `[update]` in `config.toml`, and only over https.
 
 On macOS, never overwrite the installed binary with `cp` onto the existing file:
 the kernel caches the old code signature and kills the new binary (SIGKILL,
@@ -454,8 +475,9 @@ there, then `kioku service stop && kioku service start`). Then run
 `kioku invite` for every other machine (see Install).
 
 **Which URL to use.** `kioku invite` (like `--print-client-command`) prints the
-server's LAN IP. The pasted line hands the new machine exactly the address it
-used to download the script, so whichever you choose is what it keeps.
+server's LAN IP and lists the machine's other addresses; `kioku invite --host
+<address>` uses another one. The new machine keeps exactly the address in the
+line it pasted.
 - The IP also works over a VPN that routes the LAN (WireGuard), but breaks if the server's address changes.
 - `<host>.local` survives address changes, but it is mDNS, so it only resolves on the LAN itself.
 - With `bind = "0.0.0.0"` the server listens on IPv4 and IPv6, so a name that resolves to IPv6 still reaches it.
@@ -657,25 +679,41 @@ shared across branches.
 
 ## Security notes
 
-- **Auth**: one bearer token, one user. `kioku serve` refuses to start without
-  a token, whatever the bind address. Every route except `GET /api/v1/health`
-  and the invite routes below requires `Authorization: Bearer <token>`,
+- **Single user by design**: one bearer token, one person's machines. Everyone
+  who holds the token reads and writes all of the memory; there are no
+  per-user permissions. Do not share a server between people.
+- **Memory is untrusted data**: whatever an agent wrote into kioku (pages,
+  handoffs, session summaries) is only as trustworthy as what that agent read
+  while writing it — a prompt injection picked up from a web page or a file can
+  be stored and shown to every later session on every machine. kioku presents
+  stored memory as data, not instructions (a fixed note at the top of the
+  `<kioku>` block and of `kioku_read` / `kioku_query` / `kioku_handoff_pending`),
+  stored text cannot close the `<kioku>` block, and secrets are redacted in
+  pages and handoffs as in hook payloads. Check a stored procedure before you
+  let an agent run it.
+- **Auth**: `kioku serve` refuses to start without a token, whatever the bind
+  address. Every route except `GET /api/v1/health` (which tells nothing but
+  `ok`) and `POST /api/v1/join` requires `Authorization: Bearer <token>`,
   including `/mcp`, whose Host-header allowlist is disabled so the token is the
-  guard. The default bind is `127.0.0.1`.
+  guard. The default bind is `127.0.0.1`. One `kioku serve` per data directory
+  (`kioku.lock`).
 - **Invites**: `kioku invite` (bearer-authenticated `POST /api/v1/invites`)
   creates an 8-character code, held in the server's memory only, valid 10
-  minutes and once by default. `GET /i/<code>` and `GET /i/<code>.ps1` serve the
-  installer (no token in it) and `POST /api/v1/join` trades the code for the
-  token; these three need no token. More than 10 failed code lookups a minute
-  from one address (30 from all) get HTTP 429 for 60 seconds. Anyone who sees
-  an unused invite line can join, so treat it like the token for its 10
-  minutes; over plain HTTP the token crosses the network once, as it does with
-  every hook request.
-- **Rotating the token**: `kioku rotate-token` on the server machine writes a
-  new token, restarts the service (the old token is rejected from then on).
-  Then run `kioku invite --uses <n>` and paste its line on every other machine
-  (it also prints the manual `kioku setup --client-only <url> <new token>`).
-  Agents hold no token since v0.4 (`kioku mcp`), so that is all.
+  minutes and once by default. The pasted line fetches the installer from
+  GitHub over https; `POST /api/v1/join` trades the code for the token and needs
+  no token. More than 10 failed code lookups a minute from one address (30 from
+  all) get HTTP 429 for 60 seconds. Anyone who sees an unused invite line can
+  join, so treat it like the token for its 10 minutes; over plain HTTP the token
+  crosses the network once, as it does with every hook request.
+- **Rotating the token**: `kioku rotate-token` on the server machine rewrites
+  only the `auth_token` lines of `config.toml` (your comments stay), restarts
+  the service (the old token is rejected from then on) and prints an invite
+  line made with the new token (valid 30 minutes) — never the token itself;
+  `--show-token` adds the manual command. Agents hold no token since v0.4
+  (`kioku mcp`), so that is all.
+- **Tokens on the command line**: `kioku setup --client-only <url>` reads the
+  token from `KIOKU_CLIENT_TOKEN` or stdin; passing it as an argument still
+  works but warns (process list, shell history).
 - Agent files that hold the token (`~/.claude.json`, `~/.codex/config.toml`,
   `~/.cursor/mcp.json`, `~/.gemini/settings.json`) are created 0600; an
   existing one that others could read is set to 0600 when kioku adds the token
@@ -684,11 +722,16 @@ shared across branches.
   and creates the data dir, `raw/` and `logs/` as 0700 (unix).
 - **Sanitizer** — hook payloads are redacted on the client before they are
   sent (and again by the server):
-  - AWS access key ids (`AKIA…`), `sk-…` keys, Stripe `sk_live_…` /
+  - AWS access key ids (`AKIA…`, `ASIA…`), `sk-…` keys, Stripe `sk_live_…` /
     `sk_test_…` keys, GitHub `ghp_` / `gho_` / `ghu_` / `ghs_` / `ghr_` and
     `github_pat_…` tokens, Slack `xoxb-` / `xoxa-` / `xoxp-` tokens, Google
-    `AIza…` keys, JWT-shaped strings (`eyJ….….…`), PEM private key blocks
-    (to the end of the text when the `END` line is missing);
+    `AIza…` keys, npm `npm_…`, GitLab `glpat-…`, Hugging Face `hf_…`, PyPI
+    `pypi-AgEI…`, SendGrid `SG.….…`, age `AGE-SECRET-KEY-1…`, JWT-shaped
+    strings (`eyJ….….…`), PEM private key blocks (to the end of the text when
+    the `END` line is missing);
+  - `Cookie:` / `Set-Cookie:` header values; values after the key names
+    `pass`, `pwd`, `passphrase`, any `*_key` (`encryption_key`, `signing_key`,
+    `master_key`, …; not identifiers such as `primary_key`) and `AccountKey`;
   - the password in URLs (`postgres://user:[REDACTED]@host`);
   - the whole value after any key *containing* `secret`, `token`,
     `password`/`passwd`, `api_key`, `access_key`, `private_key`, `credential`
@@ -698,16 +741,23 @@ shared across branches.
     `--api-key`, and JSON values under keys containing those words (except
     counts such as `max_tokens`);
   - `tool_input` is truncated to 4 000 chars and `tool_response` to 2 000.
+  - Page titles and bodies (`kioku_write_page`) and handoffs
+    (`kioku_handoff_write`) go through the same redaction before they are
+    stored, indexed or committed.
 - **Not redacted**: anything that does not match those shapes — e.g. a
   password passed as `-p secret`, bare high-entropy strings, personal data.
   Prompts, commands, file paths and
   the (truncated) output of `Read`/`Bash`/edit tools reach the server and end
   up in `raw/`, SQLite and, in digested form, the git history of `wiki/`.
   Transcripts are not uploaded.
-- **Hooks are fail-open**: on any network or server error a hook logs one line
-  to `logs/hook.log` (capped at 1 MiB, one rotated `hook.log.1`), prints nothing and exits 0 within `timeout_ms`, so a
-  down server never blocks your agent. The only non-zero exit is the
-  deliberate Stop nudge (2).
+- **Hooks are fail-open**: on any network or server error — and on hook
+  arguments this version does not know — a hook logs one line to
+  `logs/hook.log` (capped at 1 MiB, one rotated `hook.log.1`), prints nothing
+  and exits 0 within `timeout_ms`, so a down server never blocks your agent.
+  The only non-zero exit is the deliberate Stop nudge (2).
+- **Updates run only verified binaries**: SHA-256 against the release, then
+  (macOS) kioku's Developer ID signature, and only then is the new binary run
+  for its `--version`.
 
 ## Comparison
 

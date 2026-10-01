@@ -971,7 +971,9 @@ pub enum Health {
 }
 
 /// `GET <server_url>/api/v1/health`; when it fails, a plain TCP connect tells a foreign
-/// listener from a free port.
+/// listener from a free port. The version comes from the authenticated `/status`
+/// (SPEC-M2.7 §11: health no longer tells it; an older server's health still does); it is
+/// empty when the token is missing or refused.
 pub fn probe_health(client: &ClientConfig, timeout: Duration) -> Health {
     let api = match ApiClient::new(client, timeout) {
         Ok(a) => a,
@@ -982,8 +984,9 @@ pub fn probe_health(client: &ClientConfig, timeout: Duration) -> Health {
             version: v
                 .get("version")
                 .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
+                .map(str::to_string)
+                .or_else(|| server_version(&api))
+                .unwrap_or_default(),
         },
         Ok(_) => Health::Foreign("GET /api/v1/health did not return kioku's answer".into()),
         Err(e) if e.downcast_ref::<HttpError>().is_some() => Health::Foreign(format!(
@@ -998,6 +1001,16 @@ pub fn probe_health(client: &ClientConfig, timeout: Duration) -> Health {
             }
         }
     }
+}
+
+/// The server's version from `GET /api/v1/status` (needs the token); `None` on any error.
+pub fn server_version(api: &ApiClient) -> Option<String> {
+    api.get(&["status"], &[])
+        .ok()?
+        .get("version")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
 }
 
 /// True when a TCP connection to the URL's host:port succeeds.

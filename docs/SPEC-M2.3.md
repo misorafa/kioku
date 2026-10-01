@@ -3,6 +3,14 @@
 Status: implemented (branch `m2.3-invite`), 2026-09-28; see §8 for what changed. Amends SPEC-M2 (and M2.2). Read CLAUDE.md, SPEC-M2.md
 §11, §13, §19–§21 and SPEC-M2.2 first.
 
+> **Amended by SPEC-M2.7 §4 (v0.9):** `GET /i/<code>` and `GET /i/<code>.ps1` are gone
+> (a former route answers 404 with an `echo …; exit 1` body). The macOS / Linux line is
+> now `KIOKU_JOIN='<host:port>/<CODE>' sh -c "$(curl -fsSL
+> https://raw.githubusercontent.com/misorafa/kioku/main/install.sh)"` — the script from
+> GitHub over https, only the code over the LAN, like the Windows line of §9.
+> `kioku invite --host <addr>` overrides the printed address; otherwise the machine's
+> other IPv4 addresses are listed (LAN first). `POST /api/v1/join` is unchanged.
+
 ## 1. Why
 
 Adding a machine must be **one pasted line that leaves kioku fully usable**, for

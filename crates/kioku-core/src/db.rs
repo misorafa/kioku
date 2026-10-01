@@ -112,18 +112,71 @@ pub struct PageRow {
     pub hash: String,
 }
 
-/// Opens the database with WAL + foreign keys and applies the schema.
+/// Schema version this binary writes into `PRAGMA user_version` (SPEC-M2.7 §5): M1 = 1,
+/// M2.4 = 2, M2.6 = 3. A database stamped with a higher version is refused.
+pub const SCHEMA_VERSION: u32 = 3;
+
+/// A database written by a newer kioku (its `user_version` is above [`SCHEMA_VERSION`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "this data directory was written by a newer kioku (schema {found} > {supported}); run `kioku update` or `kioku restore` into a new directory"
+)]
+pub struct NewerSchema {
+    /// `user_version` found in the file.
+    pub found: u32,
+    /// [`SCHEMA_VERSION`] of this binary.
+    pub supported: u32,
+}
+
+/// Opens the database with WAL + foreign keys, applies the schema and stamps
+/// [`SCHEMA_VERSION`]; refuses (with [`NewerSchema`]) a file from a newer kioku before
+/// changing anything in it. `user_version` 0 (before SPEC-M2.7) is upgraded.
 pub fn open(path: &Path) -> anyhow::Result<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let found = user_version(&conn)?;
+    if found > SCHEMA_VERSION {
+        return Err(NewerSchema {
+            found,
+            supported: SCHEMA_VERSION,
+        }
+        .into());
+    }
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.execute_batch(SCHEMA).context("applying schema")?;
     migrate(&conn).context("migrating schema")?;
+    if found != SCHEMA_VERSION {
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .context("stamping the schema version")?;
+    }
     Ok(conn)
+}
+
+/// `PRAGMA user_version` of an open database.
+pub fn user_version(conn: &Connection) -> anyhow::Result<u32> {
+    let v: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .context("reading the schema version")?;
+    Ok(u32::try_from(v).unwrap_or(u32::MAX))
+}
+
+/// [`NewerSchema`] when the database at `path` exists and was written by a newer kioku;
+/// `None` when it is missing, unreadable or compatible (read-only; `kioku doctor`).
+pub fn newer_schema_on_disk(path: &Path) -> Option<NewerSchema> {
+    if !path.is_file() {
+        return None;
+    }
+    let conn =
+        Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    let found = user_version(&conn).ok()?;
+    (found > SCHEMA_VERSION).then_some(NewerSchema {
+        found,
+        supported: SCHEMA_VERSION,
+    })
 }
 
 /// Columns added after the first M1 schema; `CREATE TABLE IF NOT EXISTS` does not add them
@@ -780,4 +833,47 @@ pub fn count(conn: &Connection, table: &str) -> anyhow::Result<u64> {
     anyhow::ensure!(allowed.contains(&table), "unknown table {table}");
     let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
     Ok(n as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stamp(path: &Path, v: u32) {
+        let conn = Connection::open(path).unwrap();
+        conn.pragma_update(None, "user_version", v).unwrap();
+    }
+
+    fn version(path: &Path) -> u32 {
+        user_version(&Connection::open(path).unwrap()).unwrap()
+    }
+
+    /// SPEC-M2.7 §5: a newer schema is refused untouched; 0 (pre-M2.7) and the current
+    /// version open and end up stamped.
+    #[test]
+    fn schema_version_is_stamped_and_newer_files_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("db").join("kioku.sqlite");
+        drop(open(&path).unwrap());
+        assert_eq!(version(&path), SCHEMA_VERSION);
+        assert_eq!(newer_schema_on_disk(&path), None);
+        // same version → opens
+        drop(open(&path).unwrap());
+        // an old database (user_version 0) → opens and is stamped
+        stamp(&path, 0);
+        drop(open(&path).unwrap());
+        assert_eq!(version(&path), SCHEMA_VERSION);
+        // a newer one → refused, and left as it was
+        stamp(&path, SCHEMA_VERSION + 1);
+        let err = open(&path).unwrap_err();
+        let newer = err.downcast_ref::<NewerSchema>().copied().unwrap();
+        assert_eq!(newer.found, SCHEMA_VERSION + 1);
+        let msg = err.to_string();
+        assert!(msg.contains("written by a newer kioku"), "{msg}");
+        assert!(msg.contains(&format!("schema {} > {SCHEMA_VERSION}", SCHEMA_VERSION + 1)));
+        assert!(msg.contains("kioku update") && msg.contains("kioku restore"));
+        assert_eq!(version(&path), SCHEMA_VERSION + 1);
+        assert_eq!(newer_schema_on_disk(&path), Some(newer));
+        assert_eq!(newer_schema_on_disk(&tmp.path().join("missing")), None);
+    }
 }

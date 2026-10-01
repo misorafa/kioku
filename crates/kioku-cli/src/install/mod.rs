@@ -1140,7 +1140,7 @@ mod tests {
         std::os::unix::fs::symlink(&real_toml, &toml_link).unwrap();
         block::install_codex_config(
             &toml_link,
-            block::CodexMcp::Http("http://h/mcp", Some("t")),
+            block::CodexMcp::http("http://h/mcp", Some("t")),
             false,
             false,
         )

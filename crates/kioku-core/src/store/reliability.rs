@@ -5,6 +5,9 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// A second backup within this window is refused (SPEC-M2.7 §12).
+pub const BACKUP_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Read-only operational evidence, available through the diagnostics endpoint.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReliabilityReport {
@@ -230,7 +233,24 @@ impl Store {
     /// log lengths (raw lines are appended under the DB lock, so those prefixes match the
     /// snapshot); the write lock while the wiki is copied (pages change only under it); raw
     /// prefixes are copied and everything is hashed after both locks are released.
+    ///
+    /// A backup within [`BACKUP_MIN_INTERVAL`] of the last one is refused
+    /// ([`Error::Conflict`]); after a successful one only the newest `[server] backup_keep`
+    /// snapshots are kept (SPEC-M2.7 §12).
     pub fn backup(&self) -> Result<BackupManifest> {
+        if let Some(last) = self.meta("last_backup")?
+            && let Some(at) = util::parse_ts(&last)
+        {
+            let age = util::now().signed_duration_since(at);
+            if age >= chrono::Duration::zero()
+                && age < chrono::Duration::from_std(BACKUP_MIN_INTERVAL).unwrap_or_default()
+            {
+                return Err(Error::Conflict(format!(
+                    "a backup was made at {last}, less than {} s ago; wait a minute and try again",
+                    BACKUP_MIN_INTERVAL.as_secs()
+                )));
+            }
+        }
         let root = self.dirs.root().join("backups");
         util::create_private_dir(&root).context("creating backup root")?;
         let id = util::generate_token();
@@ -278,7 +298,23 @@ impl Store {
         if result.is_err() {
             let _ = std::fs::remove_dir_all(&stage);
         }
-        Ok(result.context("creating backup")?)
+        let manifest = result.context("creating backup")?;
+        prune_backups(&root, self.config.server.backup_keep.max(1));
+        Ok(manifest)
+    }
+
+    /// A `reliability_meta` value.
+    fn meta(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .lock()
+            .query_row(
+                "SELECT value FROM reliability_meta WHERE key=?1",
+                [key],
+                |r| r.get(0),
+            )
+            .optional()
+            .context("reading reliability metadata")?)
     }
 
     /// Checks storage health without changing files, metadata or the search index. Only the
@@ -338,6 +374,34 @@ impl Store {
             unparseable_pages: unparseable,
             index_count_matches: self.index.num_docs() == rows.len() as u64,
         })
+    }
+}
+
+/// Removes the oldest completed snapshots in `root` (by manifest time) until `keep` remain.
+/// Best effort: a snapshot that cannot be removed stays.
+fn prune_backups(root: &Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut snapshots: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        .filter_map(|e| {
+            let manifest: BackupManifest =
+                serde_json::from_slice(&std::fs::read(e.path().join("manifest.json")).ok()?)
+                    .ok()?;
+            Some((manifest.created, e.path()))
+        })
+        .collect();
+    if snapshots.len() <= keep {
+        return;
+    }
+    snapshots.sort();
+    let excess = snapshots.len() - keep;
+    for (_, dir) in snapshots.into_iter().take(excess) {
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            tracing::warn!(path = %dir.display(), error = %e, "could not remove an old backup");
+        }
     }
 }
 
@@ -976,6 +1040,44 @@ mod tests {
         );
     }
 
+    /// SPEC-M2.7 §12: a second backup within 60 s is refused; only `backup_keep` snapshots
+    /// stay, the oldest go.
+    #[test]
+    fn backups_are_rate_limited_and_pruned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = Config::for_data_dir(tmp.path());
+        cfg.server.backup_keep = 2;
+        let store = Store::open(cfg).unwrap();
+        start(&store, "s1", None);
+        let first = store.backup().unwrap();
+        assert!(matches!(store.backup(), Err(Error::Conflict(m)) if m.contains("wait a minute")));
+        let set_last = |ts: &str| {
+            store
+                .db
+                .lock()
+                .execute(
+                    "INSERT OR REPLACE INTO reliability_meta VALUES ('last_backup', ?1)",
+                    [ts],
+                )
+                .unwrap();
+        };
+        let mut made = vec![first.path.clone()];
+        for _ in 0..2 {
+            set_last("2020-01-01T00:00:00Z");
+            // Distinct, ordered manifest times.
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+            made.push(store.backup().unwrap().path);
+        }
+        let left: Vec<String> = std::fs::read_dir(tmp.path().join("backups"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path().display().to_string())
+            .collect();
+        assert_eq!(left.len(), 2, "{left:?}");
+        assert!(!Path::new(&made[0]).exists(), "the oldest went");
+        assert!(Path::new(&made[1]).exists() && Path::new(&made[2]).exists());
+    }
+
     #[test]
     fn an_interrupted_backup_stage_is_cleaned_up_by_the_next_backup() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1064,5 +1166,72 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "手動編集");
         std::fs::remove_file(file).unwrap();
         assert_eq!(store.reliability().unwrap().inconsistent_pages, vec![path]);
+    }
+
+    /// SPEC-M2.7 §6: one process per data directory; the lock goes with the store.
+    #[test]
+    fn a_second_open_of_the_same_directory_fails_until_the_first_is_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config::for_data_dir(tmp.path());
+        let store = Store::open(cfg.clone()).unwrap();
+        let err = Store::open(cfg.clone())
+            .err()
+            .expect("second open must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("another kioku is using"), "{msg}");
+        assert!(msg.contains(&tmp.path().display().to_string()), "{msg}");
+        // Other directories are unaffected.
+        let other = tempfile::tempdir().unwrap();
+        drop(Store::open(Config::for_data_dir(other.path())).unwrap());
+        drop(store);
+        let again = Store::open(cfg).unwrap();
+        assert!(tmp.path().join(crate::store::LOCK_FILE).is_file());
+        drop(again);
+        assert!(
+            tmp.path().join(crate::store::LOCK_FILE).is_file(),
+            "the lock file is never deleted"
+        );
+    }
+
+    /// SPEC-M2.7 §6: a page that reached disk and SQLite but not the index (flagged
+    /// `needs_reindex`) is indexed at the next start, and the flag is cleared.
+    #[test]
+    fn needs_reindex_heals_the_index_at_the_next_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config::for_data_dir(tmp.path());
+        let store = Store::open(cfg.clone()).unwrap();
+        store
+            .write_page(&WritePageRequest {
+                title: "既存".into(),
+                content: "最初のページ".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        // What a failed index upsert leaves behind: the file, no index entry, the flag.
+        let file = tmp.path().join("wiki/_global/索引漏れ.md");
+        std::fs::write(
+            &file,
+            "---\ntitle: 索引漏れ\nscope: global\nkind: page\ncreated: 2026-10-01T00:00:00Z\nupdated: 2026-10-01T00:00:00Z\n---\n形態素解析の自己修復\n",
+        )
+        .unwrap();
+        store
+            .db
+            .lock()
+            .execute(
+                "INSERT OR REPLACE INTO reliability_meta VALUES ('needs_reindex', '1')",
+                [],
+            )
+            .unwrap();
+        assert!(
+            store
+                .search("自己修復", &SearchScope::All, 3)
+                .unwrap()
+                .is_empty()
+        );
+        drop(store);
+        let store = Store::open(cfg).unwrap();
+        let hits = store.search("自己修復", &SearchScope::All, 3).unwrap();
+        assert_eq!(hits[0].path, "_global/索引漏れ.md");
+        assert!(!store.needs_reindex().unwrap());
     }
 }

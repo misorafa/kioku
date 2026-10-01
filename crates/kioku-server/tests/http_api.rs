@@ -18,7 +18,8 @@ async fn health_is_public() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["ok"], true);
-    assert_eq!(body["version"], kioku_core::VERSION);
+    // SPEC-M2.7 §11: the version is only told to authenticated callers.
+    assert!(body.get("version").is_none(), "{body}");
 }
 
 #[tokio::test]
@@ -869,6 +870,9 @@ async fn durable_delivery_page_conflicts_and_backup_api() {
     assert_eq!(backup["format"], 1);
     assert!(backup["files"]["db/kioku.sqlite"]["sha256"].is_string());
     assert!(server.get("/api/v1/diagnostics").await.1["last_backup"].is_string());
+    // SPEC-M2.7 §12: a second backup within 60 s is refused.
+    let (code, again) = server.post("/api/v1/backup", json!({})).await;
+    assert_eq!(code, 409, "{again}");
     let unauth = server
         .http
         .post(server.url("/api/v1/backup"))

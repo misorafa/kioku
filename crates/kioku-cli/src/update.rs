@@ -101,6 +101,8 @@ pub struct UpdateArgs {
     pub background: bool,
     /// `--require-signature` (macOS: refuse a binary not signed by kioku's team).
     pub require_signature: bool,
+    /// `--rollback` (SPEC-M2.7 §7: put `<exe>.prev` back).
+    pub rollback: bool,
 }
 
 /// `<exe><suffix>` next to `exe`, e.g. `kioku.exe.old`.
@@ -313,14 +315,46 @@ pub fn is_winget_install(exe: &Path) -> bool {
     s.contains("\\winget\\packages\\") || s.contains("\\winget\\links\\")
 }
 
-/// Base URL of the releases: `$KIOKU_DOWNLOAD_BASE`, else
-/// `https://github.com/<$KIOKU_REPO or misorafa/kioku>/releases` (no trailing `/`).
-pub fn release_base() -> String {
-    let repo = std::env::var("KIOKU_REPO").unwrap_or_else(|_| KIOKU_REPO.to_string());
-    std::env::var("KIOKU_DOWNLOAD_BASE")
-        .unwrap_or_else(|_| format!("https://github.com/{repo}/releases"))
-        .trim_end_matches('/')
-        .to_string()
+/// The official releases: `https://github.com/misorafa/kioku/releases`.
+pub fn official_release_base() -> String {
+    format!("https://github.com/{KIOKU_REPO}/releases")
+}
+
+/// Base URL of the releases (no trailing `/`) and a warning to show (SPEC-M2.7 §11). Only
+/// with `[update] allow_mirror = true` are `KIOKU_DOWNLOAD_BASE` (a mirror) and `KIOKU_REPO`
+/// (a fork) honoured; otherwise they are ignored with a warning, so an environment variable
+/// alone can never redirect an update. A mirror must use https unless it is on loopback.
+pub fn release_base_for(
+    update: &kioku_core::UpdateConfig,
+    vars: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<(String, Option<String>)> {
+    let get = |k: &str| vars.get(k).map(|v| v.trim()).filter(|v| !v.is_empty());
+    let (mirror, repo) = (get("KIOKU_DOWNLOAD_BASE"), get("KIOKU_REPO"));
+    if !update.allow_mirror {
+        let warning = (mirror.is_some() || repo.is_some()).then(|| {
+            "kioku: warning: KIOKU_DOWNLOAD_BASE / KIOKU_REPO ignored (set [update] allow_mirror = true in config.toml to use a mirror or fork)".to_string()
+        });
+        return Ok((official_release_base(), warning));
+    }
+    let base = match (mirror, repo) {
+        (Some(m), _) => m.trim_end_matches('/').to_string(),
+        (None, Some(r)) => format!("https://github.com/{r}/releases"),
+        (None, None) => official_release_base(),
+    };
+    let url = reqwest::Url::parse(&base).with_context(|| format!("invalid release base {base}"))?;
+    match url.scheme() {
+        "https" => {}
+        "http" if crate::client::is_loopback_url(&url) => {}
+        _ => bail!(
+            "refusing the release base {base}: a mirror must use https (plain http only on this machine)"
+        ),
+    }
+    Ok((base, None))
+}
+
+/// [`release_base_for`] with `cfg`'s `[update]` and the process environment.
+pub fn release_base(cfg: &kioku_core::Config) -> anyhow::Result<(String, Option<String>)> {
+    release_base_for(&cfg.update, &kioku_core::util::env_vars())
 }
 
 /// The HTTP client of updates from `base` (5 min timeout, `kioku/<version>` user agent;
@@ -412,10 +446,17 @@ pub fn install_release(
 /// `kioku update [--version <tag>] [--check] [--background] [--require-signature]`;
 /// returns the exit code (10 = `--check` found a newer release).
 pub fn run_update(args: UpdateArgs) -> anyhow::Result<i32> {
+    if args.rollback {
+        return run_rollback();
+    }
     if args.background {
         return Ok(crate::auto_update::run_background(args.version));
     }
-    let base = release_base();
+    let cfg = kioku_core::Config::load()?;
+    let (base, warning) = release_base(&cfg)?;
+    if let Some(w) = warning {
+        eprintln!("{w}");
+    }
     let base = base.as_str();
     let http = http_client(base)?;
     let explicit = args.version.is_some();
@@ -489,6 +530,8 @@ fn replace(
         );
     }
     std::fs::create_dir_all(work)?;
+    // Order (SPEC-M2.7 §2): checksum → extract → signature → `--version` → swap. Nothing
+    // from the archive runs before its signature is accepted.
     let tarball = work.join(&asset);
     std::fs::write(&tarball, &bytes)?;
     let status = kioku_core::util::quiet_command(&tar_program())
@@ -508,6 +551,18 @@ fn replace(
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(new, std::fs::Permissions::from_mode(0o755))?;
     }
+    match verify.signature {
+        SignaturePolicy::Skip => {}
+        SignaturePolicy::Require => verify_signature(new)
+            .context("refusing to install an unsigned or foreign binary; nothing was changed")?,
+        SignaturePolicy::Warn => {
+            if let Err(err) = verify_signature(new) {
+                eprintln!(
+                    "kioku: warning: {err:#} (installing anyway; pass --require-signature to refuse)"
+                );
+            }
+        }
+    }
     // On Windows run the extracted `kioku.exe`: `kioku.exe.new` has no executable extension.
     let probe = if cfg!(windows) { &bin } else { new };
     let out = kioku_core::util::quiet_command(&probe.display().to_string())
@@ -526,22 +581,92 @@ fn replace(
         }
         eprintln!("kioku: warning: the new binary reports {reported:?}, not {tag}");
     }
-    match verify.signature {
-        SignaturePolicy::Skip => {}
-        SignaturePolicy::Require => verify_signature(new)
-            .context("refusing to install an unsigned or foreign binary; nothing was changed")?,
-        SignaturePolicy::Warn => {
-            if let Err(err) = verify_signature(new) {
-                eprintln!(
-                    "kioku: warning: {err:#} (installing anyway; pass --require-signature to refuse)"
-                );
-            }
-        }
-    }
+    // SPEC-M2.7 §7: keep the binary being replaced as `<exe>.prev` for a rollback.
+    keep_previous(exe);
     // Same directory: atomic; a running `kioku serve` keeps the old inode until restarted.
     // On Windows the running exe is renamed aside first (SPEC-M2.2 §5).
     swap_binary(new, exe, cfg!(windows))?;
     Ok(reported)
+}
+
+/// Suffix of the copy of the replaced binary kept for a rollback (SPEC-M2.7 §7).
+pub const PREV_SUFFIX: &str = ".prev";
+
+/// Copies `exe` to `<exe>.prev` (atomically: temp copy + rename; a running exe can be
+/// copied on every platform). Best effort: a failure only costs the rollback.
+pub fn keep_previous(exe: &Path) {
+    if !exe.is_file() {
+        return;
+    }
+    let prev = sibling(exe, PREV_SUFFIX);
+    let tmp = sibling(exe, &format!("{PREV_SUFFIX}.{}.tmp", std::process::id()));
+    let ok = std::fs::copy(exe, &tmp).is_ok() && std::fs::rename(&tmp, &prev).is_ok();
+    if !ok {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// The version `bin --version` reports (`0.8.0`), `None` when it does not run. On Windows a
+/// copy with an `.exe` name is probed (`kioku.exe.prev` has no executable extension).
+pub fn binary_version(bin: &Path) -> Option<String> {
+    let probe = if cfg!(windows) {
+        let p = bin.with_file_name(format!(".kioku-probe-{}.exe", std::process::id()));
+        std::fs::copy(bin, &p).ok()?;
+        p
+    } else {
+        bin.to_path_buf()
+    };
+    let out = output_quiet(&probe);
+    if cfg!(windows) {
+        let _ = std::fs::remove_file(&probe);
+    }
+    let out = out?;
+    String::from_utf8_lossy(&out)
+        .split_whitespace()
+        .find(|w| {
+            w.trim_start_matches('v')
+                .starts_with(|c: char| c.is_ascii_digit())
+        })
+        .map(|w| w.trim_start_matches('v').to_string())
+}
+
+/// stdout of `bin --version` when it exits 0 (5 s at most).
+fn output_quiet(bin: &Path) -> Option<Vec<u8>> {
+    let mut cmd = kioku_core::util::quiet_command(&bin.display().to_string());
+    cmd.arg("--version");
+    let out = kioku_core::util::output_with_deadline(cmd, Duration::from_secs(5))?;
+    out.status.success().then_some(out.stdout)
+}
+
+/// Puts `<exe>.prev` back in the place of `exe` (rename; Windows: the rename dance) and
+/// returns the version it reports. Refuses when there is no `.prev` or it does not run.
+pub fn rollback_binary(exe: &Path) -> anyhow::Result<String> {
+    let prev = sibling(exe, PREV_SUFFIX);
+    if !prev.is_file() {
+        bail!(
+            "there is no previous binary ({} is missing): nothing to roll back to",
+            prev.display()
+        );
+    }
+    let version = binary_version(&prev)
+        .with_context(|| format!("{} does not run; refusing to roll back", prev.display()))?;
+    swap_binary(&prev, exe, cfg!(windows))?;
+    Ok(version)
+}
+
+/// `kioku update --rollback`: swap `<exe>.prev` back in and restart the service.
+pub fn run_rollback() -> anyhow::Result<i32> {
+    let exe = std::env::current_exe().context("locating the kioku binary")?;
+    let exe = kioku_core::util::canonical_plain(&exe).unwrap_or(exe);
+    if is_winget_install(&exe) {
+        bail!("kioku was installed with winget; use winget to install another version");
+    }
+    let version = rollback_binary(&exe)?;
+    println!("kioku: rolled back v{VERSION} -> v{version}");
+    for line in restart_service(&exe) {
+        println!("{line}");
+    }
+    Ok(0)
 }
 
 /// Restarts the kioku service if one is installed (hooks need nothing: same path); returns
@@ -638,14 +763,16 @@ pub(crate) mod fixture {
     /// and bytes (unix: the dummy is a shell script).
     #[cfg(unix)]
     pub(crate) fn release(tag: &str, reports: &str) -> (String, Vec<u8>) {
+        release_with_script(tag, &format!("#!/bin/sh\necho 'kioku {reports}'\n"))
+    }
+
+    /// A release `tag` whose dummy binary is `script` (unix).
+    #[cfg(unix)]
+    pub(crate) fn release_with_script(tag: &str, script: &str) -> (String, Vec<u8>) {
         let tmp = tempfile::tempdir().unwrap();
         let name = format!("kioku-{tag}-{TARGET}");
         std::fs::create_dir(tmp.path().join(&name)).unwrap();
-        std::fs::write(
-            tmp.path().join(&name).join("kioku"),
-            format!("#!/bin/sh\necho 'kioku {reports}'\n"),
-        )
-        .unwrap();
+        std::fs::write(tmp.path().join(&name).join("kioku"), script).unwrap();
         let tarball = tmp.path().join(format!("{name}.tar.gz"));
         let ok = std::process::Command::new("tar")
             .arg("-czf")
@@ -925,6 +1052,84 @@ mod tests {
         assert!(std::fs::read_to_string(&exe).unwrap().contains("9.9.9"));
     }
 
+    /// SPEC-M2.7 §2: an unsigned binary under `Require` is refused before it ever runs
+    /// (the dummy writes a marker file when executed; the marker must not exist).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_signature_is_checked_before_the_new_binary_runs() {
+        use fixture::{release_with_script, serve, sums};
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("ran");
+        let script = format!(
+            "#!/bin/sh\ntouch '{}'\necho 'kioku 9.9.9'\n",
+            marker.display()
+        );
+        let (asset, bytes) = release_with_script("v9.9.9", &script);
+        let base = serve(
+            vec![(asset, bytes.clone()), sums("v9.9.9", &bytes, true)],
+            None,
+        );
+        let exe = tmp.path().join("kioku");
+        std::fs::write(&exe, "old").unwrap();
+        let http = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        let verify = Verify {
+            signature: SignaturePolicy::Require,
+            exact_version: true,
+        };
+        let err = install_release(&http, &base, "v9.9.9", &exe, verify).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unsigned or foreign"),
+            "{err:#}"
+        );
+        assert!(!marker.exists(), "the unverified binary was executed");
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "old");
+        // Without the signature requirement the probe runs it (the marker appears).
+        install_release(&http, &base, "v9.9.9", &exe, Verify::unsigned()).unwrap();
+        assert!(marker.exists());
+    }
+
+    /// SPEC-M2.7 §7: an update keeps the replaced binary as `.prev`; `--rollback` puts it
+    /// back and refuses when there is none.
+    #[cfg(unix)]
+    #[test]
+    fn updates_keep_prev_and_rollback_restores_it() {
+        use fixture::{release, serve, sums};
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("kioku");
+        assert!(
+            format!("{:#}", rollback_binary(&exe).unwrap_err()).contains("nothing to roll back"),
+            "no .prev → refused"
+        );
+        std::fs::write(&exe, "#!/bin/sh\necho 'kioku 9.9.8'\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let (asset, bytes) = release("v9.9.9", "9.9.9");
+        let base = serve(
+            vec![(asset, bytes.clone()), sums("v9.9.9", &bytes, true)],
+            None,
+        );
+        let http = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        install_release(&http, &base, "v9.9.9", &exe, Verify::unsigned()).unwrap();
+        let prev = sibling(&exe, PREV_SUFFIX);
+        assert_eq!(binary_version(&exe).as_deref(), Some("9.9.9"));
+        assert_eq!(binary_version(&prev).as_deref(), Some("9.9.8"));
+        assert_eq!(rollback_binary(&exe).unwrap(), "9.9.8");
+        assert_eq!(binary_version(&exe).as_deref(), Some("9.9.8"));
+        assert!(!prev.exists(), "the .prev was moved into place");
+        // A .prev that does not run is refused, and nothing changes.
+        std::fs::write(&prev, "not a program").unwrap();
+        assert!(rollback_binary(&exe).is_err());
+        assert_eq!(binary_version(&exe).as_deref(), Some("9.9.8"));
+    }
+
     /// The real `codesign` on the test binary itself (never replaced, only inspected): it is
     /// not signed by kioku's team, so it fails verification.
     #[cfg(target_os = "macos")]
@@ -1010,6 +1215,72 @@ mod tests {
         assert!(lines[0].contains("restarted the service"), "{lines:?}");
         let calls: Vec<String> = runner.calls().iter().map(|c| c.join(" ")).collect();
         assert_eq!(calls, ["systemctl --user restart kioku.service"]);
+    }
+
+    /// SPEC-M2.7 §11: mirrors and forks only with `[update] allow_mirror = true`, and only
+    /// over https (plain http on loopback for tests).
+    #[test]
+    fn release_base_needs_allow_mirror_and_https() {
+        let vars = |pairs: &[(&str, &str)]| -> std::collections::HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let off = kioku_core::UpdateConfig::default();
+        let on = kioku_core::UpdateConfig {
+            allow_mirror: true,
+            ..Default::default()
+        };
+        let official = "https://github.com/misorafa/kioku/releases".to_string();
+        assert_eq!(
+            release_base_for(&off, &vars(&[])).unwrap(),
+            (official.clone(), None)
+        );
+        let (base, warning) = release_base_for(
+            &off,
+            &vars(&[("KIOKU_DOWNLOAD_BASE", "https://evil.example/releases")]),
+        )
+        .unwrap();
+        assert_eq!(base, official);
+        assert!(warning.unwrap().contains("allow_mirror"));
+        let (base, warning) =
+            release_base_for(&off, &vars(&[("KIOKU_REPO", "someone/fork")])).unwrap();
+        assert_eq!(base, official);
+        assert!(warning.is_some());
+        assert_eq!(
+            release_base_for(
+                &on,
+                &vars(&[("KIOKU_DOWNLOAD_BASE", "https://mirror.example/kioku/")])
+            )
+            .unwrap(),
+            ("https://mirror.example/kioku".to_string(), None)
+        );
+        assert_eq!(
+            release_base_for(&on, &vars(&[("KIOKU_REPO", "someone/fork")]))
+                .unwrap()
+                .0,
+            "https://github.com/someone/fork/releases"
+        );
+        assert_eq!(
+            release_base_for(
+                &on,
+                &vars(&[("KIOKU_DOWNLOAD_BASE", "http://127.0.0.1:8080/releases")])
+            )
+            .unwrap()
+            .0,
+            "http://127.0.0.1:8080/releases"
+        );
+        for bad in [
+            "http://192.168.1.5/releases",
+            "ftp://x/releases",
+            "file:///tmp/r",
+        ] {
+            assert!(
+                release_base_for(&on, &vars(&[("KIOKU_DOWNLOAD_BASE", bad)])).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

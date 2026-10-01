@@ -57,9 +57,10 @@ pub enum Command {
     /// Set up this machine in one idempotent step: config, background service, hooks + MCP
     /// for every detected agent, summary.
     Setup {
-        /// Client-only machine: talk to the server at URL with TOKEN (checked before anything
-        /// is written).
-        #[arg(long, num_args = 2, value_names = ["URL", "TOKEN"])]
+        /// Client-only machine: talk to the server at URL (checked before anything is
+        /// written). The token comes from KIOKU_CLIENT_TOKEN or one line on stdin; giving it
+        /// as a second argument still works but is deprecated (process list, shell history).
+        #[arg(long, num_args = 1..=2, value_names = ["URL", "TOKEN"])]
         client_only: Option<Vec<String>>,
         /// Do not install the background service.
         #[arg(long)]
@@ -98,6 +99,10 @@ pub enum Command {
         /// How many machines may use it (at most 20).
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
         uses: u32,
+        /// The address other machines reach this server at (`192.168.1.5`, `mini.local:7391`);
+        /// default: this machine's LAN address, with its other addresses listed.
+        #[arg(long)]
+        host: Option<String>,
     },
     /// Join the server with a code from `kioku invite`: fetch its token, write a client-only
     /// config and set up every detected agent (what the pasted invite line runs).
@@ -229,6 +234,10 @@ pub enum Command {
         /// macOS: refuse a binary that is not signed by kioku's Developer ID team.
         #[arg(long)]
         require_signature: bool,
+        /// Put back the binary the last update replaced (`<binary>.prev`) and restart the
+        /// service.
+        #[arg(long, conflicts_with_all = ["version", "check", "background"])]
+        rollback: bool,
     },
     /// Rebuild the search index from the wiki (via the server).
     Reindex,
@@ -240,6 +249,10 @@ pub enum Command {
         /// Show what would change; write nothing.
         #[arg(long)]
         dry_run: bool,
+        /// Also print the manual `kioku setup --client-only` command, which contains the new
+        /// token (by default only a `kioku invite` line is printed).
+        #[arg(long)]
+        show_token: bool,
     },
     /// Serve the kioku MCP tools on stdin/stdout for an agent, relaying to the server in
     /// [client] (what `kioku install` registers as the agents' MCP server).
@@ -461,6 +474,18 @@ mod tests {
             ])
             .is_err()
         );
+        // SPEC-M2.7 §10: the token argument is optional now.
+        assert!(matches!(
+            p(&["setup", "--client-only", "http://h:7391", "--dry-run"]).unwrap().command,
+            Command::Setup { client_only: Some(v), dry_run: true, .. } if v == ["http://h:7391"]
+        ));
+        assert!(matches!(
+            p(&["rotate-token", "--show-token"]).unwrap().command,
+            Command::RotateToken {
+                dry_run: false,
+                show_token: true
+            }
+        ));
         for sub in ["install", "uninstall", "start", "stop", "status", "logs"] {
             assert!(p(&["service", sub]).is_ok(), "{sub}");
         }
@@ -510,7 +535,7 @@ mod tests {
         assert!(p(&["project", "merge", "only-one"]).is_err());
         assert!(matches!(
             p(&["update", "--version", "v0.2.0"]).unwrap().command,
-            Command::Update { version: Some(v), check: false, background: false, require_signature: false } if v == "v0.2.0"
+            Command::Update { version: Some(v), check: false, background: false, require_signature: false, rollback: false } if v == "v0.2.0"
         ));
         assert!(matches!(
             p(&["update", "--check"]).unwrap().command,
@@ -531,16 +556,33 @@ mod tests {
                 ..
             }
         ));
+        assert!(matches!(
+            p(&["update", "--rollback"]).unwrap().command,
+            Command::Update { rollback: true, .. }
+        ));
+        assert!(p(&["update", "--rollback", "--version", "v0.7.0"]).is_err());
         assert!(p(&["reindex"]).is_ok());
         assert!(matches!(
             p(&["invite"]).unwrap().command,
-            Command::Invite { ttl: 10, uses: 1 }
+            Command::Invite {
+                ttl: 10,
+                uses: 1,
+                host: None
+            }
         ));
         assert!(matches!(
             p(&["invite", "--ttl", "30", "--uses", "3"])
                 .unwrap()
                 .command,
-            Command::Invite { ttl: 30, uses: 3 }
+            Command::Invite {
+                ttl: 30,
+                uses: 3,
+                host: None
+            }
+        ));
+        assert!(matches!(
+            p(&["invite", "--host", "100.64.0.7"]).unwrap().command,
+            Command::Invite { host: Some(h), .. } if h == "100.64.0.7"
         ));
         assert!(p(&["invite", "--uses", "0"]).is_err());
         assert!(matches!(

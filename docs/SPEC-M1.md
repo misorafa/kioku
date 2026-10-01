@@ -553,7 +553,7 @@ Auth is enforced when `auth_token` is set (always set by `kioku init`).
 Loopback requests without a token are rejected too — simpler, one rule.
 
 ```
-GET  /api/v1/health                          → {ok:true, version}
+GET  /api/v1/health                          → {ok:true, observation_dedup:true}  (no version since SPEC-M2.7 §11)
 POST /api/v1/sessions/start                  {session_id, agent, cwd, source, project:{id,name,root,remote}}
                                              → {project_id, pending_handoff?, state_excerpt?, recent_sessions:[{title,path,date}]}
 GET  /api/v1/sessions/{id}                   → {project_id, status, counts:{prompts,tool_uses}, has_agent_handoff, tool_uses_since_handoff}
@@ -581,8 +581,10 @@ when there is none. `search`: an explicit `scope` wins; without one, a given
 `project` means scope `project`, otherwise `all`; `scope=project` without a
 project → 400; `limit` defaults to 10 and is clamped to 1..=100.
 
-Errors: `{error: "<message>"}` with 400/401/404/500 (core `NotFound` → 404,
-`InvalidInput` and malformed JSON / query strings → 400, anything else → 500).
+Errors: `{error: "<message>"}` with 400/401/404/409/500 (core `NotFound` → 404,
+`InvalidInput` and malformed JSON / query strings → 400, `Conflict` → 409 — a stale
+`expected_revision`, a delivery id reused with other contents, a second backup within
+60 s (SPEC-M2.6, SPEC-M2.7 §12) — anything else → 500).
 Unknown session on `observations` → 404 (hook then silently drops). An unknown
 project on `PUT /pages` or `POST /handoffs` → 404 whose message lists the
 known project ids.
@@ -597,11 +599,11 @@ model reads, so write them carefully (Japanese + English one-liner each).
 
 | tool | input | output |
 |------|-------|--------|
-| `kioku_query` | `{query, project?, scope?: "project"\|"global"\|"all" (default: project if `project` is given, else all), limit? (default 8)}` | text: numbered hits `path — title (score) [global]` + snippet, or `no hits` |
-| `kioku_read` | `{path}` | text: frontmatter summary + body |
+| `kioku_query` | `{query, project?, scope?: "project"\|"global"\|"all" (default: project if `project` is given, else all), limit? (default 8)}` | text: the untrusted-memory note (SPEC-M2.7 §3), then numbered hits `path — title (score) [global]` + snippet, or `no hits` |
+| `kioku_read` | `{path}` | text: the note, frontmatter summary + body |
 | `kioku_write_page` | `{title, content, project?, scope?, tags?, path?}` | text: `wrote <path>` |
 | `kioku_handoff_write` | §7.5 | text: `handoff recorded for <project>` |
-| `kioku_handoff_pending` | `{project, accept?: false}` | text: one header line (id, source, dates) + handoff, or `none` |
+| `kioku_handoff_pending` | `{project, accept?: false}` | text: the note, one header line (id, source, dates) + handoff, or `none` |
 | `kioku_status` | `{}` | text: counts + data dir + known project ids |
 
 Tool failures are returned as tool results with `isError: true` and the error

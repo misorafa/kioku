@@ -1,7 +1,7 @@
 # kioku installer for Windows (docs/SPEC-M2.2.md section 6, docs/SPEC-M2.3.md section 4).
 # Windows PowerShell 5.1 or PowerShell 7, normal or elevated.
 #
-#   irm http://192.168.1.240:7391/i/K7Q2M9XD.ps1 | iex     # the line `kioku invite` prints
+#   $env:KIOKU_JOIN='192.168.1.240:7391/K7Q2M9XD'; irm https://raw.githubusercontent.com/misorafa/kioku/main/install.ps1 | iex   # the line `kioku invite` prints
 #   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/misorafa/kioku/main/install.ps1))) -ClientOnly http://192.168.1.240:7391 <token>
 #   & ([scriptblock]::Create((irm .../install.ps1))) -Version v0.5.0 -NoSetup
 #   $env:KIOKU_JOIN='home.lan:7391/<code>'; irm https://raw.githubusercontent.com/misorafa/kioku/main/install.ps1 | iex
@@ -10,7 +10,8 @@
 # SHA-256 against the release's SHA256SUMS, installs it to
 # %LOCALAPPDATA%\Programs\kioku\kioku.exe, adds that directory to the user PATH (and to this
 # window's $env:Path), then runs `kioku join <url> <code>` (join mode: $KiokuJoinUrl and
-# $KiokuJoinCode set, as the `/i/<code>.ps1` script of a kioku server does, or -Join) or
+# $KiokuJoinCode set, as the former `/i/<code>.ps1` script of a kioku server did, or
+# $env:KIOKU_JOIN, or -Join) or
 # `kioku setup --client-only <url> <token>`.
 # Windows machines are kioku clients only: the server runs on macOS or Linux.
 # Never needs administrator rights; it always installs for the user who runs it.
@@ -313,7 +314,8 @@ function Invoke-KiokuInstall([object[]]$Arguments) {
     if (-not $repo) { $repo = 'misorafa/kioku' }
     $setup = $true
     $noPath = $false
-    # Join mode (SPEC-M2.3 section 4.1): the server's /i/<code>.ps1 sets these two variables.
+    # Join mode (SPEC-M2.3 section 4.1): these two variables (the server's former /i/<code>.ps1
+    # set them; SPEC-M2.7 section 4 removed that route), or KIOKU_JOIN below.
     $joinUrl = ''
     $joinCode = ''
     if ($KiokuJoinUrl) { $joinUrl = [string]$KiokuJoinUrl }

@@ -20,13 +20,39 @@ pub const TOOL_INPUT_MAX: usize = 4000;
 /// Secret-looking key names (substring, case-insensitive) shared by the text and JSON-key rules.
 const SECRET_WORD: &str = r"(secret|token|passw(?:or)?d|api[_-]?key|access[_-]?key|private[_-]?key|credential|authorization)";
 
+/// Whole key names that hold a secret but are too short or common to match as substrings
+/// (SPEC-M2.7 §9): `pass` / `pwd` / `passphrase` (optionally prefixed, `DB_PASS`,
+/// `MYSQL_PWD`), any `*_key` (`encryption_key`, `signing_key`, `master_key`,
+/// `supabase_key`), `*accountkey` and cookies.
+const SECRET_NAME: &str =
+    r"(?:[\w.-]*[_.-])?(?:pass|pwd|passphrase)|[\w.-]*_key|[\w.-]*accountkey|(?:set-)?cookie";
+
+/// `*_key` names that are identifiers, not credentials (`primary_key`, `sort_key`, …).
+const BENIGN_KEY_PREFIXES: [&str; 12] = [
+    "primary",
+    "foreign",
+    "sort",
+    "partition",
+    "cache",
+    "public",
+    "map",
+    "hash",
+    "lookup",
+    "unique",
+    "group",
+    "idempotency",
+];
+
 struct Patterns {
     whole: Vec<Regex>,
     unterminated_key: Regex,
     url_userinfo: Regex,
     key_value: Regex,
+    name_value: Regex,
+    cookie: Regex,
     flag_value: Regex,
     secret_key: Regex,
+    secret_name: Regex,
 }
 
 fn patterns() -> &'static Patterns {
@@ -42,6 +68,14 @@ fn patterns() -> &'static Patterns {
             r"xox[bap]-[A-Za-z0-9-]{10,}",
             r"AIza[0-9A-Za-z_-]{35}",
             r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
+            // SPEC-M2.7 §9
+            r"ASIA[0-9A-Z]{16}",
+            r"npm_[A-Za-z0-9]{36}",
+            r"glpat-[A-Za-z0-9_-]{20,}",
+            r"hf_[A-Za-z0-9]{30,}",
+            r"pypi-AgEI[A-Za-z0-9_-]{20,}",
+            r"SG\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}",
+            r"AGE-SECRET-KEY-1[A-Z0-9]{50,}",
         ]
         .iter()
         .map(|p| Regex::new(p).expect("valid secret regex"))
@@ -60,11 +94,22 @@ fn patterns() -> &'static Patterns {
                 r#"(?i)(?P<key>[\w.-]*{SECRET_WORD}[\w.-]*)(?P<sep>\\?["']?\s*[:=]\s*){value}"#
             ))
             .expect("valid key/value regex"),
+            // Whole-word names only (`\b`): `compass: north` or `passing: 3` stay.
+            name_value: Regex::new(&format!(
+                r#"(?i)\b(?P<key>{SECRET_NAME})(?P<sep>\\?["']?\s*[:=]\s*){value}"#
+            ))
+            .expect("valid name/value regex"),
+            // A cookie header's value runs to the end of the line (`a=1; b=2`).
+            cookie: Regex::new(
+                r#"(?im)\b(?P<key>(?:set-)?cookie)(?P<sep>\s*:\s*)(?P<value>[^\r\n"\\]+)"#,
+            )
+            .expect("valid cookie regex"),
             flag_value: Regex::new(&format!(
                 r#"(?i)(?P<key>--(?:password|token|api-key))(?P<sep>\s+){value}"#
             ))
             .expect("valid flag regex"),
             secret_key: Regex::new(&format!("(?i){SECRET_WORD}")).expect("valid key regex"),
+            secret_name: Regex::new(&format!("(?i)^(?:{SECRET_NAME})$")).expect("valid name regex"),
         }
     })
 }
@@ -74,7 +119,13 @@ fn patterns() -> &'static Patterns {
 fn benign_key(key: &str) -> bool {
     let k = key.to_ascii_lowercase();
     let k = k.trim_matches(|c: char| c == '"' || c == '\'' || c == '\\');
-    k.ends_with("tokens") || k.contains("tokenizer")
+    if k.ends_with("tokens") || k.contains("tokenizer") {
+        return true;
+    }
+    k.strip_suffix("_key").is_some_and(|head| {
+        let last = head.rsplit(['_', '.', '-']).next().unwrap_or(head);
+        BENIGN_KEY_PREFIXES.contains(&last)
+    })
 }
 
 /// Replaces the `value` group of every match with `[REDACTED]`, keeping quotes around
@@ -136,7 +187,9 @@ pub fn redact(text: &str) -> String {
         out = p.unterminated_key.replace_all(&out, REDACTED).into_owned();
     }
     out = redact_values(&p.url_userinfo, &out);
+    out = redact_values(&p.cookie, &out);
     out = redact_values(&p.key_value, &out);
+    out = redact_values(&p.name_value, &out);
     out = redact_values(&p.flag_value, &out);
     out
 }
@@ -150,7 +203,7 @@ pub fn redact_value(value: &Value) -> Value {
         Value::Object(map) => Value::Object(
             map.iter()
                 .map(|(k, v)| {
-                    let v = if p.secret_key.is_match(k)
+                    let v = if (p.secret_key.is_match(k) || p.secret_name.is_match(k))
                         && !benign_key(k)
                         && (v.is_string() || v.is_number())
                     {
@@ -386,6 +439,73 @@ mod tests {
         for t in &cases {
             redacted_all(&format!("value {t} end"), t);
         }
+    }
+
+    /// SPEC-M2.7 §9: the new token shapes.
+    #[test]
+    fn m27_token_patterns() {
+        let cases = [
+            format!("ASIA{}", "ABCDEFGHIJ234567"),
+            format!("npm_{}", "a1B2c3".repeat(6)),
+            format!("glpat-{}", "xY_z-12345".repeat(2)),
+            format!("hf_{}", "abcDEF1234".repeat(3)),
+            format!("pypi-AgEI{}", "cHlwaS5vcmc_-x".repeat(2)),
+            format!("SG.{}.{}", "abcdefghij_-KLMNOPQRS", "tuvwxyz0123456789-_AB"),
+            format!("AGE-SECRET-KEY-1{}", "QZ7J".repeat(14)),
+        ];
+        for t in &cases {
+            redacted_all(&format!("値 {t} です"), t);
+            let once = redact(t);
+            assert_eq!(redact(&once), once, "idempotent: {t}");
+        }
+        assert_eq!(redact("ASIA-short"), "ASIA-short");
+        assert_eq!(redact("hf_short"), "hf_short");
+    }
+
+    /// SPEC-M2.7 §9: short key names and `*_key` as whole words; cookies to end of line.
+    #[test]
+    fn m27_key_names_and_cookies() {
+        for (input, secret) in [
+            ("DB_PASS=hunter2", "hunter2"),
+            ("pass: s3cr3t", "s3cr3t"),
+            ("MYSQL_PWD=abc123", "abc123"),
+            ("pwd = 'p w'", "p w"),
+            ("passphrase: correct-horse", "correct-horse"),
+            ("encryption_key=0123abcd", "0123abcd"),
+            ("signing_key: zzz", "zzz"),
+            ("MASTER_KEY=mk", "mk"),
+            ("supabase_key: eyJx", "eyJx"),
+            ("AccountKey=azure+key/==", "azure+key/=="),
+            ("Cookie: session=abc; csrftoken=def", "session=abc"),
+            ("Set-Cookie: sid=xyz; HttpOnly", "sid=xyz"),
+        ] {
+            redacted_all(input, secret);
+            let once = redact(input);
+            assert_eq!(redact(&once), once, "idempotent: {input}");
+        }
+        assert_eq!(
+            redact("Cookie: a=1; b=2\n次の行"),
+            "Cookie: [REDACTED]\n次の行"
+        );
+        // Words that merely contain the names, and identifier keys, survive.
+        for s in [
+            "compass: north",
+            "passing: 3 tests",
+            "bypass = true",
+            "primary_key: id",
+            "sort_key=created_at",
+            "パスワードの設計",
+            "the cookie banner",
+        ] {
+            assert_eq!(redact(s), s);
+        }
+        let out = redact_value(
+            &json!({"pass": "x", "signing_key": "y", "sort_key": "z", "cookie": "c=1"}),
+        );
+        assert_eq!(out["pass"], REDACTED);
+        assert_eq!(out["signing_key"], REDACTED);
+        assert_eq!(out["sort_key"], "z");
+        assert_eq!(out["cookie"], REDACTED);
     }
 
     #[test]

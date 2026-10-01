@@ -356,7 +356,7 @@ What `kioku install codex` writes (merged into `hooks.json`; `<bin>` absolute):
                                    "timeout": 10, "statusMessage": "kioku: loading handoff",
                                    "additionalContextLimit": 0 }] }],
     "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "<bin> hook user-prompt-submit --agent codex", "timeout": 5 }] }],
-    "PostToolUse": [{ "matcher": "^(Bash|apply_patch)$",
+    "PostToolUse": [{ "matcher": "^(Bash|shell|exec_command|apply_patch)$",
                       "hooks": [{ "type": "command", "command": "<bin> hook post-tool-use --agent codex", "timeout": 5 }] }],
     "PreCompact": [{ "hooks": [{ "type": "command", "command": "<bin> hook pre-compact --agent codex", "timeout": 5 }] }],
     "Stop": [{ "hooks": [{ "type": "command", "command": "<bin> hook stop --agent codex", "timeout": 10 }] }],
@@ -1344,7 +1344,24 @@ New `[client]` keys: `hook_dump = false`, `cursor_late_context = true`.
 ## 15. Security notes
 
 - Tokens only in user-level files (0600 when kioku creates them), never on argv,
-  never in a repository, never printed except by `--print-client-command`.
+  never in a repository, never printed except by `--print-client-command` and
+  `kioku rotate-token --show-token` (SPEC-M2.7 §10). `kioku setup --client-only <url>`
+  reads the token from `KIOKU_CLIENT_TOKEN` or one line on stdin; the old
+  `--client-only <url> <token>` form still works but prints a deprecation warning.
+  `kioku rotate-token` prints a `kioku invite` line (an invite created with the new
+  token, valid 30 minutes) instead of the token. `kioku invite` and `kioku join` never
+  print it.
+- Memory is untrusted data (SPEC-M2.7 §3). Anything an agent wrote into kioku — pages,
+  handoffs, the session summaries built from its observations — is exactly as trustworthy
+  as the pages, files and web content that agent read while writing it: a prompt
+  injection an agent picked up can be stored and replayed into every later session on
+  every machine. kioku therefore introduces stored memory as data, not instructions (a
+  fixed note at the top of the `<kioku>` block and of `kioku_read` / `kioku_query` /
+  `kioku_handoff_pending`), keeps stored text from closing the `<kioku>` block, and
+  redacts secrets in pages and handoffs as in observations. Agents must judge stored
+  procedures before running them.
+- kioku is single-user by design: one token, one person's machines. Everyone holding the
+  token reads and writes all memory; there are no per-user permissions.
 - `hook-dump.jsonl` holds raw payloads: 0600, opt-in, flagged by doctor.
 - Codex hook trust and Gemini project-hook fingerprints are the user's decision;
   kioku never writes trust state.
@@ -1542,6 +1559,10 @@ it falls back to `0.0.0.0`. Any other bind value is used as given. The
 
 The cache is advisory: an unreadable or corrupt file is ignored. It holds
 addresses only, never the token.
+
+`kioku invite` (SPEC-M2.7 §4) advertises the address the route above picks; on a
+machine with several (LAN, VPN such as Tailscale) it lists the others below the lines,
+LAN first, and `kioku invite --host <addr>` prints the lines for any of them.
 
 ### 19.3 What this does not cover
 

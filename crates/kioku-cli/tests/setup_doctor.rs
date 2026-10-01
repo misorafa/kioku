@@ -108,7 +108,12 @@ fn snapshot(dir: &Path, skip: &[&str]) -> BTreeMap<PathBuf, Vec<u8>> {
         for e in entries.flatten() {
             let p = e.path();
             let rel = p.strip_prefix(root).unwrap().to_path_buf();
-            if skip.iter().any(|s| rel.starts_with(s)) {
+            // `kioku.lock` is held by a running server (unreadable on Windows) and only
+            // carries a pid (SPEC-M2.7 §6).
+            if skip.iter().any(|s| rel.starts_with(s))
+                || p.file_name()
+                    .is_some_and(|n| n == kioku_core::store::LOCK_FILE)
+            {
                 continue;
             }
             if p.is_dir() {
@@ -453,6 +458,8 @@ fn rotate_token_restarts_the_service_with_a_new_token() {
     let port = free_port();
     let old = "old-token-0123456789abcdef";
     let config = server_config(home.path(), port, old);
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, format!("# 手で書いたコメント\n{text}")).unwrap();
     let unit = home
         .path()
         .join(".config")
@@ -479,11 +486,11 @@ fn rotate_token_restarts_the_service_with_a_new_token() {
 
     // --dry-run writes nothing.
     let before = std::fs::read_to_string(&config).unwrap();
-    let dry = run_rotate(true, &env);
+    let dry = run_rotate(true, false, &env);
     assert_eq!(dry.exit_code, 0, "{:?}", dry.lines);
     assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
 
-    let r = run_rotate(false, &env);
+    let r = run_rotate(false, false, &env);
     assert_eq!(r.exit_code, 0, "{:?}", r.lines);
     let cfg = Config::load_from_dir(&home.path().join(".kioku"), &HashMap::new()).unwrap();
     let new = cfg.server.auth_token.clone().unwrap();
@@ -500,23 +507,21 @@ fn rotate_token_restarts_the_service_with_a_new_token() {
         "{:?}",
         r.lines
     );
-    // SPEC-M2.3 §2: other machines are updated with `kioku invite`.
+    // SPEC-M2.7 §10: an invite line (created with the new token), never the token itself.
+    let all = r.lines.join("\n");
+    assert!(all.contains("valid 30 minutes"), "{all}");
     assert!(
-        r.lines
-            .iter()
-            .any(|l| l.contains("run `kioku invite --uses <n>` here")),
-        "{:?}",
-        r.lines
+        all.contains("KIOKU_JOIN='") && all.contains("install.sh"),
+        "{all}"
     );
-    let line = r
-        .lines
-        .iter()
-        .find(|l| {
-            l.trim_start()
-                .starts_with("kioku setup --client-only http://")
-        })
-        .unwrap_or_else(|| panic!("{:?}", r.lines));
-    assert!(line.ends_with(&format!(" {new}")), "{line}");
+    assert!(!all.contains(&new), "the token is not printed: {all}");
+    assert!(!all.contains("kioku setup --client-only"), "{all}");
+    // SPEC-M2.7 §12: comments and everything else in config.toml survive.
+    let text = std::fs::read_to_string(&config).unwrap();
+    assert!(
+        text.starts_with("# 手で書いたコメント\n[server]\n"),
+        "{text}"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -538,6 +543,26 @@ fn rotate_token_restarts_the_service_with_a_new_token() {
     };
     assert_eq!(ask(&new), 200);
     assert_eq!(ask(old), 401);
+
+    // --show-token prints the manual command (with the token, via KIOKU_CLIENT_TOKEN);
+    // here without a service, so nothing waits for a restart.
+    std::fs::remove_file(&unit).unwrap();
+    let r = run_rotate(false, true, &env);
+    assert_eq!(r.exit_code, 0, "{:?}", r.lines);
+    let newer = Config::load_from_dir(&home.path().join(".kioku"), &HashMap::new())
+        .unwrap()
+        .server
+        .auth_token
+        .unwrap();
+    let line = r
+        .lines
+        .iter()
+        .find(|l| l.contains("kioku setup --client-only http://"))
+        .unwrap_or_else(|| panic!("{:?}", r.lines));
+    assert!(
+        line.contains(&format!("KIOKU_CLIENT_TOKEN='{newer}'")),
+        "{line}"
+    );
 }
 
 #[test]
@@ -551,7 +576,7 @@ fn rotate_token_refusals_and_no_service() {
         Runner::recording(|_| CmdOutput::ok("")),
     );
     // No config at all / a client-only machine.
-    let r = run_rotate(false, &env);
+    let r = run_rotate(false, false, &env);
     assert_eq!(r.exit_code, 1);
     assert!(
         r.lines[0].contains("run kioku rotate-token on the server machine"),
@@ -565,7 +590,7 @@ fn rotate_token_refusals_and_no_service() {
         "[client]\nserver_url = \"http://h:7391\"\nauth_token = \"t\"\n",
     )
     .unwrap();
-    assert_eq!(run_rotate(false, &env).exit_code, 1);
+    assert_eq!(run_rotate(false, false, &env).exit_code, 1);
 
     // KIOKU_AUTH_TOKEN overrides the file: refuse.
     let old = "old-token-0123456789abcdef";
@@ -576,14 +601,20 @@ fn rotate_token_refusals_and_no_service() {
         vars(&[("KIOKU_AUTH_TOKEN", "from-env")]),
         Runner::recording(|_| CmdOutput::ok("")),
     );
-    let r = run_rotate(false, &with_env);
+    let r = run_rotate(false, false, &with_env);
     assert_eq!(r.exit_code, 1);
     assert!(r.lines[0].contains("KIOKU_AUTH_TOKEN"), "{:?}", r.lines);
     assert!(std::fs::read_to_string(&config).unwrap().contains(old));
 
     // No service installed: rotated, with the hint to restart kioku serve.
-    let r = run_rotate(false, &env);
+    let r = run_rotate(false, false, &env);
     assert_eq!(r.exit_code, 0, "{:?}", r.lines);
+    let new = Config::load_file(&config)
+        .unwrap()
+        .server
+        .auth_token
+        .unwrap();
+    assert!(!r.lines.join("\n").contains(&new), "{:?}", r.lines);
     assert!(!std::fs::read_to_string(&config).unwrap().contains(old));
     assert!(
         r.lines.iter().any(|l| l.contains("restart kioku serve")),
