@@ -16,8 +16,9 @@ use std::time::{Duration, SystemTime};
 use anyhow::Context;
 use kioku_core::project::GitBudget;
 use kioku_core::sanitize::sanitize_payload;
+use kioku_core::session::ASSISTANT_MAX;
 use kioku_core::strings::{fill, strings};
-use kioku_core::util::{home_dir_opt, now_ts, one_line};
+use kioku_core::util::{home_dir_opt, now_ts, one_line, truncate_chars};
 use kioku_core::{
     Config, DataDir, NewObservation, ObservationKind, ProjectIdentity, SessionInfo,
     SessionStartRequest, SessionStartResponse,
@@ -70,15 +71,52 @@ pub enum StopDecision {
     Finalize,
 }
 
-/// Stop-hook rule (spec §7.1): nudge only when at least [`NUDGE_MIN_TOOL_USES`] tools were
-/// used since the session's latest agent handoff (or since the start, without one), the
-/// agent is not already continuing because of a Stop hook, and the nudge is enabled.
+/// When the Stop hook may nudge (`[client] stop_nudge` / `nudge`, `nudge_min_minutes`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NudgePolicy {
+    /// Nudging is on at all.
+    pub enabled: bool,
+    /// Minutes since the last handoff (or the start), and between two nudges.
+    pub min_minutes: u64,
+}
+
+impl NudgePolicy {
+    /// The policy of a client config.
+    pub fn from_config(cfg: &kioku_core::ClientConfig) -> NudgePolicy {
+        NudgePolicy {
+            enabled: cfg.nudge_enabled(),
+            min_minutes: cfg.nudge_min_minutes,
+        }
+    }
+
+    fn min(&self) -> Duration {
+        Duration::from_secs(self.min_minutes.saturating_mul(60))
+    }
+}
+
+/// Stop-hook rule (spec §7.1, SPEC-M3.0 §4): nudge only when the nudge is enabled, the agent
+/// is not already continuing because of a Stop hook, and **all** of: at least
+/// [`NUDGE_MIN_TOOL_USES`] tools were used since the session's latest agent handoff (or since
+/// the start, without one); `min_minutes` passed since that handoff (or the start) by the
+/// server's clock — not checked against an older server, which does not report it; and the
+/// previous nudge of this session (`since_last_nudge`) is at least `min_minutes` old.
 pub fn stop_decision(
     info: &SessionInfo,
     stop_hook_active: bool,
-    nudge_enabled: bool,
+    policy: &NudgePolicy,
+    since_last_nudge: Option<Duration>,
 ) -> StopDecision {
-    if nudge_enabled && !stop_hook_active && info.tool_uses_since_handoff() >= NUDGE_MIN_TOOL_USES {
+    let min = policy.min();
+    let quiet_long_enough = info
+        .secs_since_handoff
+        .is_none_or(|s| Duration::from_secs(s) >= min);
+    let not_nudged_lately = since_last_nudge.is_none_or(|d| d >= min);
+    if policy.enabled
+        && !stop_hook_active
+        && info.tool_uses_since_handoff() >= NUDGE_MIN_TOOL_USES
+        && quiet_long_enough
+        && not_nudged_lately
+    {
         StopDecision::Nudge
     } else {
         StopDecision::Finalize
@@ -341,6 +379,7 @@ impl Handler<'_> {
             source: source.to_string(),
             project: project.clone(),
             lane,
+            machine: crate::machine::machine_name(self.env),
         };
         let resp = self
             .client
@@ -356,16 +395,12 @@ impl Handler<'_> {
     }
 
     fn block(&self, project_name: &str, resp: SessionStartResponse) -> String {
-        let ctx = StartContext {
-            project_name: project_name.to_string(),
-            project_id: resp.project_id,
-            session_id: self.ev.session_id.clone(),
-            server_url: self.cfg.client.server_url.clone(),
-            lane: resp.lane,
-            handoff: resp.pending_handoff.map(|h| h.content_md),
-            reference: resp.reference_handoff.map(|h| h.content_md),
-            state: resp.state_excerpt,
-        };
+        let ctx = StartContext::from_response(
+            project_name,
+            &self.ev.session_id,
+            &self.cfg.client.server_url,
+            resp,
+        );
         render_session_start(self.cfg.client.lang, &ctx)
     }
 
@@ -488,6 +523,7 @@ impl Handler<'_> {
             source: kioku_core::store::OFFLINE_REPLAY_SOURCE.into(),
             project,
             lane,
+            machine: crate::machine::machine_name(self.env),
         };
         crate::outbox::enqueue(self.cfg, obs, session).map(|_| ())
     }
@@ -627,6 +663,8 @@ impl Handler<'_> {
         };
         let info: SessionInfo =
             serde_json::from_value(info).context("unexpected session info response")?;
+        // SPEC-M3.0 §3: the agent's last reply, recorded before anything is finalized.
+        self.record_reply();
         // Cursor: aborted / errored stops finalize without a nudge.
         let completed = self.agent != Agent::Cursor
             || self
@@ -634,7 +672,11 @@ impl Handler<'_> {
                 .stop_status
                 .as_deref()
                 .is_none_or(|s| s == "completed");
-        let nudge_enabled = self.cfg.client.stop_nudge && completed;
+        let config = NudgePolicy::from_config(&self.cfg.client);
+        let policy = NudgePolicy {
+            enabled: config.enabled && completed,
+            ..config
+        };
         // Antigravity (M2.1 §3.7): our own marker says the previous Stop nudged.
         let nudge_marker = (self.agent == Agent::Antigravity)
             .then(|| marker_dir(self.agent, self.cfg, self.env))
@@ -646,8 +688,18 @@ impl Handler<'_> {
         {
             active = true;
         }
-        match stop_decision(&info, active, nudge_enabled) {
+        let mut decision = stop_decision(&info, active, &policy, None);
+        // The throttle file is read only when everything else says "nudge" (SPEC-M3.0 §4).
+        let throttle = nudge_throttle_file(self.cfg, self.env, &self.ev.session_id);
+        if decision == StopDecision::Nudge {
+            let age = throttle.as_deref().and_then(last_nudge_age);
+            decision = stop_decision(&info, active, &policy, age);
+        }
+        match decision {
             StopDecision::Nudge => {
+                if let Some(f) = &throttle {
+                    remember_nudge(f);
+                }
                 if let Some(m) = &nudge_marker
                     && let Some(d) = m.parent()
                 {
@@ -672,6 +724,46 @@ impl Handler<'_> {
                 self.finalize("stop")?;
                 Ok(HookResult::Silent)
             }
+        }
+    }
+
+    /// Posts the turn's final reply as an `assistant` observation (SPEC-M3.0 §3): from the
+    /// payload (Claude Code / Codex / Gemini CLI), else for Cursor / Antigravity from the
+    /// tail of the transcript. Nothing without a reply; an older server that does not know
+    /// the kind (400 / 422) is skipped silently; any other failure is logged and the Stop
+    /// goes on.
+    fn record_reply(&self) {
+        let reply = self.ev.assistant_message.clone().or_else(|| {
+            matches!(self.agent, Agent::Cursor | Agent::Antigravity)
+                .then(|| transcript_path(&self.ev.raw))
+                .flatten()
+                .and_then(|p| last_assistant_reply_within(p, TRANSCRIPT_READ_DEADLINE))
+        });
+        let Some(reply) = reply
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty())
+        else {
+            return;
+        };
+        let obs = NewObservation {
+            event_id: None,
+            session_id: self.ev.session_id.clone(),
+            kind: ObservationKind::Assistant,
+            ts: Some(now_ts()),
+            payload: sanitize_payload(&json!({ "text": truncate_chars(&reply, ASSISTANT_MAX) })),
+        };
+        let posted = serde_json::to_value(&obs)
+            .map_err(anyhow::Error::from)
+            .and_then(|body| self.client.post(&["observations"], &body));
+        match posted {
+            Ok(_) => {}
+            Err(err) if matches!(http_status(&err), Some(400 | 422)) => {}
+            Err(err) => log_failure(
+                self.cfg,
+                self.ev.event,
+                &self.ev.session_id,
+                &err.context("recording the last reply"),
+            ),
         }
     }
 
@@ -757,6 +849,123 @@ pub fn user_request(content: &str) -> String {
             body.trim().to_string()
         }
         None => content.to_string(),
+    }
+}
+
+/// `<kioku dir>/state/nudge-<session>`: when the Stop hook last nudged this session (unix
+/// seconds; SPEC-M3.0 §4).
+pub fn nudge_throttle_file(cfg: &Config, env: &HookEnv, session_id: &str) -> Option<PathBuf> {
+    client_state_root(cfg, env).map(|d| {
+        d.join("state")
+            .join(format!("nudge-{}", marker_name(session_id)))
+    })
+}
+
+/// How long ago the nudge recorded in `file` was; `None` when there is none.
+pub fn last_nudge_age(file: &Path) -> Option<Duration> {
+    let secs: u64 = std::fs::read_to_string(file).ok()?.trim().parse().ok()?;
+    let at = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+    Some(
+        SystemTime::now()
+            .duration_since(at)
+            .unwrap_or(Duration::ZERO),
+    )
+}
+
+/// Records a nudge now in `file` (best effort).
+fn remember_nudge(file: &Path) {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    if let Some(d) = file.parent() {
+        let _ = kioku_core::util::create_private_dir(d);
+    }
+    let _ = std::fs::write(file, now.to_string());
+}
+
+/// Bytes of a Cursor / Antigravity transcript's tail searched for the last reply.
+pub const REPLY_TAIL_BYTES: u64 = 64 * 1024;
+/// How long the Stop hook waits for that read.
+pub const TRANSCRIPT_READ_DEADLINE: Duration = Duration::from_millis(500);
+
+/// An absolute `transcript_path` / `transcriptPath` of a payload.
+fn transcript_path(raw: &Value) -> Option<PathBuf> {
+    ["transcript_path", "transcriptPath"]
+        .iter()
+        .find_map(|k| raw.get(*k).and_then(Value::as_str))
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+}
+
+/// [`last_assistant_reply`] on a helper thread, given up after `deadline` (a stalled network
+/// file system must not hold the Stop hook).
+pub fn last_assistant_reply_within(path: PathBuf, deadline: Duration) -> Option<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(last_assistant_reply(&path));
+    });
+    rx.recv_timeout(deadline).ok().flatten()
+}
+
+/// The text of the last assistant entry in the last [`REPLY_TAIL_BYTES`] of a JSONL
+/// transcript: a line whose `role` / `type` (or `message.role`) is `assistant`, or an
+/// Antigravity `PLANNER_RESPONSE`, with text in `content` / `text` / `message.content` (a
+/// string or `[{type: "text", text}]`). Lines cut by the tail or still being written are
+/// skipped.
+pub fn last_assistant_reply(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let start = len.saturating_sub(REPLY_TAIL_BYTES);
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    f.take(len - start).read_to_end(&mut buf).ok()?;
+    let mut found = None;
+    for line in buf.split(|&b| b == b'\n') {
+        let Ok(v) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+        let role = s(&v, "role")
+            .or_else(|| v.get("message").and_then(|m| s(m, "role")))
+            .or_else(|| s(&v, "type"))
+            .unwrap_or_default();
+        if !matches!(role.as_str(), "assistant" | "PLANNER_RESPONSE" | "model") {
+            continue;
+        }
+        let text = [
+            v.get("content"),
+            v.get("text"),
+            v.get("message").and_then(|m| m.get("content")),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(content_text);
+        if let Some(t) = text.filter(|t| !t.trim().is_empty()) {
+            found = Some(t);
+        }
+    }
+    found
+}
+
+/// Text of a transcript `content`: a string, `{text}`, or the `text` parts of an array.
+fn content_text(content: &Value) -> Option<String> {
+    match content {
+        Value::String(s) => Some(s.clone()),
+        Value::Object(o) => o.get("text").and_then(Value::as_str).map(str::to_string),
+        Value::Array(parts) => {
+            let texts: Vec<&str> = parts
+                .iter()
+                .filter(|p| {
+                    p.get("type")
+                        .and_then(Value::as_str)
+                        .is_none_or(|t| t == "text")
+                })
+                .filter_map(|p| p.get("text").and_then(Value::as_str).or_else(|| p.as_str()))
+                .collect();
+            (!texts.is_empty()).then(|| texts.join("\n"))
+        }
+        _ => None,
     }
 }
 
@@ -944,6 +1153,7 @@ mod tests {
 
     fn info(tool_uses: u32, has_agent_handoff: bool) -> SessionInfo {
         SessionInfo {
+            secs_since_handoff: None,
             project_id: "kioku-3f9a1c2e".into(),
             status: SessionStatus::Open,
             counts: SessionCounts {
@@ -966,30 +1176,180 @@ mod tests {
     fn stop_decision_rules() {
         use StopDecision::*;
         // old server (no tool_uses_since_handoff): cumulative count without a handoff
-        assert_eq!(stop_decision(&info(3, false), false, true), Nudge);
-        assert_eq!(stop_decision(&info(10, false), false, true), Nudge);
-        assert_eq!(stop_decision(&info(2, false), false, true), Finalize);
-        assert_eq!(stop_decision(&info(3, true), false, true), Finalize);
-        assert_eq!(stop_decision(&info(3, false), true, true), Finalize);
-        assert_eq!(stop_decision(&info(3, false), false, false), Finalize);
+        assert_eq!(decide(&info(3, false), false, true), Nudge);
+        assert_eq!(decide(&info(10, false), false, true), Nudge);
+        assert_eq!(decide(&info(2, false), false, true), Finalize);
+        assert_eq!(decide(&info(3, true), false, true), Finalize);
+        assert_eq!(decide(&info(3, false), true, true), Finalize);
+        assert_eq!(decide(&info(3, false), false, false), Finalize);
+    }
+
+    /// The M1/M2 rules: an older server (no time reported) and no earlier nudge.
+    fn decide(i: &SessionInfo, active: bool, enabled: bool) -> StopDecision {
+        let policy = NudgePolicy {
+            enabled,
+            min_minutes: 10,
+        };
+        stop_decision(i, active, &policy, None)
+    }
+
+    /// SPEC-M3.0 §4: tool uses AND time since the handoff (or start) AND no nudge in the
+    /// last `min_minutes`.
+    #[test]
+    fn stop_decision_matrix_with_times() {
+        use StopDecision::*;
+        let on = NudgePolicy {
+            enabled: true,
+            min_minutes: 10,
+        };
+        let at = |tools: u32, secs: Option<u64>| SessionInfo {
+            secs_since_handoff: secs,
+            ..since(40, tools)
+        };
+        let min = |m: u64| Some(Duration::from_secs(m * 60));
+        // (tool uses since handoff, seconds since handoff, last nudge age) → decision
+        let cases = [
+            (3, Some(600), None, Nudge),
+            (3, Some(3600), min(30), Nudge),
+            (3, Some(599), None, Finalize), // handoff (or start) too recent
+            (2, Some(3600), None, Finalize), // too little work
+            (3, Some(3600), min(9), Finalize), // nudged 9 minutes ago
+            (3, Some(3600), min(10), Nudge),
+            (3, None, None, Nudge),      // older server: no time check
+            (3, None, min(1), Finalize), // … but the client throttle still holds
+        ];
+        for (tools, secs, last, want) in cases {
+            assert_eq!(
+                stop_decision(&at(tools, secs), false, &on, last),
+                want,
+                "{tools} tool uses, {secs:?} s, last nudge {last:?}"
+            );
+        }
+        // stop_hook_active and a disabled nudge always finalize
+        assert_eq!(stop_decision(&at(9, Some(9999)), true, &on, None), Finalize);
+        let off = NudgePolicy {
+            enabled: false,
+            ..on
+        };
+        assert_eq!(
+            stop_decision(&at(9, Some(9999)), false, &off, None),
+            Finalize
+        );
+        // a shorter setting
+        let five = NudgePolicy {
+            min_minutes: 5,
+            ..on
+        };
+        assert_eq!(
+            stop_decision(&at(3, Some(300)), false, &five, min(5)),
+            Nudge
+        );
+        assert_eq!(
+            stop_decision(&at(3, Some(299)), false, &five, None),
+            Finalize
+        );
+    }
+
+    /// SPEC-M3.0 §4: the nudge names the handoff fields and lets the agent answer first.
+    #[test]
+    fn nudge_text_allows_answering_first() {
+        for (t, needle) in [
+            (
+                strings(kioku_core::Lang::Ja),
+                "ユーザーへの回答を先に済ませ、次の自然な区切りで書いてもかまいません。",
+            ),
+            (
+                strings(kioku_core::Lang::En),
+                "You may answer the user first and write it at the next natural pause.",
+            ),
+        ] {
+            assert!(t.stop_nudge.contains(needle), "{}", t.stop_nudge);
+            assert!(t.stop_nudge_generic.contains(needle));
+            assert!(t.stop_nudge.contains("{project}") && t.stop_nudge.contains("{session}"));
+        }
+        assert!(
+            strings(kioku_core::Lang::Ja)
+                .stop_nudge
+                .contains("確認済みの事実 / 落とし穴")
+        );
+    }
+
+    #[test]
+    fn last_assistant_reply_reads_the_newest_reply_from_the_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        assert_eq!(last_assistant_reply(&path), None, "missing file");
+        let lines = [
+            r#"{"type":"USER_INPUT","content":"<USER_REQUEST>直して</USER_REQUEST>"}"#,
+            r#"{"type":"PLANNER_RESPONSE","tool_calls":[]}"#,
+            r#"{"type":"PLANNER_RESPONSE","content":"hello.txt を作りました。"}"#,
+            r#"{"role":"user","message":{"content":"次"}}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        assert_eq!(
+            last_assistant_reply(&path).as_deref(),
+            Some("hello.txt を作りました。")
+        );
+        // Claude-style transcript entries, a text-part array, and a half-written last line
+        let more = [
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash"},{"type":"text","text":"テストを追加しました。"}]}}"#,
+            r#"{"role":"assistant","content":"最後の"#,
+        ];
+        std::fs::write(
+            &path,
+            format!("{}\n{}\n", lines.join("\n"), more.join("\n")),
+        )
+        .unwrap();
+        assert_eq!(
+            last_assistant_reply(&path).as_deref(),
+            Some("テストを追加しました。")
+        );
+        // only the tail is read
+        let big = format!(
+            "{}\n{}\n",
+            r#"{"role":"assistant","content":"古い返答"}"#,
+            "x".repeat(REPLY_TAIL_BYTES as usize + 10)
+        );
+        std::fs::write(&path, big).unwrap();
+        assert_eq!(last_assistant_reply(&path), None);
+        assert_eq!(
+            last_assistant_reply_within(dir.path().join("none.jsonl"), Duration::from_secs(1)),
+            None
+        );
+    }
+
+    #[test]
+    fn nudge_throttle_file_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("state").join("nudge-s1");
+        assert_eq!(last_nudge_age(&file), None);
+        remember_nudge(&file);
+        assert!(last_nudge_age(&file).is_some_and(|d| d < Duration::from_secs(60)));
+        std::fs::write(&file, "0").unwrap();
+        assert!(last_nudge_age(&file).is_some_and(|d| d > Duration::from_secs(3600)));
+        let cfg = Config::for_data_dir(dir.path());
+        assert_eq!(
+            nudge_throttle_file(&cfg, &HookEnv::default(), "a/b"),
+            Some(dir.path().join("state").join("nudge-a_b"))
+        );
     }
 
     #[test]
     fn stop_decision_counts_tool_uses_since_the_last_handoff() {
         use StopDecision::*;
         // a handoff covers earlier work: many tool uses overall, none since → no nudge
-        assert_eq!(stop_decision(&since(40, 0), false, true), Finalize);
-        assert_eq!(stop_decision(&since(40, 2), false, true), Finalize);
+        assert_eq!(decide(&since(40, 0), false, true), Finalize);
+        assert_eq!(decide(&since(40, 2), false, true), Finalize);
         // work continued after the handoff → nudge to refresh it
-        assert_eq!(stop_decision(&since(40, 3), false, true), Nudge);
-        assert_eq!(stop_decision(&since(40, 3), true, true), Finalize);
-        assert_eq!(stop_decision(&since(40, 3), false, false), Finalize);
+        assert_eq!(decide(&since(40, 3), false, true), Nudge);
+        assert_eq!(decide(&since(40, 3), true, true), Finalize);
+        assert_eq!(decide(&since(40, 3), false, false), Finalize);
         // the field wins over has_agent_handoff / counts
         let mut i = since(3, 3);
         i.has_agent_handoff = false;
-        assert_eq!(stop_decision(&i, false, true), Nudge);
+        assert_eq!(decide(&i, false, true), Nudge);
         i.tool_uses_since_handoff = Some(0);
-        assert_eq!(stop_decision(&i, false, true), Finalize);
+        assert_eq!(decide(&i, false, true), Finalize);
     }
 
     fn cfg_unreachable(dir: &Path) -> Config {

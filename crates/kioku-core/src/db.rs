@@ -525,7 +525,11 @@ pub fn last_assistant(conn: &Connection, session: &str) -> anyhow::Result<Option
     Ok(row.map(|(seq, payload, text)| {
         let from_payload = serde_json::from_str::<serde_json::Value>(&payload)
             .ok()
-            .and_then(|p| p.get("text").and_then(serde_json::Value::as_str).map(str::to_string));
+            .and_then(|p| {
+                p.get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            });
         (seq, from_payload.unwrap_or(text))
     }))
 }

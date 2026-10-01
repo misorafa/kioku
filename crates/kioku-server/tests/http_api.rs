@@ -158,7 +158,10 @@ async fn session_lifecycle_round_trip() {
     let (status, mut info) = srv.get(&format!("/api/v1/sessions/{sid}")).await;
     assert_eq!(status, 200);
     // SPEC-M3.0 §4: seconds since the start (no handoff yet), by the server's clock
-    assert!(info["secs_since_handoff"].as_u64().is_some_and(|s| s < 60), "{info}");
+    assert!(
+        info["secs_since_handoff"].as_u64().is_some_and(|s| s < 60),
+        "{info}"
+    );
     info.as_object_mut().unwrap().remove("secs_since_handoff");
     assert_eq!(
         info,

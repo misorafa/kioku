@@ -168,7 +168,11 @@ fn start_carries_items_pins_pages_and_names_machines() {
             ..Items::default()
         },
     );
-    reply(&store, "s3", "検索のテストを追加しました。次は README です。");
+    reply(
+        &store,
+        "s3",
+        "検索のテストを追加しました。次は README です。",
+    );
     store.finalize_session("s3").unwrap();
 
     let rules = pin(
@@ -251,7 +255,9 @@ fn start_carries_items_pins_pages_and_names_machines() {
         .read_page(&format!("{}/STATE.md", project().id))
         .unwrap();
     assert!(
-        state.body.contains("## 決定事項（これまでの引き継ぎ）\n- ＬＩＮＤＥＲＡ を使う ("),
+        state
+            .body
+            .contains("## 決定事項（これまでの引き継ぎ）\n- ＬＩＮＤＥＲＡ を使う ("),
         "{}",
         state.body
     );
@@ -281,11 +287,21 @@ fn pinned_pages_are_capped() {
     let store = Store::open(Config::for_data_dir(tmp.path())).unwrap();
     start(&store, "s1", "claude-code", None, None);
     for i in 0..5 {
-        pin(&store, &format!("固定 {i}"), i % 2 == 0, &"あ".repeat(1000), &["pinned"]);
+        pin(
+            &store,
+            &format!("固定 {i}"),
+            i % 2 == 0,
+            &"あ".repeat(1000),
+            &["pinned"],
+        );
     }
     let r = start(&store, "s2", "claude-code", None, None);
     assert_eq!(r.pinned.len(), MAX_PINNED);
-    assert!(r.pinned.iter().all(|p| p.excerpt.chars().count() == PINNED_EXCERPT));
+    assert!(
+        r.pinned
+            .iter()
+            .all(|p| p.excerpt.chars().count() == PINNED_EXCERPT)
+    );
     assert_eq!(r.pinned[0].title, "固定 4");
 }
 

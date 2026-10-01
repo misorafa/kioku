@@ -42,7 +42,10 @@ fn session_at(store: &Store, id: &str, ts: &str, prompt: &str) {
                    "tool_response": {"stdout": "x".repeat(400), "exit_code": 1}}),
         ),
         // SPEC-M3.0 §3: a reply's stub keeps the text the digest reads
-        (ObservationKind::Assistant, json!({"text": "記憶を整理しました。"})),
+        (
+            ObservationKind::Assistant,
+            json!({"text": "記憶を整理しました。"}),
+        ),
     ];
     for (kind, payload) in obs {
         store
@@ -192,7 +195,10 @@ fn prune_applies_retention_to_old_data_only() {
     assert_eq!(after_digest.prompts, vec!["古いセッションの指示"]);
     assert_eq!(after_digest.git_commits, vec!["feat: 記憶の整理"]);
     assert_eq!(after_digest.errors, 1);
-    assert_eq!(after_digest.last_reply.as_deref(), Some("記憶を整理しました。"));
+    assert_eq!(
+        after_digest.last_reply.as_deref(),
+        Some("記憶を整理しました。")
+    );
     // backups and hook dumps
     assert!(!backups.join("snap0").exists() && backups.join("snap1").is_dir());
     assert!(!logs.join("hook-dump.jsonl.1").exists());

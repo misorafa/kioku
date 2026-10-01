@@ -606,7 +606,9 @@ impl Store {
                 .trim()
                 .to_string();
             if reply.is_empty() {
-                return Err(Error::invalid("an assistant observation needs a non-empty text"));
+                return Err(Error::invalid(
+                    "an assistant observation needs a non-empty text",
+                ));
             }
             payload = serde_json::json!({ "text": util::truncate_chars(&reply, ASSISTANT_MAX) });
         }
@@ -932,10 +934,7 @@ impl Store {
             .map(|s| s.agent.clone())
             .unwrap_or_else(|| "unknown".to_string());
         // `claude-code@mini` in the heading when the session's machine is known (§6).
-        let label = agent_label(
-            &agent,
-            session.as_ref().and_then(|s| s.machine.as_deref()),
-        );
+        let label = agent_label(&agent, session.as_ref().and_then(|s| s.machine.as_deref()));
         let content =
             render_agent_handoff(self.config.lang(), &label, &display_minute(&now), input);
         let h = Handoff {

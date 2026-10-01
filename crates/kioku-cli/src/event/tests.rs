@@ -980,3 +980,48 @@ fn windows_captured_payloads() {
         Some(json!("# kioku\r\n\r\n日本語の README です。\r\n"))
     );
 }
+
+/// SPEC-M3.0 §3: the reply of the turn from the Stop payloads that carry one (captured
+/// Claude Code and Codex payloads, Gemini CLI's `prompt_response`); none from Cursor,
+/// Antigravity or an older Claude Code payload.
+#[test]
+fn stop_payloads_carry_the_last_reply() {
+    let read = |rel: &str| {
+        std::fs::read_to_string(format!(
+            "{}/tests/fixtures/{rel}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+    };
+    let reply = |agent: Agent, rel: &str| {
+        parse_event_env(agent, HookEventKind::Stop, &read(rel), &HookEnv::default())
+            .unwrap()
+            .assistant_message
+    };
+    assert_eq!(
+        reply(Agent::ClaudeCode, "windows/claude-code/stop.captured.json").as_deref(),
+        Some("README を要約しました。")
+    );
+    assert_eq!(
+        reply(Agent::Codex, "codex/stop.captured.json").as_deref(),
+        Some("149 ファイルの作成日・変更日を揃えました。作業ツリーはクリーンです。")
+    );
+    assert_eq!(
+        reply(Agent::Codex, "windows/codex/stop.captured.json").as_deref(),
+        Some("README を要約しました。")
+    );
+    assert_eq!(
+        reply(Agent::GeminiCli, "gemini-cli/after_agent.docs.json").as_deref(),
+        Some("完了しました。")
+    );
+    assert_eq!(reply(Agent::Cursor, "cursor/stop.docs.json"), None);
+    assert_eq!(
+        reply(Agent::Antigravity, "antigravity/stop.docs.json"),
+        None
+    );
+    assert_eq!(reply(Agent::ClaudeCode, "stop.json"), None);
+    // a blank message is no message
+    let blank = r#"{"session_id":"s","cwd":"/x","last_assistant_message":"  \n"}"#;
+    let ev = parse_event(Agent::ClaudeCode, HookEventKind::Stop, blank).unwrap();
+    assert_eq!(ev.assistant_message, None);
+}

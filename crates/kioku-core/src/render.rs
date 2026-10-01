@@ -177,7 +177,10 @@ pub fn state_body(
     for (heading, lines) in [
         (s.carried_decisions, decisions),
         (s.carried_open_questions, open),
-        (s.pinned_pages, pinned.iter().flat_map(pinned_lines).collect()),
+        (
+            s.pinned_pages,
+            pinned.iter().flat_map(pinned_lines).collect(),
+        ),
     ] {
         if !lines.is_empty() {
             out.push(heading.to_string());
@@ -238,7 +241,11 @@ fn month_day(date: &str) -> String {
 
 /// One carried line: `- <prefix><text> (MM-DD)` (SPEC-M3.0 §1).
 pub fn carried_line(prefix: &str, item: &CarriedItem) -> String {
-    format!("- {prefix}{} ({})", one_line(&item.text), month_day(&item.date))
+    format!(
+        "- {prefix}{} ({})",
+        one_line(&item.text),
+        month_day(&item.date)
+    )
 }
 
 /// The lines of the carried sections: decisions then `✓` verified facts (section 3), open
@@ -444,7 +451,10 @@ mod tests {
         assert!(body.contains("## 最近のセッション\n- 2026-09-25 claude-code — 設計 (sessions/2026-09-25-0c2f1a2b.md)\n- 2026-09-25 codex [feature/検索] @mini — 検索 (sessions/2026-09-25-11111111.md)\n"));
         // nothing carried, nothing pinned → no empty sections
         let body = state_body(Lang::En, None, &Carried::default(), &[], &[], &files);
-        assert!(!body.contains("(carried)") && !body.contains("Pinned"), "{body}");
+        assert!(
+            !body.contains("(carried)") && !body.contains("Pinned"),
+            "{body}"
+        );
         assert!(body.ends_with("## Frequently touched files (last 10 sessions)\n- a.rs (3)\n"));
     }
 }

@@ -187,7 +187,7 @@ fn default_agent() -> String {
 }
 
 /// A recent session page, for SessionStart context.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecentSession {
     /// Session page title.
     pub title: String,

@@ -268,7 +268,9 @@ async fn mcp_handoff_pending_reads_a_lane() {
         assert!(out.contains("検索のレーンで作業した"), "{out}");
         // SPEC-M3.0 §2 through MCP
         assert!(
-            out.contains("### 確認済みの事実\n- 日本語の検索が通る\n### 落とし穴・注意点\n- レーン名は"),
+            out.contains(
+                "### 確認済みの事実\n- 日本語の検索が通る\n### 落とし穴・注意点\n- レーン名は"
+            ),
             "{out}"
         );
     }

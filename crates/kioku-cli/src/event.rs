@@ -219,6 +219,9 @@ pub struct HookEvent {
     pub loop_count: Option<u32>,
     /// Cursor stop `status` (`completed` | `aborted` | `error`).
     pub stop_status: Option<String>,
+    /// Stop: the agent's final reply of the turn — Claude Code / Codex
+    /// `last_assistant_message`, Gemini CLI `prompt_response` (SPEC-M3.0 §3).
+    pub assistant_message: Option<String>,
 }
 
 /// Parses a hook payload using only the payload (no environment fallbacks).
@@ -524,6 +527,9 @@ fn common(
             .and_then(Value::as_u64)
             .map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
         stop_status: text(&raw, "status"),
+        assistant_message: text(&raw, "last_assistant_message")
+            .or_else(|| text(&raw, "prompt_response"))
+            .filter(|m| !m.trim().is_empty()),
         raw,
     })
 }
