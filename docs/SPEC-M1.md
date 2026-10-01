@@ -246,6 +246,11 @@ Index these three bodies in a temp dir and assert:
 4. Title boost: two pages, one with the term only in title, one only in body;
    the title one ranks first.
 
+> Amended by **SPEC-M3.1 §2**: re-ranking (recency, kind, `pinned`), `since` / `kinds`
+> filters, the `code` identifier field, the user dictionary, and the character-bigram
+> fallback — which now finds case 1's 「引継」 as a partial match (the test asserts it).
+> The evaluation corpus and its thresholds are in SPEC-M3.1 §2 and §5.
+
 ## 7. Sessions, observations, handoffs, summary
 
 ### 7.1 Lifecycle
@@ -306,6 +311,12 @@ unaccepted handoff for the project and marks it accepted by the new session;
 older unaccepted handoffs for the same project are marked accepted too
 (superseded). `kioku_handoff_pending` with `accept=false` peeks without
 consuming.
+
+> Amended by **SPEC-M2.4 §1.4** (per-lane routing) and **SPEC-M3.1 §1**: a resumed /
+> compacted / cleared session gets back what it accepted and accepts nothing new; a
+> session never accepts its own handoff; a lane with another active session only shows
+> the pending handoff for reference; superseded rows carry `accepted_by = "superseded"`;
+> `kioku_handoff_pending(history: N)` lists a lane's recent handoffs with their status.
 
 ### 7.2 SessionDigest (rule-based, no LLM)
 

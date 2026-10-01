@@ -89,9 +89,24 @@ SessionEnd        finalize (idempotent)
   commit. Finalize runs on every Stop; a rule-based handoff that another session
   already received is refreshed in place, and a new one is issued only after a new
   prompt, file edit, commit, reply or 5+ tool calls.
-- **Handoffs are single-use**: the next SessionStart of the same project
-  consumes the newest pending handoff (older pending ones are marked
-  superseded). `kioku_handoff_pending` with `accept=false` only peeks.
+- **Who consumes a handoff** (SPEC-M3.1 §1): a handoff is accepted once, by the
+  next *new* session of the same project and lane (branch); older pending ones of
+  that lane are marked `superseded`. Three cases do not accept anything:
+  - **compact / resume / clear** of a session (or a session id kioku has seen
+    before) gets back the handoff it accepted earlier; if it never accepted one, the
+    lane's pending handoff is shown for reference only;
+  - a session **never receives its own handoff** (the rule-based one its previous
+    turn's Stop wrote stays pending for the next session);
+  - while **another session is active on the same lane** (an observation in the last
+    30 minutes and not finalized), the pending handoff is shown for reference and
+    stays pending (「同じブランチで別のセッションが作業中のため、引き継ぎは消費していません」 /
+    "another session is active on this lane; the handoff was left pending"). It is
+    accepted by the next session that starts on an idle lane, or explicitly with
+    `kioku_handoff_pending(accept=true)`.
+
+  `kioku_handoff_pending` with `accept=false` only peeks; `history: N` (≤ 20) lists
+  the lane's last N handoffs with their status (`pending` / `accepted by …` /
+  `superseded`) when the carried decisions in the block are not enough.
 
 ### What the agent sees at session start (SPEC-M3.0)
 
@@ -548,14 +563,16 @@ Other tools' groups in `hooks.json` are kept; check what agy loaded with
    project id` prints the project id kioku uses for that directory.
 2. When it finishes a turn after using a few tools (since its last handoff),
    the Stop nudge asks it to call `kioku_handoff_write`.
-3. Start a new session in the same repository (or `/clear`) — in the same or
-   another agent, on this or another machine: the handoff is injected at
-   SessionStart.
+3. Start a new session in the same repository — in the same or another agent, on
+   this or another machine: the handoff is injected at SessionStart (after `/clear`
+   or `/compact` it is shown again without being consumed).
 4. Search from the terminal:
 
 ```sh
 kioku search 引き継ぎ
 kioku search --project <id> --limit 5 設計 判断
+kioku search --since 2026-09-01 --kind page write_lock
+kioku search --path-prefix crates/kioku-core/src/store.rs
 kioku status
 ```
 
@@ -637,15 +654,43 @@ the container speaks plain HTTP.
 
 | tool | input | what it does |
 |------|-------|--------------|
-| `kioku_query` | `query`, `project?`, `scope?` (`project`/`global`/`all`), `limit?` (default 8) | full-text search (Japanese and English); `project` narrows to that project plus global pages; each hit reads `1. <path> — <title> (session, 2026-09-28)` |
+| `kioku_query` | `query`, `project?`, `scope?` (`project`/`global`/`all`), `limit?` (default 8), `since?` (`YYYY-MM-DD`), `kinds?` (`page`/`session`/`state`), `path_prefix?` | full-text search (Japanese and English; see [Search](#search)); `project` narrows to that project plus global pages; each hit reads `1. <path> — <title> (session, 2026-09-28, @mini)`; with `path_prefix` it lists the sessions that edited files under that path |
 | `kioku_read` | `path` | reads a page by its wiki-relative path (as shown in query results) |
 | `kioku_write_page` | `title`, `content`, `project?`, `scope?` (`project`/`global`), `tags?`, `path?` | saves a searchable Markdown page; the same title/path replaces it; tag it `pinned` to show it in every SessionStart block of the project (or of every project, for a global page) |
 | `kioku_handoff_write` | `project`, `session?` (from the SessionStart block), `summary`, `next_steps`, `open_questions`, `decisions`, `verified?`, `gotchas?` | records the handoff the next session of the project receives; decisions, verified facts (確認済みの事実), open questions and gotchas (落とし穴・注意点) are also carried into later sessions |
-| `kioku_handoff_pending` | `project`, `accept?` (default false), `session?`, `lane?` | peeks at (or consumes) the pending handoff of the main line, or of a session's / named branch lane |
+| `kioku_handoff_pending` | `project`, `accept?` (default false), `session?`, `lane?`, `history?` (≤ 20) | peeks at (or consumes) the pending handoff of the main line, or of a session's / named branch lane; `history` adds the lane's last handoffs with their status |
 | `kioku_status` | — | counts, data dir and known project ids |
 
 The server's MCP `instructions` tell the agent to query before exploring and to
 write a handoff before stopping.
+
+### Search
+
+- **Ranking**: the best `3 × limit` BM25 hits are re-ranked by
+  `score × recency × kind weight` — recency halves every 30 days (never below 0.25),
+  pages weigh 1.0, STATE.md 0.8, session pages 0.6, and a page tagged `pinned` ×1.5 —
+  so the newer of two near-duplicate pages comes first.
+- **Filters**: `since: "2026-09-01"` keeps what was updated on or after that day;
+  `kinds: ["page", "session"]` keeps those kinds. From the terminal:
+  `kioku search --since 2026-09-01 --kind page 索引`.
+- **Identifiers**: `kioku_handoff_write`, `Store::open`, `src/index.rs`, `write_lock`,
+  `SearchIndex` are also indexed as code identifiers — found by their whole name and by
+  their parts (`handoff`, `open`, `index.rs`, `lock`, `search`); a page that names the
+  identifier ranks above one that merely uses its words.
+- **Partial match**: when no word matches, kioku retries with character bigrams (also
+  across okurigana: 「引継」 finds 「引き継ぎ書」) and marks the result
+  `（部分一致）/ (partial match)`.
+- **Who touched this file**: `path_prefix: "crates/kioku-core/src/store.rs"` (or
+  `kioku search --path-prefix crates/kioku-core/src/store.rs`) lists the sessions that
+  edited files under that path, newest first, with their titles and handoff summaries.
+- **User dictionary** (`~/.kioku/dict/user.csv`): words the Japanese analyzer should
+  know, one per line as `surface,cost,part_of_speech,reading[,synonym_of]`
+  (`#` comments). `kioku init` writes a starter file with kioku's own terms
+  (引き継ぎ書, レーン, セッション, 観測, 索引, プロジェクト別名). A word never hides its
+  parts (引き継ぎ書 is still found by 引き継ぎ); the optional fifth column makes it a
+  synonym (`ハンドオフ,,名詞,ハンドオフ,引き継ぎ` makes either word find both). After
+  editing it run `kioku reindex`; `kioku doctor` warns while the index is older than
+  the file.
 
 ## Data layout
 
@@ -660,7 +705,8 @@ write a handoff before stopping.
       pages/<slug>.md           # pages written with kioku_write_page
   raw/<project_id>/<session_id>.jsonl   # append-only sanitized observations (.jsonl.gz once old)
   db/kioku.sqlite               # metadata, sessions, observations, handoffs
-  index/tantivy/                # derived; `kioku reindex` rebuilds it from wiki/
+  dict/user.csv                 # user dictionary of the Japanese analyzer (see Search)
+  index/tantivy-v3/             # derived; `kioku reindex` rebuilds it from wiki/
   index/schema-version          # index format; an older one is rebuilt by the server at start
   backups/<id>/                 # `kioku backup` snapshots (the newest [retention] backups_keep)
   logs/hook.log                 # client-side hook failures
@@ -677,7 +723,9 @@ Page file names are the ASCII slug of the title; when slugging drops anything
 Search normalizes text with NFKC, so full-width `Ｆｌｕｔｔｅｒ` and half-width
 `ｱﾌﾟﾘ` match `flutter` / `アプリ`. After an upgrade that changes the index format, the
 server rebuilds the index in the background right after it starts listening (search
-answers from the old index until the new one is in place); no `kioku reindex` needed.
+answers from the old index until the new one is in place; the index of each format lives
+in its own directory, `index/tantivy-v3/` since v3, and the old `index/tantivy/` is
+removed after the switch); no `kioku reindex` needed.
 At every start the server also removes temporary files left by an interrupted write and
 re-indexes pages whose file no longer matches its database row.
 
