@@ -1240,6 +1240,7 @@ version = "0.8.1"
 dependencies = [
  "anyhow",
  "chrono",
+ "flate2",
  "lindera",
  "lindera-analysis",
  "lindera-tantivy",

@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use tantivy::collector::TopDocs;
 use tantivy::directory::MmapDirectory;
 use tantivy::query::{
-    BooleanQuery, BoostQuery, ConstScoreQuery, Occur, Query, QueryParser, TermQuery,
+    AllQuery, BooleanQuery, BoostQuery, ConstScoreQuery, Occur, Query, QueryParser, TermQuery,
 };
 use tantivy::schema::{
     DateOptions, Field, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing, TextOptions,
@@ -229,6 +229,23 @@ impl SearchIndex {
         f(writer)
     }
 
+    /// Removes the documents of `paths` in one commit.
+    pub fn delete_paths(&self, paths: &[String]) -> anyhow::Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let f = self.fields;
+        self.with_writer(|w| {
+            for p in paths {
+                w.delete_term(Term::from_field_text(f.path, p));
+            }
+            w.commit().context("committing index")?;
+            Ok(())
+        })?;
+        self.reader.reload().context("reloading index reader")?;
+        Ok(())
+    }
+
     /// Replaces (or adds) the document for `doc.path` and commits.
     pub fn upsert(&self, doc: &IndexDoc) -> anyhow::Result<()> {
         self.upsert_many(std::slice::from_ref(doc), false)
@@ -239,7 +256,11 @@ impl SearchIndex {
         let f = self.fields;
         self.with_writer(|w| {
             if clear {
-                w.delete_all_documents()?;
+                // Not `delete_all_documents`: on a reopened index it can let a delete from an
+                // earlier commit hit documents re-added in this one (see the regression test
+                // `delete_then_rebuild_keeps_the_rebuilt_document`). A delete query is an
+                // ordinary, opstamp-ordered operation.
+                w.delete_query(Box::new(AllQuery))?;
             }
             for doc in docs {
                 w.delete_term(Term::from_field_text(f.path, &doc.path));
@@ -669,6 +690,44 @@ mod tests {
         assert!(hits[0].snippet.contains("【手間】"), "{}", hits[0].snippet);
         assert!(!hits[0].snippet.contains("<b>"));
         assert!(!hits[0].updated.is_empty());
+    }
+
+    /// Regression (SPEC-M2.8 §5): a deletion followed by a clearing rebuild that adds the
+    /// same path back must leave that document in the index.
+    #[test]
+    fn delete_then_rebuild_keeps_the_rebuilt_document() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (idx, _) = SearchIndex::open(tmp.path()).unwrap();
+        let a = doc("p/a.md", Some("p"), "検索", "日本語の本文");
+        idx.upsert(&a).unwrap();
+        idx.delete_paths(&["p/a.md".to_string()]).unwrap();
+        assert_eq!(idx.num_docs(), 0);
+        idx.upsert_many(std::slice::from_ref(&a), true).unwrap();
+        assert_eq!(idx.num_docs(), 1);
+        assert_eq!(idx.search("日本語", &SearchScope::All, 3).unwrap().len(), 1);
+        // The startup sweep followed by the session page migration's rebuild.
+        let (b, c, s) = (
+            doc("p/b.md", Some("p"), "b", "b"),
+            doc("p/c.md", Some("p"), "c", "c"),
+            doc("p/STATE.md", Some("p"), "s", "s"),
+        );
+        idx.upsert_many(&[a.clone(), b.clone(), s.clone()], false)
+            .unwrap();
+        idx.upsert_many(std::slice::from_ref(&c), false).unwrap();
+        idx.delete_paths(&["p/a.md".to_string(), "p/b.md".to_string()])
+            .unwrap();
+        idx.upsert_many(&[s.clone(), a.clone()], true).unwrap();
+        assert_eq!(idx.num_docs(), 2);
+        // The same on a freshly opened index (a restart).
+        idx.upsert_many(&[a.clone(), b.clone(), s.clone()], true)
+            .unwrap();
+        drop(idx);
+        let (idx, _) = SearchIndex::open(tmp.path()).unwrap();
+        idx.upsert_many(std::slice::from_ref(&c), false).unwrap();
+        idx.delete_paths(&["p/a.md".to_string(), "p/b.md".to_string()])
+            .unwrap();
+        idx.upsert_many(&[s, a], true).unwrap();
+        assert_eq!(idx.num_docs(), 2);
     }
 
     #[test]

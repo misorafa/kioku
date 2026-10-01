@@ -1,4 +1,9 @@
 //! Rule-based (zero-LLM) session digest (spec §7.2) and its auto-generated handoff section.
+//!
+//! A digest is built by folding observations in seq order ([`SessionDigest::extend`]); its
+//! [`DigestTally`] keeps the lossless running totals, so a cached digest extended with the
+//! newer observations equals a digest built from scratch (SPEC-M2.8 §1). [`stub_payload`]
+//! reduces an observation to exactly what the fold reads (SPEC-M2.8 §3).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -6,7 +11,7 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::handoff::Handoff;
 use crate::session::{Observation, ObservationKind};
@@ -17,8 +22,12 @@ use crate::util::{one_line, parse_ts, truncate_chars};
 pub const PROMPT_MAX: usize = 300;
 /// Max chars kept per command line.
 pub const COMMAND_MAX: usize = 160;
-/// Max distinct commands kept.
-pub const COMMANDS_MAX: usize = 30;
+/// Distinct commands kept from the start of the session (SPEC-M2.8 §6).
+pub const COMMANDS_FIRST: usize = 10;
+/// Distinct commands kept from the end of the session (SPEC-M2.8 §6).
+pub const COMMANDS_LAST: usize = 20;
+/// Max distinct commands kept ([`COMMANDS_FIRST`] + [`COMMANDS_LAST`]).
+pub const COMMANDS_MAX: usize = COMMANDS_FIRST + COMMANDS_LAST;
 /// Max read paths kept.
 pub const READS_MAX: usize = 20;
 
@@ -33,18 +42,37 @@ pub struct FileCount {
     pub count: u32,
 }
 
+/// The lossless running totals behind a digest's truncated lists, so a digest can be
+/// extended with newer observations (SPEC-M2.8 §1).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DigestTally {
+    /// Root the paths were made relative to (a cached digest is only extended with the
+    /// same root).
+    pub root: Option<String>,
+    /// Highest observation seq folded in (0 = none).
+    pub seq: i64,
+    /// Edited files with counts, in first-seen order.
+    pub edits: Vec<FileCount>,
+    /// Read files with counts, in first-seen order.
+    pub reads: Vec<FileCount>,
+    /// Every distinct command first line, in first-seen order.
+    pub commands: Vec<String>,
+}
+
 /// What happened in a session, derived purely from its observations.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionDigest {
-    /// Prompts in order, each truncated to 300 chars.
+    /// Prompts in order, each cleaned ([`clean_prompt`]) and truncated to 300 chars.
     pub prompts: Vec<String>,
     /// Edited files, most edits first.
     pub files: Vec<FileCount>,
     /// Read files, most reads first (top 20).
     pub reads: Vec<String>,
-    /// First lines of Bash commands, deduplicated in first-seen order (last 30 kept).
+    /// First lines of Bash commands, deduplicated in first-seen order (the first 10 and
+    /// the last 20 kept).
     pub commands: Vec<String>,
-    /// Messages of `git commit` commands.
+    /// Messages of `git commit` commands, deduplicated (first kept).
     pub git_commits: Vec<String>,
     /// Tool calls that look like they failed (heuristic).
     pub errors: u32,
@@ -60,85 +88,228 @@ pub struct SessionDigest {
     pub last_ts: Option<String>,
     /// Seconds between the first and last observation.
     pub duration_secs: i64,
+    /// Running totals the lists above are derived from.
+    #[serde(default)]
+    pub tally: DigestTally,
+}
+
+/// What the digest reads from one tool use, from a full payload or a stub alike.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ToolFacts {
+    tool: String,
+    /// Edited paths (edit tools) or the read path (`Read`).
+    paths: Vec<String>,
+    /// First line of a Bash command, truncated to [`COMMAND_MAX`].
+    command: Option<String>,
+    /// Message of a `git commit` in that command.
+    git_commit: Option<String>,
+    is_error: bool,
+}
+
+fn is_stub(payload: &Value) -> bool {
+    payload.get("stub").and_then(Value::as_bool) == Some(true)
+}
+
+fn tool_facts(payload: &Value) -> ToolFacts {
+    let tool = payload
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if is_stub(payload) {
+        let mut paths: Vec<String> = payload
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .into_iter()
+            .collect();
+        if let Some(more) = payload.get("paths").and_then(Value::as_array) {
+            paths = more
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect();
+        }
+        let s = |k: &str| payload.get(k).and_then(Value::as_str).map(str::to_string);
+        return ToolFacts {
+            tool,
+            paths,
+            command: s("command"),
+            git_commit: s("git_commit"),
+            is_error: payload.get("is_error").and_then(Value::as_bool) == Some(true),
+        };
+    }
+    let input = payload.get("tool_input").unwrap_or(&Value::Null);
+    let mut facts = ToolFacts {
+        is_error: payload.get("tool_response").is_some_and(is_error_response),
+        ..ToolFacts::default()
+    };
+    if EDIT_TOOLS.contains(&tool.as_str()) {
+        facts.paths = edit_paths(input);
+    } else if tool == "Read" {
+        facts.paths = input_path(input).into_iter().collect();
+    } else if tool == "Bash"
+        && let Some(cmd) = input.get("command").and_then(Value::as_str)
+    {
+        let first = truncate_chars(cmd.lines().next().unwrap_or("").trim(), COMMAND_MAX);
+        facts.command = (!first.is_empty()).then_some(first);
+        facts.git_commit = git_commit_message(cmd);
+    }
+    facts.tool = tool;
+    facts
+}
+
+/// The prompt text the digest keeps for a `prompt` observation.
+fn prompt_text(obs: &Observation) -> String {
+    let text = obs
+        .payload
+        .get("prompt")
+        .and_then(Value::as_str)
+        .unwrap_or(&obs.text);
+    truncate_chars(&clean_prompt(text), PROMPT_MAX)
+}
+
+/// The reduced payload of an observation (SPEC-M2.8 §3): exactly what the digest reads, so
+/// a digest of reduced observations equals the digest of the originals. A tool use keeps
+/// `tool_name`, its path(s) or first command line, the commit message and `is_error`; a
+/// prompt keeps its cleaned, truncated text; anything else keeps nothing.
+pub fn stub_payload(kind: ObservationKind, payload: &Value, text: &str) -> Value {
+    if is_stub(payload) {
+        return payload.clone();
+    }
+    match kind {
+        ObservationKind::Prompt => {
+            let obs = Observation {
+                id: 0,
+                session_id: String::new(),
+                project_id: String::new(),
+                seq: 0,
+                kind,
+                ts: String::new(),
+                payload: payload.clone(),
+                text: text.to_string(),
+            };
+            json!({"stub": true, "prompt": prompt_text(&obs)})
+        }
+        ObservationKind::ToolUse => {
+            let f = tool_facts(payload);
+            let mut out = json!({"stub": true, "tool_name": f.tool, "is_error": f.is_error});
+            if let Some(first) = f.paths.first() {
+                out["path"] = json!(first);
+            }
+            if f.paths.len() > 1 {
+                out["paths"] = json!(f.paths);
+            }
+            if let Some(c) = f.command {
+                out["command"] = json!(c);
+            }
+            if let Some(m) = f.git_commit {
+                out["git_commit"] = json!(m);
+            }
+            out
+        }
+        ObservationKind::Stop | ObservationKind::Compact | ObservationKind::Note => {
+            json!({"stub": true})
+        }
+    }
 }
 
 impl SessionDigest {
     /// Builds a digest from observations (in seq order); paths are made relative to `root`.
     pub fn from_observations(observations: &[Observation], root: Option<&str>) -> SessionDigest {
-        let mut d = SessionDigest::default();
-        let mut edits: Vec<FileCount> = Vec::new();
-        let mut reads: Vec<FileCount> = Vec::new();
-        let mut commands: Vec<String> = Vec::new();
+        let mut d = SessionDigest {
+            tally: DigestTally {
+                root: root.map(str::to_string),
+                ..DigestTally::default()
+            },
+            ..SessionDigest::default()
+        };
+        d.extend(observations);
+        d
+    }
 
+    /// Folds newer observations (in seq order) into the digest; observations at or below
+    /// `tally.seq` are already in it and skipped. Pure: `from_observations(a ++ b)` equals
+    /// `from_observations(a)` extended with `b`.
+    pub fn extend(&mut self, observations: &[Observation]) {
+        let root = self.tally.root.clone();
         for obs in observations {
-            if d.first_ts.is_none() {
-                d.first_ts = Some(obs.ts.clone());
+            if self.tally.seq > 0 && obs.seq <= self.tally.seq {
+                continue;
             }
-            d.last_ts = Some(obs.ts.clone());
-            match obs.kind {
-                ObservationKind::Prompt => {
-                    d.prompt_count += 1;
-                    let text = obs
-                        .payload
-                        .get("prompt")
-                        .and_then(Value::as_str)
-                        .unwrap_or(&obs.text);
-                    d.prompts.push(truncate_chars(text.trim(), PROMPT_MAX));
-                }
-                ObservationKind::ToolUse => {
-                    d.tool_use_count += 1;
-                    let tool = obs
-                        .payload
-                        .get("tool_name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    let input = obs.payload.get("tool_input").unwrap_or(&Value::Null);
-                    if EDIT_TOOLS.contains(&tool) {
-                        for p in edit_paths(input) {
-                            bump(&mut edits, &relative(&p, root));
-                        }
-                    } else if tool == "Read" {
-                        if let Some(p) = input_path(input) {
-                            bump(&mut reads, &relative(&p, root));
-                        }
-                    } else if tool == "Bash"
-                        && let Some(cmd) = input.get("command").and_then(Value::as_str)
-                    {
-                        let first =
-                            truncate_chars(cmd.lines().next().unwrap_or("").trim(), COMMAND_MAX);
-                        if !first.is_empty() && !commands.contains(&first) {
-                            commands.push(first);
-                        }
-                        if let Some(msg) = git_commit_message(cmd) {
-                            d.git_commits.push(msg);
-                        }
-                    }
-                    if obs
-                        .payload
-                        .get("tool_response")
-                        .is_some_and(is_error_response)
-                    {
-                        d.errors += 1;
-                    }
-                }
-                ObservationKind::Stop | ObservationKind::Compact | ObservationKind::Note => {}
-            }
+            self.fold(obs, root.as_deref());
+            self.tally.seq = self.tally.seq.max(obs.seq);
         }
+        self.derive();
+    }
 
+    fn fold(&mut self, obs: &Observation, root: Option<&str>) {
+        if self.first_ts.is_none() {
+            self.first_ts = Some(obs.ts.clone());
+        }
+        self.last_ts = Some(obs.ts.clone());
+        match obs.kind {
+            ObservationKind::Prompt => {
+                self.prompt_count += 1;
+                self.prompts.push(prompt_text(obs));
+            }
+            ObservationKind::ToolUse => {
+                self.tool_use_count += 1;
+                let f = tool_facts(&obs.payload);
+                if EDIT_TOOLS.contains(&f.tool.as_str()) {
+                    for p in &f.paths {
+                        bump(&mut self.tally.edits, &relative(p, root));
+                    }
+                } else if f.tool == "Read" {
+                    if let Some(p) = f.paths.first() {
+                        bump(&mut self.tally.reads, &relative(p, root));
+                    }
+                } else if f.tool == "Bash" {
+                    if let Some(c) = f.command
+                        && !self.tally.commands.contains(&c)
+                    {
+                        self.tally.commands.push(c);
+                    }
+                    if let Some(m) = f.git_commit
+                        && !self.git_commits.contains(&m)
+                    {
+                        self.git_commits.push(m);
+                    }
+                }
+                if f.is_error {
+                    self.errors += 1;
+                }
+            }
+            ObservationKind::Stop | ObservationKind::Compact | ObservationKind::Note => {}
+        }
+    }
+
+    /// Recomputes the truncated lists and the duration from the tally.
+    fn derive(&mut self) {
+        let mut edits = self.tally.edits.clone();
+        let mut reads = self.tally.reads.clone();
+        // Stable sorts: equal counts keep their first-seen order.
         edits.sort_by_key(|f| std::cmp::Reverse(f.count));
         reads.sort_by_key(|f| std::cmp::Reverse(f.count));
-        d.files = edits;
-        d.reads = reads.into_iter().take(READS_MAX).map(|f| f.path).collect();
-        let skip = commands.len().saturating_sub(COMMANDS_MAX);
-        d.commands = commands.into_iter().skip(skip).collect();
-        d.duration_secs = match (
-            d.first_ts.as_deref().and_then(parse_ts),
-            d.last_ts.as_deref().and_then(parse_ts),
+        self.files = edits;
+        self.reads = reads.into_iter().take(READS_MAX).map(|f| f.path).collect();
+        let all = &self.tally.commands;
+        self.commands = if all.len() <= COMMANDS_MAX {
+            all.clone()
+        } else {
+            all[..COMMANDS_FIRST]
+                .iter()
+                .chain(&all[all.len() - COMMANDS_LAST..])
+                .cloned()
+                .collect()
+        };
+        self.duration_secs = match (
+            self.first_ts.as_deref().and_then(parse_ts),
+            self.last_ts.as_deref().and_then(parse_ts),
         ) {
             (Some(a), Some(b)) => (b - a).num_seconds().max(0),
             _ => 0,
         };
-        d
     }
 
     /// True when the session had at least one prompt or tool use (spec §7.1 step 2).
@@ -206,6 +377,68 @@ impl SessionDigest {
     }
 }
 
+/// A prompt without the blocks agents wrap around it (SPEC-M2.8 §6): `<command-name>`,
+/// `<command-message>`, `<system-reminder>` and `<pasted_content …>` blocks are removed
+/// (an unclosed one to the end), as are `<command-args>` blocks, and the result is
+/// trimmed. A prompt that was nothing but a slash command becomes the command and its
+/// arguments (`/review 12`).
+pub fn clean_prompt(text: &str) -> String {
+    static BLOCKS: OnceLock<Vec<Regex>> = OnceLock::new();
+    static NAME: OnceLock<Regex> = OnceLock::new();
+    static ARGS_INNER: OnceLock<Regex> = OnceLock::new();
+    let blocks = BLOCKS.get_or_init(|| {
+        [
+            "command-name",
+            "command-message",
+            "command-args",
+            "system-reminder",
+            "pasted_content",
+        ]
+        .iter()
+        .map(|tag| {
+            // Closed block, else an unclosed one (to the end), else a self-closing tag.
+            Regex::new(&format!(
+                r"(?s)<{tag}(?:\s[^>]*)?>.*?</{tag}>|<{tag}(?:\s[^>]*)?/>|<{tag}(?:\s[^>]*)?>.*\z"
+            ))
+            .expect("valid block regex")
+        })
+        .collect()
+    });
+    let name = NAME.get_or_init(|| {
+        Regex::new(r"(?s)<command-name>(.*?)</command-name>").expect("valid name regex")
+    });
+    let mut out = text.to_string();
+    for re in blocks {
+        out = re.replace_all(&out, "").into_owned();
+    }
+    let cleaned = out.trim().to_string();
+    if !cleaned.is_empty() {
+        return cleaned;
+    }
+    let inner = |re: &Regex| {
+        re.captures(text)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().trim().to_string())
+    };
+    let args_inner = ARGS_INNER.get_or_init(|| {
+        Regex::new(r"(?s)<command-args>(.*?)</command-args>").expect("valid args regex")
+    });
+    match inner(name) {
+        Some(cmd) => one_line(&format!("{cmd} {}", inner(args_inner).unwrap_or_default())),
+        None => String::new(),
+    }
+}
+
+/// The first non-empty line of a (cleaned) prompt, for titles (SPEC-M2.8 §6).
+pub fn prompt_title_line(prompt: &str) -> String {
+    prompt
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or_default()
+        .to_string()
+}
+
 fn input_path(input: &Value) -> Option<String> {
     input
         .get("file_path")
@@ -252,28 +485,51 @@ fn bump(list: &mut Vec<FileCount>, path: &str) {
     }
 }
 
-/// Heuristic: `is_error == true`, or error text in a string response / `stderr` / `error`.
+/// Prefixes that make an error text (SPEC-M2.8 §6).
+const ERROR_PREFIXES: [&str; 6] = [
+    "error",
+    "Error",
+    "fatal:",
+    "panicked",
+    "Traceback",
+    "FAILED",
+];
+
+fn starts_with_error(s: &str) -> bool {
+    let s = s.trim_start();
+    ERROR_PREFIXES.iter().any(|p| s.starts_with(p))
+}
+
+/// Whether a tool response failed (SPEC-M2.8 §6): `is_error` / `isError` is true, an
+/// `exit_code` / `code` is a non-zero integer, `stderr` or a string `error` (or a plain
+/// string response) *starts* with `error`, `Error`, `fatal:`, `panicked`, `Traceback` or
+/// `FAILED`, or `error` is a structured (non-string, non-empty) value. Text inside a body
+/// (a file that mentions errors, a passing test log) is never matched.
 pub fn is_error_response(resp: &Value) -> bool {
-    let has_marker = |s: &str| s.contains("error") || s.contains("Error:");
     match resp {
-        Value::String(s) => has_marker(s),
+        Value::String(s) => starts_with_error(s),
         Value::Object(map) => {
             let flag = |k: &str| map.get(k).and_then(Value::as_bool).unwrap_or(false);
             if flag("is_error") || flag("isError") {
                 return true;
             }
-            let non_empty = |k: &str| match map.get(k) {
-                Some(Value::String(s)) => !s.trim().is_empty(),
-                Some(Value::Null) | None => false,
-                Some(Value::Bool(b)) => *b,
-                Some(_) => true,
-            };
-            if non_empty("error") {
+            let nonzero = |k: &str| map.get(k).and_then(Value::as_i64).is_some_and(|c| c != 0);
+            if nonzero("exit_code") || nonzero("exitCode") || nonzero("code") {
                 return true;
             }
-            map.get("stderr")
-                .and_then(Value::as_str)
-                .is_some_and(has_marker)
+            let error = match map.get("error") {
+                Some(Value::String(s)) => starts_with_error(s),
+                Some(Value::Null) | Some(Value::Bool(false)) | None => false,
+                Some(Value::Bool(true)) => true,
+                Some(Value::Object(o)) => !o.is_empty(),
+                Some(Value::Array(a)) => !a.is_empty(),
+                Some(Value::Number(_)) => false,
+            };
+            error
+                || map
+                    .get("stderr")
+                    .and_then(Value::as_str)
+                    .is_some_and(starts_with_error)
         }
         _ => false,
     }
@@ -600,10 +856,171 @@ mod tests {
     fn error_heuristic() {
         assert!(is_error_response(&json!({"is_error": true})));
         assert!(is_error_response(&json!("Error: file not found")));
-        assert!(is_error_response(&json!({"stderr": "fatal error"})));
-        assert!(is_error_response(&json!({"error": "denied"})));
+        assert!(is_error_response(
+            &json!({"stderr": "fatal: not a git repository"})
+        ));
+        assert!(is_error_response(&json!({"error": "error: denied"})));
+        assert!(is_error_response(
+            &json!({"error": {"message": "no match"}})
+        ));
         assert!(!is_error_response(&json!({"stdout": "ok", "stderr": ""})));
         assert!(!is_error_response(&json!({"content": "fn error() {}"})));
+        // SPEC-M2.8 §6: body substrings no longer count.
+        assert!(!is_error_response(&json!({"stderr": "fatal error"})));
+        assert!(!is_error_response(&json!({"error": "denied"})));
+        assert!(!is_error_response(
+            &json!({"exit_code": 0, "stderr": "warning: x"})
+        ));
+        assert!(is_error_response(
+            &json!({"stderr": "  Traceback (most recent call last):"})
+        ));
+        assert!(!is_error_response(
+            &json!({"stderr": "thread 'main' panicked at"})
+        ));
+        assert!(is_error_response(
+            &json!({"stderr": "panicked at src/main.rs"})
+        ));
+        assert!(is_error_response(&json!({"code": 2})));
+    }
+
+    /// SPEC-M2.8 §6 required cases.
+    #[test]
+    fn reading_error_rs_and_passing_tests_are_not_errors() {
+        let root = "/home/u/kioku";
+        let observations = vec![
+            tool(
+                1,
+                "Read",
+                json!({"file_path": format!("{root}/crates/kioku-core/src/error.rs")}),
+                json!({"type": "text", "file": {"filePath": "error.rs",
+                    "content": "//! エラー型\npub enum Error { NotFound(String) }\n// error handling"}}),
+            ),
+            tool(
+                2,
+                "Read",
+                json!({"file_path": format!("{root}/src/error.rs")}),
+                json!("pub struct Error;\nimpl std::error::Error for Error {}"),
+            ),
+            tool(
+                3,
+                "Bash",
+                json!({"command": "cargo test -p kioku-core"}),
+                json!({"stdout": "running 3 tests\ntest error_heuristic ... ok\ntest result: ok. 3 passed; 0 failed",
+                       "stderr": "   Compiling kioku-core v0.8.1\n    Finished `test` profile; 0 errors",
+                       "exit_code": 0}),
+            ),
+            tool(
+                4,
+                "Bash",
+                json!({"command": "cargo build"}),
+                json!({"stdout": "", "stderr": "   Compiling x\nerror[E0308]: mismatched types", "exit_code": 1}),
+            ),
+        ];
+        let d = SessionDigest::from_observations(&observations, Some(root));
+        assert_eq!(d.errors, 1, "only the exit_code 1 build failed");
+        assert!(!is_error_response(
+            &observations[0].payload["tool_response"]
+        ));
+        assert!(!is_error_response(
+            &observations[2].payload["tool_response"]
+        ));
+        assert!(is_error_response(&json!({"stdout": "", "exit_code": 1})));
+    }
+
+    /// SPEC-M2.8 §6: wrapper blocks are stripped before truncation; a slash command alone
+    /// becomes the command; titles use the first non-empty line.
+    #[test]
+    fn prompt_blocks_are_stripped_for_titles() {
+        let command = "<command-name>/review</command-name>\n<command-message>review is running…</command-message>\n<command-args>PR 12 の検索</command-args>";
+        assert_eq!(clean_prompt(command), "/review PR 12 の検索");
+        let reminder = format!(
+            "<system-reminder>\n{}\n</system-reminder>\n\n  検索の日本語テストを直して\n詳細は後で",
+            "x".repeat(500)
+        );
+        assert_eq!(
+            clean_prompt(&reminder),
+            "検索の日本語テストを直して\n詳細は後で"
+        );
+        assert_eq!(
+            clean_prompt(
+                "<command-name>/clear</command-name><command-message>clear</command-message>\n引き継ぎを書いて"
+            ),
+            "引き継ぎを書いて"
+        );
+        assert_eq!(
+            clean_prompt("<pasted_content id=\"1\" lines=\"40\">log…</pasted_content> これを見て"),
+            "これを見て"
+        );
+        assert_eq!(clean_prompt("<system-reminder>unclosed"), "");
+        let observations = vec![
+            obs(1, ObservationKind::Prompt, json!({"prompt": command})),
+            obs(2, ObservationKind::Prompt, json!({"prompt": reminder})),
+        ];
+        let d = SessionDigest::from_observations(&observations, None);
+        assert_eq!(d.prompts[0], "/review PR 12 の検索");
+        assert_eq!(
+            prompt_title_line(&d.prompts[1]),
+            "検索の日本語テストを直して"
+        );
+    }
+
+    #[test]
+    fn commits_are_deduplicated_and_commands_keep_first_and_last() {
+        let mut observations = Vec::new();
+        for i in 0..40 {
+            observations.push(tool(
+                i + 1,
+                "Bash",
+                json!({"command": format!("echo 手順{i}")}),
+                json!({}),
+            ));
+        }
+        for i in 0..2 {
+            observations.push(tool(
+                41 + i,
+                "Bash",
+                json!({"command": format!("git commit -m \"feat: 検索\" # {i}")}),
+                json!({}),
+            ));
+        }
+        let d = SessionDigest::from_observations(&observations, None);
+        assert_eq!(d.git_commits, vec!["feat: 検索"]);
+        assert_eq!(d.commands.len(), COMMANDS_MAX);
+        assert_eq!(d.commands[0], "echo 手順0");
+        assert_eq!(d.commands[9], "echo 手順9");
+        assert_eq!(d.commands[10], "echo 手順22");
+        assert_eq!(d.commands[29], "git commit -m \"feat: 検索\" # 1");
+    }
+
+    /// SPEC-M2.8 §1/§3: extending equals building from scratch, and a digest of stubs
+    /// equals the digest of the originals.
+    #[test]
+    fn extend_and_stubs_equal_from_scratch() {
+        let all = fixture();
+        let root = Some("/home/u/kioku");
+        let full = SessionDigest::from_observations(&all, root);
+        for split in 0..=all.len() {
+            let mut d = SessionDigest::from_observations(&all[..split], root);
+            d.extend(&all[split..]);
+            assert_eq!(d, full, "split at {split}");
+            // already folded observations are not counted twice
+            d.extend(&all);
+            assert_eq!(d, full);
+        }
+        let stubs: Vec<Observation> = all
+            .iter()
+            .map(|o| Observation {
+                payload: stub_payload(o.kind, &o.payload, &o.text),
+                text: String::new(),
+                ..o.clone()
+            })
+            .collect();
+        assert_eq!(SessionDigest::from_observations(&stubs, root), full);
+        // stubbing twice changes nothing
+        assert_eq!(
+            stub_payload(stubs[3].kind, &stubs[3].payload, ""),
+            stubs[3].payload
+        );
     }
 
     #[test]

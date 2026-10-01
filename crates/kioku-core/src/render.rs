@@ -1,6 +1,6 @@
 //! Markdown rendering of session pages (spec §7.3) and STATE.md (spec §7.4).
 
-use crate::digest::{FileCount, SessionDigest};
+use crate::digest::{FileCount, SessionDigest, prompt_title_line};
 use crate::handoff::Handoff;
 use crate::session::Session;
 use crate::strings::{Lang, fill, strings};
@@ -27,12 +27,15 @@ pub fn session_page_path(session: &Session) -> String {
     )
 }
 
-/// Session page title: `<YYYY-MM-DD HH:MM> <agent> — <first prompt truncated 60>`.
+/// Session page title: `<YYYY-MM-DD HH:MM> <agent> — <first prompt truncated 60>`; a
+/// multi-line prompt contributes its first non-empty line (SPEC-M2.8 §6).
 pub fn session_title(lang: Lang, session: &Session, digest: &SessionDigest) -> String {
     let first = digest
         .prompts
         .first()
-        .map(|p| truncate_chars(&one_line(p), 60))
+        .map(|p| prompt_title_line(p))
+        .filter(|p| !p.is_empty())
+        .map(|p| truncate_chars(&one_line(&p), 60))
         .unwrap_or_else(|| strings(lang).no_prompt.to_string());
     format!(
         "{} {} — {}",
@@ -244,7 +247,7 @@ mod tests {
         };
         assert_eq!(
             session_title(Lang::Ja, &s, &d),
-            "2026-09-25 02:14 claude-code — 引き継ぎサーバーの設計 をしたい"
+            "2026-09-25 02:14 claude-code — 引き継ぎサーバーの設計"
         );
     }
 

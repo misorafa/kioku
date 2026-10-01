@@ -35,7 +35,26 @@ pub struct BackupFile {
     pub sha256: String,
 }
 
+/// Snapshot format with the wiki history as `wiki.bundle` (SPEC-M2.8 §4); format 1 copied
+/// `wiki/.git` and is still restored.
+pub const BACKUP_FORMAT: u32 = 2;
+
+/// Name of the git bundle of the wiki history inside a snapshot.
+pub const WIKI_BUNDLE: &str = "wiki.bundle";
+
+#[cfg(test)]
+thread_local! {
+    /// How long the last backup on this thread held the write lock (SPEC-M2.8 §4 test).
+    pub(crate) static BACKUP_LOCK_HELD: std::cell::Cell<std::time::Duration> =
+        const { std::cell::Cell::new(std::time::Duration::ZERO) };
+}
+
 /// Completed portable snapshot of wiki, database and raw observations (no credentials).
+///
+/// Format 2 (SPEC-M2.8 §4): `wiki/` holds the working tree (no `.git`), copied under the
+/// write lock; `wiki.bundle` holds the history, made after the lock was released, so it may
+/// be a few commits *ahead* of the copied files (commits made in between). `wiki_head` is the
+/// bundle's HEAD.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BackupManifest {
     /// Snapshot format version.
@@ -48,6 +67,9 @@ pub struct BackupManifest {
     pub files: BTreeMap<String, BackupFile>,
     /// Expected SQLite table row counts after restore.
     pub counts: BTreeMap<String, u64>,
+    /// HEAD commit of `wiki.bundle` (format 2; `None` without wiki history).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wiki_head: Option<String>,
 }
 
 const TABLES: [&str; 8] = [
@@ -149,6 +171,45 @@ fn copy_tree(from: &Path, into: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Copies the wiki working tree (everything but `.git` and `.*.tmp` leftovers) into `into`.
+fn copy_wiki_files(from: &Path, into: &Path) -> anyhow::Result<()> {
+    util::create_private_dir(into)?;
+    let Ok(entries) = std::fs::read_dir(from) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == ".git" || (name.starts_with('.') && name.ends_with(".tmp")) {
+            continue;
+        }
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_tree(&entry.path(), &into.join(&name))?;
+        } else if ty.is_file() {
+            let dest = into.join(&name);
+            std::fs::copy(entry.path(), &dest)?;
+            std::fs::File::open(&dest)?.sync_all()?;
+        } else {
+            anyhow::bail!("special file refused: {}", entry.path().display());
+        }
+    }
+    Ok(())
+}
+
+/// Copies every file under `from` over `into`, replacing files that exist there.
+fn overlay_tree(from: &Path, into: &Path) -> anyhow::Result<()> {
+    let mut paths = Vec::new();
+    files(from, from, &mut paths)?;
+    for rel in paths {
+        let dest = into.join(&rel);
+        util::create_private_dir(dest.parent().context("missing parent")?)?;
+        std::fs::copy(from.join(&rel), &dest)
+            .with_context(|| format!("restoring {}", rel.display()))?;
+    }
+    Ok(())
+}
+
 impl Store {
     /// One-time move of session pages to their collision-free names (SPEC-M2.6 §1), with a
     /// redirect from each old path. Runs until it completes once (`reliability_meta`
@@ -229,14 +290,16 @@ impl Store {
 
     /// Takes a consistent server-local snapshot and publishes it only after completion.
     ///
-    /// Lock scope (SPEC-M2.6 §2): the DB lock only for `VACUUM INTO` and recording the raw
-    /// log lengths (raw lines are appended under the DB lock, so those prefixes match the
-    /// snapshot); the write lock while the wiki is copied (pages change only under it); raw
-    /// prefixes are copied and everything is hashed after both locks are released.
+    /// Lock scope (SPEC-M2.6 §2, SPEC-M2.8 §4): the DB lock only for `VACUUM INTO` and
+    /// recording the raw log lengths (raw lines are appended under the DB lock, so those
+    /// prefixes match the snapshot); the write lock while the wiki's working tree (without
+    /// `.git`) is copied. The history is bundled (`git bundle create --all`), raw prefixes
+    /// are copied and everything is hashed after both locks are released; the bundle may
+    /// therefore be a few commits ahead of the copied pages.
     ///
     /// A backup within [`BACKUP_MIN_INTERVAL`] of the last one is refused
-    /// ([`Error::Conflict`]); after a successful one only the newest `[server] backup_keep`
-    /// snapshots are kept (SPEC-M2.7 §12).
+    /// ([`Error::Conflict`]); after a successful one only the newest
+    /// [`Config::backups_keep`] snapshots are kept (SPEC-M2.7 §12, SPEC-M2.8 §3).
     pub fn backup(&self) -> Result<BackupManifest> {
         if let Some(last) = self.meta("last_backup")?
             && let Some(at) = util::parse_ts(&last)
@@ -261,6 +324,7 @@ impl Store {
             let counts;
             {
                 let _write = self.write_lock.lock();
+                let held = std::time::Instant::now();
                 remove_stale_stages(&root);
                 util::create_private_dir(&stage.join("db")).context("creating snapshot stage")?;
                 {
@@ -272,15 +336,21 @@ impl Store {
                     counts = self::counts(&conn)?;
                     raw_lengths = file_lengths(&self.dirs.raw())?;
                 }
-                copy_tree(&self.dirs.wiki(), &stage.join("wiki"))?;
+                copy_wiki_files(&self.dirs.wiki(), &stage.join("wiki"))?;
+                #[cfg(test)]
+                BACKUP_LOCK_HELD.with(|c| c.set(held.elapsed()));
+                let _ = held;
             }
+            // Outside the write lock: commits made meanwhile only put the bundle ahead.
+            let wiki_head = self.git.bundle(&stage.join(WIKI_BUNDLE))?;
             copy_prefixes(&self.dirs.raw(), &stage.join("raw"), &raw_lengths)?;
             let manifest = BackupManifest {
-                format: 1,
+                format: BACKUP_FORMAT,
                 created: now_ts(),
                 path: dest.display().to_string(),
                 files: inventory(&stage)?,
                 counts,
+                wiki_head,
             };
             let file = stage.join("manifest.json");
             std::fs::write(&file, serde_json::to_vec_pretty(&manifest)?)?;
@@ -299,7 +369,7 @@ impl Store {
             let _ = std::fs::remove_dir_all(&stage);
         }
         let manifest = result.context("creating backup")?;
-        prune_backups(&root, self.config.server.backup_keep.max(1));
+        prune_backups(&root, self.config.backups_keep(), false);
         Ok(manifest)
     }
 
@@ -377,11 +447,12 @@ impl Store {
     }
 }
 
-/// Removes the oldest completed snapshots in `root` (by manifest time) until `keep` remain.
-/// Best effort: a snapshot that cannot be removed stays.
-fn prune_backups(root: &Path, keep: usize) {
+/// Removes the oldest completed snapshots in `root` (by manifest time) until `keep` remain;
+/// returns `(count, bytes)` removed (or, with `dry_run`, that would be). Best effort: a
+/// snapshot that cannot be removed stays and is not counted.
+pub(super) fn prune_backups(root: &Path, keep: usize, dry_run: bool) -> (u64, u64) {
     let Ok(entries) = std::fs::read_dir(root) else {
-        return;
+        return (0, 0);
     };
     let mut snapshots: Vec<(String, PathBuf)> = entries
         .flatten()
@@ -394,15 +465,29 @@ fn prune_backups(root: &Path, keep: usize) {
         })
         .collect();
     if snapshots.len() <= keep {
-        return;
+        return (0, 0);
     }
     snapshots.sort();
     let excess = snapshots.len() - keep;
+    let (mut count, mut bytes) = (0, 0);
     for (_, dir) in snapshots.into_iter().take(excess) {
-        if let Err(e) = std::fs::remove_dir_all(&dir) {
-            tracing::warn!(path = %dir.display(), error = %e, "could not remove an old backup");
+        let size = super::maintenance::dir_bytes(&dir);
+        if dry_run {
+            count += 1;
+            bytes += size;
+            continue;
+        }
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {
+                count += 1;
+                bytes += size;
+            }
+            Err(e) => {
+                tracing::warn!(path = %dir.display(), error = %e, "could not remove an old backup")
+            }
         }
     }
+    (count, bytes)
 }
 
 /// Removes `.<id>.tmp` stages left by an interrupted backup (the caller holds the write
@@ -454,6 +539,90 @@ fn copy_prefixes(from: &Path, into: &Path, lengths: &[(PathBuf, u64)]) -> anyhow
     Ok(())
 }
 
+/// Format 2 (SPEC-M2.8 §4): `git clone` the staged `wiki.bundle` into `wiki/`, then
+/// overlay the copied working tree. Verifies that the clone's HEAD is the manifest's and
+/// that every copied page is known to the history (its content is in some commit — the
+/// bundle may be ahead of the copy, never behind); a page that is not is reported as a
+/// warning (an uncommitted hand edit), never dropped. Without `git`, the pages are restored
+/// without history.
+fn restore_wiki_history(stage: &Path, head: Option<&str>) -> anyhow::Result<()> {
+    let bundle = stage.join(WIKI_BUNDLE);
+    if !crate::git::git_available() {
+        tracing::warn!("git not found: the wiki is restored without its history");
+        std::fs::remove_file(&bundle)?;
+        return Ok(());
+    }
+    let pages = stage.join(".wiki-pages");
+    std::fs::rename(stage.join("wiki"), &pages)?;
+    let wiki = stage.join("wiki");
+    crate::git::run_git(
+        stage,
+        &[
+            "clone",
+            "-q",
+            &bundle.to_string_lossy(),
+            &wiki.to_string_lossy(),
+        ],
+    )
+    .context("cloning the wiki bundle")?;
+    let _ = crate::git::run_git(&wiki, &["remote", "remove", "origin"]);
+    let got = crate::git::run_git(&wiki, &["rev-parse", "HEAD"])?;
+    if let Some(want) = head {
+        anyhow::ensure!(
+            got == want,
+            "wiki bundle HEAD {got} does not match the manifest ({want})"
+        );
+    }
+    // The working tree becomes exactly the copied pages: files the bundle has beyond them
+    // were committed after the copy (the database snapshot does not know them).
+    let mut copied = Vec::new();
+    files(&pages, &pages, &mut copied)?;
+    let copied: std::collections::BTreeSet<String> = copied
+        .iter()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .collect();
+    let mut checked_out = Vec::new();
+    files(&wiki, &wiki, &mut checked_out)?;
+    for rel in checked_out {
+        let name = rel.to_string_lossy().replace('\\', "/");
+        if !name.starts_with(".git/") && !copied.contains(&name) {
+            std::fs::remove_file(wiki.join(&rel))?;
+        }
+    }
+    overlay_tree(&pages, &wiki)?;
+    for rel in &copied {
+        let oid = crate::git::run_git(&wiki, &["hash-object", "--", rel])?;
+        if crate::git::run_git(&wiki, &["cat-file", "-e", &oid]).is_err() {
+            tracing::warn!(path = %rel, "restored page is not in the wiki history (an uncommitted edit?)");
+        }
+    }
+    std::fs::remove_dir_all(&pages)?;
+    std::fs::remove_file(&bundle)?;
+    // Record the snapshot's pages on top of the bundle's history (only when they differ).
+    crate::git::run_git(&wiki, &["add", "-A", "."])?;
+    if crate::git::run_git(&wiki, &["diff", "--cached", "--quiet"]).is_err() {
+        let name = format!("user.name={}", crate::git::AUTHOR_NAME);
+        let email = format!("user.email={}", crate::git::AUTHOR_EMAIL);
+        crate::git::run_git(
+            &wiki,
+            &[
+                "-c",
+                &name,
+                "-c",
+                &email,
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--no-verify",
+                "-m",
+                "kioku: restore backup",
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 /// Restores a checked snapshot into a new directory, rebuilding and verifying its index.
 pub fn restore_backup(source: &Path, into: &Path) -> anyhow::Result<BackupManifest> {
     anyhow::ensure!(
@@ -466,7 +635,10 @@ pub fn restore_backup(source: &Path, into: &Path) -> anyhow::Result<BackupManife
     );
     let manifest: BackupManifest =
         serde_json::from_slice(&std::fs::read(source.join("manifest.json"))?)?;
-    anyhow::ensure!(manifest.format == 1, "unsupported backup format");
+    anyhow::ensure!(
+        manifest.format == 1 || manifest.format == BACKUP_FORMAT,
+        "unsupported backup format"
+    );
     let actual = inventory(source)?;
     anyhow::ensure!(
         actual.len() == manifest.files.len(),
@@ -474,7 +646,10 @@ pub fn restore_backup(source: &Path, into: &Path) -> anyhow::Result<BackupManife
     );
     for (path, expected) in &manifest.files {
         anyhow::ensure!(
-            path.starts_with("wiki/") || path.starts_with("raw/") || path == "db/kioku.sqlite",
+            path.starts_with("wiki/")
+                || path.starts_with("raw/")
+                || path == "db/kioku.sqlite"
+                || (path == WIKI_BUNDLE && manifest.format >= 2),
             "unexpected backup path"
         );
         let got = actual.get(path).context("missing backup file")?;
@@ -498,12 +673,19 @@ pub fn restore_backup(source: &Path, into: &Path) -> anyhow::Result<BackupManife
         for dir in ["wiki", "raw", "db"] {
             copy_tree(&source.join(dir), &stage.join(dir))?;
         }
+        let bundle = source.join(WIKI_BUNDLE);
+        if manifest.files.contains_key(WIKI_BUNDLE) {
+            std::fs::copy(&bundle, stage.join(WIKI_BUNDLE)).context("copying the wiki bundle")?;
+        }
         // Recheck the staged copy, so changing a source during copy cannot bypass checks.
         let staged = inventory(&stage)?;
         anyhow::ensure!(
             serde_json::to_value(&staged)? == serde_json::to_value(&manifest.files)?,
             "snapshot changed during restore"
         );
+        if manifest.files.contains_key(WIKI_BUNDLE) {
+            restore_wiki_history(&stage, manifest.wiki_head.as_deref())?;
+        }
         let conn = Connection::open(stage.join("db/kioku.sqlite"))?;
         let integrity: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
         anyhow::ensure!(
@@ -720,7 +902,8 @@ mod tests {
                 .id,
             real.id
         );
-        assert!(store.reliability().unwrap().inconsistent_pages.is_empty());
+        let report = store.reliability().unwrap();
+        assert!(report.inconsistent_pages.is_empty(), "{report:?}");
 
         // Once done it never runs again: a legacy-looking file added later stays put.
         let late = format!(
@@ -1046,7 +1229,9 @@ mod tests {
     fn backups_are_rate_limited_and_pruned() {
         let tmp = tempfile::tempdir().unwrap();
         let mut cfg = Config::for_data_dir(tmp.path());
-        cfg.server.backup_keep = 2;
+        cfg.server.backup_keep = 5;
+        // SPEC-M2.8 §3: `[retention] backups_keep` supersedes `[server] backup_keep`.
+        cfg.retention.backups_keep = Some(2);
         let store = Store::open(cfg).unwrap();
         start(&store, "s1", None);
         let first = store.backup().unwrap();
@@ -1076,6 +1261,106 @@ mod tests {
         assert_eq!(left.len(), 2, "{left:?}");
         assert!(!Path::new(&made[0]).exists(), "the oldest went");
         assert!(Path::new(&made[1]).exists() && Path::new(&made[2]).exists());
+    }
+
+    /// SPEC-M2.8 §4: the wiki history is bundled outside the write lock, so a backup holds
+    /// it only briefly while another thread keeps finalizing; the restore clones the bundle,
+    /// overlays the copied pages and keeps their history.
+    #[test]
+    fn backup_holds_the_write_lock_briefly_while_finalizing_continues() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            Store::open(Config::for_data_dir(&tmp.path().join("live"))).unwrap(),
+        );
+        start(&store, "busy", None);
+        store.add_observation(&obs("busy")).unwrap();
+        store.finalize_session("busy").unwrap();
+        for i in 0..30 {
+            store
+                .write_page(&WritePageRequest {
+                    title: format!("履歴のある記憶 {i}"),
+                    content: format!("日本語の本文 {i}"),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker = {
+            let (store, stop) = (store.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut n = 0;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let mut e = obs("busy");
+                    e.event_id = Some(format!("busy-{n}"));
+                    e.payload = serde_json::json!({"prompt": format!("並行する指示 {n}")});
+                    store.add_observation(&e).unwrap();
+                    store.finalize_session("busy").unwrap();
+                    n += 1;
+                }
+                n
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let manifest = store.backup().unwrap();
+        let held = BACKUP_LOCK_HELD.with(|c| c.get());
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let turns = worker.join().unwrap();
+        assert!(turns > 0);
+        assert!(
+            held < std::time::Duration::from_secs(1),
+            "write lock held {held:?}"
+        );
+        assert_eq!(manifest.format, BACKUP_FORMAT);
+        assert!(
+            !manifest.files.keys().any(|p| p.starts_with("wiki/.git/")),
+            "no .git copy"
+        );
+        let git = crate::git::git_available();
+        if git {
+            assert!(manifest.files.contains_key(WIKI_BUNDLE));
+            assert!(manifest.wiki_head.is_some());
+        }
+        let into = tmp.path().join("restored");
+        restore_backup(Path::new(&manifest.path), &into).unwrap();
+        let restored = Store::open(Config::for_data_dir(&into)).unwrap();
+        assert!(
+            !restored
+                .search("履歴", &SearchScope::All, 3)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            restored
+                .reliability()
+                .unwrap()
+                .inconsistent_pages
+                .is_empty()
+        );
+        drop(restored);
+        if git {
+            let wiki = into.join("wiki");
+            let log = crate::git::run_git(&wiki, &["log", "--format=%s"]).unwrap();
+            assert!(log.lines().count() >= 30, "{log}");
+            assert!(
+                crate::git::run_git(&wiki, &["status", "--porcelain"])
+                    .unwrap()
+                    .is_empty(),
+                "the restored wiki is clean"
+            );
+            assert!(crate::git::run_git(&wiki, &["remote"]).unwrap().is_empty());
+            // A tampered HEAD in the manifest is refused.
+            let mut bad = manifest.clone();
+            bad.wiki_head = Some("0".repeat(40));
+            std::fs::write(
+                Path::new(&manifest.path).join("manifest.json"),
+                serde_json::to_vec(&bad).unwrap(),
+            )
+            .unwrap();
+            let err =
+                restore_backup(Path::new(&manifest.path), &tmp.path().join("bad")).unwrap_err();
+            assert!(format!("{err:#}").contains("does not match"), "{err:#}");
+            assert!(!tmp.path().join("bad").exists());
+        }
     }
 
     #[test]

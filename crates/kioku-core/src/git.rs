@@ -126,6 +126,26 @@ impl Git {
         }
     }
 
+    /// `git bundle create <dest> --all` (SPEC-M2.8 §4: the wiki history of a backup, made
+    /// without the write lock); returns the bundle's HEAD commit id, `None` when there is
+    /// no history to bundle (git disabled, or no commit yet).
+    pub fn bundle(&self, dest: &Path) -> anyhow::Result<Option<String>> {
+        if !self.enabled || !self.root.join(".git").exists() {
+            return Ok(None);
+        }
+        if run_git(&self.root, &["rev-parse", "--verify", "-q", "HEAD"]).is_err() {
+            return Ok(None);
+        }
+        let dest_s = dest.to_string_lossy().to_string();
+        run_git(&self.root, &["bundle", "create", "-q", &dest_s, "--all"])?;
+        let heads = run_git(&self.root, &["bundle", "list-heads", &dest_s])?;
+        Ok(heads
+            .lines()
+            .find(|l| l.ends_with(" HEAD"))
+            .and_then(|l| l.split_whitespace().next())
+            .map(str::to_string))
+    }
+
     fn run(&self, args: &[&str]) -> bool {
         match crate::util::quiet_command("git")
             .arg("-C")
@@ -149,6 +169,25 @@ impl Git {
             }
         }
     }
+}
+
+/// Runs `git -C <dir> <args>` and returns its trimmed stdout; a non-zero exit is an error
+/// carrying stderr.
+pub fn run_git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
+    let out = crate::util::quiet_command("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .map_err(|e| anyhow::anyhow!("running git {}: {e}", args.join(" ")))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 #[cfg(test)]

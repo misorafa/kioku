@@ -23,7 +23,7 @@ pub mod store;
 pub mod strings;
 pub mod util;
 
-pub use config::{ClientConfig, Config, ServerConfig, UpdateConfig};
+pub use config::{ClientConfig, Config, RetentionConfig, ServerConfig, UpdateConfig};
 pub use db::{NewerSchema, ProjectAlias, ProjectRow, SCHEMA_VERSION, newer_schema_on_disk};
 pub use digest::{FileCount, SessionDigest};
 pub use error::{Error, Result};
