@@ -170,6 +170,22 @@ async fn bridge_serves_the_server_tools_over_rest() {
         out.ends_with("引き継ぎ書を毎回作るのが手間なので自動化したい"),
         "{out}"
     );
+    let revision = out
+        .lines()
+        .find_map(|line| line.strip_prefix("revision: "))
+        .unwrap();
+    let conditional = json!({"title":"引き継ぎの設計", "content":"日本語の変更", "project":PROJECT, "path":path, "expected_revision":revision});
+    let updated = bridge
+        .call_tool(call("kioku_write_page", conditional.clone()))
+        .await
+        .unwrap();
+    assert_ne!(updated.is_error, Some(true));
+    let stale = bridge
+        .call_tool(call("kioku_write_page", conditional))
+        .await
+        .unwrap();
+    assert_eq!(stale.is_error, Some(true));
+    assert!(text(&stale).contains("conflict"));
     let missing = bridge
         .call_tool(call("kioku_read", json!({"path": "nope/none.md"})))
         .await

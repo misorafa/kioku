@@ -162,7 +162,7 @@ async fn session_lifecycle_round_trip() {
     assert_eq!(fin["substantive"], true);
     let page_path = fin["session_page"].as_str().unwrap().to_string();
     assert!(page_path.starts_with(&format!("{PROJECT}/sessions/")));
-    assert!(page_path.ends_with("-0c2f1a2b.md"));
+    assert!(page_path.ends_with(&format!("-{}.md", &kioku_core::util::sha256_hex(sid)[..12])));
     let handoff_id = fin["handoff_id"].as_str().unwrap().to_string();
     let resp = srv
         .http
@@ -812,4 +812,68 @@ async fn serve_with_stops_on_request() {
         .expect("serve_with returns after a shutdown request")
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn durable_delivery_page_conflicts_and_backup_api() {
+    let server = common::spawn().await;
+    let (_, mut req) = server
+        .post(
+            "/api/v1/sessions/start",
+            common::start_body("reliability-session"),
+        )
+        .await;
+    assert_eq!(req["project_id"], common::PROJECT);
+    let observation = json!({"session_id":"reliability-session", "event_id":"delivery-1", "kind":"prompt", "payload":{"prompt":"日本語の復元テスト"}});
+    let (code, first) = server
+        .post("/api/v1/observations", observation.clone())
+        .await;
+    assert_eq!(code, 200);
+    let (_, retry) = server
+        .post("/api/v1/observations", observation.clone())
+        .await;
+    assert_eq!(retry, first);
+    let mut changed = observation;
+    changed["payload"]["prompt"] = json!("別の内容");
+    assert_eq!(server.post("/api/v1/observations", changed).await.0, 409);
+    req = json!({"title":"共有ページ", "content":"初期版", "project":common::PROJECT, "expected_revision":""});
+    let (_, page) = server
+        .send(reqwest::Method::PUT, "/api/v1/pages", req.clone())
+        .await;
+    let path = page["path"].as_str().unwrap();
+    let (_, read) = server.get(&format!("/api/v1/pages/{path}")).await;
+    let revision = read["revision"].as_str().unwrap();
+    assert_eq!(revision.len(), 64);
+    req["expected_revision"] = json!(revision);
+    req["content"] = json!("変更後");
+    assert_eq!(
+        server
+            .send(reqwest::Method::PUT, "/api/v1/pages", req.clone())
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        server
+            .send(reqwest::Method::PUT, "/api/v1/pages", req)
+            .await
+            .0,
+        409
+    );
+    assert_eq!(
+        server.get("/api/v1/diagnostics").await.1["inconsistent_pages"],
+        json!([])
+    );
+    let (code, backup) = server.post("/api/v1/backup", json!({})).await;
+    assert_eq!(code, 200);
+    assert_eq!(backup["format"], 1);
+    assert!(backup["files"]["db/kioku.sqlite"]["sha256"].is_string());
+    assert!(server.get("/api/v1/diagnostics").await.1["last_backup"].is_string());
+    let unauth = server
+        .http
+        .post(server.url("/api/v1/backup"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauth.status().as_u16(), 401);
 }

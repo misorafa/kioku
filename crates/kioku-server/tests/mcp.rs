@@ -145,6 +145,34 @@ async fn mcp_tools_over_streamable_http() {
     assert!(out.contains("tags: design"), "{out}");
     assert!(out.ends_with("引き継ぎ書を毎回作るのが手間なので自動化したい"));
 
+    // expected_revision over MCP (SPEC-M2.6 §1): a stale revision is a tool error, the
+    // current one writes.
+    let revision = out
+        .lines()
+        .find_map(|l| l.strip_prefix("revision: "))
+        .expect(&out)
+        .to_string();
+    let update = |rev: &str, body: &str| {
+        CallToolRequestParams::new("kioku_write_page").with_arguments(args(json!({
+            "title": "引き継ぎの設計",
+            "content": body,
+            "project": PROJECT,
+            "path": path,
+            "expected_revision": rev,
+        })))
+    };
+    let stale = client
+        .call_tool(update("0000", "古い版からの更新"))
+        .await
+        .unwrap();
+    assert_eq!(stale.is_error, Some(true), "{}", text(&stale));
+    assert!(text(&stale).contains("changed"), "{}", text(&stale));
+    let fresh = client
+        .call_tool(update(&revision, "最新版からの更新"))
+        .await
+        .unwrap();
+    assert_ne!(fresh.is_error, Some(true), "{}", text(&fresh));
+
     // handoff write → pending (peek) → accept
     let wrote = client
         .call_tool(

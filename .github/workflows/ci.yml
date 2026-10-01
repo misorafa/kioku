@@ -28,6 +28,7 @@ jobs:
       - name: cargo clippy
         if: ${{ !cancelled() }}
         run: cargo clippy --all-targets --locked -- -D warnings
+      # Includes M2.6 fault/recovery regression and Japanese Recall@3 / MRR evaluation.
       - name: cargo test
         if: ${{ !cancelled() }}
         run: cargo test --locked --no-fail-fast

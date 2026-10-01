@@ -1,0 +1,1068 @@
+//! Session migration, consistent snapshots, recovery and operational integrity checks.
+
+use super::*;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+/// Read-only operational evidence, available through the diagnostics endpoint.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReliabilityReport {
+    /// Last server receipt, independent of client clocks.
+    pub last_received: Option<String>,
+    /// Last completed backup time.
+    pub last_backup: Option<String>,
+    /// Failure of the last attempted wiki commit, if any.
+    pub git_error: Option<String>,
+    /// Paths with missing, changed or unindexed page contents.
+    pub inconsistent_pages: Vec<String>,
+    /// Pages that cannot be read or parsed (reindex skips them; fix or remove by hand).
+    #[serde(default)]
+    pub unparseable_pages: Vec<String>,
+    /// Whether indexed document count and metadata agree.
+    pub index_count_matches: bool,
+}
+
+/// One file in a backup manifest.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BackupFile {
+    /// File length in bytes.
+    pub bytes: u64,
+    /// SHA-256 of the bytes.
+    pub sha256: String,
+}
+
+/// Completed portable snapshot of wiki, database and raw observations (no credentials).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BackupManifest {
+    /// Snapshot format version.
+    pub format: u32,
+    /// Snapshot time in UTC.
+    pub created: String,
+    /// Server-local location (informational; never trusted during restore).
+    pub path: String,
+    /// Inventory, including the SQLite snapshot and git history.
+    pub files: BTreeMap<String, BackupFile>,
+    /// Expected SQLite table row counts after restore.
+    pub counts: BTreeMap<String, u64>,
+}
+
+const TABLES: [&str; 8] = [
+    "projects",
+    "sessions",
+    "observations",
+    "handoffs",
+    "pages",
+    "project_aliases",
+    "observation_receipts",
+    "page_redirects",
+];
+
+fn counts(conn: &Connection) -> anyhow::Result<BTreeMap<String, u64>> {
+    TABLES
+        .into_iter()
+        .map(|t| Ok((t.to_string(), db::count(conn, t)?)))
+        .collect()
+}
+
+fn files(root: &Path, at: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(at).with_context(|| format!("listing {}", at.display()))? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        anyhow::ensure!(
+            !ty.is_symlink(),
+            "symlink refused: {}",
+            entry.path().display()
+        );
+        if ty.is_dir() {
+            files(root, &entry.path(), out)?;
+        } else if ty.is_file() {
+            out.push(entry.path().strip_prefix(root)?.to_path_buf());
+        } else {
+            anyhow::bail!("special file refused: {}", entry.path().display());
+        }
+    }
+    Ok(())
+}
+
+fn inventory(root: &Path) -> anyhow::Result<BTreeMap<String, BackupFile>> {
+    let mut paths = Vec::new();
+    files(root, root, &mut paths)?;
+    let mut result = BTreeMap::new();
+    for rel in paths {
+        if rel == Path::new("manifest.json") {
+            continue;
+        }
+        let mut file = std::fs::File::open(root.join(&rel))?;
+        let mut digest = Sha256::new();
+        let mut bytes = 0;
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = std::io::Read::read(&mut file, &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            digest.update(&buf[..n]);
+            bytes += n as u64;
+        }
+        result.insert(
+            rel.to_string_lossy().replace('\\', "/"),
+            BackupFile {
+                bytes,
+                sha256: format!("{:x}", digest.finalize()),
+            },
+        );
+    }
+    Ok(result)
+}
+
+fn copy_tree(from: &Path, into: &Path) -> anyhow::Result<()> {
+    if !from.exists() {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        !std::fs::symlink_metadata(from)?.file_type().is_symlink(),
+        "symlink source refused"
+    );
+    let mut paths = Vec::new();
+    files(from, from, &mut paths)?;
+    for rel in paths {
+        let dest = into.join(&rel);
+        util::create_private_dir(dest.parent().context("missing parent")?)?;
+        let source = from.join(&rel);
+        let mut input = std::fs::File::open(&source)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut output = options.open(&dest)?;
+        std::io::copy(&mut input, &mut output)?;
+        output.sync_all()?;
+        std::fs::set_permissions(&dest, input.metadata()?.permissions())?;
+    }
+    Ok(())
+}
+
+impl Store {
+    /// One-time move of session pages to their collision-free names (SPEC-M2.6 §1), with a
+    /// redirect from each old path. Runs until it completes once (`reliability_meta`
+    /// `session_pages_v2`); a page that cannot move is skipped with a warning and stays
+    /// readable at its old path. Missing pages are never regenerated: finalizing again would
+    /// issue a new rules handoff for a session that ended long ago.
+    pub(super) fn migrate_session_pages(&self) -> Result<()> {
+        const DONE: &str = "session_pages_v2";
+        let done: Option<String> = self
+            .db
+            .lock()
+            .query_row(
+                "SELECT value FROM reliability_meta WHERE key=?1",
+                [DONE],
+                |r| r.get(0),
+            )
+            .optional()
+            .context("reading migration state")?;
+        if done.is_some() {
+            return Ok(());
+        }
+        let _write = self.write_lock.lock();
+        let wiki = self.dirs.wiki();
+        let mut moved = 0usize;
+        for path in list_wiki_pages(&wiki)? {
+            match self.migrate_one_session_page(&wiki, &path) {
+                Ok(true) => moved += 1,
+                Ok(false) => {}
+                Err(e) => tracing::warn!(%path, error = %e, "session page left at its old path"),
+            }
+        }
+        // Commit and reindex on every unfinished run, so an interrupted earlier run (files
+        // moved, index or git not yet updated) is completed by the next start.
+        self.git
+            .commit(&[".".to_string()], "kioku: migrate session page names");
+        self.reindex_locked()?;
+        self.db
+            .lock()
+            .execute(
+                "INSERT OR REPLACE INTO reliability_meta VALUES (?1, ?2)",
+                [DONE, &now_ts()],
+            )
+            .context("recording migration state")?;
+        if moved > 0 {
+            tracing::info!(moved, "session pages moved to collision-free names");
+        }
+        Ok(())
+    }
+
+    /// Moves one legacy session page; true when it moved. New copy and redirect are durable
+    /// before the old file is removed, so an interruption never loses a page.
+    fn migrate_one_session_page(&self, wiki: &Path, path: &str) -> anyhow::Result<bool> {
+        let text = std::fs::read_to_string(wiki.join(path))?;
+        let page = Page::parse(path, &text)?;
+        if page.frontmatter.kind != PageKind::Session {
+            return Ok(false);
+        }
+        let Some(id) = &page.frontmatter.session else {
+            return Ok(false);
+        };
+        let Some(session) = db::get_session(&self.db.lock(), id)? else {
+            return Ok(false);
+        };
+        let target = session_page_path(&session);
+        if target == path {
+            return Ok(false);
+        }
+        if !wiki.join(&target).exists() {
+            write_atomic(&wiki.join(&target), &text)?;
+        }
+        self.db.lock().execute(
+            "INSERT OR REPLACE INTO page_redirects VALUES (?1,?2)",
+            params![path, target],
+        )?;
+        std::fs::remove_file(wiki.join(path))?;
+        Ok(true)
+    }
+
+    /// Takes a consistent server-local snapshot and publishes it only after completion.
+    ///
+    /// Lock scope (SPEC-M2.6 §2): the DB lock only for `VACUUM INTO` and recording the raw
+    /// log lengths (raw lines are appended under the DB lock, so those prefixes match the
+    /// snapshot); the write lock while the wiki is copied (pages change only under it); raw
+    /// prefixes are copied and everything is hashed after both locks are released.
+    pub fn backup(&self) -> Result<BackupManifest> {
+        let root = self.dirs.root().join("backups");
+        util::create_private_dir(&root).context("creating backup root")?;
+        let id = util::generate_token();
+        let stage = root.join(format!(".{id}.tmp"));
+        let dest = root.join(&id);
+        let result = (|| -> anyhow::Result<BackupManifest> {
+            let raw_lengths;
+            let counts;
+            {
+                let _write = self.write_lock.lock();
+                remove_stale_stages(&root);
+                util::create_private_dir(&stage.join("db")).context("creating snapshot stage")?;
+                {
+                    let conn = self.db.lock();
+                    conn.execute(
+                        "VACUUM INTO ?1",
+                        [stage.join("db/kioku.sqlite").to_string_lossy().as_ref()],
+                    )?;
+                    counts = self::counts(&conn)?;
+                    raw_lengths = file_lengths(&self.dirs.raw())?;
+                }
+                copy_tree(&self.dirs.wiki(), &stage.join("wiki"))?;
+            }
+            copy_prefixes(&self.dirs.raw(), &stage.join("raw"), &raw_lengths)?;
+            let manifest = BackupManifest {
+                format: 1,
+                created: now_ts(),
+                path: dest.display().to_string(),
+                files: inventory(&stage)?,
+                counts,
+            };
+            let file = stage.join("manifest.json");
+            std::fs::write(&file, serde_json::to_vec_pretty(&manifest)?)?;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(file)?
+                .sync_all()?;
+            std::fs::rename(&stage, &dest)?;
+            self.db.lock().execute(
+                "INSERT OR REPLACE INTO reliability_meta VALUES ('last_backup', ?1)",
+                [&manifest.created],
+            )?;
+            Ok(manifest)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_dir_all(&stage);
+        }
+        Ok(result.context("creating backup")?)
+    }
+
+    /// Checks storage health without changing files, metadata or the search index. Only the
+    /// metadata snapshot is read under the DB lock; files are read and hashed without any
+    /// lock, so a write racing the check can show up as a momentary mismatch.
+    pub fn reliability(&self) -> Result<ReliabilityReport> {
+        let (last_received, last_backup, rows) = {
+            let conn = self.db.lock();
+            let meta = |key: &str| -> anyhow::Result<Option<String>> {
+                Ok(conn
+                    .query_row(
+                        "SELECT value FROM reliability_meta WHERE key=?1",
+                        [key],
+                        |r| r.get(0),
+                    )
+                    .optional()?)
+            };
+            let mut stmt = conn
+                .prepare("SELECT path, hash FROM pages")
+                .context("listing page metadata")?;
+            let rows: BTreeMap<String, Option<String>> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .context("reading page metadata")?
+                .collect::<rusqlite::Result<_>>()
+                .context("reading page metadata")?;
+            (meta("last_received")?, meta("last_backup")?, rows)
+        };
+        let mut mismatches = Vec::new();
+        let mut unparseable = Vec::new();
+        let mut documents = Vec::new();
+        let mut disk = std::collections::BTreeSet::new();
+        for path in list_wiki_pages(&self.dirs.wiki())? {
+            disk.insert(path.clone());
+            let page = std::fs::read_to_string(self.dirs.wiki().join(&path))
+                .ok()
+                .and_then(|t| Page::parse(&path, &t).ok().map(|p| (p, t)));
+            // reindex skips pages it cannot read or parse; report them, not as drift.
+            let Some((page, text)) = page else {
+                unparseable.push(path);
+                continue;
+            };
+            let (row, doc) = page_records(&page, &text);
+            if rows.get(&path).and_then(|h| h.as_deref()) != Some(row.hash.as_str()) {
+                mismatches.push(path);
+            }
+            documents.push(doc);
+        }
+        mismatches.extend(rows.keys().filter(|p| !disk.contains(*p)).cloned());
+        mismatches.extend(self.index.inconsistent_paths(&documents)?);
+        mismatches.sort();
+        mismatches.dedup();
+        Ok(ReliabilityReport {
+            last_received,
+            last_backup,
+            git_error: self.git.last_error(),
+            inconsistent_pages: mismatches,
+            unparseable_pages: unparseable,
+            index_count_matches: self.index.num_docs() == rows.len() as u64,
+        })
+    }
+}
+
+/// Removes `.<id>.tmp` stages left by an interrupted backup (the caller holds the write
+/// lock, so no backup is in progress).
+fn remove_stale_stages(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') && name.ends_with(".tmp") {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Lengths of every file under `root` (relative paths); empty when `root` does not exist.
+fn file_lengths(root: &Path) -> anyhow::Result<Vec<(PathBuf, u64)>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths = Vec::new();
+    files(root, root, &mut paths)?;
+    paths
+        .into_iter()
+        .map(|rel| Ok((rel.clone(), std::fs::metadata(root.join(&rel))?.len())))
+        .collect()
+}
+
+/// Copies the first `len` bytes of each listed file (append-only logs that may have grown).
+fn copy_prefixes(from: &Path, into: &Path, lengths: &[(PathBuf, u64)]) -> anyhow::Result<()> {
+    for (rel, len) in lengths {
+        let dest = into.join(rel);
+        util::create_private_dir(dest.parent().context("missing parent")?)?;
+        let input = std::fs::File::open(from.join(rel))
+            .with_context(|| format!("opening {}", from.join(rel).display()))?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut output = options.open(&dest)?;
+        let copied = std::io::copy(&mut std::io::Read::take(input, *len), &mut output)?;
+        anyhow::ensure!(copied == *len, "{} shrank during backup", rel.display());
+        output.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Restores a checked snapshot into a new directory, rebuilding and verifying its index.
+pub fn restore_backup(source: &Path, into: &Path) -> anyhow::Result<BackupManifest> {
+    anyhow::ensure!(
+        std::fs::symlink_metadata(into).is_err(),
+        "restore destination already exists"
+    );
+    anyhow::ensure!(
+        !std::fs::symlink_metadata(source)?.file_type().is_symlink(),
+        "symlink backup root refused"
+    );
+    let manifest: BackupManifest =
+        serde_json::from_slice(&std::fs::read(source.join("manifest.json"))?)?;
+    anyhow::ensure!(manifest.format == 1, "unsupported backup format");
+    let actual = inventory(source)?;
+    anyhow::ensure!(
+        actual.len() == manifest.files.len(),
+        "backup inventory differs"
+    );
+    for (path, expected) in &manifest.files {
+        anyhow::ensure!(
+            path.starts_with("wiki/") || path.starts_with("raw/") || path == "db/kioku.sqlite",
+            "unexpected backup path"
+        );
+        let got = actual.get(path).context("missing backup file")?;
+        anyhow::ensure!(
+            got.bytes == expected.bytes && got.sha256 == expected.sha256,
+            "backup checksum mismatch: {path}"
+        );
+    }
+    let parent = into
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    anyhow::ensure!(
+        !parent.canonicalize()?.starts_with(source.canonicalize()?),
+        "restore destination must be outside the backup"
+    );
+    let stage = parent.join(format!(".kioku-restore-{}", util::generate_token()));
+    util::create_private_dir(&stage).context("creating snapshot stage")?;
+    let result = (|| -> anyhow::Result<()> {
+        for dir in ["wiki", "raw", "db"] {
+            copy_tree(&source.join(dir), &stage.join(dir))?;
+        }
+        // Recheck the staged copy, so changing a source during copy cannot bypass checks.
+        let staged = inventory(&stage)?;
+        anyhow::ensure!(
+            serde_json::to_value(&staged)? == serde_json::to_value(&manifest.files)?,
+            "snapshot changed during restore"
+        );
+        let conn = Connection::open(stage.join("db/kioku.sqlite"))?;
+        let integrity: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+        anyhow::ensure!(
+            integrity == "ok",
+            "SQLite integrity check failed: {integrity}"
+        );
+        anyhow::ensure!(
+            !conn.prepare("PRAGMA foreign_key_check")?.exists([])?,
+            "SQLite foreign key check failed"
+        );
+        anyhow::ensure!(
+            counts(&conn)? == manifest.counts,
+            "restored row counts differ"
+        );
+        drop(conn);
+        let store = Store::open(Config::for_data_dir(&stage))?;
+        // `pages` is rebuilt from the restored wiki (the index is not in the backup), so it
+        // follows the wiki rather than the live table, which may have drifted; pages that
+        // cannot be parsed are skipped by that rebuild and reported, never fatal.
+        let without_pages = |mut c: BTreeMap<String, u64>| {
+            c.remove("pages");
+            c
+        };
+        anyhow::ensure!(
+            without_pages(counts(&store.db.lock())?) == without_pages(manifest.counts.clone()),
+            "restored row counts changed during rebuild"
+        );
+        let report = store.reliability()?;
+        anyhow::ensure!(
+            report.inconsistent_pages.is_empty() && report.index_count_matches,
+            "restored index differs: {:?}",
+            report.inconsistent_pages
+        );
+        for path in &report.unparseable_pages {
+            tracing::warn!(%path, "restored page cannot be parsed; it is not searchable");
+        }
+        drop(store);
+        anyhow::ensure!(
+            !into.exists(),
+            "restore destination appeared during verification"
+        );
+        std::fs::rename(&stage, into)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+    result.context("restoring backup")?;
+    Ok(manifest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn start(store: &Store, id: &str, lane: Option<&str>) -> SessionStartRequest {
+        let req = SessionStartRequest {
+            session_id: id.into(),
+            agent: "test".into(),
+            cwd: "/test".into(),
+            source: "startup".into(),
+            project: ProjectIdentity {
+                id: "test-project".into(),
+                name: "試験".into(),
+                root: "/test".into(),
+                remote: None,
+            },
+            lane: lane.map(str::to_string),
+        };
+        store.start_session(&req).unwrap();
+        req
+    }
+    fn obs(id: &str) -> NewObservation {
+        NewObservation {
+            event_id: Some("event-1".into()),
+            session_id: id.into(),
+            kind: ObservationKind::Prompt,
+            ts: None,
+            payload: serde_json::json!({"prompt":"日本語の検索と引き継ぎ"}),
+        }
+    }
+    fn handoff(store: &Store, id: &str) -> Handoff {
+        store
+            .write_handoff(&HandoffInput {
+                project: "test-project".into(),
+                session: Some(id.into()),
+                summary: "日本語の引き継ぎ".into(),
+                next_steps: vec![],
+                open_questions: vec![],
+                decisions: vec![],
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn delivery_receipt_survives_restart_and_rejects_different_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config::for_data_dir(tmp.path());
+        let store = Store::open(cfg.clone()).unwrap();
+        start(&store, "s1", None);
+        let mut original = obs("s1");
+        original.payload =
+            serde_json::from_str(r#"{"prompt":"日本語の検索","tool_name":"test"}"#).unwrap();
+        assert_eq!(store.add_observation(&original).unwrap(), 1);
+        assert_eq!(store.add_observation(&original).unwrap(), 1);
+        let mut reordered = original.clone();
+        reordered.payload =
+            serde_json::from_str(r#"{"tool_name":"test","prompt":"日本語の検索"}"#).unwrap();
+        assert_eq!(store.add_observation(&reordered).unwrap(), 1);
+        let mut changed = original.clone();
+        changed.payload = serde_json::json!({"prompt":"別の指示"});
+        assert!(matches!(
+            store.add_observation(&changed),
+            Err(Error::Conflict(_))
+        ));
+        drop(store);
+        let store = Store::open(cfg).unwrap();
+        assert_eq!(store.add_observation(&original).unwrap(), 1);
+        assert_eq!(store.observations("s1").unwrap().len(), 1);
+    }
+
+    /// Writes `text` at a legacy (pre-M2.6) session page path and clears the migration flag,
+    /// as on a store created by an older version.
+    fn legacy_page(store: &Store, root: &Path, rel: &str, text: &str) {
+        let file = root.join("wiki").join(rel);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, text).unwrap();
+        store
+            .db
+            .lock()
+            .execute(
+                "DELETE FROM reliability_meta WHERE key='session_pages_v2'",
+                [],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn same_prefix_session_ids_get_distinct_pages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(Config::for_data_dir(tmp.path())).unwrap();
+        let mut paths = Vec::new();
+        for id in ["01a0efaf-one", "01a0efaf-two"] {
+            start(&store, id, None);
+            store.add_observation(&obs(id)).unwrap();
+            paths.push(store.finalize_session(id).unwrap().session_page.unwrap());
+        }
+        assert_ne!(paths[0], paths[1]);
+        assert!(paths[0].contains("-01a0efaf-"), "{}", paths[0]);
+        assert!(
+            store
+                .search("引き継ぎ", &SearchScope::All, 10)
+                .unwrap()
+                .len()
+                >= 2
+        );
+    }
+
+    /// Regression (review of ca8afe5): the migration regenerated missing session pages by
+    /// finalizing again, which issued a fresh unaccepted rules handoff for a session that
+    /// ended long ago; the next session got the stale summary and the real handoff was
+    /// consumed. Migration now only moves pages.
+    #[test]
+    fn migration_moves_legacy_pages_once_without_issuing_handoffs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config::for_data_dir(tmp.path());
+        let store = Store::open(cfg.clone()).unwrap();
+        for id in ["01a0efaf-one", "01a0efaf-two"] {
+            start(&store, id, None);
+            store.add_observation(&obs(id)).unwrap();
+            store.finalize_session(id).unwrap();
+        }
+        // Both rules handoffs consumed by a later session; a newer agent handoff pending.
+        start(&store, "later", None);
+        let real = handoff(&store, "later");
+        let two = store.session("01a0efaf-two").unwrap();
+        let current = session_page_path(&two);
+        let text = std::fs::read_to_string(tmp.path().join("wiki").join(&current)).unwrap();
+        // Simulate the pre-M2.6 layout: one colliding legacy file, the other page lost.
+        let old = format!(
+            "test-project/sessions/{}-01a0efaf.md",
+            display_date(&now_ts())
+        );
+        std::fs::remove_file(tmp.path().join("wiki").join(&current)).unwrap();
+        let one = session_page_path(&store.session("01a0efaf-one").unwrap());
+        std::fs::remove_file(tmp.path().join("wiki").join(&one)).unwrap();
+        legacy_page(&store, tmp.path(), &old, &text);
+        let handoffs = db::count(&store.db.lock(), "handoffs").unwrap();
+        drop(store);
+
+        let store = Store::open(cfg.clone()).unwrap();
+        assert!(tmp.path().join("wiki").join(&current).is_file());
+        assert!(!tmp.path().join("wiki").join(&old).exists());
+        assert_eq!(
+            store
+                .read_page(&old)
+                .unwrap()
+                .frontmatter
+                .session
+                .as_deref(),
+            Some("01a0efaf-two")
+        );
+        assert!(
+            !tmp.path().join("wiki").join(&one).exists(),
+            "never regenerated"
+        );
+        assert_eq!(db::count(&store.db.lock(), "handoffs").unwrap(), handoffs);
+        assert_eq!(
+            store
+                .pending_handoff_routed("test-project", false, None, None)
+                .unwrap()
+                .handoff
+                .unwrap()
+                .id,
+            real.id
+        );
+        assert!(store.reliability().unwrap().inconsistent_pages.is_empty());
+
+        // Once done it never runs again: a legacy-looking file added later stays put.
+        let late = format!(
+            "test-project/sessions/{}-01a0efa0.md",
+            display_date(&now_ts())
+        );
+        std::fs::write(tmp.path().join("wiki").join(&late), &text).unwrap();
+        drop(store);
+        let _store = Store::open(cfg).unwrap();
+        assert!(tmp.path().join("wiki").join(&late).is_file());
+    }
+
+    #[test]
+    fn a_page_that_cannot_migrate_never_stops_the_store_from_opening() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config::for_data_dir(tmp.path());
+        let store = Store::open(cfg.clone()).unwrap();
+        legacy_page(
+            &store,
+            tmp.path(),
+            "test-project/sessions/2026-09-01-broken.md",
+            "---\nkind: session\nsession: [unclosed\n---\n壊れたページ\n",
+        );
+        drop(store);
+        let store = Store::open(cfg).unwrap();
+        assert!(
+            tmp.path()
+                .join("wiki/test-project/sessions/2026-09-01-broken.md")
+                .is_file()
+        );
+        let done: Option<String> = store
+            .db
+            .lock()
+            .query_row(
+                "SELECT value FROM reliability_meta WHERE key='session_pages_v2'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(done.is_some());
+    }
+
+    /// Regression (review of ca8afe5): a SessionStart with a known session id (compact /
+    /// resume) must not get the handoff it accepted earlier again; an offline replay start
+    /// must not consume the pending one.
+    #[test]
+    fn resumed_and_replayed_starts_do_not_reissue_or_consume_handoffs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(Config::for_data_dir(tmp.path())).unwrap();
+        start(&store, "writer", Some("feature"));
+        let h = handoff(&store, "writer");
+        let mut req = SessionStartRequest {
+            session_id: "reader".into(),
+            agent: "test".into(),
+            cwd: "/test".into(),
+            source: "startup".into(),
+            project: ProjectIdentity {
+                id: "test-project".into(),
+                name: "試験".into(),
+                root: "/test".into(),
+                remote: None,
+            },
+            lane: Some("feature".into()),
+        };
+        assert_eq!(
+            store
+                .start_session(&req)
+                .unwrap()
+                .pending_handoff
+                .unwrap()
+                .id,
+            h.id
+        );
+        req.source = "compact".into();
+        assert!(store.start_session(&req).unwrap().pending_handoff.is_none());
+
+        let newer = handoff(&store, "writer");
+        let mut replay = req.clone();
+        replay.session_id = "offline".into();
+        replay.source = OFFLINE_REPLAY_SOURCE.into();
+        assert!(
+            store
+                .start_session(&replay)
+                .unwrap()
+                .pending_handoff
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .pending_handoff_routed("test-project", false, None, Some("feature"))
+                .unwrap()
+                .handoff
+                .unwrap()
+                .id,
+            newer.id
+        );
+    }
+
+    #[test]
+    fn conditional_page_updates_detect_stale_and_concurrent_writers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(Store::open(Config::for_data_dir(tmp.path())).unwrap());
+        let req = WritePageRequest {
+            title: "共有メモ".into(),
+            content: "初期版".into(),
+            ..Default::default()
+        };
+        let path = store.write_page(&req).unwrap();
+        let revision = store.read_page(&path).unwrap().revision;
+        let handles: Vec<_> = ["変更A", "変更B"]
+            .into_iter()
+            .map(|body| {
+                let store = store.clone();
+                let revision = revision.clone();
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    store.write_page(&WritePageRequest {
+                        title: "共有メモ".into(),
+                        content: body.into(),
+                        path: Some(path),
+                        expected_revision: Some(revision),
+                        ..Default::default()
+                    })
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| matches!(r, Err(Error::Conflict(_))))
+                .count(),
+            1
+        );
+    }
+
+    /// Regression (review of ca8afe5): "" meant create-only, so clients that send "" for every
+    /// optional argument could no longer update pages. "" is now unconditional.
+    #[test]
+    fn empty_expected_revision_is_an_unconditional_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(Config::for_data_dir(tmp.path())).unwrap();
+        let mut req = WritePageRequest {
+            title: "空の版".into(),
+            content: "一".into(),
+            expected_revision: Some(String::new()),
+            ..Default::default()
+        };
+        let path = store.write_page(&req).unwrap();
+        req.content = "二".into();
+        assert_eq!(store.write_page(&req).unwrap(), path);
+        assert!(store.read_page(&path).unwrap().body.contains("二"));
+    }
+
+    /// Regression (review of ca8afe5): a `_global/` path written with a project, or a page
+    /// moved by `project merge`, resolved to a path that did not exist, so every retry got
+    /// "page changed; read again" forever.
+    #[test]
+    fn conditional_writes_follow_global_paths_and_redirects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(Config::for_data_dir(tmp.path())).unwrap();
+        start(&store, "s", None);
+        let global = store
+            .write_page(&WritePageRequest {
+                title: "全体メモ".into(),
+                content: "共通".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(global.starts_with("_global/"));
+        let rev = store.read_page(&global).unwrap().revision;
+        let written = store
+            .write_page(&WritePageRequest {
+                title: "全体メモ".into(),
+                content: "更新".into(),
+                project: Some("test-project".into()),
+                path: Some(global.clone()),
+                expected_revision: Some(rev),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(written, global);
+
+        let page = store
+            .write_page(&WritePageRequest {
+                title: "設計".into(),
+                content: "旧".into(),
+                project: Some("test-project".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let moved = page.replace("/pages/", "/pages/moved-");
+        std::fs::rename(
+            tmp.path().join("wiki").join(&page),
+            tmp.path().join("wiki").join(&moved),
+        )
+        .unwrap();
+        store
+            .db
+            .lock()
+            .execute(
+                "INSERT INTO page_redirects VALUES (?1, ?2)",
+                params![page, moved],
+            )
+            .unwrap();
+        let rev = store.read_page(&page).unwrap().revision;
+        let written = store
+            .write_page(&WritePageRequest {
+                title: "設計".into(),
+                content: "新".into(),
+                project: Some("test-project".into()),
+                path: Some(page.clone()),
+                expected_revision: Some(rev),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(written, moved);
+
+        let err = store
+            .write_page(&WritePageRequest {
+                title: "無い".into(),
+                content: "x".into(),
+                project: Some("test-project".into()),
+                path: Some("none.md".into()),
+                expected_revision: Some("abc".into()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "{err}");
+    }
+
+    #[test]
+    fn snapshot_restores_lanes_aliases_receipts_and_japanese_search() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(Config::for_data_dir(&tmp.path().join("live"))).unwrap();
+        start(&store, "writer", Some("feature/検索"));
+        let original = obs("writer");
+        store.add_observation(&original).unwrap();
+        let h = handoff(&store, "writer");
+        store.finalize_session("writer").unwrap();
+        db::upsert_alias(&store.db.lock(), "alias-project", "test-project", &now_ts()).unwrap();
+        let manifest = store.backup().unwrap();
+        assert!(store.reliability().unwrap().last_backup.is_some());
+        let into = tmp.path().join("restored");
+        restore_backup(Path::new(&manifest.path), &into).unwrap();
+        assert!(restore_backup(Path::new(&manifest.path), &into).is_err());
+        let restored = Store::open(Config::for_data_dir(&into)).unwrap();
+        assert_eq!(
+            restored.resolve_project_id("alias-project").unwrap(),
+            "test-project"
+        );
+        assert_eq!(restored.add_observation(&original).unwrap(), 1);
+        assert_eq!(
+            restored
+                .pending_handoff_routed("test-project", false, None, Some("feature/検索"))
+                .unwrap()
+                .handoff
+                .unwrap()
+                .id,
+            h.id
+        );
+        assert!(
+            !restored
+                .search("引き継ぎ", &SearchScope::All, 3)
+                .unwrap()
+                .is_empty()
+        );
+        let db = Path::new(&manifest.path).join("db/kioku.sqlite");
+        std::fs::write(db, "corrupt").unwrap();
+        assert!(restore_backup(Path::new(&manifest.path), &tmp.path().join("bad")).is_err());
+        assert!(!tmp.path().join("bad").exists());
+    }
+
+    /// Regression (review of ca8afe5): one unparseable page, or a page row whose file was
+    /// removed by hand, made every restore fail with "restored index differs".
+    #[test]
+    fn a_backup_with_an_unparseable_page_or_drift_still_restores() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = tmp.path().join("live");
+        let store = Store::open(Config::for_data_dir(&live)).unwrap();
+        let kept = store
+            .write_page(&WritePageRequest {
+                title: "残る記憶".into(),
+                content: "日本語の本文".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let gone = store
+            .write_page(&WritePageRequest {
+                title: "消えた記憶".into(),
+                content: "x".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        std::fs::remove_file(live.join("wiki").join(&gone)).unwrap();
+        std::fs::write(
+            live.join("wiki/_global/broken.md"),
+            "---\ntitle: [unclosed\n---\n壊れた\n",
+        )
+        .unwrap();
+        let report = store.reliability().unwrap();
+        assert_eq!(
+            report.unparseable_pages,
+            vec!["_global/broken.md".to_string()]
+        );
+        assert_eq!(report.inconsistent_pages, vec![gone]);
+        let manifest = store.backup().unwrap();
+        let into = tmp.path().join("restored");
+        restore_backup(Path::new(&manifest.path), &into).unwrap();
+        let restored = Store::open(Config::for_data_dir(&into)).unwrap();
+        assert!(restored.read_page(&kept).is_ok());
+        assert_eq!(
+            restored.search("日本語", &SearchScope::All, 3).unwrap()[0].path,
+            kept
+        );
+    }
+
+    #[test]
+    fn an_interrupted_backup_stage_is_cleaned_up_by_the_next_backup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(Config::for_data_dir(tmp.path())).unwrap();
+        let stale = tmp.path().join("backups/.deadbeef.tmp");
+        std::fs::create_dir_all(stale.join("wiki")).unwrap();
+        store.backup().unwrap();
+        assert!(!stale.exists());
+    }
+
+    #[test]
+    fn snapshot_and_concurrent_receipts_have_matching_raw_and_database_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            Store::open(Config::for_data_dir(&tmp.path().join("live"))).unwrap(),
+        );
+        start(&store, "concurrent", None);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let writer = {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                for n in 0..20 {
+                    let mut e = obs("concurrent");
+                    e.event_id = Some(format!("event-{n}"));
+                    store.add_observation(&e).unwrap();
+                }
+            })
+        };
+        barrier.wait();
+        let manifest = store.backup().unwrap();
+        writer.join().unwrap();
+        let restored = tmp.path().join("restored");
+        restore_backup(Path::new(&manifest.path), &restored).unwrap();
+        let raw = std::fs::read_to_string(restored.join("raw/test-project/concurrent.jsonl"))
+            .unwrap_or_default();
+        assert_eq!(raw.lines().count() as u64, manifest.counts["observations"]);
+        assert_eq!(store.observations("concurrent").unwrap().len(), 20);
+    }
+
+    #[test]
+    fn diagnostics_find_stale_index_content_even_when_counts_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(Config::for_data_dir(tmp.path())).unwrap();
+        let path = store
+            .write_page(&WritePageRequest {
+                title: "日本語の記憶".into(),
+                content: "引き継ぎ".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let text = std::fs::read_to_string(tmp.path().join("wiki").join(&path)).unwrap();
+        let page = store.read_page(&path).unwrap();
+        let (_, mut doc) = page_records(&page, &text);
+        doc.body = "誤った検索内容".into();
+        store.index.upsert(&doc).unwrap();
+        let report = store.reliability().unwrap();
+        assert!(report.index_count_matches);
+        assert_eq!(report.inconsistent_pages, vec![path.clone()]);
+        store.reindex().unwrap();
+        assert!(store.reliability().unwrap().inconsistent_pages.is_empty());
+        assert_eq!(
+            store.search("引き継ぎ", &SearchScope::All, 1).unwrap()[0].path,
+            path
+        );
+    }
+
+    #[test]
+    fn diagnostics_detect_external_edits_and_missing_files_without_repairing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(Config::for_data_dir(tmp.path())).unwrap();
+        let path = store
+            .write_page(&WritePageRequest {
+                title: "記憶".into(),
+                content: "本文".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let file = tmp.path().join("wiki").join(&path);
+        std::fs::write(&file, "手動編集").unwrap();
+        assert_eq!(
+            store.reliability().unwrap().inconsistent_pages,
+            vec![path.clone()]
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "手動編集");
+        std::fs::remove_file(file).unwrap();
+        assert_eq!(store.reliability().unwrap().inconsistent_pages, vec![path]);
+    }
+}

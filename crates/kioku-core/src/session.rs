@@ -51,6 +51,9 @@ impl ObservationKind {
 /// Input of `Store::add_observation` (`POST /api/v1/observations`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NewObservation {
+    /// Stable delivery ID; absent for legacy append-only clients.
+    #[serde(default)]
+    pub event_id: Option<String>,
     /// Agent session id.
     pub session_id: String,
     /// Observation kind.

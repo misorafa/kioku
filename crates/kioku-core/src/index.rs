@@ -273,6 +273,48 @@ impl SearchIndex {
         self.reader.searcher().num_docs()
     }
 
+    /// Paths whose indexed content differs from wiki-derived documents (read-only).
+    pub fn inconsistent_paths(&self, expected: &[IndexDoc]) -> anyhow::Result<Vec<String>> {
+        let mut wanted: std::collections::BTreeMap<_, _> =
+            expected.iter().map(|d| (d.path.clone(), d)).collect();
+        let searcher = self.reader.searcher();
+        let n = searcher.num_docs() as usize;
+        let mut bad = Vec::new();
+        if n > 0 {
+            let hits = searcher.search(
+                &tantivy::query::AllQuery,
+                &TopDocs::with_limit(n).order_by_score(),
+            )?;
+            for (_, addr) in hits {
+                let doc: TantivyDocument = searcher.doc(addr)?;
+                let text = |field| {
+                    doc.get_first(field)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                };
+                let path = text(self.fields.path).to_string();
+                let matches = wanted.remove(&path).is_some_and(|d| {
+                    let tags: Vec<_> = doc
+                        .get_all(self.fields.tags)
+                        .filter_map(|v| v.as_str())
+                        .collect();
+                    text(self.fields.title) == d.title
+                        && text(self.fields.body).trim_end_matches('\n')
+                            == d.body.trim_end_matches('\n')
+                        && text(self.fields.kind) == d.kind
+                        && tags == d.tags.iter().map(String::as_str).collect::<Vec<_>>()
+                });
+                if !matches {
+                    bad.push(path);
+                }
+            }
+        }
+        bad.extend(wanted.into_keys());
+        bad.sort();
+        bad.dedup();
+        Ok(bad)
+    }
+
     /// Full-text search (spec §6.3): OR semantics, title boosted ×2, scope filter, snippets.
     pub fn search(
         &self,
@@ -703,3 +745,6 @@ mod tests {
         assert!(toks.contains(&"wireguard".to_string()), "{toks:?}");
     }
 }
+
+#[cfg(test)]
+mod evaluation;

@@ -20,6 +20,22 @@ pub struct Cli {
 /// Top-level commands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Create a consistent backup on the server (returns its path and manifest).
+    Backup,
+    /// Restore a local backup into a new data directory; never overwrites live data.
+    Restore {
+        /// Server backup directory, copied to this machine if necessary.
+        backup: std::path::PathBuf,
+        /// New data directory, which must not already exist.
+        #[arg(long)]
+        into: std::path::PathBuf,
+        /// Explicit verification (checksums, database and index are always verified).
+        #[arg(long)]
+        verify: bool,
+    },
+    /// Resend observations queued while the server was unreachable (runs by itself after hooks).
+    Sync,
+
     /// Create the data dir, config.toml (with a new auth token) and the wiki repository.
     Init {
         /// Only write a [client] section pointing at an existing server.

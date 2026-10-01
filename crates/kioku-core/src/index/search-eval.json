@@ -1,0 +1,30 @@
+{
+  "pages": [
+    {"id":"handoff", "title":"作業の引き継ぎ", "body":"セッション終了時に決定事項と次にやることを記録する。次のエージェントに引き継ぎ書を渡す。"},
+    {"id":"backup", "title":"バックアップから復元", "body":"サーバーを壊してしまった。wikiとSQLiteのバックアップを新しいディレクトリに復元し、チェックサムを検証する。"},
+    {"id":"network", "title":"VPNで接続できない", "body":"外出先のWireGuardから自宅サーバーに接続する。mDNSはVPNを越えないのでIPアドレスを使う。"},
+    {"id":"search", "title":"日本語検索の仕組み", "body":"linderaで形態素解析し、tantivyで全文検索する。全角と半角をNFKCで正規化する。"},
+    {"id":"flutter", "title":"Flutterアプリ開発", "body":"Flutterでコードチャートのアプリを作っている。画面の描画を改善した。"},
+    {"id":"retry", "title":"観測の再送と重複排除", "body":"通信断の間はローカルキューに保存する。再接続後に再送し、イベントIDで重複を防ぐ。"},
+    {"id":"conflict", "title":"共有ページの編集競合", "body":"二人のエージェントが同じメモを更新する。リビジョンが異なれば競合を返し、再読込してから編集する。"},
+    {"id":"other", "title":"夕食の買い物", "body":"牛乳と卵を買う。明日の朝食にパンを焼く。"},
+    {"id":"handoff-format", "title":"引き継ぎ書の書式", "body":"見出しの順番と箇条書きの記号を決める。Markdownのテンプレートを用意した。"},
+    {"id":"git-revert", "title":"gitで以前の状態に戻す", "body":"誤ったコミットを取り消して、作業ツリーを前の版に戻した。"},
+    {"id":"flutter-ui", "title":"Flutterのボタン配置", "body":"ボタンの余白とフォントサイズを調整した。"}
+  ],
+  "queries": [
+    {"q":"引き継ぎ書", "relevant":["handoff"]},
+    {"q":"バックアップ 復元", "relevant":["backup"]},
+    {"q":"自宅サーバー WireGuard", "relevant":["network"]},
+    {"q":"形態素解析", "relevant":["search"]},
+    {"q":"Ｆｌｕｔｔｅｒ ｱﾌﾟﾘ", "relevant":["flutter"]},
+    {"q":"通信断 再送 重複", "relevant":["retry"]},
+    {"q":"メモの編集競合", "relevant":["conflict"]},
+    {"q":"決定事項 次にやること", "relevant":["handoff"], "top":true},
+    {"q":"チェックサム 検証", "relevant":["backup"], "top":true},
+    {"q":"ｺｰﾄﾞﾁｬｰﾄ 描画", "relevant":["flutter"], "top":true},
+    {"q":"NFKC 半角", "relevant":["search"]},
+    {"q":"リビジョン 再読込", "relevant":["conflict"]},
+    {"q":"引き継ぎ バックアップ", "relevant":["handoff","backup"]}
+  ]
+}

@@ -207,6 +207,24 @@ pub fn run_doctor(env: &DoctorEnv, only: Option<Agent>) -> Vec<Check> {
                 if let Ok(status) = serde_json::from_value::<StatusReport>(body) {
                     out.push(index_check(&status));
                 }
+                // The server hashes every wiki page for this (without holding its locks):
+                // give it longer than a health probe.
+                match ApiClient::new(&cfg.client, env.timeout.max(DIAGNOSTICS_TIMEOUT))
+                    .and_then(|c| c.get(&["diagnostics"], &[]))
+                {
+                    Ok(v) => {
+                        match serde_json::from_value::<kioku_core::store::ReliabilityReport>(v) {
+                            Ok(r) => out.extend(reliability_checks(&r)),
+                            Err(e) => out.push(check("storage", Status::Warn, e.to_string(), None)),
+                        }
+                    }
+                    Err(e) => out.push(check(
+                        "storage",
+                        Status::Warn,
+                        format!("diagnostics unavailable: {e}"),
+                        Some("update server or retry kioku doctor".into()),
+                    )),
+                }
                 out.push(mcp_check(&cfg.client, env.timeout));
             }
             Err(e) => {
@@ -251,6 +269,42 @@ pub fn run_doctor(env: &DoctorEnv, only: Option<Agent>) -> Vec<Check> {
         out.push(c);
     }
 
+    let queue = crate::outbox::count(&cfg);
+    let queue_error = crate::outbox::last_error(&cfg);
+    let refused = crate::outbox::failed_count(&cfg);
+    out.push(match queue {
+        Ok(n) => check(
+            "outbox",
+            if n == 0 && queue_error.is_none() && refused == 0 {
+                Status::Ok
+            } else {
+                Status::Warn
+            },
+            format!(
+                "{n} observation(s) waiting to be resent{}{}",
+                if refused > 0 {
+                    format!(
+                        "; {refused} refused by the server (kept in {})",
+                        crate::outbox::directory(&cfg).join("failed").display()
+                    )
+                } else {
+                    String::new()
+                },
+                queue_error
+                    .map(|e| format!("; last error: {e}"))
+                    .unwrap_or_default()
+            ),
+            (n > 0).then(|| {
+                "kioku sync (runs by itself after the next hook that reaches the server)".into()
+            }),
+        ),
+        Err(e) => check(
+            "outbox",
+            Status::Fail,
+            e.to_string(),
+            Some("check outbox permissions".into()),
+        ),
+    });
     out.push(hook_log_check(&cfg, env));
     out.push(hook_dump_check(&cfg, env));
     out
@@ -1700,5 +1754,139 @@ mod tests {
         assert!(find_rpc_answer("{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{}}").is_some());
         assert!(find_rpc_answer("data: {\"jsonrpc\":\"2.0\",\"method\":\"x\"}\n").is_none());
         assert!(find_rpc_answer("data: {\"jsonrpc\"").is_none());
+    }
+}
+
+/// Deadline for `GET /diagnostics` (it reads and hashes the whole wiki on the server).
+const DIAGNOSTICS_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Storage health from `GET /diagnostics` (SPEC-M2.6 §4). Staleness is informational: an
+/// idle machine records nothing and a user may keep backups elsewhere, so neither warns.
+fn reliability_checks(r: &kioku_core::store::ReliabilityReport) -> Vec<Check> {
+    let age = |s: &Option<String>| {
+        s.as_deref()
+            .and_then(kioku_core::util::parse_ts)
+            .map(|t| (kioku_core::util::now() - t).num_hours())
+    };
+    let backup = match (&r.last_backup, age(&r.last_backup)) {
+        (Some(at), Some(h)) if h < 168 => check(
+            "backup",
+            Status::Ok,
+            format!("last completed backup: {at}"),
+            None,
+        ),
+        (Some(at), _) => check(
+            "backup",
+            Status::Warn,
+            format!("last completed backup: {at} (older than 7 days)"),
+            Some("kioku backup; copy the snapshot off this server".into()),
+        ),
+        (None, _) => check(
+            "backup",
+            Status::Ok,
+            "no kioku backup yet (optional: `kioku backup`, then copy the snapshot off this server)",
+            None,
+        ),
+    };
+    let drift = !r.inconsistent_pages.is_empty() || !r.index_count_matches;
+    let mut out = vec![
+        check(
+            "recording",
+            Status::Ok,
+            format!(
+                "last observation received: {}",
+                r.last_received.as_deref().unwrap_or("never")
+            ),
+            None,
+        ),
+        backup,
+        check(
+            "wiki.git",
+            if r.git_error.is_some() {
+                Status::Warn
+            } else {
+                Status::Ok
+            },
+            r.git_error
+                .clone()
+                .unwrap_or_else(|| "no recorded commit failure".into()),
+            r.git_error.as_ref().map(|_| {
+                "check the wiki's git status, disk space and permissions on the server".into()
+            }),
+        ),
+        check(
+            "storage.consistency",
+            if drift { Status::Warn } else { Status::Ok },
+            if drift {
+                format!(
+                    "{} page(s) differ between wiki files, metadata and the search index{}: {}",
+                    r.inconsistent_pages.len(),
+                    if r.index_count_matches {
+                        ""
+                    } else {
+                        " (index count differs)"
+                    },
+                    preview(&r.inconsistent_pages)
+                )
+            } else {
+                "wiki files, metadata and search index agree".into()
+            },
+            drift.then(|| "kioku reindex (on the server machine)".into()),
+        ),
+    ];
+    if !r.unparseable_pages.is_empty() {
+        out.push(check(
+            "storage.unparseable",
+            Status::Warn,
+            format!(
+                "{} page(s) cannot be parsed and are not searchable: {}",
+                r.unparseable_pages.len(),
+                preview(&r.unparseable_pages)
+            ),
+            Some("fix their frontmatter by hand (or remove them), then kioku reindex".into()),
+        ));
+    }
+    out
+}
+
+/// The first few paths of a list, for one-line messages.
+fn preview(paths: &[String]) -> String {
+    let mut s = paths.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+    if paths.len() > 3 {
+        s.push_str(&format!(", … (+{})", paths.len() - 3));
+    }
+    s
+}
+
+#[cfg(test)]
+mod reliability_tests {
+    use super::*;
+    #[test]
+    fn recording_backup_and_integrity_have_distinct_health_signals() {
+        let mut report = kioku_core::store::ReliabilityReport {
+            last_received: None,
+            last_backup: None,
+            git_error: None,
+            inconsistent_pages: vec![],
+            unparseable_pages: vec![],
+            index_count_matches: true,
+        };
+        // A fresh or idle install is healthy: nothing recorded yet and no backup is not a
+        // warning.
+        let checks = reliability_checks(&report);
+        assert!(checks.iter().all(|c| c.status == Status::Ok), "{checks:?}");
+        report.last_backup = Some("2020-01-01T00:00:00.000Z".into());
+        report.git_error = Some("git commit failed".into());
+        report
+            .inconsistent_pages
+            .push("project/pages/記憶.md".into());
+        report.unparseable_pages.push("_global/壊れた.md".into());
+        let checks = reliability_checks(&report);
+        let status = |name: &str| checks.iter().find(|c| c.id == name).unwrap().status;
+        assert_eq!(status("backup"), Status::Warn);
+        assert_eq!(status("wiki.git"), Status::Warn);
+        assert_eq!(status("storage.consistency"), Status::Warn);
+        assert_eq!(status("storage.unparseable"), Status::Warn);
+        assert_eq!(exit_code(&checks), 0);
     }
 }

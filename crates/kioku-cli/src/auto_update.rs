@@ -324,9 +324,16 @@ pub fn with_notice(block: &str, line: &str) -> String {
 /// and their console: a new process group with null stdio on Unix, `DETACHED_PROCESS |
 /// CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW` on Windows. Not waited for.
 pub fn spawn_background(tag: &str) -> anyhow::Result<()> {
+    spawn_detached(&["update", "--version", tag, "--background"])
+        .context("starting kioku update --background")
+}
+
+/// Starts `kioku <args>` detached from the hook, the agent and their console (see
+/// [`spawn_background`]). Shared with the offline-queue replay (`kioku sync`).
+pub fn spawn_detached(args: &[&str]) -> anyhow::Result<()> {
     let exe = current_binary().context("locating the kioku binary")?;
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(["update", "--version", tag, "--background"])
+    cmd.args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -343,7 +350,7 @@ pub fn spawn_background(tag: &str) -> anyhow::Result<()> {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
-    cmd.spawn().context("starting kioku update --background")?;
+    cmd.spawn()?;
     Ok(())
 }
 

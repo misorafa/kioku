@@ -1,6 +1,7 @@
 # kioku M1 — specification
 
-Status: authoritative for milestone M1. Later milestones (M2 web UI + other
+Status: authoritative for milestone M1. SPEC-M2.6 amends persistence, session page
+identity, retry semantics, conditional page writes, diagnostics and recovery. Later milestones (M2 web UI + other
 agents' installers, M3 embeddings + bi-temporal facts, M4 ingest adapters,
 M5 eval harness) are out of scope here and must not leak into M1 code paths.
 

@@ -910,6 +910,12 @@ fn doctor_all_ok_then_warn_and_fail_scenarios() {
     // Expected warnings: the test binary lives in a temp dir; Codex trust is unverifiable.
     expected.insert("binary".into(), Status::Warn);
     expected.insert("agent.codex.trust".into(), Status::Warn);
+    // A fresh install: nothing recorded yet and no backup are informational (SPEC-M2.6 §4).
+    expected.insert("recording".into(), Status::Ok);
+    expected.insert("backup".into(), Status::Ok);
+    expected.insert("wiki.git".into(), Status::Ok);
+    expected.insert("storage.consistency".into(), Status::Ok);
+    expected.insert("outbox".into(), Status::Ok);
     expected.insert("update".into(), Status::Ok);
     assert_eq!(
         statuses(&checks),

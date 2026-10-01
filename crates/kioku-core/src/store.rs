@@ -4,12 +4,15 @@
 //! `tokio::task::spawn_blocking`. Page writes, finalize and reindex are serialized by one
 //! write lock; lock order is always write lock → db → index writer.
 
+mod reliability;
+pub use reliability::{BackupManifest, ReliabilityReport, restore_backup};
+
 use std::io::Write;
 use std::path::Path;
 
 use anyhow::Context;
 use parking_lot::Mutex;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
@@ -20,7 +23,9 @@ use crate::git::Git;
 use crate::handoff::{Handoff, HandoffInput, HandoffSource, PendingHandoff, render_agent_handoff};
 use crate::index::{Hit, INDEX_SCHEMA_VERSION, IndexDoc, SearchIndex, SearchScope};
 use crate::layout::DataDir;
-use crate::page::{Frontmatter, Page, PageKind, PageScope, resolve_write_path, validate_rel_path};
+use crate::page::{
+    Frontmatter, GLOBAL_DIR, Page, PageKind, PageScope, resolve_write_path, validate_rel_path,
+};
 use crate::project::{
     ProjectIdentity, comparable_root, is_derived_id, is_remote_derived, is_valid_id, normalize_lane,
 };
@@ -42,9 +47,15 @@ pub const RECENT_SESSIONS: usize = 5;
 /// Sessions considered for STATE.md.
 pub const STATE_SESSIONS: usize = 10;
 
+/// `SessionStartRequest.source` of a session re-created while replaying queued observations.
+pub const OFFLINE_REPLAY_SOURCE: &str = "offline-replay";
+
 /// Input of `Store::write_page` (`kioku_write_page`, `PUT /api/v1/pages`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WritePageRequest {
+    /// Revision from a read; empty means create-only, absent means unconditional.
+    #[serde(default)]
+    pub expected_revision: Option<String>,
     /// Page title.
     pub title: String,
     /// Markdown body.
@@ -159,6 +170,10 @@ impl Store {
                 "the search index was built by an older kioku; run `kioku reindex` so search \
                  matches this version (e.g. full-width / half-width text)"
             );
+        }
+        // Never fatal: a page that cannot move stays where it is and stays readable.
+        if let Err(e) = store.migrate_session_pages() {
+            tracing::warn!(error = %e, "session page migration did not finish; retrying at next start");
         }
         Ok(store)
     }
@@ -282,7 +297,16 @@ impl Store {
                     lane: lane.clone(),
                 },
             )?;
-            let routed = route_pending(&tx, &project_id, lane.as_deref(), &req.session_id, &now)?;
+            // A session re-created by an offline replay is not a person starting work: it
+            // must not consume the handoff meant for the next real session (SPEC-M2.6 §3).
+            let routed = if req.source == OFFLINE_REPLAY_SOURCE {
+                PendingHandoff {
+                    handoff: None,
+                    reference_handoff: None,
+                }
+            } else {
+                route_pending(&tx, &project_id, lane.as_deref(), &req.session_id, &now)?
+            };
             let recent = recent_sessions(&tx, &project_id, None, RECENT_SESSIONS)?;
             tx.commit().context("committing session start")?;
             (project_id, routed, recent)
@@ -305,7 +329,12 @@ impl Store {
             let conn = self.db.lock();
             let session = db::get_session(&conn, id)?
                 .ok_or_else(|| Error::not_found(format!("session {id}")))?;
-            let pending = db::newest_handoff_accepted_by(&conn, id)?;
+            let pending = db::newest_handoff_accepted_by(
+                &conn,
+                id,
+                &session.project_id,
+                session.lane.as_deref(),
+            )?;
             // A branch lane without a handoff of its own sees the project lane's pending one
             // for reference (§1.4 rule 2), without consuming it.
             let reference = match (&pending, &session.lane) {
@@ -374,11 +403,37 @@ impl Store {
             .map(util::fmt_ts)
             .unwrap_or_else(now_ts);
         let payload_json = serde_json::to_string(&payload).context("serializing payload")?;
+        if obs
+            .event_id
+            .as_ref()
+            .is_some_and(|id| id.is_empty() || id.len() > 200)
+        {
+            return Err(Error::invalid("event_id must be 1..200 bytes"));
+        }
+        let mut receipt_content =
+            serde_json::to_value((obs.kind, &obs.ts, &payload)).context("normalizing delivery")?;
+        receipt_content.sort_all_objects();
+        let request_hash =
+            sha256_hex(&serde_json::to_string(&receipt_content).context("hashing delivery")?);
+        let mut conn = self.db.lock();
         let (seq, project_id) = {
-            let mut conn = self.db.lock();
             let tx = conn.transaction().context("starting transaction")?;
             let session = db::get_session(&tx, &obs.session_id)?
                 .ok_or_else(|| Error::not_found(format!("session {}", obs.session_id)))?;
+            if let Some(id) = &obs.event_id {
+                let receipt: Option<(i64, String)> = tx.query_row(
+                    "SELECT seq, request_hash FROM observation_receipts WHERE session_id=?1 AND event_id=?2",
+                    params![obs.session_id, id], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .optional().context("reading receipt")?;
+                if let Some((seq, old_hash)) = receipt {
+                    if old_hash != request_hash {
+                        return Err(Error::Conflict(
+                            "event_id reused with different content".into(),
+                        ));
+                    }
+                    return Ok(seq);
+                }
+            }
             let seq = db::insert_observation(
                 &tx,
                 &session.id,
@@ -393,6 +448,18 @@ impl Store {
             if substantive && session.status == SessionStatus::Finalized {
                 db::set_session_status(&tx, &session.id, SessionStatus::Open, None)?;
             }
+            if let Some(id) = &obs.event_id {
+                tx.execute(
+                    "INSERT INTO observation_receipts VALUES (?1,?2,?3,?4)",
+                    params![obs.session_id, id, seq, request_hash],
+                )
+                .context("recording receipt")?;
+            }
+            tx.execute(
+                "INSERT OR REPLACE INTO reliability_meta VALUES ('last_received', ?1)",
+                [now_ts()],
+            )
+            .context("recording receipt time")?;
             tx.commit().context("committing observation")?;
             (seq, session.project_id)
         };
@@ -695,11 +762,19 @@ impl Store {
         if title.is_empty() {
             return Err(Error::invalid("title must not be empty"));
         }
-        let scope = req.scope.unwrap_or(if req.project.is_some() {
-            PageScope::Project
-        } else {
-            PageScope::Global
+        // A path read from `_global/…` is a global page even when the agent also names its
+        // project (it usually does); nesting it under `<project>/pages/` would write elsewhere.
+        let explicit_global = req.path.as_deref().is_some_and(|p| {
+            p.trim_start_matches('/')
+                .starts_with(&format!("{GLOBAL_DIR}/"))
         });
+        let scope = req
+            .scope
+            .unwrap_or(if req.project.is_some() && !explicit_global {
+                PageScope::Project
+            } else {
+                PageScope::Global
+            });
         let project = match scope {
             PageScope::Global => None,
             PageScope::Project => {
@@ -710,7 +785,11 @@ impl Store {
                 Some(self.project(id)?.id)
             }
         };
-        let path = resolve_write_path(title, scope, project.as_deref(), req.path.as_deref())?;
+        let path =
+            match self.redirected_write_path(req.path.as_deref(), scope, project.as_deref())? {
+                Some(moved) => moved,
+                None => resolve_write_path(title, scope, project.as_deref(), req.path.as_deref())?,
+            };
         let fm = Frontmatter {
             title: title.to_string(),
             project,
@@ -720,13 +799,81 @@ impl Store {
             ..Frontmatter::default()
         };
         let _write = self.write_lock.lock();
+        // An empty revision is the same as none: some MCP clients send "" for every
+        // optional string argument, and that must keep the legacy unconditional write.
+        if let Some(expected) = req.expected_revision.as_deref().filter(|r| !r.is_empty()) {
+            let actual = match std::fs::read(self.dirs.wiki().join(&path)) {
+                Ok(bytes) => format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(&bytes)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(Error::Conflict(format!(
+                        "{path} does not exist, so it cannot match expected_revision; check the \
+                         path and scope (a revision is only for updating an existing page)"
+                    )));
+                }
+                Err(e) => {
+                    return Err(anyhow::Error::from(e)
+                        .context("reading page revision")
+                        .into());
+                }
+            };
+            if expected != actual {
+                return Err(Error::Conflict(format!(
+                    "{path} changed since it was read; read it again before writing"
+                )));
+            }
+        }
         self.put_page(&path, fm, &req.content)?;
         Ok(path)
+    }
+
+    /// Where an explicit write path that was moved (merge, migration) lives now, when that
+    /// place is one this scope may write (`<project>/pages/…` or `_global/…`).
+    fn redirected_write_path(
+        &self,
+        explicit: Option<&str>,
+        scope: PageScope,
+        project: Option<&str>,
+    ) -> Result<Option<String>> {
+        let Some(raw) = explicit else {
+            return Ok(None);
+        };
+        let rel = validate_rel_path(raw)?;
+        if self.dirs.wiki().join(&rel).is_file() {
+            return Ok(None);
+        }
+        let moved = self.follow_redirect(rel.clone())?;
+        if moved == rel {
+            return Ok(None);
+        }
+        let root = match (scope, project) {
+            (PageScope::Project, Some(p)) => format!("{p}/pages/"),
+            _ => format!("{GLOBAL_DIR}/"),
+        };
+        Ok(moved.starts_with(&root).then_some(moved))
+    }
+
+    /// `rel`, or where a moved page now lives (`page_redirects`); a real file at `rel` wins.
+    fn follow_redirect(&self, rel: String) -> Result<String> {
+        if self.dirs.wiki().join(&rel).is_file() {
+            return Ok(rel);
+        }
+        Ok(self
+            .db
+            .lock()
+            .query_row(
+                "SELECT new_path FROM page_redirects WHERE old_path=?1",
+                [&rel],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .context("reading page redirect")?
+            .unwrap_or(rel))
     }
 
     /// Reads a page by wiki-relative path.
     pub fn read_page(&self, path: &str) -> Result<Page> {
         let rel = validate_rel_path(path)?;
+        let rel = self.follow_redirect(rel)?;
         let file = self.dirs.wiki().join(&rel);
         let text = match std::fs::read_to_string(&file) {
             Ok(t) => t,
@@ -885,6 +1032,18 @@ impl Store {
             let mut conn = self.db.lock();
             let tx = conn.transaction().context("starting transaction")?;
             db::move_project_rows(&tx, from, &into_row.id)?;
+            for (old, new) in &moves {
+                tx.execute(
+                    "UPDATE page_redirects SET new_path=?2 WHERE new_path=?1",
+                    params![old, new],
+                )
+                .context("moving legacy redirects")?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO page_redirects VALUES (?1,?2)",
+                    params![old, new],
+                )
+                .context("preserving moved page paths")?;
+            }
             db::repoint_aliases(&tx, from, &into_row.id)?;
             db::upsert_alias(&tx, from, &into_row.id, &now_ts())?;
             tx.commit().context("committing project merge")?;
@@ -926,12 +1085,14 @@ impl Store {
             fm.created = now.clone();
         }
         fm.updated = now;
-        let page = Page {
+        let mut page = Page {
+            revision: String::new(),
             path: path.to_string(),
             frontmatter: fm,
             body: body.to_string(),
         };
         let text = page.render()?;
+        page.revision = sha256_hex(&text);
         write_atomic(&file, &text)?;
         let (row, doc) = page_records(&page, &text);
         db::upsert_page(&self.db.lock(), &row)?;
@@ -1276,6 +1437,11 @@ fn write_atomic(file: &Path, text: &str) -> Result<()> {
         util::new_id()
     ));
     std::fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&tmp)
+        .and_then(|f| f.sync_all())
+        .context("syncing page")?;
     std::fs::rename(&tmp, file).with_context(|| format!("renaming into {}", file.display()))?;
     Ok(())
 }
@@ -1334,6 +1500,7 @@ mod tests {
     fn observe(store: &Store, session: &str, kind: ObservationKind, payload: serde_json::Value) {
         store
             .add_observation(&NewObservation {
+                event_id: None,
                 session_id: session.into(),
                 kind,
                 ts: None,
@@ -1906,7 +2073,10 @@ mod tests {
         assert!(first.substantive);
         let page_path = first.session_page.clone().unwrap();
         assert!(page_path.starts_with("kioku-3f9a1c2e/sessions/"));
-        assert!(page_path.ends_with("-0c2f1a2b.md"));
+        assert!(page_path.ends_with(&format!(
+            "-0c2f1a2b-{}.md",
+            &sha256_hex("0c2f1a2b-aaaa")[..12]
+        )));
         let page = store.read_page(&page_path).unwrap();
         assert_eq!(page.frontmatter.kind, PageKind::Session);
         assert_eq!(page.frontmatter.tags, vec!["claude-code"]);
@@ -2291,7 +2461,11 @@ mod tests {
         store.finalize_session("cursor-1").unwrap();
         let ctx = store.session_context("cursor-1").unwrap();
         assert_eq!(ctx.recent_sessions.len(), 1);
-        assert!(ctx.recent_sessions[0].path.ends_with("-earlier.md"));
+        assert!(
+            ctx.recent_sessions[0]
+                .path
+                .ends_with(&format!("-earlier-{}.md", &sha256_hex("earlier")[..12]))
+        );
         assert_eq!(ctx.pending_handoff.unwrap().id, rules);
     }
 
@@ -2483,6 +2657,7 @@ mod tests {
         assert_eq!(raw.lines().count(), 1);
         assert!(!raw.contains("hunter2"));
         let err = store.add_observation(&NewObservation {
+            event_id: None,
             session_id: "unknown".into(),
             kind: ObservationKind::Prompt,
             ts: None,
@@ -2490,6 +2665,7 @@ mod tests {
         });
         assert!(matches!(err, Err(Error::NotFound(_))));
         let err = store.add_observation(&NewObservation {
+            event_id: None,
             session_id: "../x".into(),
             kind: ObservationKind::Prompt,
             ts: None,

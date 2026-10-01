@@ -8,7 +8,7 @@ change between minor versions.
 
 kioku is a self-hosted memory server shared by all your AI coding agents on all
 your machines. It is a single Rust binary. Everything it remembers is plain
-Markdown in a git repository (the source of truth); SQLite holds metadata and a
+Markdown in a git repository (the source of truth for page content); SQLite holds session, observation and handoff state, and a
 tantivy index makes it searchable, with Japanese segmented properly by lindera
 (IPADIC) — Japanese is the primary language, English works too. Agents reach it
 through MCP (streamable HTTP) and lifecycle hooks: sessions are captured
@@ -537,7 +537,7 @@ write a handoff before stopping.
 ```
 ~/.kioku/                       # $KIOKU_DATA_DIR
   config.toml
-  wiki/                         # git repository — source of truth
+  wiki/                         # git repository — source of truth for page content
     _global/<slug>.md           # cross-project pages (scope = global)
     <project_id>/
       STATE.md                  # current state, rewritten at every finalize
@@ -551,9 +551,9 @@ write a handoff before stopping.
 ```
 
 Pages are Markdown with YAML frontmatter; you can read and edit them with any
-editor (run `kioku reindex` afterwards so search sees the change). kioku commits but never pushes: backing up (for example, pushing
-`wiki/` to a private remote, and copying `db/`, where handoffs live) is up to
-you.
+editor (run `kioku reindex` afterwards so search sees the change). kioku commits but never pushes.
+Use `kioku backup` for a consistent wiki/SQLite/raw snapshot and copy it off the server;
+see the recovery section below.
 
 Page file names are the ASCII slug of the title; when slugging drops anything
 (non-ASCII, punctuation, repeated separators — `C++ tips` vs `C tips`) a
@@ -727,7 +727,52 @@ self-hosted server shared by every machine. On the roadmap: whole-life ingest
 - **Later**: web UI.
 - **M3**: embeddings + bi-temporal facts.
 - **M4**: ingest adapters.
-- **M5**: eval harness.
+- **M5**: eval harness (Japanese retrieval and failure regression baseline delivered early in M2.6).
+
+## Reliable memory and recovery (M2.6)
+
+**Session pages** are named `YYYY-MM-DD-<first 8 of the session id>-<12 hex of its SHA-256>.md`,
+so two sessions whose ids share their first 8 characters (Codex ids started within about a
+minute) no longer overwrite each other. Existing session pages are renamed once, at the
+first start of this version, in one git commit; the old paths keep working through
+redirects. A page lost to an earlier collision is not regenerated.
+
+**Page updates without lost edits.** `kioku_read` returns a `revision`; pass it to
+`kioku_write_page` as `expected_revision` and a write over someone else's newer change
+fails (HTTP 409 / MCP tool error) instead of replacing it — read again, merge, write. No
+`expected_revision` (or an empty one) keeps the old unconditional write.
+
+**Offline recording.** Observations normally go to the server exactly as before. When a
+delivery fails because the server cannot be reached (or answers 5xx), the observation is
+kept in a private queue under `~/.kioku/outbox/` (no token stored; 50 MiB / 10,000 entries
+per server) and resent by `kioku sync`, which starts by itself in the background after a
+later hook. Resending is safe: each observation carries an id the server de-duplicates,
+so a delivery whose answer was lost is not recorded twice. Entries the server refuses for
+good are moved to `outbox/<server>/failed/` and shown by `kioku doctor`. This needs a
+server of this version; with an older server nothing is queued.
+
+**Backup and restore.**
+
+```sh
+kioku backup                                         # on any machine; runs on the server
+kioku restore <backup dir> --into <new data directory>
+```
+
+`backup` writes a snapshot on the **server** under `<data_dir>/backups/<id>/`: the wiki
+(with its git history), a consistent SQLite copy and the raw observation logs, with a
+manifest of SHA-256 checksums. It excludes configuration, tokens, logs and the search
+index (rebuilt on restore). Page writes pause while the wiki is copied; recording does
+not. Copy snapshots off the server and remove old ones yourself. `restore` runs locally,
+only into a directory that does not exist yet, and always verifies checksums, SQLite
+integrity, row counts and the rebuilt search index; it never touches a running service.
+Run `KIOKU_DATA_DIR=<restored dir> kioku init` to give it fresh credentials. Markdown alone
+and `kioku reindex` cannot bring back sessions and handoffs — they live in SQLite.
+
+**Diagnostics.** `kioku doctor` also shows the last observation the server received, the
+last backup (warns when older than 7 days), wiki git commit failures, drift between wiki
+files, metadata and the search index, pages that cannot be parsed, and the offline queue.
+The Japanese retrieval evaluation runs in CI; print Recall@3 / MRR@3 with
+`cargo test -p kioku-core search_evaluation -- --nocapture`.
 
 ## License
 
