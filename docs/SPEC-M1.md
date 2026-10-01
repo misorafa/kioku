@@ -471,6 +471,12 @@ Apply to `prompt`, `tool_input`, `tool_response` text (serialized):
 
 ### 8.3 SessionStart output
 
+> **Superseded by [SPEC-M3.0 §1](SPEC-M3.0.md)** (2026-10-01): the block now carries the
+> handoff, decisions / open questions carried from earlier handoffs, pinned pages, recent
+> sessions and the previous session's last reply, each section with its own cap, within
+> 8,000 chars; the STATE.md excerpt is no longer printed. The layout below is what a client
+> still prints for an older server's response (no `context_version`).
+
 Print plain text (Claude Code adds stdout of SessionStart hooks as context):
 
 ```

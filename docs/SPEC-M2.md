@@ -1361,7 +1361,9 @@ New `[client]` keys: `hook_dump = false`, `cursor_late_context = true`.
   redacts secrets in pages and handoffs as in observations. Agents must judge stored
   procedures before running them.
 - kioku is single-user by design: one token, one person's machines. Everyone holding the
-  token reads and writes all memory; there are no per-user permissions.
+  token reads and writes all memory; there are no per-user permissions. One server = one
+  person; the token is never shared between people. The machine name shown at session start
+  (SPEC-M3.0 §6) tells that person's machines apart, not users.
 - `hook-dump.jsonl` holds raw payloads: 0600, opt-in, flagged by doctor.
 - Codex hook trust and Gemini project-hook fingerprints are the user's decision;
   kioku never writes trust state.
