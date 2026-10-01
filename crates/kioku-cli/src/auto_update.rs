@@ -36,12 +36,10 @@ pub const NOTICE_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 pub const MISMATCH_WARN: Duration = Duration::from_secs(24 * 3600);
 /// The server's first check after start (§3.1 step 1).
 pub const FIRST_CHECK: Duration = Duration::from_secs(10 * 60);
-/// The server's check interval (± [`CHECK_JITTER`]).
-pub const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 3600);
-/// Maximal jitter of [`CHECK_INTERVAL`].
-pub const CHECK_JITTER: Duration = Duration::from_secs(3600);
+/// The server's retention run interval (SPEC-M2.8 §3: daily; ± an eighth of jitter).
+pub const PRUNE_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 /// The server's first retention run: 10 minutes after the first update check (SPEC-M2.8
-/// §3), then every [`next_interval`].
+/// §3), then every [`PRUNE_INTERVAL`].
 pub const FIRST_PRUNE: Duration = Duration::from_secs(FIRST_CHECK.as_secs() + 10 * 60);
 /// Client-side log of automatic updates, in `<kioku dir>/logs/`.
 pub const UPDATE_LOG: &str = "update.log";
@@ -690,26 +688,30 @@ pub fn server_check_once(check: &ServerCheck, status: &SharedUpdateStatus) -> Se
     }
 }
 
-/// [`CHECK_INTERVAL`] ± up to [`CHECK_JITTER`] (from the clock and pid; no RNG crate).
-pub fn next_interval() -> Duration {
+/// `base` ± up to an eighth of it (from the clock and pid; no RNG crate), so several
+/// servers do not all ask GitHub at the same second.
+pub fn next_interval(base: Duration) -> Duration {
+    let jitter = (base.as_secs() / 8).max(1);
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.subsec_nanos() as u64)
         .unwrap_or(0);
     let mixed = nanos ^ (u64::from(std::process::id())).wrapping_mul(2_654_435_761);
-    let span = 2 * CHECK_JITTER.as_secs() + 1;
-    let offset = (mixed % span) as i64 - CHECK_JITTER.as_secs() as i64;
-    Duration::from_secs((CHECK_INTERVAL.as_secs() as i64 + offset) as u64)
+    let span = 2 * jitter + 1;
+    let offset = (mixed % span) as i64 - jitter as i64;
+    Duration::from_secs((base.as_secs() as i64 + offset) as u64)
 }
 
-/// The server's update loop: first check after `first`, then every [`next_interval`].
-/// After a successful update it sets `shutdown` to `true` and returns (the caller exits
-/// 75); with `auto` off it logs each newly seen release once.
+/// The server's update loop: first check after `first`, then every `interval` (±
+/// [`next_interval`] jitter; `[update] interval_hours`). After a successful update it
+/// sets `shutdown` to `true` and returns (the caller exits 75); with `auto` off it logs
+/// each newly seen release once.
 pub async fn server_update_task(
     check: ServerCheck,
     status: SharedUpdateStatus,
     shutdown: tokio::sync::watch::Sender<bool>,
     first: Duration,
+    interval: Duration,
 ) {
     tokio::time::sleep(first).await;
     let mut announced: Option<String> = None;
@@ -746,12 +748,12 @@ pub async fn server_update_task(
             }
             ServerOutcome::UpToDate => tracing::debug!("kioku is up to date"),
         }
-        tokio::time::sleep(next_interval()).await;
+        tokio::time::sleep(next_interval(interval)).await;
     }
 }
 
 /// The server's daily retention run (SPEC-M2.8 §3): `Store::prune` on the blocking pool
-/// after `first`, then every [`next_interval`]. Started by `kioku serve` unless
+/// after `first`, then every [`PRUNE_INTERVAL`]. Started by `kioku serve` unless
 /// `[retention] auto = false`; failures are logged and retried at the next interval.
 pub async fn prune_task(store: std::sync::Arc<kioku_core::Store>, first: Duration) {
     tokio::time::sleep(first).await;
@@ -762,7 +764,7 @@ pub async fn prune_task(store: std::sync::Arc<kioku_core::Store>, first: Duratio
             Ok(Err(e)) => tracing::warn!(error = format!("{e:#}"), "daily prune failed"),
             Err(e) => tracing::warn!(error = %e, "daily prune panicked"),
         }
-        tokio::time::sleep(next_interval()).await;
+        tokio::time::sleep(next_interval(PRUNE_INTERVAL)).await;
     }
 }
 

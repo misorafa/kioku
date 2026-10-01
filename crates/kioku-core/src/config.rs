@@ -106,6 +106,9 @@ pub struct UpdateConfig {
     /// Honour `KIOKU_DOWNLOAD_BASE` / `KIOKU_REPO` (a release mirror or fork; SPEC-M2.7 §11).
     /// Off by default: an environment variable alone cannot redirect updates.
     pub allow_mirror: bool,
+    /// Hours between the server's release checks (SPEC-M2.5 §3.1; 1–168, default 4). The
+    /// jitter is an eighth of it. Clients follow the server at every session start.
+    pub interval_hours: u32,
 }
 
 impl Default for UpdateConfig {
@@ -114,7 +117,18 @@ impl Default for UpdateConfig {
             auto: true,
             channel: "stable".to_string(),
             allow_mirror: false,
+            interval_hours: DEFAULT_UPDATE_INTERVAL_HOURS,
         }
+    }
+}
+
+/// Default of `[update] interval_hours`.
+pub const DEFAULT_UPDATE_INTERVAL_HOURS: u32 = 4;
+
+impl UpdateConfig {
+    /// The check interval as a duration, clamped to 1 h … 7 days.
+    pub fn interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(self.interval_hours.clamp(1, 168)) * 3600)
     }
 }
 

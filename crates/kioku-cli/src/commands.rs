@@ -504,6 +504,7 @@ fn serve(
             Some(format!("kioku: warning: {e:#}; automatic updates are off")),
         ),
     };
+    let update_interval = cfg.update.interval();
     let store = match Store::open(cfg) {
         Ok(s) => Arc::new(s),
         // SPEC-M2.7 §5: an older binary never touches a newer data directory.
@@ -585,6 +586,7 @@ fn serve(
                     update,
                     tx,
                     crate::auto_update::FIRST_CHECK,
+                    update_interval,
                 ));
             }
             // No update task: nothing will request a shutdown.

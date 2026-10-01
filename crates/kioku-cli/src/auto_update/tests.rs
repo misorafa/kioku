@@ -177,10 +177,26 @@ fn state_file_round_trip_and_lock() {
 
 #[test]
 fn check_interval_has_bounded_jitter() {
+    let four_hours = Duration::from_secs(4 * 3600);
+    let half_hour = Duration::from_secs(1800);
     for _ in 0..50 {
-        let d = next_interval();
-        assert!(d >= CHECK_INTERVAL - CHECK_JITTER && d <= CHECK_INTERVAL + CHECK_JITTER);
+        let d = next_interval(four_hours);
+        assert!(
+            d >= four_hours - half_hour && d <= four_hours + half_hour,
+            "{d:?}"
+        );
     }
+    assert!(next_interval(Duration::from_secs(1)) >= Duration::ZERO);
+}
+
+#[test]
+fn update_interval_comes_from_config_and_is_clamped() {
+    let mut u = kioku_core::config::UpdateConfig::default();
+    assert_eq!(u.interval(), Duration::from_secs(4 * 3600));
+    u.interval_hours = 0;
+    assert_eq!(u.interval(), Duration::from_secs(3600));
+    u.interval_hours = 1000;
+    assert_eq!(u.interval(), Duration::from_secs(168 * 3600));
 }
 
 fn status() -> SharedUpdateStatus {
@@ -356,6 +372,7 @@ async fn server_task_swaps_the_binary_and_requests_exit() {
         st.clone(),
         tx,
         Duration::from_millis(10),
+        Duration::from_secs(3600),
     ));
     tokio::time::timeout(Duration::from_secs(30), rx.wait_for(|v| *v))
         .await

@@ -149,7 +149,7 @@ kioku が入っているマシンでは、トークンをコマンドライン�
 
 ### 更新
 
-更新は自動です。サーバー（`kioku service` として動いているもの）は 1 日 1 回 GitHub を確認し、
+更新は自動です。サーバー（`kioku service` として動いているもの）は 4 時間ごと（`[update] interval_hours` で変更可）に GitHub を確認し、
 新しい安定版リリースがあれば自分でインストールして再起動します（SHA-256 を検証し、macOS では
 kioku の Developer ID で署名されたバイナリだけを受け入れます）。クライアントは GitHub ではなく
 サーバーに追従します。SessionStart フックがサーバーの新しいバージョンに気づくと、クライアントを
@@ -563,6 +563,7 @@ lang = "ja"             # ja | en — SessionStart のブロックと Stop の�
 [update]                # 任意。値はいずれも既定値
 auto = true             # false = 自動更新せず、お知らせだけを出す
 channel = "stable"      # タグに "-" を含まないリリース
+interval_hours = 4      # サーバーがリリースを確認する間隔（時間、1〜168）
 
 [retention]             # 任意。値はいずれも既定値（日数 0 = 無期限に保持）
 raw_days = 90           # これより古い raw/*.jsonl は gzip、2 倍の日数で削除

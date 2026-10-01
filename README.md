@@ -165,7 +165,7 @@ history.
 ### Updates
 
 Updates are automatic. The server (when it runs as `kioku service`) checks
-GitHub once a day and installs a newer stable release itself — SHA-256
+GitHub every 4 hours (`[update] interval_hours`) and installs a newer stable release itself — SHA-256
 verified, and on macOS only a binary signed by kioku's Developer ID — then
 restarts. Clients follow the server, not GitHub: when a SessionStart hook sees
 that the server runs a newer version, it updates the client in the background
@@ -622,6 +622,7 @@ lang = "ja"             # ja | en — SessionStart block and Stop nudge
 [update]                # optional; these are the defaults
 auto = true             # false = never update automatically, only show a notice
 channel = "stable"      # releases without "-" in the tag
+interval_hours = 4      # how often the server looks for a release (1–168)
 
 [retention]             # optional; these are the defaults (0 days = keep forever)
 raw_days = 90           # raw/*.jsonl older than this are gzipped, deleted at twice this age
