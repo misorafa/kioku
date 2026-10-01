@@ -50,6 +50,7 @@ impl From<Error> for ApiError {
         let status = match &err {
             Error::NotFound(_) => StatusCode::NOT_FOUND,
             Error::InvalidInput(_) => StatusCode::BAD_REQUEST,
+            Error::Conflict(_) => StatusCode::CONFLICT,
             Error::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         if status == StatusCode::INTERNAL_SERVER_ERROR {
@@ -103,6 +104,8 @@ pub fn protected_routes(store: Arc<Store>, update: SharedUpdateStatus) -> Router
         .route("/api/v1/handoffs/pending", get(pending_handoff))
         .route("/api/v1/handoffs", post(write_handoff))
         .route("/api/v1/status", get(status))
+        .route("/api/v1/backup", post(backup))
+        .route("/api/v1/diagnostics", get(diagnostics))
         .route("/api/v1/projects/merge", post(merge_projects))
         .route("/api/v1/reindex", post(reindex))
         .layer(Extension(update))
@@ -116,7 +119,7 @@ pub fn public_routes() -> Router {
 
 /// `GET /api/v1/health` → `{ok, version}`.
 async fn health() -> Json<Value> {
-    Json(json!({ "ok": true, "version": VERSION }))
+    Json(json!({ "ok": true, "version": VERSION, "observation_dedup": true }))
 }
 
 /// `POST /api/v1/sessions/start` (+ `server_version`, SPEC-M2.5 §3.2: clients follow it).
@@ -127,6 +130,9 @@ async fn start_session(
     let Json(req) = body?;
     let Json(mut v) = to_json(blocking(&store, move |s| s.start_session(&req)).await?)?;
     v["server_version"] = json!(SERVER_VERSION);
+    // Clients add `event_id` and queue failed deliveries only for a server that says this
+    // (SPEC-M2.6 §3); learning it here saves a health probe per observation.
+    v["observation_dedup"] = json!(true);
     Ok(Json(v))
 }
 
@@ -311,4 +317,12 @@ async fn merge_projects(
 async fn reindex(State(store): State<Arc<Store>>) -> ApiResult {
     let docs = blocking(&store, |s| s.reindex()).await?;
     Ok(Json(json!({ "docs": docs })))
+}
+
+async fn backup(State(store): State<Arc<Store>>) -> ApiResult {
+    to_json(blocking(&store, |s| s.backup()).await?)
+}
+
+async fn diagnostics(State(store): State<Arc<Store>>) -> ApiResult {
+    to_json(blocking(&store, |s| s.reliability()).await?)
 }

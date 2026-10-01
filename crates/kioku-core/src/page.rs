@@ -197,6 +197,9 @@ impl Frontmatter {
 /// A page as stored in `wiki/`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Page {
+    /// SHA-256 of the complete file, for conditional writes.
+    #[serde(default)]
+    pub revision: String,
     /// Path relative to `wiki/`, with `/` separators.
     pub path: String,
     /// Parsed frontmatter.
@@ -214,6 +217,7 @@ impl Page {
             None => infer_frontmatter(path, &body),
         };
         Ok(Page {
+            revision: crate::util::sha256_hex(text),
             path: path.to_string(),
             frontmatter,
             body,
@@ -432,7 +436,10 @@ mod tests {
 
         let rendered = page.render().unwrap();
         let again = Page::parse(&page.path, &rendered).unwrap();
-        assert_eq!(again, page);
+        assert_eq!(again.frontmatter, page.frontmatter);
+        assert_eq!(again.body, page.body);
+        assert_eq!(again.path, page.path);
+        assert_eq!(again.revision, crate::util::sha256_hex(&rendered));
         assert!(rendered.contains("custom_key: 42"));
         assert!(rendered.contains("b: テキスト"));
         // rendering is a fixed point

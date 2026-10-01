@@ -30,6 +30,49 @@ use crate::render::{HookResult, render};
 /// Runs a parsed command line; returns the process exit code.
 pub fn run(cli: Cli) -> i32 {
     let result = match cli.command {
+        Command::Backup => (|| -> anyhow::Result<()> {
+            let cfg = Config::load()?;
+            let body = ApiClient::new(&cfg.client, COMMAND_TIMEOUT)?
+                .post(&["backup"], &serde_json::json!({}))?;
+            let m: kioku_core::store::BackupManifest =
+                serde_json::from_value(body).context("unexpected backup response")?;
+            let bytes: u64 = m.files.values().map(|f| f.bytes).sum();
+            println!(
+                "backup {} complete: {} files, {:.1} MiB, {} sessions, {} observations, {} pages\n  {}\n(on the server machine; copy it elsewhere, test with: kioku restore <dir> --into <new dir>)",
+                m.created,
+                m.files.len(),
+                bytes as f64 / (1024.0 * 1024.0),
+                m.counts.get("sessions").copied().unwrap_or(0),
+                m.counts.get("observations").copied().unwrap_or(0),
+                m.counts.get("pages").copied().unwrap_or(0),
+                m.path
+            );
+            Ok(())
+        })(),
+        Command::Restore {
+            backup,
+            into,
+            verify: _,
+        } => (|| -> anyhow::Result<()> {
+            let manifest = kioku_core::store::restore_backup(&backup, &into)?;
+            println!(
+                "restored {} to {} (checksums, SQLite and index verified; run KIOKU_DATA_DIR=<restored-directory> kioku init to create fresh credentials)",
+                manifest.created,
+                into.display()
+            );
+            Ok(())
+        })(),
+        Command::Sync => (|| -> anyhow::Result<()> {
+            let cfg = Config::load()?;
+            let r = crate::outbox::flush(&cfg)?;
+            println!(
+                "synced {} queued observation(s); {} refused by the server (kept in {})",
+                r.delivered,
+                r.refused,
+                crate::outbox::directory(&cfg).join("failed").display()
+            );
+            Ok(())
+        })(),
         Command::Hook { event, agent } => return hook(event, agent),
         Command::HookDump {
             command: HookDumpCommand::Extract { agent, event, out },
@@ -230,11 +273,17 @@ fn hook(event: HookEventKind, agent: Agent) -> i32 {
     let _ = std::io::stderr().flush();
     // SPEC-M2.5 §3.3: after the context is out, follow the server's version in a detached
     // updater (the hook never waits for it).
-    if let Some(tag) = &outcome.spawn_update
-        && let Err(err) = crate::auto_update::spawn_background(tag)
-        && let Ok(cfg) = Config::load()
-    {
-        log_failure(&cfg, event, "-", &err);
+    if let Ok(cfg) = Config::load() {
+        if let Some(tag) = &outcome.spawn_update
+            && let Err(err) = crate::auto_update::spawn_background(tag)
+        {
+            log_failure(&cfg, event, "-", &err);
+        }
+        // SPEC-M2.6 §3: replay failed deliveries in the background (backs off after a spawn
+        // or a failed replay; a no-op when nothing is queued).
+        if let Err(err) = crate::outbox::spawn_sync_if_due(&cfg) {
+            log_failure(&cfg, event, "-", &err);
+        }
     }
     outcome.exit_code
 }

@@ -11,6 +11,9 @@ pub enum Error {
     /// The caller passed something the core refuses (bad path, empty title, …).
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    /// A conditional write or delivery ID conflicts with stored data.
+    #[error("conflict: {0}")]
+    Conflict(String),
     /// Anything else: I/O, SQLite, tantivy, serialization.
     #[error(transparent)]
     Internal(#[from] anyhow::Error),

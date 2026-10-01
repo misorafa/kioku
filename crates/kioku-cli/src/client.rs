@@ -75,6 +75,14 @@ pub const ADDR_CACHE_FILE: &str = "server-addrs.json";
 /// command deadline must not let one dead address stall it (SPEC-M2 §19.2).
 const CONNECT_TIMEOUT_CAP: Duration = Duration::from_secs(4);
 
+/// Connect timeout for the cached-address attempt: half of that attempt's budget (a third of
+/// the deadline), so an address that no longer answers fails as a *connect* error, which
+/// falls back to DNS even for a POST. When it equalled the budget, the request timeout fired
+/// first, the error was not `is_connect`, and POSTs never fell back (review of ca8afe5).
+fn pinned_connect_timeout(total: Duration) -> Duration {
+    total / 6
+}
+
 /// Addresses kept per server in [`ADDR_CACHE_FILE`].
 const ADDR_CACHE_MAX: usize = 4;
 
@@ -135,7 +143,7 @@ impl ApiClient {
         };
         let pinned = match (&cache_key, base.host_str()) {
             (Some(_), Some(host)) if !cached.is_empty() => Some(
-                builder(total / 3)
+                builder(pinned_connect_timeout(total))
                     .resolve_to_addrs(host, &cached)
                     .build()
                     .context("building HTTP client")?,
@@ -173,24 +181,28 @@ impl ApiClient {
     /// Authenticated GET of `/api/v1/<segments>` with query parameters; returns the JSON body.
     pub fn get(&self, segments: &[&str], query: &[(&str, String)]) -> anyhow::Result<Value> {
         let url = self.api_url(segments)?;
-        self.send(|c| c.get(url.clone()).query(query))
+        self.send(true, |c| c.get(url.clone()).query(query))
     }
 
     /// Authenticated POST of a JSON body to `/api/v1/<segments>`; returns the JSON body.
     pub fn post(&self, segments: &[&str], body: &Value) -> anyhow::Result<Value> {
         let url = self.api_url(segments)?;
-        self.send(|c| c.post(url.clone()).json(body))
+        self.send(false, |c| c.post(url.clone()).json(body))
     }
 
     /// Authenticated PUT of a JSON body to `/api/v1/<segments>`; returns the JSON body.
     pub fn put(&self, segments: &[&str], body: &Value) -> anyhow::Result<Value> {
         let url = self.api_url(segments)?;
-        self.send(|c| c.put(url.clone()).json(body))
+        self.send(false, |c| c.put(url.clone()).json(body))
     }
 
     /// Sends the request built by `make`: first to the cached last-good addresses (with a
     /// third of the remaining time), then — if those do not connect — with normal DNS.
-    fn send(&self, make: impl Fn(&Client) -> RequestBuilder) -> anyhow::Result<Value> {
+    fn send(
+        &self,
+        retry_timeout: bool,
+        make: impl Fn(&Client) -> RequestBuilder,
+    ) -> anyhow::Result<Value> {
         let prepare = |c: &Client, budget: Duration| -> anyhow::Result<RequestBuilder> {
             let remaining = self.deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -207,7 +219,7 @@ impl ApiClient {
             match prepare(pinned, third)?.send() {
                 Ok(resp) => return self.finish(resp),
                 // Moved server or a different network: fall through to normal resolution.
-                Err(e) if e.is_connect() || e.is_timeout() => {}
+                Err(e) if e.is_connect() || (retry_timeout && e.is_timeout()) => {}
                 Err(e) => return Err(transport_error(e)),
             }
         }
@@ -461,6 +473,53 @@ mod tests {
         assert!(format!("{err}").starts_with("request failed: "), "{err}");
     }
 
+    #[test]
+    fn a_post_with_a_lost_response_is_not_retried_by_dns_fallback() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let seen = accepted.clone();
+        let thread = std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_millis(600);
+            let mut held = Vec::new();
+            while Instant::now() < until {
+                if let Ok((stream, _)) = listener.accept() {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    held.push(stream);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join(ADDR_CACHE_FILE);
+        write_cache(
+            &cache,
+            &format!("localhost:{port}"),
+            &[format!("127.0.0.1:{port}")],
+        );
+        let c = ApiClient::with_addr_cache(
+            &cfg(format!("http://localhost:{port}")),
+            Duration::from_millis(300),
+            Some(cache),
+        )
+        .unwrap();
+        assert!(
+            c.post(&["observations"], &serde_json::json!({"test":true}))
+                .is_err()
+        );
+        thread.join().unwrap();
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "response timeout must not replay a mutation"
+        );
+    }
+
     fn write_cache(path: &std::path::Path, key: &str, addrs: &[String]) {
         let v = serde_json::json!({ key: addrs });
         std::fs::write(path, v.to_string()).unwrap();
@@ -518,6 +577,13 @@ mod tests {
             2,
             "the old address is kept behind: {now:?}"
         );
+    }
+
+    #[test]
+    fn a_dead_cached_address_fails_at_connect_before_the_attempt_times_out() {
+        for total in [Duration::from_millis(900), Duration::from_secs(5)] {
+            assert!(pinned_connect_timeout(total) < total / 3);
+        }
     }
 
     #[test]

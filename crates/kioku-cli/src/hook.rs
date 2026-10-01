@@ -312,6 +312,7 @@ impl Handler<'_> {
             .get("server_version")
             .and_then(Value::as_str)
             .map(str::to_string);
+        crate::outbox::remember_dedup(self.cfg, resp["observation_dedup"] == true);
         let resp: SessionStartResponse =
             serde_json::from_value(resp).context("unexpected sessions/start response")?;
         Ok((self.block(&project.name, resp), server_version))
@@ -390,19 +391,53 @@ impl Handler<'_> {
     /// Posts `ev`'s observation; an unknown session is started implicitly (§3.9) and the
     /// observation retried — the start's `<kioku>` block is returned then.
     fn post_observation(&self, ev: &HookEvent) -> anyhow::Result<Option<String>> {
-        let obs = observation_for(ev).context("event carries no observation")?;
-        let body = serde_json::to_value(&obs)?;
-        let Err(err) = self.client.post(&["observations"], &body) else {
-            return Ok(None);
-        };
-        if http_status(&err) != Some(404) {
-            return Err(err);
+        let mut obs = observation_for(ev).context("event carries no observation")?;
+        // Only a server that said it de-duplicates (at SessionStart) gets an event_id, and
+        // only such deliveries are ever queued and replayed (SPEC-M2.6 §3).
+        let dedup = crate::outbox::server_dedups(self.cfg);
+        if dedup {
+            obs.event_id = Some(kioku_core::util::generate_token());
         }
-        let block = self.start(IMPLICIT_SOURCE)?;
-        self.client
-            .post(&["observations"], &body)
-            .context("retrying the observation after an implicit session start")?;
-        Ok(Some(block))
+        let body = serde_json::to_value(&obs)?;
+        let delivered = match self.client.post(&["observations"], &body) {
+            Ok(_) => Ok(None),
+            Err(err) if http_status(&err) == Some(404) => {
+                self.start(IMPLICIT_SOURCE).and_then(|block| {
+                    self.client
+                        .post(&["observations"], &body)
+                        .context("retrying the observation after an implicit session start")
+                        .map(|_| Some(block))
+                })
+            }
+            Err(err) => Err(err),
+        };
+        match delivered {
+            Err(err) if dedup && crate::outbox::is_transient(&err) => {
+                Err(match self.queue(ev, &obs) {
+                    Ok(()) => err.context("delivery failed; queued for kioku sync"),
+                    Err(q) => {
+                        err.context(format!("delivery failed and could not be queued: {q:#}"))
+                    }
+                })
+            }
+            other => other,
+        }
+    }
+
+    /// Saves a failed delivery with what a replay needs to re-create its session. Runs only
+    /// after a failure, so the project lookup (git) never slows the normal path.
+    fn queue(&self, ev: &HookEvent, obs: &NewObservation) -> anyhow::Result<()> {
+        let cwd = self.cwd()?;
+        let deadline = hook_deadline_ms(self.agent, self.ev.event, self.cfg.client.timeout_ms);
+        let session = SessionStartRequest {
+            session_id: ev.session_id.clone(),
+            agent: ev.agent.clone(),
+            cwd: cwd.display().to_string(),
+            source: kioku_core::store::OFFLINE_REPLAY_SOURCE.into(),
+            project: identify(&cwd)?,
+            lane: kioku_core::project::lane(&cwd, Duration::from_millis(deadline)),
+        };
+        crate::outbox::enqueue(self.cfg, obs, session).map(|_| ())
     }
 
     /// Antigravity PreInvocation (M2.1 §3.5, §3.6): records a prompt that is new in the
@@ -770,6 +805,7 @@ pub fn observation_for(ev: &HookEvent) -> Option<NewObservation> {
         _ => return None,
     };
     Some(NewObservation {
+        event_id: None,
         session_id: ev.session_id.clone(),
         kind,
         ts: Some(now_ts()),

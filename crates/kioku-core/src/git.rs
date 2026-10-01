@@ -13,6 +13,7 @@ pub const AUTHOR_EMAIL: &str = "kioku@localhost";
 pub struct Git {
     root: PathBuf,
     enabled: bool,
+    last_error: std::sync::Arc<parking_lot::Mutex<Option<String>>>,
 }
 
 /// True when a `git` executable can be run (checked once per process; warns once if not).
@@ -38,6 +39,7 @@ impl Git {
         let git = Git {
             root: root.to_path_buf(),
             enabled,
+            last_error: Default::default(),
         };
         if enabled && !root.join(".git").exists() {
             let ok = git.run(&["-c", "init.defaultBranch=main", "init", "-q"]);
@@ -57,6 +59,31 @@ impl Git {
         self.enabled
     }
 
+    /// Failure of the most recent commit attempt.
+    pub fn last_error(&self) -> Option<String> {
+        if let Some(e) = self.last_error.lock().clone() {
+            return Some(e);
+        }
+        if !self.enabled {
+            return Some("git history is disabled".into());
+        }
+        // Read-only: without --no-optional-locks `git status` may rewrite .git/index, and a
+        // deadline kill mid-write would leave index.lock behind and break every later commit.
+        let mut cmd = crate::util::quiet_command("git");
+        cmd.arg("-C").arg(&self.root).args([
+            "--no-optional-locks",
+            "-c",
+            "core.fsmonitor=false",
+            "status",
+            "--porcelain",
+        ]);
+        match crate::util::output_with_deadline(cmd, std::time::Duration::from_secs(2)) {
+            Some(out) if out.status.success() && out.stdout.is_empty() => None,
+            Some(out) if out.status.success() => Some("wiki contains uncommitted changes".into()),
+            _ => Some("cannot inspect wiki git history".into()),
+        }
+    }
+
     /// Stages `paths` (relative to the root) and commits them with `message`, if anything changed.
     pub fn commit(&self, paths: &[String], message: &str) {
         if !self.enabled || paths.is_empty() {
@@ -65,6 +92,7 @@ impl Git {
         let mut add = vec!["add", "-A", "--"];
         add.extend(paths.iter().map(String::as_str));
         if !self.run(&add) {
+            *self.last_error.lock() = Some("git add failed".into());
             tracing::warn!(?paths, "git add failed");
             return;
         }
@@ -91,7 +119,10 @@ impl Git {
         ];
         commit.extend(paths.iter().map(String::as_str));
         if !self.run(&commit) {
+            *self.last_error.lock() = Some("git commit failed".into());
             tracing::warn!(message, "git commit failed");
+        } else {
+            *self.last_error.lock() = None;
         }
     }
 

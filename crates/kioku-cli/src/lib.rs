@@ -22,6 +22,7 @@ pub mod hook;
 pub mod install;
 pub mod invite;
 pub mod logfile;
+pub mod outbox;
 pub mod render;
 pub mod rotate;
 pub mod service;

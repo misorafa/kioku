@@ -145,6 +145,7 @@ impl KiokuBridge {
         Parameters(p): Parameters<WritePageParams>,
     ) -> Result<String, String> {
         let body = json!({
+            "expected_revision": p.expected_revision,
             "title": p.title,
             "content": p.content,
             "project": p.project,

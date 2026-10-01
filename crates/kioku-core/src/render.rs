@@ -6,7 +6,10 @@ use crate::session::Session;
 use crate::strings::{Lang, fill, strings};
 use crate::util::{display_date, display_minute, one_line, truncate_chars};
 
-/// Wiki-relative path of a session page: `<project>/sessions/YYYY-MM-DD-<first 8 of id>.md`.
+/// Wiki-relative path of a session page:
+/// `<project>/sessions/YYYY-MM-DD-<first 8 of id>-<first 12 hex of sha256(id)>.md`. The
+/// readable prefix matches what users see in hook output; the hash keeps ids that share
+/// their first 8 characters (Codex UUIDv7 ids started within ~65 s) apart (SPEC-M2.6 §1).
 pub fn session_page_path(session: &Session) -> String {
     let short: String = session
         .id
@@ -14,11 +17,13 @@ pub fn session_page_path(session: &Session) -> String {
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .take(8)
         .collect();
+    let hash = crate::util::sha256_hex(&session.id);
     format!(
-        "{}/sessions/{}-{}.md",
+        "{}/sessions/{}-{}-{}.md",
         session.project_id,
         display_date(&session.started_at),
-        short
+        short,
+        &hash[..12]
     )
 }
 
@@ -231,7 +236,7 @@ mod tests {
         let s = session();
         assert_eq!(
             session_page_path(&s),
-            "kioku-3f9a1c2e/sessions/2026-09-25-0c2f1a2b.md"
+            "kioku-3f9a1c2e/sessions/2026-09-25-0c2f1a2b-9618b70bdda7.md"
         );
         let d = SessionDigest {
             prompts: vec!["引き継ぎサーバーの設計\nをしたい".into()],

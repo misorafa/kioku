@@ -146,6 +146,11 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
             conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
         }
     }
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS observation_receipts (
+        session_id TEXT NOT NULL, event_id TEXT NOT NULL, seq INTEGER NOT NULL,
+        request_hash TEXT NOT NULL, PRIMARY KEY(session_id, event_id));
+        CREATE TABLE IF NOT EXISTS page_redirects (old_path TEXT PRIMARY KEY, new_path TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS reliability_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")?;
     Ok(())
 }
 
@@ -676,11 +681,13 @@ pub fn newest_session_handoff(
 pub fn newest_handoff_accepted_by(
     conn: &Connection,
     session: &str,
+    project: &str,
+    lane: Option<&str>,
 ) -> anyhow::Result<Option<Handoff>> {
     Ok(conn
         .query_row(
-            &format!("{HANDOFF_SELECT} WHERE h.accepted_by = ?1 {HANDOFF_ORDER}"),
-            params![session],
+            &format!("{HANDOFF_SELECT} WHERE h.accepted_by = ?1 AND h.project_id = ?2 AND h.lane IS ?3 {HANDOFF_ORDER}"),
+            params![session, project, lane],
             handoff_from_row,
         )
         .optional()?)
@@ -760,7 +767,16 @@ pub fn delete_all_pages(conn: &Connection) -> anyhow::Result<()> {
 
 /// Row counts of a table (`projects`, `pages`, `sessions`, `observations`, `handoffs`).
 pub fn count(conn: &Connection, table: &str) -> anyhow::Result<u64> {
-    let allowed = ["projects", "pages", "sessions", "observations", "handoffs"];
+    let allowed = [
+        "projects",
+        "pages",
+        "sessions",
+        "observations",
+        "handoffs",
+        "project_aliases",
+        "observation_receipts",
+        "page_redirects",
+    ];
     anyhow::ensure!(allowed.contains(&table), "unknown table {table}");
     let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
     Ok(n as u64)
