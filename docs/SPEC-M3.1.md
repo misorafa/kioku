@@ -10,7 +10,7 @@ SPEC-M2.4.md, SPEC-M3.0.md first. Source: the v0.8.0 audit. Depends on M3.0 (sec
 Today every SessionStart except `offline-replay` routes and accepts the newest pending
 handoff of its lane. Three cases are wrong:
 
-1. **compact / resume / clear of a known session** (`source ∈ {compact, resume, clear}`
+1. **compact / resume of a known session** (`source ∈ {compact, resume}`
    or the session id already exists): the session gets back **the handoff it accepted
    last** (same project and lane, `accepted_by = this session`) as `pending_handoff`,
    rendered under the usual heading, **and does not accept anything new**. If it never
@@ -84,10 +84,11 @@ Where the spec was impossible, silent or had to be made concrete.
 
 ### Handoffs (§1)
 
-1. **Resume detection.** Rule 1 applies when `source ∈ {compact, resume, clear}` *or* the
-   session id is already in `sessions` (checked before the upsert), taken literally: a
-   `startup` with a known id resumes too, and Claude Code's `/clear` (a new id with
-   `source = clear`) never accepts — it sees the lane's pending handoff for reference.
+1. **Resume detection.** Rule 1 applies when `source ∈ {compact, resume}` *or* the
+   session id is already in `sessions` (checked before the upsert): a `startup` with a
+   known id resumes too. Claude Code's `/clear` starts a new session id, so it is a new
+   session and accepts the lane's pending handoff (review of PR #11; `clear` with a known
+   id still resumes through the known-id check).
    A resumed session gets `db::newest_handoff_accepted_by` (same project and lane).
 2. **Own handoffs** (rule 2) are left out of every pending lookup that names a session —
    SessionStart, `kioku_handoff_pending(session=…)` peeks and explicit accepts — and an

@@ -131,8 +131,10 @@ fn handoff_summary(md: &str) -> Option<String> {
     ))
 }
 
-/// SessionStart sources that continue an existing session (SPEC-M3.1 §1 rule 1).
-pub const RESUME_SOURCES: [&str; 3] = ["compact", "resume", "clear"];
+/// SessionStart sources that continue an existing session (SPEC-M3.1 §1 rule 1). Claude
+/// Code's `/clear` starts a *new* session id, so it is a new session, not a resume (a
+/// known id with `source = clear` still resumes, through the known-id check).
+pub const RESUME_SOURCES: [&str; 2] = ["compact", "resume"];
 /// Another session with an observation this recent makes a lane busy (SPEC-M3.1 §1 rule 3).
 pub const ACTIVE_SESSION_MINUTES: i64 = 30;
 

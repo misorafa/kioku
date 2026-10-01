@@ -118,9 +118,9 @@ fn consumption_matrix_on_two_lanes() {
         assert_eq!(resp.reference_reason.as_deref(), Some(REFERENCE_CONCURRENT));
         assert!(row(&store, &later.id).accepted_by.is_none());
 
-        // 4. a resume/clear with an id that never accepted anything: reference only
+        // 4. a resume with an id that never accepted anything: reference only
         let cleared = s(lane, "cleared");
-        let resp = start_with(&store, &cleared, lane, "clear");
+        let resp = start_with(&store, &cleared, lane, "resume");
         assert!(resp.pending_handoff.is_none());
         assert_eq!(resp.reference_handoff.unwrap().id, later.id);
         assert_eq!(resp.reference_reason.as_deref(), Some(REFERENCE_RESUMED));
@@ -235,4 +235,27 @@ fn history_lists_the_lane_with_status() {
             .len(),
         1
     );
+}
+
+/// Claude Code's `/clear` starts a new session id with `source = clear`: it is a new
+/// session and takes the lane's pending handoff like any other (review of PR #11).
+#[test]
+fn clear_with_a_new_id_is_a_new_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(Config::for_data_dir(tmp.path())).unwrap();
+    let lane = Some("feature/クリア");
+    let writer = s(lane, "writer");
+    start(&store, &writer, lane);
+    let h = write(&store, &writer, "クリア前の引き継ぎ");
+    store.finalize_session(&writer).unwrap();
+    let cleared = s(lane, "after-clear");
+    let resp = start_with(&store, &cleared, lane, "clear");
+    assert_eq!(resp.pending_handoff.unwrap().id, h.id);
+    assert_eq!(
+        row(&store, &h.id).accepted_by.as_deref(),
+        Some(cleared.as_str())
+    );
+    // The same id again with `clear` is a resume: it gets its accepted handoff back.
+    let again = start_with(&store, &cleared, lane, "clear");
+    assert_eq!(again.pending_handoff.unwrap().id, h.id);
 }

@@ -92,7 +92,7 @@ SessionEnd        finalize (idempotent)
 - **Who consumes a handoff** (SPEC-M3.1 §1): a handoff is accepted once, by the
   next *new* session of the same project and lane (branch); older pending ones of
   that lane are marked `superseded`. Three cases do not accept anything:
-  - **compact / resume / clear** of a session (or a session id kioku has seen
+  - **compact / resume** of a session (or a session id kioku has seen
     before) gets back the handoff it accepted earlier; if it never accepted one, the
     lane's pending handoff is shown for reference only;
   - a session **never receives its own handoff** (the rule-based one its previous
