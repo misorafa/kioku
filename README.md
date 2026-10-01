@@ -313,6 +313,7 @@ errors in `hook.log` and an enabled payload dump. Exit 1 if any check fails.
 
 ```sh
 kioku service install      # write the definition, enable, start (idempotent)
+kioku service install --daemon   # macOS without a logged-in user: print a LaunchDaemon (below)
 kioku service status       # installed? active? pid; server health
 kioku service start|stop    # start restarts a running launchd job (kickstart -k)
 kioku service logs [-f] [-n 200]   # tail ~/.kioku/logs/serve.log
@@ -331,6 +332,17 @@ containers) it prints how to run `kioku serve` yourself (or use Docker) and
 The service is restarted after a crash but not after a clean exit, and a
 crash loop is throttled (launchd: 10 s between starts; systemd: at most 5
 starts per 60 s). `serve.log` rotates at 10 MiB (`.1`–`.3` kept).
+
+**Headless Mac.** A LaunchAgent runs only while a user is logged in. On a Mac nobody logs
+in to (a Mac mini in a closet), `kioku service install` and `kioku doctor` say so
+(`launchctl print gui/<uid>` fails): turn on automatic login, or run
+`kioku service install --daemon > /tmp/dev.kioku.serve.plist`. That prints a
+LaunchDaemon plist for `/Library/LaunchDaemons/dev.kioku.serve.plist` — same binary and
+paths, run as you (`UserName`), `KIOKU_SERVICE=1` so it still updates itself — and the
+two `sudo` commands that install it (`sudo install … /Library/LaunchDaemons/…` and
+`sudo launchctl bootstrap system …`). kioku never runs `sudo` itself. Remove the
+LaunchAgent first (`kioku service uninstall`) if one is installed; `kioku service
+start|stop` manage the LaunchAgent only.
 
 ## Agents
 
@@ -565,10 +577,11 @@ write a handoff before stopping.
       STATE.md                  # current state, rewritten at every finalize
       sessions/YYYY-MM-DD-<session>.md
       pages/<slug>.md           # pages written with kioku_write_page
-  raw/<project_id>/<session_id>.jsonl   # append-only sanitized observations
+  raw/<project_id>/<session_id>.jsonl   # append-only sanitized observations (.jsonl.gz once old)
   db/kioku.sqlite               # metadata, sessions, observations, handoffs
   index/tantivy/                # derived; `kioku reindex` rebuilds it from wiki/
-  index/schema-version          # index format; an older one → run `kioku reindex`
+  index/schema-version          # index format; an older one is rebuilt by the server at start
+  backups/<id>/                 # `kioku backup` snapshots (the newest [retention] backups_keep)
   logs/hook.log                 # client-side hook failures
 ```
 
@@ -581,8 +594,11 @@ Page file names are the ASCII slug of the title; when slugging drops anything
 (non-ASCII, punctuation, repeated separators — `C++ tips` vs `C tips`) a
 6-hex hash of the title is appended so different titles never share a file.
 Search normalizes text with NFKC, so full-width `Ｆｌｕｔｔｅｒ` and half-width
-`ｱﾌﾟﾘ` match `flutter` / `アプリ`. **After upgrading kioku, run `kioku reindex`**
-if the server log warns that the index was built by an older version.
+`ｱﾌﾟﾘ` match `flutter` / `アプリ`. After an upgrade that changes the index format, the
+server rebuilds the index in the background right after it starts listening (search
+answers from the old index until the new one is in place); no `kioku reindex` needed.
+At every start the server also removes temporary files left by an interrupted write and
+re-indexes pages whose file no longer matches its database row.
 
 ## Configuration
 
@@ -606,6 +622,13 @@ lang = "ja"             # ja | en — SessionStart block and Stop nudge
 [update]                # optional; these are the defaults
 auto = true             # false = never update automatically, only show a notice
 channel = "stable"      # releases without "-" in the tag
+
+[retention]             # optional; these are the defaults (0 days = keep forever)
+raw_days = 90           # raw/*.jsonl older than this are gzipped, deleted at twice this age
+observations_days = 180 # observations of finalized sessions older than this become stubs
+backups_keep = 10       # backups kept (was [server] backup_keep, which is still read)
+hook_dump_days = 7      # logs/hook-dump.jsonl* older than this are deleted
+auto = true             # run the policy daily inside `kioku serve`
 ```
 
 Environment variables (env beats the file):
@@ -809,14 +832,53 @@ kioku restore <backup dir> --into <new data directory>
 ```
 
 `backup` writes a snapshot on the **server** under `<data_dir>/backups/<id>/`: the wiki
-(with its git history), a consistent SQLite copy and the raw observation logs, with a
-manifest of SHA-256 checksums. It excludes configuration, tokens, logs and the search
-index (rebuilt on restore). Page writes pause while the wiki is copied; recording does
-not. Copy snapshots off the server and remove old ones yourself. `restore` runs locally,
+pages, their git history as one `wiki.bundle` (`git bundle create --all`), a consistent
+SQLite copy and the raw observation logs, with a manifest of SHA-256 checksums. It excludes
+configuration, tokens, logs and the search index (rebuilt on restore). Page writes pause
+only while the Markdown files are copied; the history is bundled afterwards, so the bundle
+may be a few commits *ahead* of the copied pages (commits made in between) — `restore`
+clones the bundle, puts the copied pages on top (recorded as one `kioku: restore backup`
+commit when they differ) and checks that the bundle's HEAD matches the manifest. Older
+snapshots (with `wiki/.git` copied) still restore. Only the newest `[retention]
+backups_keep` snapshots stay; copy them off the server. `restore` runs locally,
 only into a directory that does not exist yet, and always verifies checksums, SQLite
 integrity, row counts and the rebuilt search index; it never touches a running service.
 Run `KIOKU_DATA_DIR=<restored dir> kioku init` to give it fresh credentials. Markdown alone
 and `kioku reindex` cannot bring back sessions and handoffs — they live in SQLite.
+
+**Retention: `kioku prune`.** Storage has a ceiling: the server applies `[retention]`
+(see Configuration) once a day (20 minutes after it starts, then every ~24 h; off with
+`auto = false`), and `kioku prune` applies it now (`--dry-run` only reports). Per category
+it prints how many files / sessions and how many bytes: raw logs gzipped and deleted,
+sessions whose observations were reduced to stubs (tool name, path or first command line,
+commit message, error flag — exactly what the session summary uses, so pages, STATE.md
+and handoffs are unchanged; the full text is dropped), old backups and hook dumps.
+`kioku status` shows the sizes of the database, raw logs, wiki, backups and index, the
+oldest raw log and the last prune.
+
+**Removing something: `kioku forget`.**
+
+```sh
+kioku forget --session <id>              # observations, raw log, session page, its handoffs
+kioku forget --project <id> [--yes]      # everything of a project (asks first)
+kioku forget --session <id> --purge-history   # … and print how to purge git history
+```
+
+`forget` removes the session's (or project's) observations, delivery receipts, raw logs,
+handoffs and pages (one git commit `kioku: forget session <id>`), rebuilds the search
+index and rewrites STATE.md. The pages stay in the wiki's git history and in older
+backups; `--purge-history` prints the `git filter-repo` (or `git filter-branch`) commands
+to run on the server machine — kioku does not rewrite history itself.
+
+**Turn cost.** Finishing a turn (the Stop hook's finalize) now reads only the
+observations recorded since the previous turn (the session summary is cached in the
+database), and writes the session page and STATE.md in one git commit — none when
+nothing changed.
+
+**Hook payload capture** (`KIOKU_HOOK_DUMP=1`) stops by itself 24 hours after the first
+captured hook (`kioku doctor` shows "hook dump expired"); `kioku hook-dump enable` starts
+another 24 hours. `kioku hook-dump extract` writes to `~/.kioku/captures/<date>/` unless
+`--out` is given.
 
 **Diagnostics.** `kioku doctor` also shows the last observation the server received, the
 last backup (warns when older than 7 days), wiki git commit failures, drift between wiki

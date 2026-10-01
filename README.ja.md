@@ -284,6 +284,7 @@ kioku doctor --json           # {"checks":[{id, status, message, fix?}]}
 
 ```sh
 kioku service install      # 定義を書き、有効化して起動（冪等）
+kioku service install --daemon   # ログインユーザーのいない Mac: LaunchDaemon を表示（下記）
 kioku service status       # インストール済み? 動作中? pid、サーバーの health
 kioku service start|stop    # start は動作中の launchd ジョブを再起動（kickstart -k）
 kioku service logs [-f] [-n 200]   # ~/.kioku/logs/serve.log の末尾
@@ -300,6 +301,18 @@ WSL、コンテナ）では、`kioku serve` を自分で動かす方法（また
 サービスはクラッシュ後には再起動しますが、正常終了後には再起動せず、クラッシュの繰り返しは抑制されます
 （launchd: 起動間隔 10 秒、systemd: 60 秒に 5 回まで）。`serve.log` は 10 MiB でローテートします
 （`.1`〜`.3` を保持）。
+
+**ログインしない Mac。** LaunchAgent はユーザーがログインしている間しか動きません。誰もログインしない
+Mac（棚に置いた Mac mini など）では、`kioku service install` と `kioku doctor` がそれを伝えます
+（`launchctl print gui/<uid>` が失敗するため）:「この Mac にログインしているユーザーセッションがありません。
+自動ログインを有効にするか、`kioku service install --daemon` を使ってください」。
+`kioku service install --daemon > /tmp/dev.kioku.serve.plist` は
+`/Library/LaunchDaemons/dev.kioku.serve.plist` 用の LaunchDaemon の plist（同じバイナリとパス、
+あなたのユーザーとして実行（`UserName`）、自動更新が続くよう `KIOKU_SERVICE=1`）を出力し、
+インストール用の `sudo` コマンド 2 つ（`sudo install … /Library/LaunchDaemons/…` と
+`sudo launchctl bootstrap system …`）を表示します。kioku 自身が `sudo` を実行することはありません。
+LaunchAgent が入っている場合は先に `kioku service uninstall` で外してください。`kioku service start|stop`
+が扱うのは LaunchAgent だけです。
 
 ## エージェント
 
@@ -508,10 +521,11 @@ Compose の場合（`docker-compose.yml` 参照）は、同じ場所の `.env` �
       STATE.md                  # 現在の状態。finalize のたびに書き直される
       sessions/YYYY-MM-DD-<session>.md
       pages/<slug>.md           # kioku_write_page で書いたページ
-  raw/<project_id>/<session_id>.jsonl   # 追記のみ・サニタイズ済みの観測
+  raw/<project_id>/<session_id>.jsonl   # 追記のみ・サニタイズ済みの観測（古くなると .jsonl.gz）
   db/kioku.sqlite               # メタデータ、セッション、観測、引き継ぎ
   index/tantivy/                # 派生データ。`kioku reindex` で wiki/ から再構築
-  index/schema-version          # 索引の形式。古ければ `kioku reindex` を実行
+  index/schema-version          # 索引の形式。古ければサーバーが起動時に作り直す
+  backups/<id>/                 # `kioku backup` のスナップショット（新しい順に [retention] backups_keep 個）
   logs/hook.log                 # クライアント側フックの失敗ログ
 ```
 
@@ -523,8 +537,9 @@ Compose の場合（`docker-compose.yml` 参照）は、同じ場所の `.env` �
 ページのファイル名はタイトルの ASCII slug です。slug 化で何かが落ちる場合（非 ASCII、記号、連続した区切り —
 `C++ tips` と `C tips` など）は、タイトルの 6 桁のハッシュを付けるので、別のタイトルが同じファイルになることは
 ありません。検索は NFKC で正規化するので、全角の `Ｆｌｕｔｔｅｒ` や半角の `ｱﾌﾟﾘ` も `flutter` / `アプリ` で
-見つかります。**kioku を更新した後、索引が古いバージョンで作られたという警告がサーバーのログに出たら
-`kioku reindex` を実行してください。**
+見つかります。索引の形式が変わる更新の後は、サーバーが待ち受けを始めた直後に裏で索引を作り直します
+（作り直しが終わるまでは古い索引で検索に答えます）。`kioku reindex` の実行は不要です。起動のたびに、
+中断した書き込みの一時ファイルを消し、データベースの行とファイルが食い違うページを索引し直します。
 
 ## 設定
 
@@ -548,6 +563,13 @@ lang = "ja"             # ja | en — SessionStart のブロックと Stop の�
 [update]                # 任意。値はいずれも既定値
 auto = true             # false = 自動更新せず、お知らせだけを出す
 channel = "stable"      # タグに "-" を含まないリリース
+
+[retention]             # 任意。値はいずれも既定値（日数 0 = 無期限に保持）
+raw_days = 90           # これより古い raw/*.jsonl は gzip、2 倍の日数で削除
+observations_days = 180 # これより古い終了済みセッションの観測は要約だけの形に縮める
+backups_keep = 10       # 残すバックアップの数（旧 [server] backup_keep も引き続き読む）
+hook_dump_days = 7      # これより古い logs/hook-dump.jsonl* を削除
+auto = true             # `kioku serve` が毎日この方針を適用する
 ```
 
 環境変数（ファイルより優先）:
@@ -722,14 +744,47 @@ kioku backup                                         # どの端末からでも�
 kioku restore <バックアップ> --into <新しいデータディレクトリ>
 ```
 
-`backup` はサーバーの `<data_dir>/backups/<id>/` に、wiki（git 履歴込み）、整合性のとれた SQLite の
-コピー、raw ログと、SHA-256 のチェックサム一覧を保存します。設定・トークン・ログ・検索索引（復元時に
-作り直します）は含めません。wiki のコピー中はページの書き込みが待たされますが、記録は止まりません。
-スナップショットの別媒体へのコピーと古いものの削除は利用者が行います。`restore` は手元で実行し、
+`backup` はサーバーの `<data_dir>/backups/<id>/` に、wiki のページ、その git 履歴を 1 つにまとめた
+`wiki.bundle`（`git bundle create --all`）、整合性のとれた SQLite のコピー、raw ログと、SHA-256 の
+チェックサム一覧を保存します。設定・トークン・ログ・検索索引（復元時に作り直します）は含めません。
+ページの書き込みが待たされるのは Markdown ファイルをコピーする短い間だけで、履歴はその後にまとめるため、
+bundle はコピーしたページより数コミット**先に進んでいる**ことがあります（その間のコミット）。`restore` は
+bundle を clone し、その上にコピーしたページを重ね（違いがあれば `kioku: restore backup` の 1 コミットに
+記録）、bundle の HEAD がマニフェストと一致することを確かめます。以前の形式（`wiki/.git` をコピーした
+もの）も復元できます。残るのは新しい `[retention] backups_keep` 個だけなので、別媒体にもコピーしてください。`restore` は手元で実行し、
 **まだ存在しないディレクトリだけ**に復元します。チェックサム、SQLite の整合性、件数、作り直した検索索引を
 必ず検証し、稼働中のサービスには触れません。復元後は `KIOKU_DATA_DIR=<復元先> kioku init` で新しい
 認証情報を作ってください。Markdown と `kioku reindex` だけではセッションや引き継ぎは戻りません
 （SQLite にあるため）。
+
+**保持期間: `kioku prune`。** 容量には上限があります。サーバーは `[retention]`（「設定」参照）を
+1 日 1 回適用し（起動の 20 分後、その後ほぼ 24 時間ごと。`auto = false` で停止）、`kioku prune` は
+今すぐ適用します（`--dry-run` は報告のみ）。種類ごとに件数とバイト数を表示します: gzip / 削除した
+raw ログ、観測を要約だけの形（ツール名、パスまたはコマンドの 1 行目、コミットメッセージ、エラーかどうか —
+セッションの要約が使うものだけなので、ページ・STATE.md・引き継ぎは変わりません。本文は消えます）に
+縮めたセッション、古いバックアップとフックのダンプ。`kioku status` はデータベース、raw ログ、wiki、
+バックアップ、索引の大きさ、最も古い raw ログ、最後の prune を表示します。
+
+**記録を消す: `kioku forget`。**
+
+```sh
+kioku forget --session <id>              # 観測、raw ログ、セッションページ、そのセッションの引き継ぎ
+kioku forget --project <id> [--yes]      # プロジェクトのすべて（先に確認する）
+kioku forget --session <id> --purge-history   # …に加えて git 履歴から消す方法を表示
+```
+
+`forget` はセッション（またはプロジェクト）の観測、受信記録、raw ログ、引き継ぎ、ページ（git コミット
+`kioku: forget session <id>`）を消し、検索索引を作り直し、STATE.md を書き直します。ページは wiki の
+git 履歴と以前のバックアップには残ります。`--purge-history` はサーバーのマシンで実行する
+`git filter-repo`（または `git filter-branch`）のコマンドを表示します。kioku 自身は履歴を書き換えません。
+
+**ターンごとの負荷。** ターンの終わり（Stop フックの finalize）は、前のターン以降に記録された観測だけを
+読むようになりました（セッションの要約はデータベースにキャッシュ）。セッションページと STATE.md は
+1 つの git コミットにまとめ、何も変わらなければコミットしません。
+
+**フックのペイロード記録**（`KIOKU_HOOK_DUMP=1`）は、最初に記録したフックから 24 時間で自動的に止まります
+（`kioku doctor` に "hook dump expired" と表示）。`kioku hook-dump enable` でさらに 24 時間記録します。
+`kioku hook-dump extract` は `--out` を指定しなければ `~/.kioku/captures/<日付>/` に書き出します。
 
 **診断。** `kioku doctor` は、サーバーが最後に受け取った観測、最後のバックアップ（7日より古いと警告）、
 wiki の git コミット失敗、wiki・メタデータ・検索索引のずれ、解析できないページ、オフラインキューも表示します。

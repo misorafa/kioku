@@ -114,6 +114,7 @@ pub async fn serve_with(
     }
     let mcp_config = mcp::transport_config();
     let mcp_cancel = mcp_config.cancellation_token.clone();
+    let reindex_store = store.clone();
     let app = app(
         store,
         token,
@@ -124,6 +125,16 @@ pub async fn serve_with(
     let listener = bind_listener(&bind, port).await?;
     let addr = listener.local_addr().context("reading local address")?;
     tracing::info!(%addr, "kioku server listening (API /api/v1, MCP /mcp)");
+    // SPEC-M2.8 §5: an index built by an older kioku is rebuilt now that the server
+    // answers; search serves the old index until the rebuild commits.
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = reindex_store.reindex_if_outdated() {
+            tracing::error!(
+                error = format!("{e:#}"),
+                "rebuilding the outdated index failed"
+            );
+        }
+    });
     // Connect info: the invite routes rate-limit failed lookups per peer (SPEC-M2.3 §3.2).
     let requested = opts.shutdown.clone();
     let server = axum::serve(

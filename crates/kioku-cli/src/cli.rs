@@ -241,6 +241,30 @@ pub enum Command {
     },
     /// Rebuild the search index from the wiki (via the server).
     Reindex,
+    /// Apply the [retention] policy on the server now: gzip / delete old raw logs, reduce
+    /// old observation payloads, drop old backups and hook dumps (the server also runs it
+    /// daily).
+    Prune {
+        /// Only report what would be removed.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove a session or a whole project from the server: observations, raw logs,
+    /// handoffs, pages (with a git commit) and the search index.
+    Forget {
+        /// The session to forget.
+        #[arg(long, conflicts_with = "project", required_unless_present = "project")]
+        session: Option<String>,
+        /// The project to forget (everything of it; asks first unless --yes).
+        #[arg(long)]
+        project: Option<String>,
+        /// Also print the commands that remove the pages from the wiki's git history.
+        #[arg(long)]
+        purge_history: bool,
+        /// Do not ask for confirmation (--project).
+        #[arg(long)]
+        yes: bool,
+    },
     /// Show server status and counts.
     Status,
     /// Replace the server's auth token (run on the server machine), restart the service and
@@ -294,7 +318,12 @@ impl InstallTarget {
 #[derive(Debug, Subcommand)]
 pub enum ServiceCommand {
     /// Write the definition, enable and start it (idempotent).
-    Install,
+    Install {
+        /// macOS without a logged-in user: print a LaunchDaemon plist (runs as you) on
+        /// stdout and the two `sudo` commands that install it; nothing is run.
+        #[arg(long)]
+        daemon: bool,
+    },
     /// Stop, disable and remove the definition.
     Uninstall,
     /// Start the installed service.
@@ -317,6 +346,8 @@ pub enum ServiceCommand {
 /// `kioku hook-dump …`.
 #[derive(Debug, Subcommand)]
 pub enum HookDumpCommand {
+    /// Restart the 24-hour capture window (capture stops by itself 24 h after it began).
+    Enable,
     /// Write the newest captured payload as `<out>/<agent>/<event>.captured.json`.
     Extract {
         /// Agent whose payload to extract.
@@ -324,7 +355,8 @@ pub enum HookDumpCommand {
         agent: Agent,
         /// Neutral event (`post-tool-use`) or native name (`afterFileEdit`, `BeforeAgent`).
         event: String,
-        /// Output directory (default: current directory).
+        /// Output directory (default: `~/.kioku/captures/<date>/`, never the current
+        /// directory).
         #[arg(long)]
         out: Option<std::path::PathBuf>,
     },
@@ -489,6 +521,38 @@ mod tests {
         for sub in ["install", "uninstall", "start", "stop", "status", "logs"] {
             assert!(p(&["service", sub]).is_ok(), "{sub}");
         }
+        assert!(matches!(
+            p(&["service", "install", "--daemon"]).unwrap().command,
+            Command::Service {
+                command: ServiceCommand::Install { daemon: true }
+            }
+        ));
+        assert!(matches!(
+            p(&["prune", "--dry-run"]).unwrap().command,
+            Command::Prune { dry_run: true }
+        ));
+        assert!(matches!(
+            p(&["forget", "--session", "abc", "--purge-history"]).unwrap().command,
+            Command::Forget { session: Some(s), project: None, purge_history: true, yes: false } if s == "abc"
+        ));
+        assert!(matches!(
+            p(&["forget", "--project", "kioku-1", "--yes"])
+                .unwrap()
+                .command,
+            Command::Forget {
+                project: Some(_),
+                yes: true,
+                ..
+            }
+        ));
+        assert!(p(&["forget"]).is_err());
+        assert!(p(&["forget", "--session", "a", "--project", "b"]).is_err());
+        assert!(matches!(
+            p(&["hook-dump", "enable"]).unwrap().command,
+            Command::HookDump {
+                command: HookDumpCommand::Enable
+            }
+        ));
         assert!(matches!(
             p(&["service", "logs", "-f", "-n", "50"]).unwrap().command,
             Command::Service {

@@ -40,6 +40,9 @@ pub const FIRST_CHECK: Duration = Duration::from_secs(10 * 60);
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 /// Maximal jitter of [`CHECK_INTERVAL`].
 pub const CHECK_JITTER: Duration = Duration::from_secs(3600);
+/// The server's first retention run: 10 minutes after the first update check (SPEC-M2.8
+/// §3), then every [`next_interval`].
+pub const FIRST_PRUNE: Duration = Duration::from_secs(FIRST_CHECK.as_secs() + 10 * 60);
 /// Client-side log of automatic updates, in `<kioku dir>/logs/`.
 pub const UPDATE_LOG: &str = "update.log";
 /// `update.log` is rotated once it would exceed this.
@@ -69,6 +72,10 @@ pub struct AutoUpdateState {
     /// Server: starts of a version that did not survive [`BOOT_OK_AFTER`] (SPEC-M2.7 §7).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub boot_failures: Option<BootFailures>,
+    /// Server: a tag the automatic rollback moved away from; the update task does not
+    /// install it again (a newer tag clears it; SPEC-M2.8 §9).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_tag: Option<String>,
 }
 
 /// Consecutive starts of one server version that did not run for [`BOOT_OK_AFTER`].
@@ -143,6 +150,8 @@ pub fn boot_check(exe: &Path, state_dir: &Path, running: &str) -> Option<String>
                     );
                     state.boot_failures = None;
                     state.last_error = Some(msg);
+                    // Do not install the failing release again (SPEC-M2.8 §9).
+                    state.skip_tag = Some(format!("v{}", running.trim_start_matches('v')));
                     let _ = state.save(state_dir);
                     Some(version)
                 }
@@ -586,6 +595,9 @@ pub enum ServerOutcome {
     UpToDate,
     /// A newer release exists but `auto` is off.
     Available(String),
+    /// The newest release is the one an automatic rollback moved away from
+    /// (`skip_tag`); it is not installed again.
+    Skipped(String),
     /// The binary was replaced; the server must exit 75.
     Updated {
         /// Old version (`X.Y.Z`).
@@ -632,6 +644,19 @@ pub fn server_check_once(check: &ServerCheck, status: &SharedUpdateStatus) -> Se
         return ServerOutcome::Available(tag);
     }
     if let Some(dir) = &check.state_dir {
+        // SPEC-M2.8 §9: never reinstall the release a rollback moved away from; a newer
+        // release clears the mark.
+        let state = AutoUpdateState::load(dir);
+        match state.skip_tag.as_deref() {
+            Some(skip) if skip == tag => {
+                status.lock().last_error = None;
+                return ServerOutcome::Skipped(tag);
+            }
+            Some(skip) if is_newer(&tag, skip) => {
+                AutoUpdateState::update(dir, |s| s.skip_tag = None);
+            }
+            _ => {}
+        }
         AutoUpdateState::update(dir, |s| {
             s.target = Some(tag.clone());
             s.last_attempt = Some(now_ts());
@@ -699,6 +724,14 @@ pub async fn server_update_task(
                 let _ = shutdown.send(true);
                 return;
             }
+            ServerOutcome::Skipped(tag) => {
+                if announced.as_deref() != Some(tag.as_str()) {
+                    tracing::warn!(
+                        "kioku {tag} is not installed again: the server rolled back from it after failed starts; a newer release will be"
+                    );
+                    announced = Some(tag);
+                }
+            }
             ServerOutcome::Available(tag) => {
                 if announced.as_deref() != Some(tag.as_str()) {
                     tracing::info!(
@@ -712,6 +745,22 @@ pub async fn server_update_task(
                 tracing::warn!(error = %err, "automatic update check failed; retrying at the next interval");
             }
             ServerOutcome::UpToDate => tracing::debug!("kioku is up to date"),
+        }
+        tokio::time::sleep(next_interval()).await;
+    }
+}
+
+/// The server's daily retention run (SPEC-M2.8 §3): `Store::prune` on the blocking pool
+/// after `first`, then every [`next_interval`]. Started by `kioku serve` unless
+/// `[retention] auto = false`; failures are logged and retried at the next interval.
+pub async fn prune_task(store: std::sync::Arc<kioku_core::Store>, first: Duration) {
+    tokio::time::sleep(first).await;
+    loop {
+        let s = store.clone();
+        match tokio::task::spawn_blocking(move || s.prune(false)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!(error = format!("{e:#}"), "daily prune failed"),
+            Err(e) => tracing::warn!(error = %e, "daily prune panicked"),
         }
         tokio::time::sleep(next_interval()).await;
     }

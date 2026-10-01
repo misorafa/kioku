@@ -3,7 +3,11 @@
 //! When enabled (env `KIOKU_HOOK_DUMP=1` or `[client] hook_dump = true`), every hook
 //! invocation appends one JSON line — raw stdin, filtered env, argv and the outcome — to
 //! `<log dir>/hook-dump.jsonl` (0600, rotated at 5 MiB). Dumping never changes the outcome
-//! and never fails the hook. `extract` turns the newest matching line into a test fixture.
+//! and never fails the hook. The first dumped invocation records
+//! `<kioku dir>/state/hook-dump-enabled-at`; capture stops by itself 24 h later until
+//! `kioku hook-dump enable` (SPEC-M2.8 §7). A hook with dumping off does no extra I/O.
+//! `extract` turns the newest matching line into a test fixture under
+//! `<kioku dir>/captures/<date>/`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -29,6 +33,68 @@ pub fn dump_enabled(cfg: &Config, env: &HookEnv) -> bool {
         .var("KIOKU_HOOK_DUMP")
         .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"));
     from_env || cfg.client.hook_dump
+}
+
+/// Marker inside `<kioku dir>/state/`: when the current capture window began.
+pub const HOOK_DUMP_MARKER: &str = "hook-dump-enabled-at";
+/// Capture stops by itself this long after it began (SPEC-M2.8 §7).
+pub const HOOK_DUMP_WINDOW: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+/// `<kioku dir>/state/hook-dump-enabled-at`.
+pub fn marker_path(cfg: &Config, env: &HookEnv) -> Option<PathBuf> {
+    crate::hook::client_state_root(cfg, env).map(|d| d.join("state").join(HOOK_DUMP_MARKER))
+}
+
+/// When the capture window began, in unix seconds (`None`: no marker yet, or unreadable).
+pub fn window_start(cfg: &Config, env: &HookEnv) -> Option<i64> {
+    let text = std::fs::read_to_string(marker_path(cfg, env)?).ok()?;
+    kioku_core::util::parse_ts(text.trim()).map(|t| t.timestamp())
+}
+
+/// True when dumping is enabled and its window began more than 24 h before `now` (unix
+/// seconds).
+pub fn dump_expired_at(cfg: &Config, env: &HookEnv, now: i64) -> bool {
+    dump_enabled(cfg, env)
+        && window_start(cfg, env).is_some_and(|t| now - t >= HOOK_DUMP_WINDOW.as_secs() as i64)
+}
+
+/// Whether this invocation is dumped: enabled, and inside the 24-hour window (the window
+/// starts — the marker is written — with the first dumped invocation). No I/O when dumping
+/// is off.
+pub fn dump_active_at(cfg: &Config, env: &HookEnv, now: i64) -> bool {
+    if !dump_enabled(cfg, env) {
+        return false;
+    }
+    match window_start(cfg, env) {
+        Some(_) => !dump_expired_at(cfg, env, now),
+        None => {
+            if let Some(path) = marker_path(cfg, env) {
+                if let Some(dir) = path.parent() {
+                    let _ = kioku_core::util::create_private_dir(dir);
+                }
+                let _ = std::fs::write(&path, format!("{}\n", now_ts()));
+            }
+            true
+        }
+    }
+}
+
+/// Restarts the capture window now (`kioku hook-dump enable`); returns the marker path.
+pub fn reset_window(cfg: &Config, env: &HookEnv) -> anyhow::Result<PathBuf> {
+    let path = marker_path(cfg, env).context("no kioku directory (HOME is not set)")?;
+    if let Some(dir) = path.parent() {
+        kioku_core::util::create_private_dir(dir)
+            .with_context(|| format!("creating {}", dir.display()))?;
+    }
+    std::fs::write(&path, format!("{}\n", now_ts()))
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
+}
+
+/// Default output of `kioku hook-dump extract`: `<kioku dir>/captures/<date of ts>/`.
+pub fn default_capture_dir(cfg: &Config, env: &HookEnv, ts: &str) -> Option<PathBuf> {
+    crate::hook::client_state_root(cfg, env)
+        .map(|d| d.join("captures").join(kioku_core::util::display_date(ts)))
 }
 
 /// `<log dir>/hook-dump.jsonl` (log dir as for `hook.log`).
@@ -108,7 +174,7 @@ pub fn dump_invocation(
     stdin: &str,
     outcome: &HookOutcome,
 ) {
-    if !dump_enabled(cfg, env) {
+    if !dump_active_at(cfg, env, kioku_core::util::now().timestamp()) {
         return;
     }
     if let Some(path) = dump_path(cfg) {
@@ -411,6 +477,74 @@ mod tests {
         ] {
             assert_eq!(fixture_name(input), want, "{input}");
         }
+    }
+
+    /// SPEC-M2.8 §7: the first dumped invocation starts a 24-hour window; after it, nothing
+    /// is dumped until `kioku hook-dump enable`; with dumping off no marker is written.
+    #[test]
+    fn capture_expires_after_24_hours() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_unreachable(dir.path());
+        let on = env();
+        let mut off = env();
+        off.vars.remove("KIOKU_HOOK_DUMP");
+        let marker = marker_path(&cfg, &on).unwrap();
+        let now = kioku_core::util::now().timestamp();
+        assert!(!dump_active_at(&cfg, &off, now));
+        assert!(!marker.exists(), "no I/O while dumping is off");
+        assert!(dump_active_at(&cfg, &on, now));
+        assert!(marker.is_file(), "the window starts");
+        let day = HOOK_DUMP_WINDOW.as_secs() as i64;
+        assert!(dump_active_at(&cfg, &on, now + day - 60));
+        assert!(!dump_active_at(&cfg, &on, now + day + 60), "expired");
+        assert!(dump_expired_at(&cfg, &on, now + day + 60));
+        assert!(!dump_expired_at(&cfg, &off, now + day + 60));
+        // an expired window dumps nothing
+        std::fs::write(&marker, "2020-01-01T00:00:00Z\n").unwrap();
+        let path = dump_path(&cfg).unwrap();
+        let _ = std::fs::remove_file(&path);
+        dump_invocation(
+            &cfg,
+            &on,
+            Agent::ClaudeCode,
+            HookEventKind::Stop,
+            &argv("claude-code", "stop"),
+            "{}",
+            &HookOutcome::ok(),
+        );
+        assert!(!path.exists());
+        // re-enabled: captured again
+        reset_window(&cfg, &on).unwrap();
+        dump_invocation(
+            &cfg,
+            &on,
+            Agent::ClaudeCode,
+            HookEventKind::Stop,
+            &argv("claude-code", "stop"),
+            "{}",
+            &HookOutcome::ok(),
+        );
+        assert!(path.is_file());
+    }
+
+    /// SPEC-M2.8 §7: `extract` writes under `<kioku dir>/captures/<date>/` by default.
+    #[test]
+    fn default_capture_dir_is_under_the_kioku_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_unreachable(dir.path());
+        assert_eq!(
+            default_capture_dir(&cfg, &env(), "2026-10-01T09:30:00Z").unwrap(),
+            dir.path().join("captures").join("2026-10-01")
+        );
+        // a client machine without a data dir: ~/.kioku/captures/<date>
+        let mut client = Config::for_data_dir(&dir.path().join("missing"));
+        client.data_dir = dir.path().join("missing");
+        let mut e = env();
+        e.home = Some(dir.path().join("home"));
+        assert_eq!(
+            default_capture_dir(&client, &e, "2026-10-01T09:30:00Z").unwrap(),
+            dir.path().join("home/.kioku/captures/2026-10-01")
+        );
     }
 
     #[test]
