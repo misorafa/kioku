@@ -654,6 +654,16 @@ fn index_check(s: &StatusReport) -> Check {
         );
     }
     match s.index_schema_version {
+        // SPEC-M3.1 §2: the user dictionary changed after the index was built.
+        Some(v) if v == s.index_schema_expected && s.user_dict_stale => check(
+            "index",
+            Status::Warn,
+            format!(
+                "index schema v{v} ({} documents), but dict/user.csv changed after the index was built / ユーザー辞書が索引より新しい",
+                s.index_docs
+            ),
+            Some("kioku reindex".into()),
+        ),
         Some(v) if v == s.index_schema_expected => check(
             "index",
             Status::Ok,

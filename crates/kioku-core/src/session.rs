@@ -206,6 +206,34 @@ pub struct RecentSession {
     pub machine: Option<String>,
 }
 
+/// A session that edited files under a path (SPEC-M3.1 §3, `kioku_query(path_prefix)`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathSession {
+    /// Session id.
+    pub session_id: String,
+    /// Project id.
+    pub project_id: String,
+    /// Wiki-relative path of the session page (readable with `kioku_read` once finalized).
+    pub path: String,
+    /// Session page title (empty when the session has no page yet).
+    pub title: String,
+    /// `YYYY-MM-DD` of its start.
+    pub date: String,
+    /// Agent of the session.
+    pub agent: String,
+    /// Lane of the session, if not the project lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<String>,
+    /// Machine that ran the session, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+    /// The edited files under the prefix, most edited first (at most 5).
+    pub files: Vec<String>,
+    /// Summary of the session's newest handoff (agent-written preferred), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
 /// A line carried forward from earlier agent handoffs (decisions, verified facts, open
 /// questions, gotchas; SPEC-M3.0 §1–§2).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,6 +279,10 @@ pub struct SessionStartResponse {
     /// shown for reference and NOT accepted (M2.4 §1.4 rule 2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reference_handoff: Option<Handoff>,
+    /// Why `reference_handoff` was not accepted (SPEC-M3.1 §1; see
+    /// [`crate::handoff::REFERENCE_CONCURRENT`]); absent = the main line's (M2.4 §1.4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_reason: Option<String>,
     /// [`CONTEXT_VERSION`] when the fields below are computed; 0 (absent) from an older
     /// server, whose block is rendered as before (handoff + STATE excerpt).
     #[serde(default)]

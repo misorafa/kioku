@@ -1043,6 +1043,37 @@ fn doctor_all_ok_then_warn_and_fail_scenarios() {
     assert!(!c.fix.as_deref().unwrap_or("").contains("kioku reindex"));
     std::fs::write(&version_file, original).unwrap();
 
+    // SPEC-M3.1 §2: a user dictionary edited after the index was built → WARN, reindex.
+    let dict = fx.home.path().join(".kioku/dict/user.csv");
+    assert!(
+        std::fs::read_to_string(&dict)
+            .unwrap()
+            .contains("引き継ぎ書,"),
+        "init writes the starter dictionary"
+    );
+    let set_mtime = |secs_from_now: i64| {
+        let at = if secs_from_now >= 0 {
+            std::time::SystemTime::now() + Duration::from_secs(secs_from_now as u64)
+        } else {
+            std::time::SystemTime::now() - Duration::from_secs((-secs_from_now) as u64)
+        };
+        std::fs::File::options()
+            .write(true)
+            .open(&dict)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    };
+    set_mtime(3600);
+    let checks = doctor::run_doctor(&fx.env(), None);
+    let c = find(&checks, "index");
+    assert_eq!(c.status, Status::Warn, "{}", c.message);
+    assert!(c.message.contains("dict/user.csv"), "{}", c.message);
+    assert_eq!(c.fix.as_deref(), Some("kioku reindex"));
+    set_mtime(-3600);
+    let checks = doctor::run_doctor(&fx.env(), None);
+    assert_eq!(find(&checks, "index").status, Status::Ok);
+
     // Moved binary → FAIL agent.claude-code.hooks.
     install_agent(
         Agent::ClaudeCode,

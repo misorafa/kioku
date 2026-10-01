@@ -201,7 +201,8 @@ fn start_carries_items_pins_pages_and_names_machines() {
     assert_eq!(
         texts(&r.decisions),
         [
-            "ＬＩＮＤＥＲＡ を使う",
+            // the earliest wording of a restated decision (SPEC-M3.1 review item)
+            "lindera を使う",
             "検索の再ランキングはどうするか → M3.1 でやる",
             "SQLite は WAL"
         ]
@@ -257,7 +258,7 @@ fn start_carries_items_pins_pages_and_names_machines() {
     assert!(
         state
             .body
-            .contains("## 決定事項（これまでの引き継ぎ）\n- ＬＩＮＤＥＲＡ を使う ("),
+            .contains("## 決定事項（これまでの引き継ぎ）\n- lindera を使う ("),
         "{}",
         state.body
     );

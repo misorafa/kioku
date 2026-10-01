@@ -901,20 +901,110 @@ pub fn newest_handoff_accepted_by(
         .optional()?)
 }
 
-/// Marks every pending handoff of a project on one lane (`None` = the project lane) as
-/// accepted by `by` (consume + supersede); other lanes are untouched.
-pub fn accept_pending_handoffs(
+/// Sessions with a cached digest (SPEC-M2.8 §1) whose JSON contains `needle`, of `project`
+/// (every project when `None`), newest start first, with that JSON.
+pub fn sessions_with_digest_containing(
+    conn: &Connection,
+    project: Option<&str>,
+    needle: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<(Session, String)>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SESSION_COLS}, digest_json FROM sessions
+         WHERE digest_json IS NOT NULL AND (?1 IS NULL OR project_id = ?1)
+           AND instr(digest_json, ?2) > 0
+         ORDER BY started_at DESC, rowid DESC LIMIT ?3"
+    ))?;
+    let rows = stmt.query_map(params![project, needle, limit as i64], |r| {
+        Ok((session_from_row(r)?, r.get::<_, String>(11)?))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Newest pending handoff of a project on one lane (`None` = the project lane), leaving
+/// out those written by `exclude_session` (a session never receives its own, SPEC-M3.1 §1).
+pub fn newest_pending_handoff(
     conn: &Connection,
     project: &str,
     lane: Option<&str>,
-    by: &str,
-    now: &str,
-) -> anyhow::Result<usize> {
-    Ok(conn.execute(
-        "UPDATE handoffs SET accepted_at = ?3, accepted_by = ?2
-         WHERE project_id = ?1 AND lane IS ?4 AND accepted_at IS NULL",
-        params![project, by, now, lane],
-    )?)
+    exclude_session: Option<&str>,
+) -> anyhow::Result<Option<Handoff>> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "{HANDOFF_SELECT} WHERE h.project_id = ?1 AND h.lane IS ?2 AND h.accepted_at IS NULL
+                 AND (?3 IS NULL OR h.session_id IS NOT ?3) {HANDOFF_ORDER}"
+            ),
+            params![project, lane, exclude_session],
+            handoff_from_row,
+        )
+        .optional()?)
+}
+
+/// Accepts handoff `id` for `by` and marks the other pending handoffs of its project and
+/// lane — except those written by `by` itself — as [`crate::handoff::SUPERSEDED`]
+/// (SPEC-M3.1 §1); other lanes are untouched.
+pub fn accept_handoff(conn: &Connection, id: &str, by: &str, now: &str) -> anyhow::Result<()> {
+    let Some(h) = get_handoff(conn, id)? else {
+        return Ok(());
+    };
+    conn.execute(
+        "UPDATE handoffs SET accepted_at = ?2, accepted_by = ?3 WHERE id = ?1 AND accepted_at IS NULL",
+        params![id, now, by],
+    )?;
+    conn.execute(
+        "UPDATE handoffs SET accepted_at = ?3, accepted_by = ?5
+         WHERE project_id = ?1 AND lane IS ?2 AND accepted_at IS NULL AND id != ?4
+           AND session_id IS NOT ?6",
+        params![
+            h.project_id,
+            h.lane,
+            now,
+            id,
+            crate::handoff::SUPERSEDED,
+            by
+        ],
+    )?;
+    Ok(())
+}
+
+/// The last `limit` handoffs of a project on one lane, newest first, whatever their status.
+pub fn lane_handoffs(
+    conn: &Connection,
+    project: &str,
+    lane: Option<&str>,
+    limit: usize,
+) -> anyhow::Result<Vec<Handoff>> {
+    let mut stmt = conn.prepare(&format!(
+        "{HANDOFF_SELECT} WHERE h.project_id = ?1 AND h.lane IS ?2
+         ORDER BY h.created_at DESC, (h.source = 'agent') DESC, h.rowid DESC LIMIT ?3"
+    ))?;
+    let rows = stmt.query_map(params![project, lane, limit as i64], handoff_from_row)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Another open session of a project on one lane with an observation at or after `since`
+/// (SPEC-M3.1 §1 rule 3), newest observation first.
+pub fn other_active_session(
+    conn: &Connection,
+    project: &str,
+    lane: Option<&str>,
+    exclude: &str,
+    since: &str,
+) -> anyhow::Result<Option<Session>> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT {SESSION_COLS} FROM sessions s
+                 WHERE s.project_id = ?1 AND s.lane IS ?2 AND s.id != ?3 AND s.status = 'open'
+                   AND EXISTS (SELECT 1 FROM observations o WHERE o.session_id = s.id AND o.ts >= ?4)
+                 ORDER BY (SELECT MAX(o.ts) FROM observations o WHERE o.session_id = s.id) DESC
+                 LIMIT 1"
+            ),
+            params![project, lane, exclude, since],
+            session_from_row,
+        )
+        .optional()?)
 }
 
 fn page_from_row(r: &Row<'_>) -> rusqlite::Result<PageRow> {

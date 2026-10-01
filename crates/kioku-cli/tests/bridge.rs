@@ -254,6 +254,106 @@ async fn bridge_serves_the_server_tools_over_rest() {
     assert!(text(&main).contains("メインの引き継ぎ"));
     assert!(!text(&main).contains("accepted: "));
 
+    // SPEC-M3.1: filters, path_prefix and history go through REST too
+    let filtered = bridge
+        .call_tool(call(
+            "kioku_query",
+            json!({"query": "引き継ぎ", "kinds": ["page"], "since": "2000-01-01", "project": PROJECT}),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        text(&filtered).contains("— 引き継ぎの設計 (page, "),
+        "{}",
+        text(&filtered)
+    );
+    let later = bridge
+        .call_tool(call(
+            "kioku_query",
+            json!({"query": "引き継ぎ", "since": "2999-01-01"}),
+        ))
+        .await
+        .unwrap();
+    assert!(text(&later).ends_with("no hits"), "{}", text(&later));
+    let bad = bridge
+        .call_tool(call(
+            "kioku_query",
+            json!({"query": "引き継ぎ", "kinds": ["メモ"]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(bad.is_error, Some(true));
+    let by_path = bridge
+        .call_tool(call(
+            "kioku_query",
+            json!({"path_prefix": "src/検索.rs", "project": PROJECT}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        text(&by_path),
+        format!(
+            "{}src/検索.rs を編集したセッション（新しい順） / sessions that edited src/検索.rs, newest first:\nnone",
+            memory_note()
+        )
+    );
+    let history = bridge
+        .call_tool(call(
+            "kioku_handoff_pending",
+            json!({"project": PROJECT, "history": 3}),
+        ))
+        .await
+        .unwrap();
+    let out = text(&history);
+    assert!(out.contains("## history, newest first"), "{out}");
+    assert!(out.contains("stdio ブリッジを実装した"), "{out}");
+
+    bridge.cancel().await.unwrap();
+}
+
+/// SPEC-M3.1 §3: a server that predates `path_prefix` answers a plain search; the bridge
+/// says so instead of printing an empty session list.
+#[tokio::test(flavor = "multi_thread")]
+async fn path_prefix_against_an_older_server_is_a_clear_error() {
+    let app = axum::Router::new().route(
+        "/api/v1/search",
+        axum::routing::get(|| async { axum::Json(json!({"hits": []})) }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (ours, theirs) = tokio::io::duplex(1 << 16);
+    let cfg = client_cfg(&format!("http://{addr}"));
+    tokio::spawn(async move {
+        let svc = KiokuBridge::new(cfg)
+            .serve(tokio::io::split(ours))
+            .await
+            .unwrap();
+        let _ = svc.waiting().await;
+    });
+    let bridge = ().serve(tokio::io::split(theirs)).await.expect("initialize");
+    let r = bridge
+        .call_tool(
+            CallToolRequestParams::new("kioku_query")
+                .with_arguments(args(json!({"path_prefix": "src/索引.rs"}))),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.is_error, Some(true));
+    assert!(
+        text(&r).contains("path_prefix に対応していません"),
+        "{}",
+        text(&r)
+    );
+    // a plain query still works against it
+    let r = bridge
+        .call_tool(
+            CallToolRequestParams::new("kioku_query")
+                .with_arguments(args(json!({"query": "索引"}))),
+        )
+        .await
+        .unwrap();
+    assert_eq!(text(&r), format!("{}no hits", memory_note()));
     bridge.cancel().await.unwrap();
 }
 

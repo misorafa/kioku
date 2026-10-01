@@ -259,10 +259,34 @@ async fn mcp_handoff_pending_reads_a_lane() {
             .unwrap(),
     );
     assert_eq!(out, format!("{}none", memory_note()));
-    // by lane and by session
+    // by session: the lane of wt-a, but never wt-a's own handoff (SPEC-M3.1 §1 rule 2)
+    let own = text(
+        &client
+            .call_tool(call(json!({"project": PROJECT, "session": "wt-a"})))
+            .await
+            .unwrap(),
+    );
+    assert!(!own.contains("検索のレーンで作業した"), "{own}");
+    // by lane, and by a lane-mate's session
+    srv.store
+        .start_session(&kioku_core::SessionStartRequest {
+            session_id: "wt-b".into(),
+            agent: "codex".into(),
+            cwd: "/home/u/kioku".into(),
+            source: "resume".into(),
+            project: kioku_core::ProjectIdentity {
+                id: PROJECT.into(),
+                name: "kioku".into(),
+                root: "/home/u/kioku".into(),
+                remote: Some("github.com/u/kioku".into()),
+            },
+            lane: Some("feature/検索".into()),
+            machine: None,
+        })
+        .unwrap();
     for a in [
         json!({"project": PROJECT, "lane": "feature/検索"}),
-        json!({"project": PROJECT, "session": "wt-a"}),
+        json!({"project": PROJECT, "session": "wt-b"}),
     ] {
         let out = text(&client.call_tool(call(a)).await.unwrap());
         assert!(out.contains("検索のレーンで作業した"), "{out}");
@@ -309,6 +333,151 @@ async fn mcp_handoff_pending_reads_a_lane() {
         out.contains("メインの引き継ぎ"),
         "still pending on the main line: {out}"
     );
+
+    client.cancel().await.unwrap();
+}
+
+/// SPEC-M3.1 through MCP: `kioku_query` with `kinds` / `since` / `path_prefix`, the
+/// partial-match note and `@machine`; `kioku_handoff_pending` with `history` and the
+/// busy-lane reference.
+#[tokio::test]
+async fn mcp_query_filters_paths_and_handoff_history() {
+    let srv = spawn().await;
+    let mut body = start_body("s-a");
+    body["machine"] = json!("mini");
+    srv.post("/api/v1/sessions/start", body).await;
+    for (kind, payload) in [
+        ("prompt", json!({"prompt": "索引の再構築を速くする"})),
+        (
+            "tool_use",
+            json!({"tool_name": "Edit", "tool_input": {"file_path": "/home/u/kioku/src/index.rs"}, "tool_response": {}}),
+        ),
+    ] {
+        srv.post(
+            "/api/v1/observations",
+            json!({"session_id": "s-a", "kind": kind, "payload": payload}),
+        )
+        .await;
+    }
+    srv.post(
+        "/api/v1/handoffs",
+        json!({"project": PROJECT, "session": "s-a", "summary": "再構築を別ディレクトリで行う"}),
+    )
+    .await;
+    srv.post("/api/v1/sessions/s-a/finalize", json!({})).await;
+
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(srv.url("/mcp")).auth_header(TOKEN),
+    );
+    let client = ().serve(transport).await.expect("initialize");
+    let query =
+        |a: serde_json::Value| CallToolRequestParams::new("kioku_query").with_arguments(args(a));
+
+    let out = text(
+        &client
+            .call_tool(query(
+                json!({"query": "索引の再構築", "kinds": ["session"]}),
+            ))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        out.contains("(session, ") && out.contains(", @mini)"),
+        "{out}"
+    );
+    let out = text(
+        &client
+            .call_tool(query(
+                json!({"query": "索引の再構築", "since": "2999-01-01"}),
+            ))
+            .await
+            .unwrap(),
+    );
+    assert!(out.ends_with("no hits"), "{out}");
+    let bad = client
+        .call_tool(query(json!({"query": "索引", "since": "先週"})))
+        .await
+        .unwrap();
+    assert_eq!(bad.is_error, Some(true));
+    // partial match
+    let out = text(
+        &client
+            .call_tool(query(json!({"query": "再構築を速くす"})))
+            .await
+            .unwrap(),
+    );
+    assert!(out.contains("no hits") || out.contains("1. "), "{out}");
+    let out = text(
+        &client
+            .call_tool(query(json!({"query": "構築を速"})))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        out.contains("（部分一致）/ (partial match)") || out.contains("1. "),
+        "{out}"
+    );
+    // who touched src/index.rs and why
+    let out = text(
+        &client
+            .call_tool(query(
+                json!({"path_prefix": "src/index.rs", "project": PROJECT}),
+            ))
+            .await
+            .unwrap(),
+    );
+    assert!(out.starts_with(&memory_note()), "{out}");
+    assert!(
+        out.contains("src/index.rs を編集したセッション（新しい順）"),
+        "{out}"
+    );
+    assert!(
+        out.contains("claude-code@mini") && out.contains("files: src/index.rs"),
+        "{out}"
+    );
+    assert!(
+        out.contains("summary: 再構築を別ディレクトリで行う"),
+        "{out}"
+    );
+    assert!(!out.contains("no hits"), "no terms, no hit list: {out}");
+    let missing = client
+        .call_tool(query(json!({"query": " "})))
+        .await
+        .unwrap();
+    assert_eq!(missing.is_error, Some(true));
+
+    // a second session works on the lane while a third starts: reference only
+    let (_, b) = srv.post("/api/v1/sessions/start", start_body("s-b")).await;
+    assert!(b["pending_handoff"]["id"].is_string(), "{b}");
+    srv.post(
+        "/api/v1/observations",
+        json!({"session_id": "s-b", "kind": "prompt", "payload": {"prompt": "続きをやる"}}),
+    )
+    .await;
+    srv.post(
+        "/api/v1/handoffs",
+        json!({"project": PROJECT, "session": "s-b", "summary": "途中経過"}),
+    )
+    .await;
+    let (_, c) = srv.post("/api/v1/sessions/start", start_body("s-c")).await;
+    assert!(c["pending_handoff"].is_null(), "{c}");
+    assert_eq!(c["reference_reason"], "concurrent", "{c}");
+    let pending = |a: serde_json::Value| {
+        CallToolRequestParams::new("kioku_handoff_pending").with_arguments(args(a))
+    };
+    let out = text(
+        &client
+            .call_tool(pending(json!({"project": PROJECT, "history": 5})))
+            .await
+            .unwrap(),
+    );
+    assert!(out.contains("途中経過"), "{out}");
+    assert!(
+        out.contains("## history, newest first / 履歴（新しい順、"),
+        "{out}"
+    );
+    assert!(out.contains(" — pending (agent, "), "{out}");
+    assert!(out.contains(" — accepted by s-b ("), "{out}");
 
     client.cancel().await.unwrap();
 }

@@ -1,4 +1,6 @@
 {
+  "now": "2026-10-01T00:00:00Z",
+  "user_dict": "# 評価用の辞書\nハンドオフ,-10000,名詞,ハンドオフ,引き継ぎ\n引継,-10000,名詞,ヒキツギ,引き継ぎ\nインデックス,-10000,名詞,インデックス,索引\nエイリアス,-10000,名詞,エイリアス,別名\nプロジェクト別名,-10000,名詞,プロジェクトベツメイ\n引き継ぎ書,-10000,名詞,ヒキツギショ\n",
   "pages": [
     {"id":"handoff", "title":"作業の引き継ぎ", "body":"セッション終了時に決定事項と次にやることを記録する。次のエージェントに引き継ぎ書を渡す。"},
     {"id":"backup", "title":"バックアップから復元", "body":"サーバーを壊してしまった。wikiとSQLiteのバックアップを新しいディレクトリに復元し、チェックサムを検証する。"},
@@ -10,10 +12,60 @@
     {"id":"other", "title":"夕食の買い物", "body":"牛乳と卵を買う。明日の朝食にパンを焼く。"},
     {"id":"handoff-format", "title":"引き継ぎ書の書式", "body":"見出しの順番と箇条書きの記号を決める。Markdownのテンプレートを用意した。"},
     {"id":"git-revert", "title":"gitで以前の状態に戻す", "body":"誤ったコミットを取り消して、作業ツリーを前の版に戻した。"},
-    {"id":"flutter-ui", "title":"Flutterのボタン配置", "body":"ボタンの余白とフォントサイズを調整した。"}
+    {"id":"flutter-ui", "title":"Flutterのボタン配置", "body":"ボタンの余白とフォントサイズを調整した。"},
+
+    {"id":"handoff-tool", "title":"MCP ツールの引数", "body":"kioku_handoff_write は summary と next_steps を受け取る。project と session も渡す。"},
+    {"id":"store-open", "title":"ストアを開く処理", "body":"Store::open はデータディレクトリをロックし、SQLite と全文索引を開く。"},
+    {"id":"index-rs", "title":"索引モジュールの構成", "body":"src/index.rs に tantivy のスキーマと検索処理がある。JA_TOKENIZER を登録する。"},
+    {"id":"write-lock", "title":"書き込みの直列化", "body":"ページの書き込みは write_lock で直列化する。順番は write_lock、db、index writer の順。"},
+    {"id":"rebuild", "title":"古い索引からの切り替え", "body":"SearchIndex::rebuild は新しいディレクトリに作ってから切り替える。"},
+    {"id":"config-file", "title":"設定ファイルの場所", "body":"~/.kioku/config.toml に server_url と auth_token を書く。"},
+    {"id":"spawn-blocking", "title":"非同期ランタイムを止めない", "body":"SQLite や git の処理は tokio::task::spawn_blocking の中で実行する。"},
+    {"id":"http-api", "title":"検索 API の仕様", "body":"GET /api/v1/search?q= で検索結果を JSON で返す。limit で件数を絞る。"},
+
+    {"id":"docker", "title":"Docker でサーバーを動かす", "body":"docker compose up でコンテナを起動し、ボリュームに wiki を置く。"},
+    {"id":"launchd", "title":"macOS の常駐設定", "body":"launchd の plist を LaunchAgents に置き、ログイン時に kioku serve を起動する。"},
+    {"id":"systemd", "title":"Linux の常駐設定", "body":"systemd の user unit で kioku serve を起動する。loginctl enable-linger が必要。"},
+    {"id":"windows-task", "title":"Windows の常駐設定", "body":"タスクスケジューラに登録してログオン時に起動する。PowerShell で install.ps1 を実行する。"},
+    {"id":"ci-cache", "title":"CI のビルドキャッシュ", "body":"GitHub Actions で cargo のキャッシュを使い、辞書のビルド時間を短くする。"},
+    {"id":"token-rotate", "title":"トークンの再発行", "body":"rotate-token で auth_token を作り直し、各マシンに配り直す。"},
+
+    {"id":"keyboard", "title":"キーボードショートカット", "body":"エディタのショートカットを設定した。"},
+    {"id":"migration", "title":"データベースのマイグレーション", "body":"スキーマのバージョンを上げてマイグレーションを実行する。"},
+    {"id":"backup-schedule", "title":"定期実行のスケジュール", "body":"毎晩ジョブを動かし、世代を七つ残す。"},
+    {"id":"printer", "title":"プリンターの設定", "body":"ネットワークプリンターのドライバを入れた。"},
+
+    {"id":"lane-routing", "title":"レーンごとの受け渡し", "body":"ブランチごとにレーンを分け、引き継ぎは同じレーンのセッションだけが受け取る。"},
+    {"id":"reindex", "title":"索引の作り直し", "body":"kioku reindex で wiki から索引を作り直す。辞書を変えたあとに必要。"},
+    {"id":"alias", "title":"古い id の扱い", "body":"リモートが付いたプロジェクトは古い id を別名として残す。"},
+    {"id":"observation", "title":"観測の記録", "body":"フックはプロンプトとツール呼び出しを観測として送る。"},
+
+    {"id":"deploy-old", "title":"デプロイ手順", "body":"サーバーへのデプロイは scp でバイナリをコピーして再起動する。", "updated":"2026-03-01T00:00:00Z"},
+    {"id":"deploy-new", "title":"デプロイ手順", "body":"サーバーへのデプロイは kioku update による自動更新で行う。コピーは不要になった。", "updated":"2026-09-25T00:00:00Z"},
+    {"id":"port-old", "title":"待ち受けポート", "body":"サーバーは 8080 番で待ち受ける。", "updated":"2026-01-10T00:00:00Z"},
+    {"id":"port-new", "title":"待ち受けポート", "body":"サーバーは 7878 番で待ち受ける。ファイアウォールでも開けておく。", "updated":"2026-09-20T00:00:00Z"},
+    {"id":"nudge-old", "title":"引き継ぎの催促", "body":"ツール呼び出しが三回を超えたら催促する。", "updated":"2026-05-01T00:00:00Z"},
+    {"id":"nudge-new", "title":"引き継ぎの催促", "body":"前回の引き継ぎから三十分たったら催促する。回数ではなく時間で判断する。", "updated":"2026-09-28T00:00:00Z"},
+    {"id":"release-old", "title":"リリース手順", "body":"タグを打って手元でビルドし、成果物を手動で上げる。", "updated":"2026-02-15T00:00:00Z"},
+    {"id":"release-new", "title":"リリース手順", "body":"タグを打つと CI がビルドしてリリースを作る。", "updated":"2026-09-29T00:00:00Z"},
+
+    {"id":"rules-pinned", "title":"このリポジトリのルール", "body":"コミットは日本語で書く。テストには日本語のクエリを含める。", "tags":["pinned"]},
+    {"id":"commit-notes", "title":"開発のメモ", "body":"コミットは小さく分ける。テストを先に書く。"},
+    {"id":"ops-pinned", "title":"サーバー運用の約束", "body":"待ち受けの番号は変えない。ログは毎週確認する。", "tags":["pinned"]},
+    {"id":"ops-notes", "title":"サーバー運用のメモ", "body":"ログを確認した。待ち受けの番号を調べた。"},
+
+    {"id":"flutter-nav", "title":"Flutter の画面遷移", "body":"Navigator で画面遷移する。戻るボタンの挙動も決めた。"},
+    {"id":"session-flutter", "title":"Flutter の画面遷移を直す", "body":"Flutter の画面遷移のバグを直した。", "kind":"session"},
+    {"id":"state-1", "title":"記憶 の現在の状態", "body":"最近のセッション: 画面遷移の修正。", "kind":"state"},
+
+    {"id":"meeting", "title":"週次ミーティング", "body":"進捗と課題を共有した。次回は金曜日。"},
+    {"id":"travel", "title":"出張の準備", "body":"新幹線と宿を予約した。"},
+    {"id":"budget", "title":"予算の見直し", "body":"クラウドの費用を減らすためにインスタンスを小さくした。"},
+    {"id":"handoff-words", "title":"handoff と write の話", "body":"kioku の handoff を write する流れ。handoff は session ごとに write する。"},
+    {"id":"lock-words", "title":"lock と write の注意", "body":"write の前に lock を取る。lock は短く持つ。"}
   ],
   "queries": [
-    {"q":"引き継ぎ書", "relevant":["handoff"]},
+    {"q":"引き継ぎ書", "relevant":["handoff","handoff-format"]},
     {"q":"バックアップ 復元", "relevant":["backup"]},
     {"q":"自宅サーバー WireGuard", "relevant":["network"]},
     {"q":"形態素解析", "relevant":["search"]},
@@ -25,6 +77,55 @@
     {"q":"ｺｰﾄﾞﾁｬｰﾄ 描画", "relevant":["flutter"], "top":true},
     {"q":"NFKC 半角", "relevant":["search"]},
     {"q":"リビジョン 再読込", "relevant":["conflict"]},
-    {"q":"引き継ぎ バックアップ", "relevant":["handoff","backup"]}
+    {"q":"引き継ぎ バックアップ", "relevant":["handoff","backup"]},
+
+    {"q":"kioku_handoff_write", "relevant":["handoff-tool"], "top":true},
+    {"q":"handoff write の引数", "relevant":["handoff-tool","handoff-words"]},
+    {"q":"Store::open", "relevant":["store-open"], "top":true},
+    {"q":"src/index.rs", "relevant":["index-rs"], "top":true},
+    {"q":"index.rs のスキーマ", "relevant":["index-rs"], "top":true},
+    {"q":"write_lock", "relevant":["write-lock"], "top":true},
+    {"q":"lock の順番", "relevant":["write-lock"]},
+    {"q":"SearchIndex rebuild", "relevant":["rebuild"], "top":true},
+    {"q":"spawn_blocking", "relevant":["spawn-blocking"], "top":true},
+    {"q":"config.toml", "relevant":["config-file"], "top":true},
+    {"q":"/api/v1/search", "relevant":["http-api"], "top":true},
+    {"q":"JA_TOKENIZER", "relevant":["index-rs"], "top":true},
+
+    {"q":"Docker compose で起動", "relevant":["docker"], "top":true},
+    {"q":"launchd の plist", "relevant":["launchd"], "top":true},
+    {"q":"systemd linger", "relevant":["systemd"], "top":true},
+    {"q":"タスクスケジューラ PowerShell", "relevant":["windows-task"], "top":true},
+    {"q":"GitHub Actions キャッシュ", "relevant":["ci-cache"], "top":true},
+    {"q":"auth_token を再発行", "relevant":["token-rotate"], "top":true},
+
+    {"q":"ｷｰﾎﾞｰﾄﾞ ｼｮｰﾄｶｯﾄ", "relevant":["keyboard"], "top":true},
+    {"q":"ﾏｲｸﾞﾚｰｼｮﾝ", "relevant":["migration"], "top":true},
+    {"q":"ｽｹｼﾞｭｰﾙ", "relevant":["backup-schedule"], "top":true},
+    {"q":"ﾌﾟﾘﾝﾀｰ ﾄﾞﾗｲﾊﾞ", "relevant":["printer"], "top":true},
+
+    {"q":"ハンドオフ", "relevant":["handoff","handoff-format","lane-routing","nudge-new","nudge-old"]},
+    {"q":"引継の書式", "relevant":["handoff-format"], "top":true},
+    {"q":"インデックス 作り直し", "relevant":["reindex"], "top":true},
+    {"q":"エイリアス", "relevant":["alias"], "top":true},
+    {"q":"プロジェクト別名", "relevant":["alias"], "top":true},
+
+    {"q":"デプロイ手順", "relevant":["deploy-new"], "top":true},
+    {"q":"待ち受けポート", "relevant":["port-new"], "top":true},
+    {"q":"引き継ぎの催促", "relevant":["nudge-new"], "top":true},
+    {"q":"リリース手順", "relevant":["release-new"], "top":true},
+
+    {"q":"コミット テスト", "relevant":["rules-pinned"], "top":true},
+    {"q":"サーバー運用 待ち受け", "relevant":["ops-pinned"], "top":true},
+
+    {"q":"Flutter 画面遷移", "relevant":["flutter-nav"], "top":true},
+
+    {"q":"チェックサ", "relevant":["backup"], "top":true, "partial":true},
+    {"q":"マイグレーショ", "relevant":["migration"], "top":true, "partial":true},
+    {"q":"ショートカ", "relevant":["keyboard"], "top":true, "partial":true},
+
+    {"q":"週次の進捗", "relevant":["meeting"], "top":true},
+    {"q":"新幹線 予約", "relevant":["travel"], "top":true},
+    {"q":"クラウドの費用", "relevant":["budget"], "top":true}
   ]
 }

@@ -72,6 +72,36 @@ pub struct PendingHandoff {
     /// for reference, never accepted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reference_handoff: Option<Handoff>,
+    /// Why `reference_handoff` is only a reference (SPEC-M3.1 §1): [`REFERENCE_MAIN_LINE`],
+    /// [`REFERENCE_CONCURRENT`] or [`REFERENCE_RESUMED`]; absent = main line (older server).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_reason: Option<String>,
+    /// The last handoffs of the lane, newest first, when asked for (`history`, ≤ 20).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<Handoff>,
+}
+
+/// `reference_reason`: the main line's handoff on a branch lane without its own (M2.4 §1.4).
+pub const REFERENCE_MAIN_LINE: &str = "main_line";
+/// `reference_reason`: another session is active on the lane (SPEC-M3.1 §1 rule 3).
+pub const REFERENCE_CONCURRENT: &str = "concurrent";
+/// `reference_reason`: a resumed / compacted session that never accepted one (§1 rule 1).
+pub const REFERENCE_RESUMED: &str = "resumed";
+/// `accepted_by` of a handoff that a newer one replaced when it was accepted (§1).
+pub const SUPERSEDED: &str = "superseded";
+/// Max `history` of `kioku_handoff_pending`.
+pub const MAX_HISTORY: usize = 20;
+
+impl Handoff {
+    /// `pending`, `superseded` or `accepted by <session>`.
+    pub fn status(&self) -> String {
+        match (&self.accepted_at, self.accepted_by.as_deref()) {
+            (None, _) => "pending".to_string(),
+            (Some(_), Some(SUPERSEDED)) => SUPERSEDED.to_string(),
+            (Some(_), Some(by)) => format!("accepted by {by}"),
+            (Some(_), None) => "accepted".to_string(),
+        }
+    }
 }
 
 /// Input of `kioku_handoff_write` / `POST /api/v1/handoffs` (spec §7.5).

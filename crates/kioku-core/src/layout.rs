@@ -49,9 +49,34 @@ impl DataDir {
         self.root.join("db").join("kioku.sqlite")
     }
 
-    /// `index/tantivy/`.
+    /// `index/tantivy-v<N>/` — the index of the current [`crate::index::INDEX_SCHEMA_VERSION`].
+    /// Each version is built in its own directory so the older one keeps serving searches
+    /// until the rebuild switches over (SPEC-M3.1 §2, SPEC-M2.8 §5).
     pub fn index_dir(&self) -> PathBuf {
-        self.root.join("index").join("tantivy")
+        self.index_dir_for(crate::index::INDEX_SCHEMA_VERSION)
+    }
+
+    /// The index directory of schema version `v` (`index/tantivy/` up to version 2).
+    pub fn index_dir_for(&self, v: u32) -> PathBuf {
+        let index = self.root.join("index");
+        if v <= 2 {
+            index.join("tantivy")
+        } else {
+            index.join(format!("tantivy-v{v}"))
+        }
+    }
+
+    /// Index directories of older schema versions, newest first.
+    pub fn legacy_index_dirs(&self) -> Vec<PathBuf> {
+        (2..crate::index::INDEX_SCHEMA_VERSION)
+            .rev()
+            .map(|v| self.index_dir_for(v))
+            .collect()
+    }
+
+    /// `dict/user.csv` — the user dictionary of the `ja` analyzer (SPEC-M3.1 §2).
+    pub fn user_dict_file(&self) -> PathBuf {
+        self.root.join("dict").join("user.csv")
     }
 
     /// `index/schema-version` — [`crate::index::INDEX_SCHEMA_VERSION`] the index was built with.
@@ -125,6 +150,7 @@ pub fn init(config: &mut Config) -> Result<InitReport> {
     if config_written {
         config.save()?;
     }
+    write_starter_dict(&DataDir::new(&config.data_dir))?;
     let store = Store::open(config.clone())?;
     Ok(InitReport {
         data_dir: config.data_dir.display().to_string(),
@@ -133,6 +159,20 @@ pub fn init(config: &mut Config) -> Result<InitReport> {
         token_generated,
         git_enabled: store.git_enabled(),
     })
+}
+
+/// Writes the starter user dictionary (SPEC-M3.1 §2) unless `dict/user.csv` exists.
+pub fn write_starter_dict(dirs: &DataDir) -> Result<bool> {
+    let file = dirs.user_dict_file();
+    if file.exists() {
+        return Ok(false);
+    }
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    std::fs::write(&file, crate::index::STARTER_USER_DICT)
+        .with_context(|| format!("writing {}", file.display()))?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -157,11 +197,20 @@ mod tests {
         let token = config.server.auth_token.clone().unwrap();
         assert_eq!(config.client.auth_token.as_deref(), Some(token.as_str()));
 
+        // SPEC-M3.1 §2: the starter user dictionary, never overwritten once edited
+        let dict = std::fs::read_to_string(d.user_dict_file()).unwrap();
+        assert!(dict.contains("引き継ぎ書,") && dict.contains("プロジェクト別名,"));
+        std::fs::write(d.user_dict_file(), "記憶,-10000,名詞,キオク\n").unwrap();
+
         let mut again = Config::load_file(&config.config_file).unwrap();
         let report = init(&mut again).unwrap();
         assert!(!report.config_written);
         assert!(!report.token_generated);
         assert_eq!(again.server.auth_token.as_deref(), Some(token.as_str()));
+        assert_eq!(
+            std::fs::read_to_string(d.user_dict_file()).unwrap(),
+            "記憶,-10000,名詞,キオク\n"
+        );
     }
 
     #[cfg(unix)]

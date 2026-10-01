@@ -8,8 +8,12 @@
 mod context_tests;
 #[cfg(test)]
 mod finalize_tests;
+#[cfg(test)]
+mod handoff_tests;
 mod maintenance;
 mod reliability;
+#[cfg(test)]
+mod search_tests;
 pub use maintenance::{
     ForgetReport, PruneCount, PruneReport, StorageReport, SweepReport, dir_bytes,
     purge_history_commands,
@@ -35,8 +39,11 @@ use crate::db::{self, PageRow, ProjectAlias, ProjectRow};
 use crate::digest::{SessionDigest, aggregate_files};
 use crate::error::{Error, Result};
 use crate::git::Git;
-use crate::handoff::{Handoff, HandoffInput, HandoffSource, PendingHandoff, render_agent_handoff};
-use crate::index::{Hit, INDEX_SCHEMA_VERSION, IndexDoc, SearchIndex, SearchScope};
+use crate::handoff::{
+    Handoff, HandoffInput, HandoffSource, MAX_HISTORY, PendingHandoff, REFERENCE_CONCURRENT,
+    REFERENCE_MAIN_LINE, REFERENCE_RESUMED, render_agent_handoff,
+};
+use crate::index::{Hit, INDEX_SCHEMA_VERSION, IndexDoc, SearchIndex, SearchOptions, SearchScope};
 use crate::layout::DataDir;
 use crate::page::{
     Frontmatter, GLOBAL_DIR, Page, PageKind, PageScope, resolve_write_path, validate_rel_path,
@@ -51,7 +58,7 @@ use crate::render::{
 use crate::sanitize::{redact, sanitize_payload};
 use crate::session::{
     ASSISTANT_MAX, CONTEXT_VERSION, FinalizeResult, HANDOFF_STALE_TOOL_USES, NewObservation,
-    Observation, ObservationKind, PinnedPage, RecentSession, Session, SessionInfo,
+    Observation, ObservationKind, PathSession, PinnedPage, RecentSession, Session, SessionInfo,
     SessionStartRequest, SessionStartResponse, SessionStatus, is_valid_session_id,
     normalize_machine, observation_text,
 };
@@ -66,6 +73,68 @@ pub const STATE_SESSIONS: usize = 10;
 
 /// `SessionStartRequest.source` of a session re-created while replaying queued observations.
 pub const OFFLINE_REPLAY_SOURCE: &str = "offline-replay";
+/// Sessions scanned by [`Store::sessions_for_path`] (newest first).
+pub const PATH_SCAN_LIMIT: usize = 2000;
+/// Files listed per session by [`Store::sessions_for_path`].
+pub const PATH_FILES_MAX: usize = 5;
+/// Chars of a handoff summary in [`Store::sessions_for_path`].
+pub const PATH_SUMMARY_MAX: usize = 300;
+
+/// `\` → `/`, a leading `./` and surrounding spaces removed.
+fn normalize_path_prefix(prefix: &str) -> String {
+    let p = prefix.trim().replace('\\', "/");
+    p.strip_prefix("./").unwrap_or(&p).to_string()
+}
+
+/// True when `file` (relative, or absolute when outside the project) lies under `prefix`:
+/// it starts with it, or a part of it after a `/` does.
+fn path_under(file: &str, prefix: &str) -> bool {
+    let file = file.strip_prefix("./").unwrap_or(file);
+    file.starts_with(prefix)
+        || file
+            .match_indices('/')
+            .any(|(i, _)| file[i + 1..].starts_with(prefix))
+}
+
+/// The `要約` / `Summary` section of a handoff (else its first plain line), on one line.
+fn handoff_summary(md: &str) -> Option<String> {
+    let title = |l: &str| l.trim_start_matches('#').trim().to_string();
+    let headings = [
+        title(crate::strings::JA.handoff_summary),
+        title(crate::strings::EN.handoff_summary),
+    ];
+    let mut in_summary = false;
+    let mut lines = Vec::new();
+    for line in md.lines().map(str::trim) {
+        if line.starts_with('#') {
+            if in_summary {
+                break;
+            }
+            in_summary = headings.contains(&title(line));
+            continue;
+        }
+        if in_summary && !line.is_empty() {
+            lines.push(line);
+        }
+    }
+    let text = if lines.is_empty() {
+        md.lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with('#'))?
+            .to_string()
+    } else {
+        lines.join(" ")
+    };
+    Some(util::truncate_chars(
+        &util::one_line(&text),
+        PATH_SUMMARY_MAX,
+    ))
+}
+
+/// SessionStart sources that continue an existing session (SPEC-M3.1 §1 rule 1).
+pub const RESUME_SOURCES: [&str; 3] = ["compact", "resume", "clear"];
+/// Another session with an observation this recent makes a lane busy (SPEC-M3.1 §1 rule 3).
+pub const ACTIVE_SESSION_MINUTES: i64 = 30;
 
 /// Input of `Store::write_page` (`kioku_write_page`, `PUT /api/v1/pages`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,6 +195,10 @@ pub struct StatusReport {
     /// Disk usage and the last prune (SPEC-M2.8 §3; `None` from an older server).
     #[serde(default)]
     pub storage: Option<StorageReport>,
+    /// `dict/user.csv` changed after the index was built: `kioku reindex` (SPEC-M3.1 §2;
+    /// false from an older server).
+    #[serde(default)]
+    pub user_dict_stale: bool,
 }
 
 /// Output of `Store::merge_projects` (`kioku project merge`, M2.4 §2.3).
@@ -242,7 +315,11 @@ impl Store {
         let lock = lock_data_dir(&dirs.root())?;
         let git = Git::open(&dirs.wiki());
         let conn = db::open(&dirs.db_file())?;
-        let (index, fresh) = SearchIndex::open(&dirs.index_dir())?;
+        let (index, fresh) = SearchIndex::open_with(
+            &dirs.index_dir(),
+            &dirs.legacy_index_dirs(),
+            Some(&dirs.user_dict_file()),
+        )?;
         let store = Store {
             config,
             dirs,
@@ -267,7 +344,10 @@ impl Store {
                 let n = store.reindex()?;
                 tracing::info!(pages = n, "index was empty; rebuilt from wiki");
             }
-        } else if store.index_outdated() {
+        } else if !store.index_outdated() {
+            // A switch whose cleanup failed last time (Windows keeps mapped files busy).
+            store.index.remove_legacy_dirs();
+        } else {
             tracing::info!(
                 built_with = store.index_version(),
                 current = INDEX_SCHEMA_VERSION,
@@ -298,9 +378,23 @@ impl Store {
             .and_then(|s| s.trim().parse().ok())
     }
 
-    /// True when the index predates [`INDEX_SCHEMA_VERSION`] and needs `kioku reindex`.
+    /// True when the index predates [`INDEX_SCHEMA_VERSION`] (or an older index is still
+    /// being served) and needs a rebuild.
     pub fn index_outdated(&self) -> bool {
-        self.index_version() < INDEX_SCHEMA_VERSION
+        self.index_version() < INDEX_SCHEMA_VERSION || self.index.serving_legacy()
+    }
+
+    /// True when `dict/user.csv` changed after the index was last built (SPEC-M3.1 §2:
+    /// `kioku doctor` asks for `kioku reindex`).
+    pub fn user_dict_newer_than_index(&self) -> bool {
+        let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        match (
+            modified(&self.dirs.user_dict_file()),
+            modified(&self.dirs.index_version_file()),
+        ) {
+            (Some(dict), Some(index)) => dict > index,
+            _ => false,
+        }
     }
 
     /// True when a page write left the index behind (`reliability_meta.needs_reindex`).
@@ -401,6 +495,8 @@ impl Store {
             let mut conn = self.db.lock();
             let tx = conn.transaction().context("starting transaction")?;
             let project_id = canonical_for_start(&tx, &req.project, &now)?;
+            // SPEC-M3.1 §1 rule 1: a session id seen before is a resume / compact / clear.
+            let known = db::get_session(&tx, &req.session_id)?.is_some();
             let project = ProjectIdentity {
                 id: project_id.clone(),
                 ..req.project.clone()
@@ -425,12 +521,17 @@ impl Store {
             // A session re-created by an offline replay is not a person starting work: it
             // must not consume the handoff meant for the next real session (SPEC-M2.6 §3).
             let routed = if req.source == OFFLINE_REPLAY_SOURCE {
-                PendingHandoff {
-                    handoff: None,
-                    reference_handoff: None,
-                }
+                PendingHandoff::default()
             } else {
-                route_pending(&tx, &project_id, lane.as_deref(), &req.session_id, &now)?
+                let resumed = known || RESUME_SOURCES.contains(&req.source.as_str());
+                route_for_start(
+                    &tx,
+                    &project_id,
+                    lane.as_deref(),
+                    &req.session_id,
+                    resumed,
+                    &now,
+                )?
             };
             // The session's own page (a resumed session) is not "recent" context for itself.
             let recent: Vec<(Session, String)> =
@@ -449,6 +550,7 @@ impl Store {
             recent_sessions: recent.into_iter().map(recent_entry).collect(),
             lane,
             reference_handoff: routed.reference_handoff,
+            reference_reason: routed.reference_reason,
             ..SessionStartResponse::default()
         };
         self.fill_context(&mut resp, &req.session_id)?;
@@ -529,7 +631,9 @@ impl Store {
             // A branch lane without a handoff of its own sees the project lane's pending one
             // for reference (§1.4 rule 2), without consuming it.
             let reference = match (&pending, &session.lane) {
-                (None, Some(_)) => db::newest_handoff(&conn, &session.project_id, None, true)?,
+                (None, Some(_)) => {
+                    db::newest_pending_handoff(&conn, &session.project_id, None, Some(id))?
+                }
                 _ => None,
             };
             let recent: Vec<(Session, String)> =
@@ -546,6 +650,9 @@ impl Store {
             pending_handoff,
             recent_sessions: recent.into_iter().map(recent_entry).collect(),
             lane: session.lane,
+            reference_reason: reference_handoff
+                .as_ref()
+                .map(|_| REFERENCE_MAIN_LINE.to_string()),
             reference_handoff,
             ..SessionStartResponse::default()
         };
@@ -1005,10 +1112,119 @@ impl Store {
                 &now_ts(),
             )?
         } else {
-            peek_pending(&tx, &project, lane.as_deref())?
+            peek_pending(&tx, &project, lane.as_deref(), session)?
         };
         tx.commit().context("committing handoff acceptance")?;
         Ok(routed)
+    }
+
+    /// The sessions that edited files under `prefix` (SPEC-M3.1 §3), newest first, from
+    /// the cached digests (sessions without one — never finalized — are not seen), with
+    /// their page titles and handoff summaries; `project` limits them to one project.
+    pub fn sessions_for_path(
+        &self,
+        prefix: &str,
+        project: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<PathSession>> {
+        let prefix = normalize_path_prefix(prefix);
+        // A literal piece of the prefix pre-filters rows in SQL: the last segment, which
+        // JSON never escapes (it holds no `/`, `\` or quote).
+        let needle = prefix
+            .rsplit('/')
+            .find(|s| !s.is_empty())
+            .unwrap_or_default()
+            .to_string();
+        if needle.is_empty() || needle.contains('"') {
+            return Err(Error::invalid("path_prefix must name a file or directory"));
+        }
+        let conn = self.db.lock();
+        let project = project.map(|p| resolve_id(&conn, p)).transpose()?;
+        let mut out = Vec::new();
+        for (s, json) in db::sessions_with_digest_containing(
+            &conn,
+            project.as_deref(),
+            &needle,
+            PATH_SCAN_LIMIT,
+        )? {
+            let Ok(cache) = serde_json::from_str::<DigestCache>(&json) else {
+                continue;
+            };
+            let edits = if cache.full.tally.edits.is_empty() {
+                cache.full.files.clone()
+            } else {
+                let mut e = cache.full.tally.edits.clone();
+                e.sort_by(|a, b| b.count.cmp(&a.count));
+                e
+            };
+            let files: Vec<String> = edits
+                .iter()
+                .map(|f| f.path.replace('\\', "/"))
+                .filter(|f| path_under(f, &prefix))
+                .take(PATH_FILES_MAX)
+                .collect();
+            if files.is_empty() {
+                continue;
+            }
+            let path = session_page_path(&s);
+            let title = db::get_page(&conn, &path)?
+                .map(|p| p.title)
+                .unwrap_or_default();
+            let handoff = match db::newest_session_handoff(
+                &conn,
+                &s.id,
+                Some(HandoffSource::Agent),
+                false,
+            )? {
+                Some(h) => Some(h),
+                None => db::newest_session_handoff(&conn, &s.id, None, false)?,
+            };
+            out.push(PathSession {
+                session_id: s.id.clone(),
+                project_id: s.project_id.clone(),
+                path,
+                title,
+                date: display_date(&s.started_at),
+                agent: s.agent.clone(),
+                lane: s.lane.clone(),
+                machine: s.machine.clone(),
+                files,
+                summary: handoff.and_then(|h| handoff_summary(&h.content_md)),
+            });
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// The last `n` (≤ [`MAX_HISTORY`]) handoffs of a lane, newest first, whatever their
+    /// status (SPEC-M3.1 §1, `kioku_handoff_pending(history)`). The lane is chosen like
+    /// [`Store::pending_handoff_routed`]'s.
+    pub fn handoff_history(
+        &self,
+        project: &str,
+        session: Option<&str>,
+        lane: Option<&str>,
+        n: usize,
+    ) -> Result<Vec<Handoff>> {
+        let conn = self.db.lock();
+        let project = resolve_id(&conn, project)?;
+        let lane = match lane {
+            Some(l) => normalize_lane(l),
+            None => match session {
+                Some(id) => db::get_session(&conn, id)?
+                    .filter(|s| s.project_id == project)
+                    .and_then(|s| s.lane),
+                None => None,
+            },
+        };
+        Ok(db::lane_handoffs(
+            &conn,
+            &project,
+            lane.as_deref(),
+            n.min(MAX_HISTORY),
+        )?)
     }
 
     /// Newest handoff of a project on the project lane, accepted or not.
@@ -1159,11 +1375,22 @@ impl Store {
     /// Full-text search (spec §6.3).
     /// A `project` scope naming an alias searches its canonical project.
     pub fn search(&self, query: &str, scope: &SearchScope, limit: usize) -> Result<Vec<Hit>> {
+        self.search_with(query, scope, limit, &SearchOptions::default())
+    }
+
+    /// [`Store::search`] with the SPEC-M3.1 §2 filters (`since`, `kinds`).
+    pub fn search_with(
+        &self,
+        query: &str,
+        scope: &SearchScope,
+        limit: usize,
+        opts: &SearchOptions,
+    ) -> Result<Vec<Hit>> {
         let scope = match scope {
             SearchScope::Project(id) => SearchScope::Project(self.resolve_project_id(id)?),
             other => other.clone(),
         };
-        Ok(self.index.search(query, &scope, limit)?)
+        Ok(self.index.search_with(query, &scope, limit, opts)?)
     }
 
     /// Clears and rebuilds `pages` + the index from `wiki/`; returns the number of pages.
@@ -1205,7 +1432,7 @@ impl Store {
             }
             tx.commit().context("committing reindex")?;
         }
-        self.index.upsert_many(&docs, true)?;
+        self.index.rebuild(&docs)?;
         self.write_index_version()?;
         self.db
             .lock()
@@ -1232,6 +1459,7 @@ impl Store {
             index_schema_expected: INDEX_SCHEMA_VERSION,
             aliases: db::list_aliases(&conn)?,
             storage,
+            user_dict_stale: self.user_dict_newer_than_index(),
         })
     }
 
@@ -1562,22 +1790,33 @@ fn canonical_for_start(conn: &Connection, identity: &ProjectIdentity, now: &str)
     }
 }
 
-/// Peeks at the pending handoff for `lane` (§1.4) without accepting anything.
-fn peek_pending(conn: &Connection, project: &str, lane: Option<&str>) -> Result<PendingHandoff> {
-    let handoff = db::newest_handoff(conn, project, lane, true)?;
+/// Peeks at the pending handoff for `lane` (§1.4) without accepting anything; handoffs
+/// written by `own` (the asking session) are never offered to it (SPEC-M3.1 §1 rule 2).
+fn peek_pending(
+    conn: &Connection,
+    project: &str,
+    lane: Option<&str>,
+    own: Option<&str>,
+) -> Result<PendingHandoff> {
+    let handoff = db::newest_pending_handoff(conn, project, lane, own)?;
     let reference_handoff = match (&handoff, lane) {
-        (None, Some(_)) => db::newest_handoff(conn, project, None, true)?,
+        (None, Some(_)) => db::newest_pending_handoff(conn, project, None, own)?,
         _ => None,
     };
     Ok(PendingHandoff {
+        reference_reason: reference_handoff
+            .as_ref()
+            .map(|_| REFERENCE_MAIN_LINE.to_string()),
         handoff,
         reference_handoff,
+        history: Vec::new(),
     })
 }
 
-/// §1.4 routing with acceptance: the newest pending handoff on `lane` is accepted by `by`
-/// (older pending ones of that lane are superseded); on a branch lane without one, the
-/// project lane's pending handoff is returned as a reference and left pending.
+/// §1.4 routing with acceptance: the newest pending handoff on `lane` not written by `by`
+/// is accepted by `by` (older pending ones of that lane become `superseded`); on a branch
+/// lane without one, the project lane's pending handoff is returned as a reference and
+/// left pending.
 fn route_pending(
     conn: &Connection,
     project: &str,
@@ -1585,12 +1824,57 @@ fn route_pending(
     by: &str,
     now: &str,
 ) -> Result<PendingHandoff> {
-    let mut routed = peek_pending(conn, project, lane)?;
+    let mut routed = peek_pending(conn, project, lane, Some(by))?;
     if let Some(h) = routed.handoff.take() {
-        db::accept_pending_handoffs(conn, project, lane, by, now)?;
+        db::accept_handoff(conn, &h.id, by, now)?;
         routed.handoff = db::get_handoff(conn, &h.id)?;
     }
     Ok(routed)
+}
+
+/// The lane's pending handoff turned into a reference that is not accepted, for `reason`
+/// (SPEC-M3.1 §1 rules 1 and 3); a branch lane without one keeps the main line's.
+fn pending_as_reference(
+    conn: &Connection,
+    project: &str,
+    lane: Option<&str>,
+    own: &str,
+    reason: &str,
+) -> Result<PendingHandoff> {
+    let mut routed = peek_pending(conn, project, lane, Some(own))?;
+    if let Some(h) = routed.handoff.take() {
+        routed.reference_handoff = Some(h);
+        routed.reference_reason = Some(reason.to_string());
+    }
+    Ok(routed)
+}
+
+/// SessionStart routing (SPEC-M2.4 §1.4 as extended by SPEC-M3.1 §1): a resumed session
+/// gets back what it accepted (else the lane's pending handoff as a reference); while
+/// another session is active on the lane the pending handoff is only a reference;
+/// otherwise the newest pending handoff is accepted.
+fn route_for_start(
+    conn: &Connection,
+    project: &str,
+    lane: Option<&str>,
+    session: &str,
+    resumed: bool,
+    now: &str,
+) -> Result<PendingHandoff> {
+    if resumed {
+        if let Some(h) = db::newest_handoff_accepted_by(conn, session, project, lane)? {
+            return Ok(PendingHandoff {
+                handoff: Some(h),
+                ..PendingHandoff::default()
+            });
+        }
+        return pending_as_reference(conn, project, lane, session, REFERENCE_RESUMED);
+    }
+    let since = util::fmt_ts(util::now() - chrono::Duration::minutes(ACTIVE_SESSION_MINUTES));
+    if db::other_active_session(conn, project, lane, session, &since)?.is_some() {
+        return pending_as_reference(conn, project, lane, session, REFERENCE_CONCURRENT);
+    }
+    route_pending(conn, project, lane, session, now)
 }
 
 /// Recent substantive sessions with their page titles (sessions without a page are skipped).
@@ -1789,6 +2073,7 @@ fn page_records(page: &Page, text: &str) -> (PageRow, IndexDoc) {
         body: page.body.clone(),
         tags: fm.tags.clone(),
         updated,
+        machine: fm.machine.clone(),
     };
     (row, doc)
 }
@@ -2112,7 +2397,7 @@ mod tests {
         assert_eq!(m2.pending_handoff.unwrap().id, loose.id);
         assert_eq!(
             handoff_row(&store, &hm.id).accepted_by.as_deref(),
-            Some("main-2")
+            Some(crate::handoff::SUPERSEDED)
         );
         assert!(handoff_row(&store, &hb.id).accepted_at.is_none());
         assert!(start_on(&store, "main-3", None).pending_handoff.is_none());
@@ -2150,12 +2435,19 @@ mod tests {
             .pending_handoff_routed(&pid, false, None, Some("task-b"))
             .unwrap();
         assert_eq!(by_lane.handoff.unwrap().id, hb2.id);
-        let by_session = store
+        // SPEC-M3.1 §1 rule 2: a session never accepts its own handoff...
+        let own = store
             .pending_handoff_routed(&pid, true, Some("b-2"), None)
+            .unwrap();
+        assert!(own.handoff.is_none());
+        assert!(handoff_row(&store, &hb2.id).accepted_at.is_none());
+        // ... another one on that lane does
+        let by_session = store
+            .pending_handoff_routed(&pid, true, Some("b-3"), Some("task-b"))
             .unwrap();
         assert_eq!(
             by_session.handoff.unwrap().accepted_by.as_deref(),
-            Some("b-2")
+            Some("b-3")
         );
         let main_again = store
             .write_handoff(&agent_handoff(&pid, Some("main-4"), "メイン"))
@@ -2528,7 +2820,7 @@ mod tests {
         assert!(start(&store, "sess-b").pending_handoff.is_none());
         let conn = store.db.lock();
         let old = db::get_handoff(&conn, &older.id).unwrap().unwrap();
-        assert_eq!(old.accepted_by.as_deref(), Some("sess-a"));
+        assert_eq!(old.accepted_by.as_deref(), Some(crate::handoff::SUPERSEDED));
         drop(conn);
 
         // explicit accept via the API path
