@@ -202,7 +202,11 @@ fn sync_files(root: &Path) -> anyhow::Result<()> {
     let mut paths = Vec::new();
     files(root, root, &mut paths)?;
     for rel in paths {
-        std::fs::File::open(root.join(&rel))?.sync_all()?;
+        // Write access: Windows refuses to flush a file opened read-only.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(root.join(&rel))?
+            .sync_all()?;
     }
     Ok(())
 }
