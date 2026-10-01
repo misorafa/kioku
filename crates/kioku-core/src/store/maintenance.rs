@@ -341,7 +341,6 @@ impl Store {
         if r.observations_days > 0 {
             let cutoff =
                 util::fmt_ts(util::now() - chrono::Duration::days(i64::from(r.observations_days)));
-            let _write = self.write_lock.lock();
             let sessions: Vec<Session> = {
                 let conn = self.db.lock();
                 let ids: Vec<String> = {
@@ -368,6 +367,25 @@ impl Store {
                 out
             };
             for session in sessions {
+                // The write lock per session: finalize waits for one session at most. A
+                // session reopened since it was listed is left alone.
+                let _write = self.write_lock.lock();
+                let still_old: bool = self
+                    .db
+                    .lock()
+                    .query_row(
+                        "SELECT s.status = 'finalized' AND (SELECT MAX(o.ts) FROM observations o
+                           WHERE o.session_id = s.id) < ?2 FROM sessions s WHERE s.id = ?1",
+                        params![session.id, cutoff],
+                        |r| r.get::<_, Option<bool>>(0),
+                    )
+                    .optional()
+                    .context("querying the database")?
+                    .flatten()
+                    .unwrap_or(false);
+                if !still_old {
+                    continue;
+                }
                 let (rows, bytes) = self.reduce_session(&session, dry_run)?;
                 report.sessions_reduced.count += 1;
                 report.sessions_reduced.bytes += bytes;
