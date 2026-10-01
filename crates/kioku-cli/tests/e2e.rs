@@ -17,6 +17,7 @@ const PROJECT: &str = "e2e-proj";
 
 struct Server {
     base: String,
+    store: Arc<Store>,
     _dir: tempfile::TempDir,
 }
 
@@ -24,6 +25,7 @@ struct Server {
 fn start_server() -> Server {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::open(Config::for_data_dir(dir.path())).unwrap());
+    let served = store.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -31,7 +33,7 @@ fn start_server() -> Server {
             .build()
             .unwrap();
         rt.block_on(async move {
-            let app = kioku_server::build_app(store, TOKEN.to_string());
+            let app = kioku_server::build_app(served, TOKEN.to_string());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             tx.send(listener.local_addr().unwrap()).unwrap();
             axum::serve(listener, app).await.unwrap();
@@ -40,6 +42,7 @@ fn start_server() -> Server {
     let addr = rx.recv().unwrap();
     Server {
         base: format!("http://{addr}"),
+        store,
         _dir: dir,
     }
 }
@@ -56,8 +59,12 @@ fn client_config(client_dir: &Path, base: &str, token: &str, extra: &[(&str, &st
     for (k, v) in extra {
         env.insert(k.to_string(), v.to_string());
     }
-    let cfg = Config::load_with_env(&env).unwrap();
+    let mut cfg = Config::load_with_env(&env).unwrap();
     assert_eq!(cfg.client.server_url, base);
+    // These sessions are seconds old: without this the SPEC-M3.0 §4 time rule (10 minutes
+    // since the handoff or the start) would hold every nudge back. Tests of that rule set
+    // it back explicitly.
+    cfg.client.nudge_min_minutes = 0;
     cfg
 }
 
@@ -297,8 +304,8 @@ fn full_session_lifecycle_with_nudge_and_handoff() {
             .contains("日本語検索と引き継ぎの自動化を実装した")
     );
     assert!(out.stdout.contains("Stop フックのテストを増やす"));
-    assert!(out.stdout.contains("## 現在の状態（STATE.md 抜粋）"));
-    // STATE.md's "latest handoff" section would repeat the handoff: it is stripped.
+    // SPEC-M3.0 §1: the STATE.md excerpt gave way to the carried sections.
+    assert!(!out.stdout.contains("## 現在の状態（STATE.md 抜粋）"));
     assert!(!out.stdout.contains("## 最新の引き継ぎ"), "{}", out.stdout);
     assert_eq!(
         out.stdout
@@ -306,7 +313,13 @@ fn full_session_lifecycle_with_nudge_and_handoff() {
             .count(),
         1
     );
-    assert!(out.stdout.contains("## 最近のセッション"));
+    assert!(
+        out.stdout.contains("## 最近のセッション\n- "),
+        "{}",
+        out.stdout
+    );
+    // the handoff's decision is in section 2, so it is not carried again
+    assert_eq!(out.stdout.matches("handoff は単回消費").count(), 1);
     assert!(out.stdout.chars().count() <= kioku_cli::SESSION_START_CAP);
 
     // The handoff was consumed: a third session gets none.
@@ -1403,4 +1416,266 @@ fn parallel_worktrees_keep_their_handoffs_apart() {
     let out = start_in(&cfg, "c-detached", &wt_c);
     assert!(!out.contains("\nlane: "), "{out}");
     assert!(!client_dir.path().join("logs/hook.log").exists());
+}
+
+// ---------------------------------------------------------------------------------------
+// SPEC-M3.0: the agent's last reply, the nudge timing, the machine name
+
+/// A captured Stop payload (`tests/fixtures/<rel>`) re-pointed at this test's session.
+fn captured_stop(rel: &str, sid: &str, cwd: &Path) -> Value {
+    let path = format!("{}/tests/fixtures/{rel}", env!("CARGO_MANIFEST_DIR"));
+    let mut v: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    v["session_id"] = json!(sid);
+    v["cwd"] = json!(cwd.display().to_string());
+    v
+}
+
+fn assistant_texts(store: &Store, sid: &str) -> Vec<String> {
+    store
+        .observations(sid)
+        .unwrap()
+        .into_iter()
+        .filter(|o| o.kind == kioku_core::ObservationKind::Assistant)
+        .map(|o| o.payload["text"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// SPEC-M3.0 §3: Claude Code's and Codex's real Stop payloads carry the reply; it is
+/// recorded (sanitized) before finalize, once even when Stop repeats, and reaches the
+/// session page and the rules handoff.
+#[test]
+fn stop_records_the_last_reply_once() {
+    for (agent, fixture) in [
+        (Agent::ClaudeCode, "windows/claude-code/stop.captured.json"),
+        (Agent::Codex, "codex/stop.captured.json"),
+    ] {
+        let server = start_server();
+        let client_dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let proj = project_dir();
+        let cwd = proj.path();
+        let cfg = client_config(client_dir.path(), &server.base, TOKEN, &[]);
+        let env = agent_env(home.path());
+        let sid = format!("reply-{}", agent.as_str());
+        let start = with(
+            base_payload(&sid, cwd, HookEventKind::SessionStart),
+            json!({"source": "startup"}),
+        );
+        assert_eq!(
+            run(&cfg, &env, agent, HookEventKind::SessionStart, &start).exit_code,
+            0
+        );
+        run_turn(&cfg, &sid, cwd);
+
+        let mut stop = captured_stop(fixture, &sid, cwd);
+        let reply = stop["last_assistant_message"].as_str().unwrap().to_string();
+        assert!(!reply.is_ascii(), "the captured reply is Japanese: {reply}");
+        stop["last_assistant_message"] = json!(format!("{reply}\ntoken=sk-abcdefghijklmnop1234"));
+        // 3 tool uses → nudge (time rule off in these tests); the reply is recorded anyway
+        let out = run(&cfg, &env, agent, HookEventKind::Stop, &stop);
+        assert_eq!(out.exit_code, 2, "{agent:?} {out:?}");
+        stop["stop_hook_active"] = json!(true);
+        assert_eq!(
+            run(&cfg, &env, agent, HookEventKind::Stop, &stop),
+            HookOutcome::ok()
+        );
+        let info = wait_finalized(&server.base, &sid);
+        assert_eq!(info["status"], "finalized", "{info}");
+
+        let texts = assistant_texts(&server.store, &sid);
+        assert_eq!(texts.len(), 1, "a repeated reply is stored once: {texts:?}");
+        assert!(texts[0].starts_with(&reply), "{texts:?}");
+        assert!(texts[0].contains("[REDACTED]") && !texts[0].contains("sk-abcdefghij"));
+
+        let session = server.store.session(&sid).unwrap();
+        let page = server
+            .store
+            .read_page(&kioku_core::render::session_page_path(&session))
+            .unwrap();
+        assert!(
+            page.body.contains(&format!("## 最後の回答\n> {reply}")),
+            "{}",
+            page.body
+        );
+        let pending = api_get(&server.base, &format!("handoffs/pending?project={PROJECT}"));
+        let md = pending["handoff"]["content_md"].as_str().unwrap();
+        assert!(md.contains(&format!("最後の回答（要約）: {reply}")), "{md}");
+        assert!(!md.contains("次にやること"), "{md}");
+
+        // the next session gets the reply once, through the handoff of that session
+        let next = run(
+            &cfg,
+            &env,
+            agent,
+            HookEventKind::SessionStart,
+            &with(
+                base_payload("reply-next", cwd, HookEventKind::SessionStart),
+                json!({"source": "startup"}),
+            ),
+        );
+        assert!(
+            next.stdout.contains("## 前回からの引き継ぎ"),
+            "{}",
+            next.stdout
+        );
+        assert!(!next.stdout.contains("## 最後の回答（前回のセッション）"));
+        assert_eq!(
+            next.stdout.matches(reply.as_str()).count(),
+            1,
+            "{}",
+            next.stdout
+        );
+    }
+}
+
+/// SPEC-M3.0 §3: Cursor and Antigravity carry no reply in the payload; it is read from the
+/// tail of the transcript.
+#[test]
+fn cursor_and_antigravity_read_the_reply_from_the_transcript() {
+    for agent in [Agent::Cursor, Agent::Antigravity] {
+        let server = start_server();
+        let client_dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let proj = project_dir();
+        let cwd = proj.path();
+        let cfg = client_config(client_dir.path(), &server.base, TOKEN, &[]);
+        let env = agent_env(home.path());
+        let sid = format!("transcript-{}", agent.as_str());
+        let transcript = home.path().join("transcript.jsonl");
+        let entry = match agent {
+            Agent::Cursor => {
+                json!({"role": "assistant", "message": {"content": [{"type": "text", "text": "Cursor で検索を直しました。"}]}})
+            }
+            _ => json!({"type": "PLANNER_RESPONSE", "content": "hello.txt を作りました。"}),
+        };
+        let user = json!({"type": "USER_INPUT", "role": "user", "content": "直して"});
+        std::fs::write(&transcript, format!("{user}\n{entry}\n")).unwrap();
+        let start = fixture_payload(agent, "session_start", &sid, cwd);
+        assert_eq!(
+            run(&cfg, &env, agent, HookEventKind::SessionStart, &start).exit_code,
+            0
+        );
+        let mut stop = fixture_payload(agent, "stop", &sid, cwd);
+        let key = if agent == Agent::Cursor {
+            "transcript_path"
+        } else {
+            "transcriptPath"
+        };
+        stop[key] = json!(transcript.display().to_string());
+        let out = run(&cfg, &env, agent, HookEventKind::Stop, &stop);
+        assert_eq!(out.exit_code, 0, "{out:?}");
+        let want = if agent == Agent::Cursor {
+            "Cursor で検索を直しました。"
+        } else {
+            "hello.txt を作りました。"
+        };
+        assert_eq!(assistant_texts(&server.store, &sid), [want], "{agent:?}");
+    }
+}
+
+/// SPEC-M3.0 §4: with the default 10 minutes a fresh session is not nudged even after three
+/// tool uses; `nudge = false` turns it off; a nudge leaves `state/nudge-<session>`.
+#[test]
+fn nudge_waits_for_the_time_rule_and_records_its_time() {
+    let server = start_server();
+    let client_dir = tempfile::tempdir().unwrap();
+    let proj = project_dir();
+    let cwd = proj.path();
+    let mut cfg = client_config(client_dir.path(), &server.base, TOKEN, &[]);
+    for (sid, min, nudge, want) in [
+        ("fresh", 10, true, 0),
+        ("off", 0, false, 0),
+        ("due", 0, true, 2),
+    ] {
+        cfg.client.nudge_min_minutes = min;
+        cfg.client.nudge = nudge;
+        hook(
+            &cfg,
+            HookEventKind::SessionStart,
+            with(
+                base_payload(sid, cwd, HookEventKind::SessionStart),
+                json!({"source": "startup"}),
+            ),
+        );
+        run_turn(&cfg, sid, cwd);
+        let stop = with(
+            base_payload(sid, cwd, HookEventKind::Stop),
+            json!({"stop_hook_active": false}),
+        );
+        let out = hook(&cfg, HookEventKind::Stop, stop);
+        assert_eq!(out.exit_code, want, "{sid}: {out:?}");
+        let marker = client_dir.path().join("state").join(format!("nudge-{sid}"));
+        assert_eq!(marker.is_file(), want == 2, "{sid}");
+    }
+}
+
+/// SPEC-M3.0 §6: the machine (here `KIOKU_MACHINE`) is stored on the session and shown in the
+/// next session's recent sessions, the session page and the agent's handoff heading.
+#[test]
+fn session_start_sends_the_machine_name() {
+    let server = start_server();
+    let client_dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let proj = project_dir();
+    let cwd = proj.path();
+    let cfg = client_config(client_dir.path(), &server.base, TOKEN, &[]);
+    let mut env = agent_env(home.path());
+    env.vars.insert("KIOKU_MACHINE".into(), "自宅のmini".into());
+    let start = |sid: &str| {
+        with(
+            base_payload(sid, cwd, HookEventKind::SessionStart),
+            json!({"source": "startup"}),
+        )
+    };
+    let claude = Agent::ClaudeCode;
+    run(
+        &cfg,
+        &env,
+        claude,
+        HookEventKind::SessionStart,
+        &start("m1"),
+    );
+    assert_eq!(
+        server.store.session("m1").unwrap().machine.as_deref(),
+        Some("自宅のmini")
+    );
+    run_turn(&cfg, "m1", cwd);
+    let resp = http()
+        .post(format!("{}/api/v1/handoffs", server.base))
+        .bearer_auth(TOKEN)
+        .json(&json!({"project": PROJECT, "session": "m1", "summary": "マシン名を送った"}))
+        .send()
+        .unwrap();
+    assert!(resp.status().is_success());
+    let pending = api_get(&server.base, &format!("handoffs/pending?project={PROJECT}"));
+    let md = pending["handoff"]["content_md"].as_str().unwrap();
+    assert!(
+        md.starts_with("## 引き継ぎ（claude-code@自宅のmini, "),
+        "{md}"
+    );
+    let stop = with(
+        base_payload("m1", cwd, HookEventKind::Stop),
+        json!({"stop_hook_active": true}),
+    );
+    run(&cfg, &env, claude, HookEventKind::Stop, &stop);
+    wait_finalized(&server.base, "m1");
+    let session = server.store.session("m1").unwrap();
+    let page = server
+        .store
+        .read_page(&kioku_core::render::session_page_path(&session))
+        .unwrap();
+    assert_eq!(page.frontmatter.machine.as_deref(), Some("自宅のmini"));
+    let out = run(
+        &cfg,
+        &env,
+        claude,
+        HookEventKind::SessionStart,
+        &start("m2"),
+    );
+    assert!(
+        out.stdout
+            .contains(" claude-code @自宅のmini — 引き継ぎの自動化を実装して ("),
+        "{}",
+        out.stdout
+    );
 }

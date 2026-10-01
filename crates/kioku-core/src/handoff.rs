@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::strings::{Lang, fill, strings};
+use crate::util::one_line;
 
 /// Who wrote a handoff.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,9 +93,19 @@ pub struct HandoffInput {
     /// Decisions taken.
     #[serde(default)]
     pub decisions: Vec<String>,
+    /// Pitfalls the next session should know about (SPEC-M3.0 §2); older clients omit it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gotchas: Vec<String>,
+    /// Facts that were checked and hold (SPEC-M3.0 §2); older clients omit it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verified: Vec<String>,
 }
 
-/// Renders an agent-written handoff as Markdown (spec §7.5).
+/// Renders an agent-written handoff as Markdown (spec §7.5). `agent` is the heading label
+/// (`claude-code@mini` when the machine is known, SPEC-M3.0 §6). `verified` and `gotchas`
+/// (SPEC-M3.0 §2) get their sections only when non-empty, so a handoff without them renders
+/// exactly as before. A multi-line item is written on one line, so every item stays one
+/// `- ` line that [`crate::carry::handoff_items`] can read back.
 pub fn render_agent_handoff(lang: Lang, agent: &str, date: &str, input: &HandoffInput) -> String {
     let s = strings(lang);
     let mut out = vec![
@@ -102,17 +113,27 @@ pub fn render_agent_handoff(lang: Lang, agent: &str, date: &str, input: &Handoff
         s.handoff_summary.to_string(),
         input.summary.trim().to_string(),
     ];
-    for (heading, items) in [
-        (s.handoff_next_steps, &input.next_steps),
-        (s.handoff_open_questions, &input.open_questions),
-        (s.handoff_decisions, &input.decisions),
-    ] {
+    let lists = [
+        (s.handoff_next_steps, &input.next_steps, true),
+        (s.handoff_open_questions, &input.open_questions, true),
+        (s.handoff_decisions, &input.decisions, true),
+        (s.handoff_verified, &input.verified, false),
+        (s.handoff_gotchas, &input.gotchas, false),
+    ];
+    for (heading, items, always) in lists {
+        let items: Vec<String> = items
+            .iter()
+            .map(|i| one_line(i))
+            .filter(|i| !i.is_empty())
+            .collect();
+        if items.is_empty() && !always {
+            continue;
+        }
         out.push(heading.to_string());
-        let items: Vec<&String> = items.iter().filter(|i| !i.trim().is_empty()).collect();
         if items.is_empty() {
             out.push(format!("- {}", s.none));
         } else {
-            out.extend(items.iter().map(|i| format!("- {}", i.trim())));
+            out.extend(items.iter().map(|i| format!("- {i}")));
         }
     }
     let mut text = out.join("\n");
@@ -139,5 +160,40 @@ mod tests {
             md,
             "## 引き継ぎ（claude-code, 2026-09-25）\n### 要約\n検索を実装した\n### 次にやること\n- テストを書く\n### 未解決の質問\n- （なし）\n### 決定事項\n- lindera を使う\n"
         );
+    }
+
+    /// SPEC-M3.0 §2: `verified` and `gotchas` render after the decisions (only when given),
+    /// with the machine in the heading; an older client's JSON without them still parses.
+    #[test]
+    fn renders_verified_and_gotchas_and_parses_old_input() {
+        let input = HandoffInput {
+            project: "p".into(),
+            summary: "検索を実装した".into(),
+            decisions: vec!["lindera を使う".into()],
+            verified: vec!["cargo test は全件通る".into()],
+            gotchas: vec!["Windows では\nCRLF に注意".into(), " ".into()],
+            ..HandoffInput::default()
+        };
+        let md = render_agent_handoff(Lang::Ja, "claude-code@mini", "2026-10-01 10:12", &input);
+        assert!(md.starts_with("## 引き継ぎ（claude-code@mini, 2026-10-01 10:12）\n"));
+        assert!(md.ends_with(
+            "### 決定事項\n- lindera を使う\n### 確認済みの事実\n- cargo test は全件通る\n### 落とし穴・注意点\n- Windows では CRLF に注意\n"
+        ));
+        let en = render_agent_handoff(Lang::En, "codex", "d", &input);
+        assert!(en.contains("### Verified\n- cargo test は全件通る\n### Gotchas\n- Windows"));
+
+        let json = serde_json::to_value(&input).unwrap();
+        let back: HandoffInput = serde_json::from_value(json).unwrap();
+        assert_eq!(back, input);
+        let old: HandoffInput =
+            serde_json::from_str(r#"{"project":"p","summary":"s","decisions":["d"]}"#).unwrap();
+        assert!(old.gotchas.is_empty() && old.verified.is_empty());
+        // without them the output is exactly the M1 layout
+        let plain = HandoffInput {
+            verified: vec![],
+            gotchas: vec![],
+            ..input
+        };
+        assert!(!render_agent_handoff(Lang::Ja, "a", "d", &plain).contains("確認済み"));
     }
 }

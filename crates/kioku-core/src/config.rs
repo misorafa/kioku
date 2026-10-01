@@ -79,6 +79,21 @@ pub struct ClientConfig {
     pub hook_dump: bool,
     /// Deliver the `<kioku>` block on the first Cursor tool use of a session (M2 §5.6).
     pub cursor_late_context: bool,
+    /// Stop nudge on/off (SPEC-M3.0 §4); both this and `stop_nudge` must be true.
+    pub nudge: bool,
+    /// Minutes since the last handoff (or the session start) before the Stop hook nudges,
+    /// and between two nudges of one session (SPEC-M3.0 §4).
+    pub nudge_min_minutes: u64,
+}
+
+/// Default of `[client] nudge_min_minutes`.
+pub const DEFAULT_NUDGE_MIN_MINUTES: u64 = 10;
+
+impl ClientConfig {
+    /// Whether the Stop hook may nudge at all (`stop_nudge` and `nudge`).
+    pub fn nudge_enabled(&self) -> bool {
+        self.stop_nudge && self.nudge
+    }
 }
 
 impl Default for ClientConfig {
@@ -91,6 +106,8 @@ impl Default for ClientConfig {
             lang: Lang::Ja,
             hook_dump: false,
             cursor_late_context: true,
+            nudge: true,
+            nudge_min_minutes: DEFAULT_NUDGE_MIN_MINUTES,
         }
     }
 }
@@ -520,6 +537,8 @@ mod tests {
         assert_eq!(c.client.lang, Lang::Ja);
         assert!(!c.client.hook_dump);
         assert!(c.client.cursor_late_context);
+        assert!(c.client.nudge && c.client.nudge_enabled());
+        assert_eq!(c.client.nudge_min_minutes, 10);
         assert!(c.is_loopback_bind());
     }
 
@@ -528,7 +547,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(CONFIG_FILE),
-            "[server]\nbind = \"0.0.0.0\"\nport = 9000\nauth_token = \"filetok\"\nsummary_lang = \"en\"\n\n[client]\nserver_url = \"http://home:9000\"\ntimeout_ms = 500\nlang = \"en\"\nhook_dump = true\ncursor_late_context = false\n",
+            "[server]\nbind = \"0.0.0.0\"\nport = 9000\nauth_token = \"filetok\"\nsummary_lang = \"en\"\n\n[client]\nserver_url = \"http://home:9000\"\ntimeout_ms = 500\nlang = \"en\"\nhook_dump = true\ncursor_late_context = false\nnudge = false\nnudge_min_minutes = 30\n",
         )
         .unwrap();
         let d = dir.path().to_str().unwrap();
@@ -541,6 +560,9 @@ mod tests {
         assert_eq!(c.client.timeout_ms, 500);
         assert_eq!(c.client.lang, Lang::En);
         assert!(c.client.hook_dump);
+        // SPEC-M3.0 §4
+        assert!(c.client.stop_nudge && !c.client.nudge && !c.client.nudge_enabled());
+        assert_eq!(c.client.nudge_min_minutes, 30);
         assert!(!c.client.cursor_late_context);
 
         let c = Config::load_with_env(&env(&[

@@ -1,14 +1,31 @@
-//! The plain-text `<kioku>` block printed by the SessionStart hook (spec §8.3), capped at
-//! 6 000 chars by shrinking the STATE.md excerpt first, then the handoff. Stored memory is
-//! data, not instructions (SPEC-M2.7 §3): the block opens with a note saying so, and a
-//! `<kioku>` / `</kioku>` inside handoff or STATE text is defanged so it cannot end the
-//! block early.
+//! The plain-text `<kioku>` block printed by the SessionStart hook (SPEC-M3.0 §1, which
+//! replaces spec §8.3), capped at [`SESSION_START_CAP`] chars. A server that computes the
+//! SPEC-M3.0 sections gets the new layout — handoff, carried decisions, open questions,
+//! pinned pages, recent sessions, last reply — each section with its own cap (lines that do
+//! not fit become `…(N more)`), the handoff taking whatever is left. An older server's
+//! response renders exactly as before: handoff plus STATE.md excerpt, the excerpt shrunk
+//! first. Stored memory is data, not instructions (SPEC-M2.7 §3): the block opens with a
+//! note saying so, and a `<kioku>` / `</kioku>` inside stored text is defanged so it cannot
+//! end the block early.
 
+use kioku_core::carry::Carried;
+use kioku_core::render::{carried_lines, pinned_lines, quote_lines, recent_line};
 use kioku_core::strings::{EN, JA, Lang, escape_kioku_tags, fill, memory_note, strings};
 use kioku_core::util::truncate_chars;
+use kioku_core::{CarriedItem, PinnedPage, RecentSession, SessionStartResponse};
 
-/// Maximum size of the SessionStart block, in chars.
-pub const SESSION_START_CAP: usize = 6000;
+/// Maximum size of the SessionStart block, in chars (SPEC-M3.0 §1: 6,000 → 8,000).
+pub const SESSION_START_CAP: usize = 8000;
+/// Cap of the carried decisions section (heading included).
+pub const DECISIONS_CAP: usize = 1200;
+/// Cap of the carried open questions section.
+pub const OPEN_QUESTIONS_CAP: usize = 800;
+/// Cap of the pinned pages section.
+pub const PINNED_CAP: usize = 1500;
+/// Cap of the recent sessions section.
+pub const RECENT_CAP: usize = 700;
+/// Cap of the last reply section.
+pub const LAST_REPLY_CAP: usize = 800;
 /// A section is dropped instead of shrunk below this many chars.
 const MIN_SECTION: usize = 40;
 const CLOSE: &str = "</kioku>\n";
@@ -31,8 +48,64 @@ pub struct StartContext {
     /// Markdown of the main line's handoff shown for reference (not accepted) on a branch
     /// lane without a handoff of its own (M2.4 §1.4); ignored when `handoff` is set.
     pub reference: Option<String>,
-    /// STATE.md excerpt (first 60 lines), if any.
+    /// STATE.md excerpt (first 60 lines), if any; only shown in the legacy layout.
     pub state: Option<String>,
+    /// The SPEC-M3.0 sections; `None` from an older server (legacy layout).
+    pub sections: Option<Sections>,
+}
+
+/// SPEC-M3.0 §1 sections 3–7 as the server computed them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Sections {
+    /// Carried decisions.
+    pub decisions: Vec<CarriedItem>,
+    /// Carried verified facts (after the decisions, `✓`).
+    pub verified: Vec<CarriedItem>,
+    /// Carried open questions.
+    pub open_questions: Vec<CarriedItem>,
+    /// Carried gotchas (after the open questions, `⚠`).
+    pub gotchas: Vec<CarriedItem>,
+    /// Pinned pages.
+    pub pinned: Vec<PinnedPage>,
+    /// Recent sessions.
+    pub recent: Vec<RecentSession>,
+    /// The previous session's last reply.
+    pub last_reply: Option<String>,
+}
+
+impl StartContext {
+    /// The block's inputs from a `sessions/start` (or `sessions/{id}/context`) response.
+    pub fn from_response(
+        project_name: &str,
+        session_id: &str,
+        server_url: &str,
+        resp: SessionStartResponse,
+    ) -> StartContext {
+        let sections = if resp.context_version >= 1 {
+            Some(Sections {
+                decisions: resp.decisions,
+                verified: resp.verified,
+                open_questions: resp.open_questions,
+                gotchas: resp.gotchas,
+                pinned: resp.pinned,
+                recent: resp.recent_sessions,
+                last_reply: resp.last_reply,
+            })
+        } else {
+            None
+        };
+        StartContext {
+            project_name: project_name.to_string(),
+            project_id: resp.project_id,
+            session_id: session_id.to_string(),
+            server_url: server_url.to_string(),
+            lane: resp.lane,
+            handoff: resp.pending_handoff.map(|h| h.content_md),
+            reference: resp.reference_handoff.map(|h| h.content_md),
+            state: resp.state_excerpt,
+            sections,
+        }
+    }
 }
 
 /// Renders the `<kioku>` block, at most [`SESSION_START_CAP`] chars.
@@ -42,6 +115,143 @@ pub fn render_session_start(lang: Lang, ctx: &StartContext) -> String {
 
 /// [`render_session_start`] with an explicit cap (tests).
 pub fn render_with_cap(lang: Lang, ctx: &StartContext, cap: usize) -> String {
+    match &ctx.sections {
+        Some(sections) => render_sections(lang, ctx, sections, cap),
+        None => render_legacy(lang, ctx, cap),
+    }
+}
+
+/// The SPEC-M3.0 layout: each section within its own cap, the handoff in what is left.
+fn render_sections(lang: Lang, ctx: &StartContext, sec: &Sections, cap: usize) -> String {
+    let t = strings(lang);
+    let mut head = header(lang, ctx);
+    let footer = format!("\n{}\n{CLOSE}", t.start_footer);
+    let (decisions, open) = carried_lines(&Carried {
+        decisions: sec.decisions.clone(),
+        verified: sec.verified.clone(),
+        open_questions: sec.open_questions.clone(),
+        gotchas: sec.gotchas.clone(),
+    });
+    let one_line_items = |lines: Vec<String>| lines.into_iter().map(|l| vec![l]).collect();
+    let recent = sec
+        .recent
+        .iter()
+        .map(|r| {
+            vec![recent_line(
+                &r.date,
+                &r.agent,
+                r.lane.as_deref(),
+                r.machine.as_deref(),
+                &r.title,
+                &r.path,
+            )]
+        })
+        .collect();
+    let reply: Vec<Vec<String>> = sec
+        .last_reply
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .map(|r| vec![quote_lines(r)])
+        .unwrap_or_default();
+    let tail: String = [
+        (
+            t.carried_decisions,
+            one_line_items(decisions),
+            DECISIONS_CAP,
+        ),
+        (
+            t.carried_open_questions,
+            one_line_items(open),
+            OPEN_QUESTIONS_CAP,
+        ),
+        (
+            t.pinned_pages,
+            sec.pinned.iter().map(pinned_lines).collect(),
+            PINNED_CAP,
+        ),
+        (t.state_recent_sessions, recent, RECENT_CAP),
+        (t.start_last_reply_heading, reply, LAST_REPLY_CAP),
+    ]
+    .into_iter()
+    .filter_map(|(heading, items, cap)| section(lang, heading, items, cap))
+    .collect();
+
+    // Section 2: the handoff (or the main line's, for reference) in the remaining budget.
+    let clean = |s: &Option<String>| {
+        s.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(escape_kioku_tags)
+    };
+    let reference = clean(&ctx.handoff).is_none() && clean(&ctx.reference).is_some();
+    if let Some(h) = clean(&ctx.handoff).or_else(|| clean(&ctx.reference)) {
+        let heading = if reference {
+            t.start_reference_heading
+        } else {
+            t.start_handoff_heading
+        };
+        let fixed = len(&head) + len(&footer) + len(&tail) + len(heading) + 3;
+        if let Some(h) = fit(&h, cap.saturating_sub(fixed)) {
+            head.push_str(&format!("\n{heading}\n{h}\n"));
+        }
+    }
+    let out = format!("{head}{tail}{footer}");
+    if len(&out) <= cap {
+        return out;
+    }
+    // Only the fixed parts are left and they are still too long (absurd project name).
+    let body = truncate_chars(&out, cap.saturating_sub(len(CLOSE) + 1));
+    format!("{body}\n{CLOSE}")
+}
+
+/// `text` shrunk to `budget` chars at line boundaries ([`shrink`]); `None` when too small.
+fn fit(text: &str, budget: usize) -> Option<String> {
+    if len(text) <= budget {
+        Some(text.to_string())
+    } else {
+        shrink(text, budget)
+    }
+}
+
+/// One section (`\n<heading>\n<lines>\n`) within `cap` chars: whole items are kept while
+/// they fit and the rest is counted in a `…(N more)` line; a first item that alone does not
+/// fit is cut. `None` when there is nothing to show.
+fn section(lang: Lang, heading: &str, items: Vec<Vec<String>>, cap: usize) -> Option<String> {
+    if items.is_empty() {
+        return None;
+    }
+    let total = items.len();
+    let more = |n: usize| fill(strings(lang).more_items, &[("n", &n.to_string())]);
+    let mut out = format!("\n{heading}\n");
+    for (i, item) in items.iter().enumerate() {
+        let text = escape_kioku_tags(&format!("{}\n", item.join("\n")));
+        let left = total - i - 1;
+        let reserve = if left > 0 { len(&more(left)) + 1 } else { 0 };
+        if len(&out) + len(&text) + reserve <= cap {
+            out.push_str(&text);
+            continue;
+        }
+        if i == 0 {
+            let marker = if total > 1 {
+                format!("{}\n", more(total - 1))
+            } else {
+                String::new()
+            };
+            let room = cap.saturating_sub(len(&out) + len(&marker) + 1);
+            out.push_str(&truncate_chars(text.trim_end(), room));
+            out.push('\n');
+            out.push_str(&marker);
+        } else {
+            out.push_str(&format!("{}\n", more(total - i)));
+        }
+        break;
+    }
+    Some(out)
+}
+
+/// The layout before SPEC-M3.0 (an older server): handoff + STATE.md excerpt.
+fn render_legacy(lang: Lang, ctx: &StartContext, cap: usize) -> String {
     let clean = |s: &Option<String>| {
         s.as_deref()
             .map(str::trim)
@@ -98,6 +308,20 @@ fn assemble(
     state: Option<&str>,
 ) -> String {
     let t = strings(lang);
+    let mut out = header(lang, ctx);
+    if let Some(h) = handoff {
+        out.push_str(&format!("\n{handoff_heading}\n{h}\n"));
+    }
+    if let Some(s) = state {
+        out.push_str(&format!("\n{}\n{s}\n", t.start_state_heading));
+    }
+    out.push_str(&format!("\n{}\n{CLOSE}", t.start_footer));
+    out
+}
+
+/// `<kioku>`, the untrusted-memory note, and the project / session / lane / server lines.
+fn header(lang: Lang, ctx: &StartContext) -> String {
+    let t = strings(lang);
     let mut out = String::from("<kioku>\n");
     out.push_str(&memory_note());
     out.push_str(&fill(
@@ -114,13 +338,6 @@ fn assemble(
         out.push('\n');
     }
     out.push_str(&format!("server: {}\n", ctx.server_url));
-    if let Some(h) = handoff {
-        out.push_str(&format!("\n{handoff_heading}\n{h}\n"));
-    }
-    if let Some(s) = state {
-        out.push_str(&format!("\n{}\n{s}\n", t.start_state_heading));
-    }
-    out.push_str(&format!("\n{}\n{CLOSE}", t.start_footer));
     out
 }
 
@@ -175,6 +392,9 @@ fn shrink(text: &str, budget: usize) -> Option<String> {
 fn len(s: &str) -> usize {
     s.chars().count()
 }
+
+#[cfg(test)]
+mod m30_tests;
 
 #[cfg(test)]
 mod tests {

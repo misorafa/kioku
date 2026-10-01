@@ -125,6 +125,12 @@ async fn mcp_tools_over_streamable_http() {
         out.starts_with(&format!("{}1. {path} — 引き継ぎの設計 (", memory_note())),
         "{out}"
     );
+    // SPEC-M3.0 §5: kind and date per hit
+    let today = kioku_core::util::display_date(&kioku_core::util::now_ts());
+    assert!(
+        out.contains(&format!("— 引き継ぎの設計 (page, {today})\n")),
+        "{out}"
+    );
     assert!(out.contains("【"), "{out}");
     let none = client
         .call_tool(
@@ -237,7 +243,8 @@ async fn mcp_handoff_pending_reads_a_lane() {
     let wrote = client
         .call_tool(
             CallToolRequestParams::new("kioku_handoff_write").with_arguments(args(json!({
-                "project": PROJECT, "session": "wt-a", "summary": "検索のレーンで作業した"
+                "project": PROJECT, "session": "wt-a", "summary": "検索のレーンで作業した",
+                "verified": ["日本語の検索が通る"], "gotchas": ["レーン名は大文字小文字を区別する"]
             }))),
         )
         .await
@@ -259,6 +266,13 @@ async fn mcp_handoff_pending_reads_a_lane() {
     ] {
         let out = text(&client.call_tool(call(a)).await.unwrap());
         assert!(out.contains("検索のレーンで作業した"), "{out}");
+        // SPEC-M3.0 §2 through MCP
+        assert!(
+            out.contains(
+                "### 確認済みの事実\n- 日本語の検索が通る\n### 落とし穴・注意点\n- レーン名は"
+            ),
+            "{out}"
+        );
     }
 
     // a main-line handoff is a reference on another lane, never accepted there

@@ -758,6 +758,7 @@ mod tests {
 
     fn start(store: &Store, id: &str, lane: Option<&str>) -> SessionStartRequest {
         let req = SessionStartRequest {
+            machine: None,
             session_id: id.into(),
             agent: "test".into(),
             cwd: "/test".into(),
@@ -785,6 +786,8 @@ mod tests {
     fn handoff(store: &Store, id: &str) -> Handoff {
         store
             .write_handoff(&HandoffInput {
+                gotchas: Vec::new(),
+                verified: Vec::new(),
                 project: "test-project".into(),
                 session: Some(id.into()),
                 summary: "日本語の引き継ぎ".into(),
@@ -972,6 +975,7 @@ mod tests {
         start(&store, "writer", Some("feature"));
         let h = handoff(&store, "writer");
         let mut req = SessionStartRequest {
+            machine: None,
             session_id: "reader".into(),
             agent: "test".into(),
             cwd: "/test".into(),

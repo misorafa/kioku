@@ -1,8 +1,9 @@
 //! Markdown rendering of session pages (spec §7.3) and STATE.md (spec §7.4).
 
+use crate::carry::Carried;
 use crate::digest::{FileCount, SessionDigest, prompt_title_line};
 use crate::handoff::Handoff;
-use crate::session::Session;
+use crate::session::{CarriedItem, PinnedPage, Session};
 use crate::strings::{Lang, fill, strings};
 use crate::util::{display_date, display_minute, one_line, truncate_chars};
 
@@ -108,6 +109,12 @@ pub fn session_body(
         out.push(String::new());
     }
 
+    if let Some(reply) = &digest.last_reply {
+        out.push(s.session_last_reply.to_string());
+        out.extend(quote_lines(reply));
+        out.push(String::new());
+    }
+
     // The handoff content carries its own `## 引き継ぎ…` heading (spec §7.2 / §7.5).
     out.push(handoff_md.trim_end().to_string());
     let mut text = out.join("\n");
@@ -129,16 +136,21 @@ pub struct StateSession {
     pub agent: String,
     /// Handoff lane of the session (`None` = project lane), shown as `[<lane>]`.
     pub lane: Option<String>,
+    /// Machine that ran the session, shown as `@<machine>` (SPEC-M3.0 §6).
+    pub machine: Option<String>,
     /// Session page title.
     pub title: String,
     /// Path relative to the project directory (`sessions/…md`).
     pub rel_path: String,
 }
 
-/// STATE.md body (spec §7.4).
+/// STATE.md body (spec §7.4, SPEC-M3.0 §1): latest handoff, carried decisions and open
+/// questions and pinned pages (each only when non-empty), recent sessions, hot files.
 pub fn state_body(
     lang: Lang,
     latest: Option<&Handoff>,
+    carried: &Carried,
+    pinned: &[PinnedPage],
     recent: &[StateSession],
     hot_files: &[FileCount],
 ) -> String {
@@ -161,24 +173,34 @@ pub fn state_body(
     }
     out.push(String::new());
 
+    let (decisions, open) = carried_lines(carried);
+    for (heading, lines) in [
+        (s.carried_decisions, decisions),
+        (s.carried_open_questions, open),
+        (
+            s.pinned_pages,
+            pinned.iter().flat_map(pinned_lines).collect(),
+        ),
+    ] {
+        if !lines.is_empty() {
+            out.push(heading.to_string());
+            out.extend(lines);
+            out.push(String::new());
+        }
+    }
+
     out.push(s.state_recent_sessions.to_string());
     if recent.is_empty() {
         out.push(s.none.to_string());
     }
     for r in recent {
-        let summary = r
-            .title
-            .split_once(" — ")
-            .map(|(_, t)| t)
-            .unwrap_or(&r.title);
-        let lane = r
-            .lane
-            .as_deref()
-            .map(|l| format!(" [{l}]"))
-            .unwrap_or_default();
-        out.push(format!(
-            "- {} {}{lane} — {} ({})",
-            r.date, r.agent, summary, r.rel_path
+        out.push(recent_line(
+            &r.date,
+            &r.agent,
+            r.lane.as_deref(),
+            r.machine.as_deref(),
+            &r.title,
+            &r.rel_path,
         ));
     }
     out.push(String::new());
@@ -197,6 +219,103 @@ fn push_files(out: &mut Vec<String>, files: &[FileCount], none: &str) {
     for f in files {
         out.push(format!("- {} ({})", f.path, f.count));
     }
+}
+
+/// `agent@machine` when the machine is known, else `agent` (SPEC-M3.0 §6).
+pub fn agent_label(agent: &str, machine: Option<&str>) -> String {
+    match machine.filter(|m| !m.is_empty()) {
+        Some(m) => format!("{agent}@{m}"),
+        None => agent.to_string(),
+    }
+}
+
+/// `MM-DD` of a `YYYY-MM-DD…` date (the date itself when it is shorter).
+fn month_day(date: &str) -> String {
+    let d: Vec<char> = date.chars().collect();
+    if d.len() >= 10 {
+        d[5..10].iter().collect()
+    } else {
+        date.to_string()
+    }
+}
+
+/// One carried line: `- <prefix><text> (MM-DD)` (SPEC-M3.0 §1).
+pub fn carried_line(prefix: &str, item: &CarriedItem) -> String {
+    format!(
+        "- {prefix}{} ({})",
+        one_line(&item.text),
+        month_day(&item.date)
+    )
+}
+
+/// The lines of the carried sections: decisions then `✓` verified facts (section 3), open
+/// questions then `⚠` gotchas (section 4).
+pub fn carried_lines(carried: &Carried) -> (Vec<String>, Vec<String>) {
+    let decisions = carried
+        .decisions
+        .iter()
+        .map(|i| carried_line("", i))
+        .chain(carried.verified.iter().map(|i| carried_line("✓ ", i)))
+        .collect();
+    let open = carried
+        .open_questions
+        .iter()
+        .map(|i| carried_line("", i))
+        .chain(carried.gotchas.iter().map(|i| carried_line("⚠ ", i)))
+        .collect();
+    (decisions, open)
+}
+
+/// A pinned page: `- <title> (<path>)` and its excerpt as `  > ` lines (blank lines dropped).
+pub fn pinned_lines(page: &PinnedPage) -> Vec<String> {
+    let mut out = vec![format!("- {} ({})", one_line(&page.title), page.path)];
+    out.extend(
+        page.excerpt
+            .lines()
+            .map(str::trim_end)
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| format!("  > {l}")),
+    );
+    out
+}
+
+/// One recent-session line: `- <date> <agent> [<lane>] @<machine> — <title> (<path>)`; the
+/// title loses its `<date time agent> — ` prefix.
+pub fn recent_line(
+    date: &str,
+    agent: &str,
+    lane: Option<&str>,
+    machine: Option<&str>,
+    title: &str,
+    path: &str,
+) -> String {
+    let summary = title.split_once(" — ").map(|(_, t)| t).unwrap_or(title);
+    let lane = lane.map(|l| format!(" [{l}]")).unwrap_or_default();
+    let machine = machine
+        .filter(|m| !m.is_empty())
+        .map(|m| format!(" @{m}"))
+        .unwrap_or_default();
+    let agent = if agent.is_empty() {
+        String::new()
+    } else {
+        format!(" {agent}")
+    };
+    format!("- {date}{agent}{lane}{machine} — {summary} ({path})")
+}
+
+/// `text` as Markdown quote lines (`> …`), so a reply's own headings cannot start sections.
+pub fn quote_lines(text: &str) -> Vec<String> {
+    text.trim()
+        .lines()
+        .map(|l| {
+            let l = l.trim_end();
+            if l.is_empty() {
+                ">".to_string()
+            } else {
+                format!("> {l}")
+            }
+        })
+        .collect()
 }
 
 /// Pushes Markdown headings one level down so embedded handoffs nest under a `##` section.
@@ -221,6 +340,7 @@ mod tests {
 
     fn session() -> Session {
         Session {
+            machine: None,
             id: "0c2f1a2b-3c4d".into(),
             project_id: "kioku-3f9a1c2e".into(),
             agent: "claude-code".into(),
@@ -289,6 +409,7 @@ mod tests {
         };
         let recent = vec![
             StateSession {
+                machine: None,
                 date: "2026-09-25".into(),
                 agent: "claude-code".into(),
                 lane: None,
@@ -296,6 +417,7 @@ mod tests {
                 rel_path: "sessions/2026-09-25-0c2f1a2b.md".into(),
             },
             StateSession {
+                machine: Some("mini".into()),
                 date: "2026-09-25".into(),
                 agent: "codex".into(),
                 lane: Some("feature/検索".into()),
@@ -303,17 +425,36 @@ mod tests {
                 rel_path: "sessions/2026-09-25-11111111.md".into(),
             },
         ];
-        let body = state_body(
-            Lang::Ja,
-            Some(&h),
-            &recent,
-            &[FileCount {
-                path: "a.rs".into(),
-                count: 3,
-            }],
-        );
+        let item = |text: &str, date: &str| CarriedItem {
+            text: text.into(),
+            date: date.into(),
+            handoff_id: "h1".into(),
+        };
+        let carried = Carried {
+            decisions: vec![item("lindera を使う", "2026-09-28")],
+            verified: vec![item("cargo test は通る", "2026-09-27")],
+            open_questions: vec![item("再ランキングは？", "2026-09-27")],
+            gotchas: vec![item("Windows の\nパス", "2026-09-26")],
+        };
+        let pinned = [PinnedPage {
+            path: "_global/rules.md".into(),
+            title: "作業ルール".into(),
+            excerpt: "main に直接 push しない\n\n## 手順".into(),
+        }];
+        let files = [FileCount {
+            path: "a.rs".into(),
+            count: 3,
+        }];
+        let body = state_body(Lang::Ja, Some(&h), &carried, &pinned, &recent, &files);
         assert!(body.starts_with("## 最新の引き継ぎ\n_2026-09-25 03:40 / claude-code / source: rules_\n\n### 引き継ぎ（自動生成）\n"));
-        assert!(body.contains("## 最近のセッション\n- 2026-09-25 claude-code — 設計 (sessions/2026-09-25-0c2f1a2b.md)\n- 2026-09-25 codex [feature/検索] — 検索 (sessions/2026-09-25-11111111.md)\n"));
-        assert!(body.ends_with("## よく触るファイル（直近10セッション）\n- a.rs (3)\n"));
+        assert!(body.contains("\n## 決定事項（これまでの引き継ぎ）\n- lindera を使う (09-28)\n- ✓ cargo test は通る (09-27)\n\n## 未解決（これまでの引き継ぎ）\n- 再ランキングは？ (09-27)\n- ⚠ Windows の パス (09-26)\n\n## ピン留め\n- 作業ルール (_global/rules.md)\n  > main に直接 push しない\n  > ## 手順\n\n## 最近のセッション\n"), "{body}");
+        assert!(body.contains("## 最近のセッション\n- 2026-09-25 claude-code — 設計 (sessions/2026-09-25-0c2f1a2b.md)\n- 2026-09-25 codex [feature/検索] @mini — 検索 (sessions/2026-09-25-11111111.md)\n"));
+        // nothing carried, nothing pinned → no empty sections
+        let body = state_body(Lang::En, None, &Carried::default(), &[], &[], &files);
+        assert!(
+            !body.contains("(carried)") && !body.contains("Pinned"),
+            "{body}"
+        );
+        assert!(body.ends_with("## Frequently touched files (last 10 sessions)\n- a.rs (3)\n"));
     }
 }

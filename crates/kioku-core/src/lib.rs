@@ -6,6 +6,7 @@
 
 #![warn(missing_docs)]
 
+pub mod carry;
 pub mod config;
 mod db;
 pub mod digest;
@@ -33,9 +34,9 @@ pub use layout::{DataDir, InitReport, init};
 pub use page::{Frontmatter, Page, PageKind, PageScope};
 pub use project::{ProjectIdentity, identify};
 pub use session::{
-    FinalizeResult, HANDOFF_STALE_TOOL_USES, NewObservation, Observation, ObservationKind,
-    RecentSession, Session, SessionCounts, SessionInfo, SessionStartRequest, SessionStartResponse,
-    SessionStatus,
+    CONTEXT_VERSION, CarriedItem, FinalizeResult, HANDOFF_STALE_TOOL_USES, NewObservation,
+    Observation, ObservationKind, PinnedPage, RecentSession, Session, SessionCounts, SessionInfo,
+    SessionStartRequest, SessionStartResponse, SessionStatus,
 };
 pub use store::{MergeReport, StatusReport, Store, WritePageRequest};
 pub use strings::Lang;

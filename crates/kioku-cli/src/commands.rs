@@ -663,7 +663,8 @@ fn search(
     Ok(())
 }
 
-/// Human-readable hit list (same shape as the `kioku_query` MCP tool).
+/// Human-readable hit list (same shape as the `kioku_query` MCP tool):
+/// `N. <path> — <title> (<kind>, YYYY-MM-DD) [global]` (SPEC-M3.0 §5).
 pub fn format_hits(hits: &[Hit]) -> String {
     if hits.is_empty() {
         return "no hits\n".to_string();
@@ -672,11 +673,11 @@ pub fn format_hits(hits: &[Hit]) -> String {
     for (i, h) in hits.iter().enumerate() {
         let global = if h.global { " [global]" } else { "" };
         out.push_str(&format!(
-            "{}. {} — {} ({:.2}){global}\n",
+            "{}. {} — {} ({}){global}\n",
             i + 1,
             h.path,
             h.title,
-            h.score
+            kioku_server::mcp::hit_meta(h)
         ));
         if !h.snippet.trim().is_empty() {
             out.push_str(&format!("   {}\n", kioku_core::util::one_line(&h.snippet)));
@@ -1320,7 +1321,15 @@ mod tests {
         }];
         assert_eq!(
             format_hits(&hits),
-            "1. _global/rust.md — Rust の書き方 (1.23) [global]\n   【引き継ぎ】を 自動化\n"
+            "1. _global/rust.md — Rust の書き方 (page, 2026-09-25) [global]\n   【引き継ぎ】を 自動化\n"
+        );
+        // a hit without a date (older server shape) shows its kind only
+        let mut old = hits[0].clone();
+        old.updated = String::new();
+        old.kind = "session".into();
+        assert!(
+            format_hits(&[old])
+                .starts_with("1. _global/rust.md — Rust の書き方 (session) [global]\n")
         );
     }
 }

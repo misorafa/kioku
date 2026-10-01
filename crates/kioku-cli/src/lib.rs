@@ -22,6 +22,7 @@ pub mod hook;
 pub mod install;
 pub mod invite;
 pub mod logfile;
+pub mod machine;
 pub mod outbox;
 pub mod render;
 pub mod rotate;
@@ -31,5 +32,7 @@ pub mod update;
 
 pub use context::{SESSION_START_CAP, StartContext, render_session_start};
 pub use event::{ALL_AGENTS, ALL_EVENTS, Agent, HookEnv, HookEvent, HookEventKind, parse_event};
-pub use hook::{HookOutcome, StopDecision, run_hook, run_hook_with_env, stop_decision};
+pub use hook::{
+    HookOutcome, NudgePolicy, StopDecision, run_hook, run_hook_with_env, stop_decision,
+};
 pub use render::{HookResult, render};

@@ -177,6 +177,8 @@ impl KiokuBridge {
             "next_steps": p.next_steps,
             "open_questions": p.open_questions,
             "decisions": p.decisions,
+            "verified": p.verified,
+            "gotchas": p.gotchas,
         });
         let v = self.call(move |c| c.post(&["handoffs"], &body)).await?;
         // `project_id` is additive (M2 §20.1); an older server only returns `id`.

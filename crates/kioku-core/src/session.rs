@@ -21,7 +21,13 @@ pub enum ObservationKind {
     Compact,
     /// Free-form note.
     Note,
+    /// The agent's final reply of a turn (`last_assistant_message` on Stop, SPEC-M3.0 §3):
+    /// payload `{text}`, sanitized, at most [`ASSISTANT_MAX`] chars.
+    Assistant,
 }
+
+/// Max chars of an `assistant` observation's text (SPEC-M3.0 §3).
+pub const ASSISTANT_MAX: usize = 2000;
 
 impl ObservationKind {
     /// snake_case name as stored in SQLite.
@@ -32,6 +38,7 @@ impl ObservationKind {
             ObservationKind::Stop => "stop",
             ObservationKind::Compact => "compact",
             ObservationKind::Note => "note",
+            ObservationKind::Assistant => "assistant",
         }
     }
 
@@ -43,6 +50,7 @@ impl ObservationKind {
             "stop" => Some(ObservationKind::Stop),
             "compact" => Some(ObservationKind::Compact),
             "note" => Some(ObservationKind::Note),
+            "assistant" => Some(ObservationKind::Assistant),
             _ => None,
         }
     }
@@ -132,6 +140,9 @@ pub struct Session {
     /// Handoff lane (the git branch, M2.4 §1.1); `None` = the project lane.
     #[serde(default)]
     pub lane: Option<String>,
+    /// Host name of the machine that ran it (SPEC-M3.0 §6); `None` from older clients.
+    #[serde(default)]
+    pub machine: Option<String>,
 }
 
 /// Input of `Store::start_session` (`POST /api/v1/sessions/start`).
@@ -154,6 +165,21 @@ pub struct SessionStartRequest {
     /// default branch = the project lane.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lane: Option<String>,
+    /// Host name of the client machine (≤ 64 chars, `KIOKU_MACHINE` overrides; SPEC-M3.0
+    /// §6); absent from older clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+}
+
+/// Max chars of a machine name (SPEC-M3.0 §6).
+pub const MACHINE_MAX: usize = 64;
+
+/// A machine name as stored: control characters dropped, trimmed, at most [`MACHINE_MAX`]
+/// chars; `None` when nothing is left.
+pub fn normalize_machine(name: &str) -> Option<String> {
+    let clean: String = name.chars().filter(|c| !c.is_control()).collect();
+    let clean = clean.trim();
+    (!clean.is_empty()).then(|| clean.chars().take(MACHINE_MAX).collect())
 }
 
 fn default_agent() -> String {
@@ -161,7 +187,7 @@ fn default_agent() -> String {
 }
 
 /// A recent session page, for SessionStart context.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecentSession {
     /// Session page title.
     pub title: String,
@@ -169,10 +195,46 @@ pub struct RecentSession {
     pub path: String,
     /// `YYYY-MM-DD`.
     pub date: String,
+    /// Agent of the session (SPEC-M3.0 §1; empty from an older server).
+    #[serde(default)]
+    pub agent: String,
+    /// Lane of the session, if not the project lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<String>,
+    /// Machine that ran the session (SPEC-M3.0 §6), if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
 }
 
+/// A line carried forward from earlier agent handoffs (decisions, verified facts, open
+/// questions, gotchas; SPEC-M3.0 §1–§2).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CarriedItem {
+    /// The item text as written.
+    pub text: String,
+    /// `YYYY-MM-DD` of the handoff it comes from.
+    pub date: String,
+    /// Id of that handoff.
+    pub handoff_id: String,
+}
+
+/// A page tagged `pinned`, shown at session start (SPEC-M3.0 §1 section 5).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinnedPage {
+    /// Wiki-relative path.
+    pub path: String,
+    /// Page title.
+    pub title: String,
+    /// The start of the body (at most 400 chars).
+    pub excerpt: String,
+}
+
+/// [`SessionStartResponse::context_version`] of a server that computes the SPEC-M3.0
+/// sections (carried items, pinned pages, last reply).
+pub const CONTEXT_VERSION: u32 = 1;
+
 /// Output of `Store::start_session`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionStartResponse {
     /// Project id the session was attached to.
     pub project_id: String,
@@ -189,6 +251,28 @@ pub struct SessionStartResponse {
     /// shown for reference and NOT accepted (M2.4 §1.4 rule 2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reference_handoff: Option<Handoff>,
+    /// [`CONTEXT_VERSION`] when the fields below are computed; 0 (absent) from an older
+    /// server, whose block is rendered as before (handoff + STATE excerpt).
+    #[serde(default)]
+    pub context_version: u32,
+    /// Decisions of earlier agent handoffs, newest first (SPEC-M3.0 §1 section 3).
+    #[serde(default)]
+    pub decisions: Vec<CarriedItem>,
+    /// Verified facts of earlier agent handoffs, shown after the decisions (§2).
+    #[serde(default)]
+    pub verified: Vec<CarriedItem>,
+    /// Open questions of earlier agent handoffs not resolved since (§1 section 4).
+    #[serde(default)]
+    pub open_questions: Vec<CarriedItem>,
+    /// Gotchas of earlier agent handoffs, shown after the open questions (§2).
+    #[serde(default)]
+    pub gotchas: Vec<CarriedItem>,
+    /// Pages tagged `pinned` in the project or `_global`, newest first (§1 section 5).
+    #[serde(default)]
+    pub pinned: Vec<PinnedPage>,
+    /// The last reply of the previous session on this lane (§1 section 7, ≤ 600 chars).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reply: Option<String>,
 }
 
 /// Prompt / tool-use counts of a session.
@@ -215,6 +299,10 @@ pub struct SessionInfo {
     /// `None` only when talking to a server that predates this field.
     #[serde(default)]
     pub tool_uses_since_handoff: Option<u32>,
+    /// Seconds since the session's latest agent handoff, or since the session started when
+    /// it has none, by the server's clock (SPEC-M3.0 §4); `None` from an older server.
+    #[serde(default)]
+    pub secs_since_handoff: Option<u64>,
 }
 
 impl SessionInfo {
@@ -291,6 +379,11 @@ pub fn observation_text(kind: ObservationKind, payload: &Value) -> String {
             .and_then(s)
             .or_else(|| s(payload))
             .unwrap_or_else(|| payload.to_string()),
+        ObservationKind::Assistant => payload
+            .get("text")
+            .and_then(s)
+            .or_else(|| s(payload))
+            .unwrap_or_default(),
         ObservationKind::Stop | ObservationKind::Compact => String::new(),
     }
 }

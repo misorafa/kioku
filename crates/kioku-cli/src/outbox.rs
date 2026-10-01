@@ -419,6 +419,7 @@ mod tests {
                 payload: json!({"prompt":"日本語の引き継ぎ"}),
             },
             SessionStartRequest {
+                machine: None,
                 session_id: session.into(),
                 agent: "claude-code".into(),
                 cwd: "/repo".into(),
