@@ -77,6 +77,9 @@ pub fn run(cli: Cli) -> i32 {
         Command::HookDump {
             command: HookDumpCommand::Extract { agent, event, out },
         } => hook_dump_extract(agent, &event, out),
+        Command::HookDump {
+            command: HookDumpCommand::Enable,
+        } => hook_dump_enable(),
         Command::Init { client_only } => match client_only.as_deref() {
             Some([url, token]) => init_client_only(url, token),
             Some(_) => Err(anyhow::anyhow!("--client-only takes <url> <token>")),
@@ -233,6 +236,13 @@ pub fn run(cli: Cli) -> i32 {
             }
         }
         Command::Reindex => reindex(),
+        Command::Prune { dry_run } => prune(dry_run),
+        Command::Forget {
+            session,
+            project,
+            purge_history,
+            yes,
+        } => forget(session, project, purge_history, yes),
         Command::Status => status(),
         Command::RotateToken {
             dry_run,
@@ -334,16 +344,31 @@ fn hook(event: HookEventKind, agent: Agent) -> i32 {
     outcome.exit_code
 }
 
-/// `kioku hook-dump extract <agent> <event> [--out dir]`.
+/// `kioku hook-dump extract <agent> <event> [--out dir]`; the default output directory is
+/// `~/.kioku/captures/<date>/`, never the current directory (SPEC-M2.8 §7).
 fn hook_dump_extract(agent: Agent, event: &str, out: Option<PathBuf>) -> anyhow::Result<()> {
     let cfg = Config::load()?;
+    let env = HookEnv::from_process();
     let path = dump::dump_path(&cfg).context("no log directory (HOME is not set)")?;
     let out = match out {
         Some(o) => o,
-        None => std::env::current_dir().context("reading current directory")?,
+        None => dump::default_capture_dir(&cfg, &env, &kioku_core::util::now_ts())
+            .context("no kioku directory (HOME is not set)")?,
     };
     let written = dump::extract(&path, agent, event, &out)?;
     println!("wrote {}", written.display());
+    Ok(())
+}
+
+/// `kioku hook-dump enable`: restarts the 24-hour capture window (SPEC-M2.8 §7).
+fn hook_dump_enable() -> anyhow::Result<()> {
+    let cfg = Config::load()?;
+    let env = HookEnv::from_process();
+    let marker = dump::reset_window(&cfg, &env)?;
+    println!(
+        "hook payload capture runs for 24 h from now when KIOKU_HOOK_DUMP=1 or [client] hook_dump = true (marker {})",
+        marker.display()
+    );
     Ok(())
 }
 
@@ -524,7 +549,16 @@ fn serve(
         tracing::warn!("{w}");
     }
     let boot_dir = state_dir.clone();
+    let prune_store = store.clone();
+    let retention_auto = store.config().retention.auto;
     runtime.block_on(async move {
+        // SPEC-M2.8 §3: the daily retention run, on the update check's schedule.
+        if retention_auto {
+            tokio::spawn(crate::auto_update::prune_task(
+                prune_store,
+                crate::auto_update::FIRST_PRUNE,
+            ));
+        }
         if managed {
             // SPEC-M2.7 §7: a start that survives a minute is a good one.
             let dir = state_dir.clone();
@@ -678,10 +712,29 @@ fn status() -> anyhow::Result<()> {
             kioku_server::mcp::format_aliases(&s.aliases)
         );
     }
+    if let Some(st) = &s.storage {
+        print!("{}", format_storage(st));
+    }
     if let Some(u) = body.get("update") {
         println!("update       : {}", format_update_status(u));
     }
     Ok(())
+}
+
+/// The disk usage lines of `kioku status` (SPEC-M2.8 §3).
+pub fn format_storage(st: &kioku_core::store::StorageReport) -> String {
+    format!(
+        "storage      : db {}, raw {}, wiki {}, backups {}, index {}\n\
+         oldest raw   : {}\n\
+         last prune   : {}\n",
+        human_bytes(st.db_bytes),
+        human_bytes(st.raw_bytes),
+        human_bytes(st.wiki_bytes),
+        human_bytes(st.backups_bytes),
+        human_bytes(st.index_bytes),
+        st.oldest_raw.as_deref().unwrap_or("-"),
+        st.last_prune.as_deref().unwrap_or("never"),
+    )
 }
 
 /// One line for the server's `update` status block (SPEC-M2.5 §3.4).
@@ -702,6 +755,137 @@ pub fn format_update_status(u: &Value) -> String {
     }
     if let Some(e) = s("last_error") {
         out.push_str(&format!(", last error: {e}"));
+    }
+    out
+}
+
+/// `kioku prune [--dry-run]` → `POST /api/v1/prune` (SPEC-M2.8 §3).
+fn prune(dry_run: bool) -> anyhow::Result<()> {
+    let (_, client) = command_client()?;
+    let body = client.post(&["prune"], &serde_json::json!({"dry_run": dry_run}))?;
+    let report: kioku_core::store::PruneReport =
+        serde_json::from_value(body).context("unexpected prune response")?;
+    print!("{}", format_prune(&report));
+    Ok(())
+}
+
+/// Bytes as `12.3 MiB` / `456 KiB` / `78 B`.
+pub fn human_bytes(n: u64) -> String {
+    const KIB: f64 = 1024.0;
+    let f = n as f64;
+    if f >= KIB * KIB * KIB {
+        format!("{:.1} GiB", f / (KIB * KIB * KIB))
+    } else if f >= KIB * KIB {
+        format!("{:.1} MiB", f / (KIB * KIB))
+    } else if f >= KIB {
+        format!("{:.0} KiB", f / KIB)
+    } else {
+        format!("{n} B")
+    }
+}
+
+/// Human-readable `kioku prune` report.
+pub fn format_prune(r: &kioku_core::store::PruneReport) -> String {
+    let mut out = format!(
+        "{} (on the server, [retention] policy):\n",
+        if r.dry_run {
+            "would prune (dry run: nothing changed)"
+        } else {
+            "pruned"
+        }
+    );
+    let line = |label: &str, c: &kioku_core::store::PruneCount, what: &str| {
+        format!(
+            "  {label:<19}: {} ({} {what})\n",
+            c.count,
+            human_bytes(c.bytes)
+        )
+    };
+    out.push_str(&line(
+        "raw logs gzipped",
+        &r.raw_gzipped,
+        if r.dry_run { "to compress" } else { "saved" },
+    ));
+    out.push_str(&line("raw logs deleted", &r.raw_deleted, "freed"));
+    out.push_str(&format!(
+        "  {:<19}: {} ({} observations, {} of payloads)\n",
+        "sessions reduced",
+        r.sessions_reduced.count,
+        r.observations_reduced,
+        human_bytes(r.sessions_reduced.bytes)
+    ));
+    out.push_str(&line("backups removed", &r.backups_removed, "freed"));
+    out.push_str(&line("hook dumps removed", &r.hook_dumps_removed, "freed"));
+    out
+}
+
+/// `kioku forget --session <id> | --project <id>` → `POST /api/v1/forget` (SPEC-M2.8 §3).
+/// A project is forgotten only after a confirmation (or `--yes`).
+fn forget(
+    session: Option<String>,
+    project: Option<String>,
+    purge_history: bool,
+    yes: bool,
+) -> anyhow::Result<()> {
+    let (_, client) = command_client()?;
+    let target = match (&session, &project) {
+        (Some(s), None) => serde_json::json!({"session": s}),
+        (None, Some(p)) => serde_json::json!({"project": p}),
+        _ => anyhow::bail!("give exactly one of --session or --project"),
+    };
+    if project.is_some() && !yes {
+        let mut dry = target.clone();
+        dry["dry_run"] = serde_json::json!(true);
+        let report: kioku_core::store::ForgetReport =
+            serde_json::from_value(client.post(&["forget"], &dry)?)
+                .context("unexpected forget response")?;
+        print!("{}", format_forget(&report));
+        let stdin = std::io::stdin();
+        if !std::io::IsTerminal::is_terminal(&stdin) {
+            anyhow::bail!("not forgetting project {} without --yes", report.project);
+        }
+        print!(
+            "Forget project {} and everything above? This cannot be undone. [y/N] ",
+            report.project
+        );
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        stdin.read_line(&mut answer)?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            println!("nothing changed");
+            return Ok(());
+        }
+    }
+    let report: kioku_core::store::ForgetReport =
+        serde_json::from_value(client.post(&["forget"], &target)?)
+            .context("unexpected forget response")?;
+    print!("{}", format_forget(&report));
+    if purge_history {
+        println!(
+            "The pages are gone from the wiki, but its git history still has them. To remove them from the history, on the server machine run:"
+        );
+        for c in kioku_core::store::purge_history_commands(&report.wiki_dir, &report.pages) {
+            println!("  {c}");
+        }
+    }
+    Ok(())
+}
+
+/// Human-readable `kioku forget` report.
+pub fn format_forget(r: &kioku_core::store::ForgetReport) -> String {
+    let mut out = format!(
+        "{} in project {}: {} session(s), {} observation(s), {} receipt(s), {} handoff(s), {} page(s), {} raw log(s)\n",
+        if r.dry_run { "would forget" } else { "forgot" },
+        r.project,
+        r.sessions.len(),
+        r.observations,
+        r.receipts,
+        r.handoffs,
+        r.pages.len(),
+        r.raw_files.len()
+    );
+    for p in &r.pages {
+        out.push_str(&format!("  {p}\n"));
     }
     out
 }
@@ -870,7 +1054,14 @@ fn service(command: ServiceCommand) -> anyhow::Result<()> {
         }
     };
     match command {
-        ServiceCommand::Install | ServiceCommand::Start => {
+        ServiceCommand::Install { daemon: true } => {
+            let (plist, lines) = manager.daemon_definition()?;
+            print!("{plist}");
+            for l in lines {
+                eprintln!("{l}");
+            }
+        }
+        ServiceCommand::Install { daemon: false } | ServiceCommand::Start => {
             let has_token = cfg
                 .server
                 .auth_token
@@ -885,7 +1076,7 @@ fn service(command: ServiceCommand) -> anyhow::Result<()> {
             if let Some(w) = unstable_binary_warning(&env.bin) {
                 println!("{w}");
             }
-            let act = if matches!(command, ServiceCommand::Install) {
+            let act = if matches!(command, ServiceCommand::Install { .. }) {
                 manager.install()?
             } else {
                 manager.start()?

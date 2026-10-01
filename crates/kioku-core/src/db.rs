@@ -28,7 +28,9 @@ CREATE TABLE IF NOT EXISTS sessions(
     ended_at TEXT,
     status TEXT NOT NULL DEFAULT 'open',
     root_path TEXT,
-    lane TEXT
+    lane TEXT,
+    digest_json TEXT,
+    digest_seq INTEGER
 );
 CREATE INDEX IF NOT EXISTS sessions_project ON sessions(project_id, started_at);
 CREATE TABLE IF NOT EXISTS observations(
@@ -113,8 +115,9 @@ pub struct PageRow {
 }
 
 /// Schema version this binary writes into `PRAGMA user_version` (SPEC-M2.7 §5): M1 = 1,
-/// M2.4 = 2, M2.6 = 3. A database stamped with a higher version is refused.
-pub const SCHEMA_VERSION: u32 = 3;
+/// M2.4 = 2, M2.6 = 3, M2.8 = 4 (cached session digests). A database stamped with a
+/// higher version is refused.
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// A database written by a newer kioku (its `user_version` is above [`SCHEMA_VERSION`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -181,12 +184,14 @@ pub fn newer_schema_on_disk(path: &Path) -> Option<NewerSchema> {
 
 /// Columns added after the first M1 schema; `CREATE TABLE IF NOT EXISTS` does not add them
 /// to an existing database, so they are added here.
-const ADDED_COLUMNS: [(&str, &str, &str); 5] = [
+const ADDED_COLUMNS: [(&str, &str, &str); 7] = [
     ("sessions", "root_path", "TEXT"),
     ("handoffs", "updated_at", "TEXT"),
     ("handoffs", "seq_at", "INTEGER"),
     ("sessions", "lane", "TEXT"),
     ("handoffs", "lane", "TEXT"),
+    ("sessions", "digest_json", "TEXT"),
+    ("sessions", "digest_seq", "INTEGER"),
 ];
 
 fn migrate(conn: &Connection) -> anyhow::Result<()> {
@@ -564,6 +569,73 @@ pub fn tool_uses_since_handoff(conn: &Connection, session: &str) -> anyhow::Resu
     Ok(n as u32)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Observation rows parsed on this thread (SPEC-M2.8 §1: the warm-cache finalize test).
+    pub static PARSED_OBSERVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn observation_from_row(r: &Row<'_>) -> rusqlite::Result<Observation> {
+    #[cfg(test)]
+    PARSED_OBSERVATIONS.with(|c| c.set(c.get() + 1));
+    let kind: String = r.get(4)?;
+    let payload: String = r.get(6)?;
+    Ok(Observation {
+        id: r.get(0)?,
+        session_id: r.get(1)?,
+        project_id: r.get(2)?,
+        seq: r.get(3)?,
+        kind: ObservationKind::parse(&kind).unwrap_or(ObservationKind::Note),
+        ts: r.get(5)?,
+        payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
+        text: r.get(7)?,
+    })
+}
+
+/// Observations of a session with `after < seq <= upto`, in seq order.
+pub fn list_observations_between(
+    conn: &Connection,
+    session_id: &str,
+    after: i64,
+    upto: i64,
+) -> anyhow::Result<Vec<Observation>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, session_id, project_id, seq, kind, ts, payload, text FROM observations
+         WHERE session_id = ?1 AND seq > ?2 AND seq <= ?3 ORDER BY seq",
+    )?;
+    let rows = stmt.query_map(params![session_id, after, upto], observation_from_row)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// The cached digest of a session (`digest_json`, `digest_seq`; SPEC-M2.8 §1), if any.
+pub fn digest_cache(conn: &Connection, session_id: &str) -> anyhow::Result<Option<(String, i64)>> {
+    let row: Option<(Option<String>, Option<i64>)> = conn
+        .query_row(
+            "SELECT digest_json, digest_seq FROM sessions WHERE id = ?1",
+            params![session_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok(match row {
+        Some((Some(json), Some(seq))) => Some((json, seq)),
+        _ => None,
+    })
+}
+
+/// Stores the cached digest of a session as of observation `seq`.
+pub fn set_digest_cache(
+    conn: &Connection,
+    session_id: &str,
+    json: &str,
+    seq: i64,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "UPDATE sessions SET digest_json = ?2, digest_seq = ?3 WHERE id = ?1",
+        params![session_id, json, seq],
+    )?;
+    Ok(())
+}
+
 /// Observations of a session after `mark` (all when `None`), in seq order.
 pub fn list_observations_after(
     conn: &Connection,
@@ -576,20 +648,7 @@ pub fn list_observations_after(
     ))?;
     let seq_at = mark.and_then(|m| m.seq_at);
     let created = mark.map(|m| m.created_at.clone());
-    let rows = stmt.query_map(params![session_id, seq_at, created], |r| {
-        let kind: String = r.get(4)?;
-        let payload: String = r.get(6)?;
-        Ok(Observation {
-            id: r.get(0)?,
-            session_id: r.get(1)?,
-            project_id: r.get(2)?,
-            seq: r.get(3)?,
-            kind: ObservationKind::parse(&kind).unwrap_or(ObservationKind::Note),
-            ts: r.get(5)?,
-            payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
-            text: r.get(7)?,
-        })
-    })?;
+    let rows = stmt.query_map(params![session_id, seq_at, created], observation_from_row)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 

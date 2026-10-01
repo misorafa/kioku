@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+flate2.workspace = true
 lindera.workspace = true
 lindera-tantivy.workspace = true
 lindera-analysis.workspace = true

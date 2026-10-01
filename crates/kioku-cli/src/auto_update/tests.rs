@@ -252,6 +252,56 @@ fn server_same_tag_and_auto_off_download_nothing() {
     assert_eq!(std::fs::read_to_string(&check.exe).unwrap(), "old binary");
 }
 
+/// SPEC-M2.8 §3: the daily retention task runs `prune` (recorded as `last_prune`).
+#[tokio::test(flavor = "multi_thread")]
+async fn prune_task_runs_the_retention_policy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store =
+        std::sync::Arc::new(kioku_core::Store::open(Config::for_data_dir(tmp.path())).unwrap());
+    assert_eq!(store.storage().unwrap().last_prune, None);
+    let task = tokio::spawn(prune_task(store.clone(), Duration::ZERO));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while store.storage().unwrap().last_prune.is_none() {
+        assert!(std::time::Instant::now() < deadline, "prune did not run");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    task.abort();
+    assert!(FIRST_PRUNE == FIRST_CHECK + Duration::from_secs(600));
+}
+
+/// SPEC-M2.8 §9: after an automatic rollback the failing tag is recorded as `skip_tag` and
+/// never installed again; a newer tag clears the mark (and is installed as usual).
+#[test]
+fn a_rolled_back_tag_is_skipped_until_a_newer_one_appears() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state_dir = tmp.path().join("state");
+    // What the rollback records (boot_check after three failed starts of 0.7.0).
+    AutoUpdateState::update(&state_dir, |s| s.skip_tag = Some("v0.7.0".into()));
+    // The same release again: skipped, nothing downloaded (the fake has no assets).
+    let base = fixture::serve(Vec::new(), Some("v0.7.0"));
+    let check = server_check(&base, tmp.path(), true);
+    let st = status();
+    assert_eq!(
+        server_check_once(&check, &st),
+        ServerOutcome::Skipped("v0.7.0".into())
+    );
+    assert!(st.lock().last_error.is_none());
+    assert_eq!(std::fs::read_to_string(&check.exe).unwrap(), "old binary");
+    let s = AutoUpdateState::load(&state_dir);
+    assert_eq!(s.skip_tag.as_deref(), Some("v0.7.0"));
+    assert_eq!(s.target, None, "no attempt recorded");
+    // A newer release clears the mark and is attempted (it fails here: no assets).
+    let base = fixture::serve(Vec::new(), Some("v0.7.1"));
+    let check = server_check(&base, tmp.path(), true);
+    assert!(matches!(
+        server_check_once(&check, &status()),
+        ServerOutcome::Failed(_)
+    ));
+    let s = AutoUpdateState::load(&state_dir);
+    assert_eq!(s.skip_tag, None);
+    assert_eq!(s.target.as_deref(), Some("v0.7.1"));
+}
+
 /// Checksum mismatch → nothing changes, the error is recorded (status and state file).
 #[cfg(unix)]
 #[test]
@@ -413,6 +463,8 @@ fn three_failed_starts_roll_the_server_back() {
         "{st:?}"
     );
     assert_eq!(st.boot_failures, None);
+    // SPEC-M2.8 §9: the failing release is not installed again.
+    assert_eq!(st.skip_tag.as_deref(), Some("v0.9.0"));
     // The old binary starts, serves a minute, and is healthy.
     assert_eq!(boot_check(&exe, &state, "0.8.0"), None);
     assert!(

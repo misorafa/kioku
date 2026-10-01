@@ -41,6 +41,8 @@ async fn everything_else_requires_the_token() {
         (Method::POST, "/api/v1/handoffs"),
         (Method::GET, "/api/v1/status"),
         (Method::POST, "/api/v1/reindex"),
+        (Method::POST, "/api/v1/prune"),
+        (Method::POST, "/api/v1/forget"),
         (Method::POST, "/api/v1/projects/merge"),
         (Method::POST, "/api/v1/invites"),
         (Method::POST, "/mcp"),
@@ -867,7 +869,8 @@ async fn durable_delivery_page_conflicts_and_backup_api() {
     );
     let (code, backup) = server.post("/api/v1/backup", json!({})).await;
     assert_eq!(code, 200);
-    assert_eq!(backup["format"], 1);
+    // SPEC-M2.8 §4: format 2 (working tree + wiki.bundle).
+    assert_eq!(backup["format"], 2);
     assert!(backup["files"]["db/kioku.sqlite"]["sha256"].is_string());
     assert!(server.get("/api/v1/diagnostics").await.1["last_backup"].is_string());
     // SPEC-M2.7 §12: a second backup within 60 s is refused.
@@ -880,4 +883,123 @@ async fn durable_delivery_page_conflicts_and_backup_api() {
         .await
         .unwrap();
     assert_eq!(unauth.status().as_u16(), 401);
+}
+
+/// SPEC-M2.8 §5: an index built by an older kioku is rebuilt by `serve_with` after it starts
+/// listening (observable through the index version), not when the store is opened.
+#[tokio::test]
+async fn serve_with_rebuilds_an_outdated_index_after_listening() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = kioku_core::Config::for_data_dir(dir.path());
+    cfg.server.auth_token = Some(TOKEN.into());
+    let store = kioku_core::Store::open(cfg.clone()).unwrap();
+    store
+        .write_page(&kioku_core::WritePageRequest {
+            title: "古い索引".into(),
+            content: "全角ＡＢＣの日本語検索".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    drop(store);
+    std::fs::write(dir.path().join("index/schema-version"), "1\n").unwrap();
+    let store = std::sync::Arc::new(kioku_core::Store::open(cfg).unwrap());
+    assert!(store.index_outdated());
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let opts = kioku_server::ServeOptions {
+        update: kioku_server::UpdateStatus::shared_for(&store),
+        shutdown: Some(rx),
+    };
+    let task = tokio::spawn(kioku_server::serve_with(
+        store.clone(),
+        "127.0.0.1".into(),
+        0,
+        opts,
+    ));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while store.index_outdated() {
+        assert!(std::time::Instant::now() < deadline, "index not rebuilt");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        store.index_version(),
+        kioku_core::index::INDEX_SCHEMA_VERSION
+    );
+    assert!(
+        !store
+            .search("日本語検索", &kioku_core::SearchScope::All, 3)
+            .unwrap()
+            .is_empty()
+    );
+    tx.send(true).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(15), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+/// SPEC-M2.8 §3: `POST /api/v1/prune` (dry run and real), `POST /api/v1/forget`, and the
+/// storage sizes in `GET /api/v1/status`.
+#[tokio::test]
+async fn prune_forget_and_storage_over_http() {
+    let srv = spawn().await;
+    srv.post("/api/v1/sessions/start", start_body("s-forget"))
+        .await;
+    let (code, _) = srv
+        .post(
+            "/api/v1/observations",
+            json!({"session_id": "s-forget", "kind": "prompt",
+                   "payload": {"prompt": "消したい秘密の作業メモ"}}),
+        )
+        .await;
+    assert_eq!(code, 200);
+    let (_, fin) = srv
+        .post("/api/v1/sessions/s-forget/finalize", json!({}))
+        .await;
+    let page = fin["session_page"].as_str().unwrap().to_string();
+    let (_, hits) = srv.get("/api/v1/search?q=%E7%A7%98%E5%AF%86").await;
+    assert!(
+        hits["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["path"] == page)
+    );
+
+    let (code, dry) = srv.post("/api/v1/prune", json!({"dry_run": true})).await;
+    assert_eq!(code, 200, "{dry}");
+    assert_eq!(dry["dry_run"], true);
+    let (code, real) = srv.post("/api/v1/prune", json!({})).await;
+    assert_eq!(code, 200, "{real}");
+    assert_eq!(real["dry_run"], false);
+
+    let (code, body) = srv.post("/api/v1/forget", json!({})).await;
+    assert_eq!(code, 400, "{body}");
+    let (code, body) = srv
+        .post(
+            "/api/v1/forget",
+            json!({"session": "s-forget", "dry_run": true}),
+        )
+        .await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["pages"], json!([page.clone()]));
+    let (code, body) = srv
+        .post("/api/v1/forget", json!({"session": "s-forget"}))
+        .await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["sessions"], json!(["s-forget"]));
+    let (_, hits) = srv.get("/api/v1/search?q=%E7%A7%98%E5%AF%86").await;
+    assert!(hits["hits"].as_array().unwrap().is_empty(), "{hits}");
+    let (code, _) = srv.get("/api/v1/sessions/s-forget").await;
+    assert_eq!(code, 404);
+    let (code, _) = srv
+        .post("/api/v1/forget", json!({"session": "s-forget"}))
+        .await;
+    assert_eq!(code, 404);
+
+    let (_, status) = srv.get("/api/v1/status").await;
+    let storage = &status["storage"];
+    assert!(storage["db_bytes"].as_u64().unwrap() > 0, "{status}");
+    assert!(storage["wiki_bytes"].as_u64().is_some());
+    assert_eq!(storage["last_prune"], real["at"]);
 }

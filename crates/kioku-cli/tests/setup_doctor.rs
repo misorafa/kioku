@@ -1026,14 +1026,21 @@ fn doctor_all_ok_then_warn_and_fail_scenarios() {
     assert_eq!(doctor::exit_code(&checks), 0);
     std::fs::write(&cursor_mcp, original).unwrap();
 
-    // Old index version → WARN with the reindex hint.
+    // Old index version → WARN; the server rebuilds it by itself (SPEC-M2.8 §5), so no
+    // `kioku reindex` advice.
     let version_file = fx.home.path().join(".kioku/index/schema-version");
     let original = std::fs::read_to_string(&version_file).unwrap();
     std::fs::write(&version_file, "1\n").unwrap();
     let checks = doctor::run_doctor(&fx.env(), None);
     let c = find(&checks, "index");
     assert_eq!(c.status, Status::Warn);
-    assert!(c.message.contains("run `kioku reindex`"), "{}", c.message);
+    assert!(
+        c.message.contains("rebuilds it in the background"),
+        "{}",
+        c.message
+    );
+    assert!(!c.message.contains("kioku reindex"), "{}", c.message);
+    assert!(!c.fix.as_deref().unwrap_or("").contains("kioku reindex"));
     std::fs::write(&version_file, original).unwrap();
 
     // Moved binary → FAIL agent.claude-code.hooks.

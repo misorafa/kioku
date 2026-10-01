@@ -76,6 +76,98 @@ fn plist_and_unit_match_the_spec_exactly() {
     assert_eq!(render_unit(&spec("/home/me")), SPEC_UNIT);
 }
 
+/// SPEC-M2.8 §5: the LaunchDaemon plist of `service install --daemon`, byte for byte: the
+/// LaunchAgent's definition plus `UserName` and `HOME` (same paths, `KIOKU_SERVICE=1`).
+#[cfg(unix)]
+#[test]
+fn daemon_plist_golden() {
+    let plist = render_daemon_plist(&spec("/Users/me"), "me", Path::new("/Users/me"));
+    let expected = SPEC_PLIST
+        .replace(
+            "  <key>ProgramArguments</key>",
+            "  <key>UserName</key><string>me</string>\n  <key>ProgramArguments</key>",
+        )
+        .replace(
+            "    <key>KIOKU_DATA_DIR</key>",
+            "    <key>HOME</key><string>/Users/me</string>\n    <key>KIOKU_DATA_DIR</key>",
+        );
+    assert_eq!(plist, expected);
+    assert!(plist.contains(
+        "<key>Label</key><string>dev.kioku.serve</string>\n  <key>UserName</key><string>me</string>\n"
+    ));
+    assert!(plist.contains("<key>KIOKU_SERVICE</key><string>1</string>"));
+    // the user name is XML-escaped like everything else
+    assert!(
+        render_daemon_plist(&spec("/Users/me"), "a&b", Path::new("/Users/me"))
+            .contains("<string>a&amp;b</string>")
+    );
+
+    // `--daemon` writes nothing and runs nothing but `id -u`-free lookups; the commands
+    // are printed for the user.
+    let home = tempfile::tempdir().unwrap();
+    let runner = Runner::recording(|_| CmdOutput::ok(""));
+    let m = manager(home.path(), Platform::Launchd, runner.clone());
+    let (text, lines) = m.daemon_definition().unwrap();
+    assert!(text.contains("<key>UserName</key><string>me</string>"));
+    assert!(lines.iter().any(|l| l
+        == &format!(
+            "sudo install -m 644 -o root -g wheel /tmp/dev.kioku.serve.plist {LAUNCH_DAEMON_PATH}"
+        )));
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == &format!("sudo launchctl bootstrap system {LAUNCH_DAEMON_PATH}"))
+    );
+    assert_eq!(lines.iter().filter(|l| l.starts_with("sudo ")).count(), 2);
+    assert!(
+        runner
+            .calls()
+            .iter()
+            .all(|c| c[0] != "sudo" && c[0] != "launchctl")
+    );
+    assert!(!m.is_installed());
+    let linux = manager(home.path(), Platform::Systemd, runner);
+    assert!(linux.daemon_definition().is_err());
+}
+
+/// SPEC-M2.8 §5: on a Mac nobody is logged in to (no gui/<uid> domain), `service install`
+/// explains that instead of launchctl's error.
+#[cfg(unix)]
+#[test]
+fn install_on_a_headless_mac_says_so() {
+    let home = tempfile::tempdir().unwrap();
+    let runner = Runner::recording(|argv| match argv.join(" ").as_str() {
+        "id -u" => CmdOutput::ok("501\n"),
+        "launchctl print gui/501" => CmdOutput::fail("Bad request.\nCould not find domain for"),
+        "launchctl print gui/501/dev.kioku.serve" => CmdOutput::fail("Could not find domain"),
+        s if s.starts_with("launchctl bootstrap") => {
+            CmdOutput::fail("Bootstrap failed: 125: Domain does not support specified action")
+        }
+        _ => CmdOutput::ok(""),
+    });
+    let m = manager(home.path(), Platform::Launchd, runner.clone());
+    assert_eq!(m.gui_session(), Some(false));
+    let err = format!("{:#}", m.install().unwrap_err());
+    assert!(err.contains(HEADLESS_MAC_JA), "{err}");
+    assert!(err.contains("kioku service install --daemon"), "{err}");
+    assert!(err.contains(HEADLESS_MAC_EN), "{err}");
+    // A Mac with a logged-in user keeps launchctl's own message.
+    let gui = Runner::recording(|argv| match argv.join(" ").as_str() {
+        "id -u" => CmdOutput::ok("501\n"),
+        "launchctl print gui/501/dev.kioku.serve" => CmdOutput::fail("Could not find service"),
+        s if s.starts_with("launchctl bootstrap") => CmdOutput::fail("Input/output error"),
+        _ => CmdOutput::ok(""),
+    });
+    let m = manager(home.path(), Platform::Launchd, gui);
+    assert_eq!(m.gui_session(), Some(true));
+    let err = format!("{:#}", m.install().unwrap_err());
+    assert!(!err.contains(HEADLESS_MAC_JA), "{err}");
+    assert_eq!(
+        manager(home.path(), Platform::Systemd, runner).gui_session(),
+        None
+    );
+}
+
 // launchd / systemd definitions hold unix paths; Windows has no service (SPEC-M2.2 §3, §4.7).
 #[cfg(unix)]
 #[test]

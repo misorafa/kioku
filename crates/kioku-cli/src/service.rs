@@ -132,6 +132,51 @@ pub fn render_plist(spec: &ServiceSpec) -> String {
     )
 }
 
+/// Where `kioku service install --daemon` tells the user to put the LaunchDaemon plist.
+pub const LAUNCH_DAEMON_PATH: &str = "/Library/LaunchDaemons/dev.kioku.serve.plist";
+
+/// What `service install` and `doctor` say on a Mac without a logged-in user (SPEC-M2.8 §5).
+pub const HEADLESS_MAC_JA: &str = "この Mac にログインしているユーザーセッションがありません。自動ログインを有効にするか、`kioku service install --daemon` を使ってください";
+/// English form of [`HEADLESS_MAC_JA`].
+pub const HEADLESS_MAC_EN: &str = "No user is logged in on this Mac (launchctl has no gui/<uid> domain). Turn on automatic login, or use `kioku service install --daemon`.";
+
+/// [`HEADLESS_MAC_JA`] and [`HEADLESS_MAC_EN`] on two lines.
+pub fn headless_message() -> String {
+    format!("{HEADLESS_MAC_JA}\n{HEADLESS_MAC_EN}")
+}
+
+/// The LaunchDaemon plist for a Mac nobody logs in to (SPEC-M2.8 §5): the LaunchAgent's
+/// definition, run as `user` (`UserName`) with its `HOME`, same paths and
+/// `KIOKU_SERVICE=1`.
+pub fn render_daemon_plist(spec: &ServiceSpec, user: &str, home: &Path) -> String {
+    render_plist(spec)
+        .replacen(
+            "  <key>ProgramArguments</key>",
+            &format!(
+                "  <key>UserName</key><string>{}</string>\n  <key>ProgramArguments</key>",
+                xml_escape(user)
+            ),
+            1,
+        )
+        .replacen(
+            "    <key>KIOKU_DATA_DIR</key>",
+            &format!(
+                "    <key>HOME</key><string>{}</string>\n    <key>KIOKU_DATA_DIR</key>",
+                xml_escape(&home.display().to_string())
+            ),
+            1,
+        )
+}
+
+/// The two `sudo` commands that install a LaunchDaemon plist saved at `saved` (kioku never
+/// runs them).
+pub fn daemon_install_commands(saved: &str) -> Vec<String> {
+    vec![
+        format!("sudo install -m 644 -o root -g wheel {saved} {LAUNCH_DAEMON_PATH}"),
+        format!("sudo launchctl bootstrap system {LAUNCH_DAEMON_PATH}"),
+    ]
+}
+
 /// One systemd value with specifiers (`%`) escaped.
 fn systemd_escape_percent(s: &str) -> String {
     s.replace('%', "%%")
@@ -818,10 +863,56 @@ impl ServiceManager {
                 return Ok(());
             }
         }
+        // A Mac nobody is logged in to has no gui/<uid> domain to bootstrap into.
+        if self.gui_session() == Some(false) {
+            anyhow::bail!("{}", headless_message());
+        }
         anyhow::bail!(
             "launchctl bootstrap failed ({BOOTSTRAP_ATTEMPTS} attempts): {}",
             last.stderr.trim()
         )
+    }
+
+    /// launchd: whether `launchctl print gui/<uid>` works (a user is logged in); `None` on
+    /// other platforms or when the uid is unknown.
+    pub fn gui_session(&self) -> Option<bool> {
+        if !matches!(self.platform, Platform::Launchd) {
+            return None;
+        }
+        let uid = self.uid().ok()?;
+        Some(
+            self.runner
+                .run(&["launchctl", "print", &format!("gui/{uid}")])
+                .success,
+        )
+    }
+
+    /// `kioku service install --daemon`: the LaunchDaemon plist (for stdout) and the lines
+    /// to print around it. Writes nothing and runs no `sudo`.
+    pub fn daemon_definition(&self) -> anyhow::Result<(String, Vec<String>)> {
+        if !matches!(self.platform, Platform::Launchd) {
+            anyhow::bail!("--daemon is for macOS (launchd) only");
+        }
+        let user = self
+            .user_name()
+            .context("cannot tell the user name the daemon should run as")?;
+        let plist = render_daemon_plist(&self.spec, &user, &self.home);
+        let saved = "/tmp/dev.kioku.serve.plist";
+        let mut lines = vec![
+            format!(
+                "# The plist above (stdout) runs `kioku serve` as {user} at boot, without a login."
+            ),
+            format!("# Save it: kioku service install --daemon > {saved}"),
+            "# then install it (kioku never runs sudo itself):".to_string(),
+        ];
+        lines.extend(daemon_install_commands(saved));
+        if self.is_installed() {
+            lines.push(
+                "# A LaunchAgent is installed too; remove it first: kioku service uninstall"
+                    .to_string(),
+            );
+        }
+        Ok((plist, lines))
     }
 
     /// launchd: `kickstart -k` a loaded job (kills and restarts it in place), bootstraps an

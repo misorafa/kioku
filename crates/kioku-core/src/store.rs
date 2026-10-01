@@ -4,8 +4,17 @@
 //! `tokio::task::spawn_blocking`. Page writes, finalize and reindex are serialized by one
 //! write lock; lock order is always write lock → db → index writer.
 
+#[cfg(test)]
+mod finalize_tests;
+mod maintenance;
 mod reliability;
-pub use reliability::{BackupManifest, ReliabilityReport, restore_backup};
+pub use maintenance::{
+    ForgetReport, PruneCount, PruneReport, StorageReport, SweepReport, dir_bytes,
+    purge_history_commands,
+};
+pub use reliability::{
+    BACKUP_FORMAT, BackupManifest, ReliabilityReport, WIKI_BUNDLE, restore_backup,
+};
 
 use std::io::Write;
 use std::path::Path;
@@ -106,6 +115,9 @@ pub struct StatusReport {
     /// Project aliases `alias → project_id` (M2.4 §2.2; empty from an older server).
     #[serde(default)]
     pub aliases: Vec<ProjectAlias>,
+    /// Disk usage and the last prune (SPEC-M2.8 §3; `None` from an older server).
+    #[serde(default)]
+    pub storage: Option<StorageReport>,
 }
 
 /// Output of `Store::merge_projects` (`kioku project merge`, M2.4 §2.3).
@@ -248,12 +260,16 @@ impl Store {
                 tracing::info!(pages = n, "index was empty; rebuilt from wiki");
             }
         } else if store.index_outdated() {
-            tracing::warn!(
+            tracing::info!(
                 built_with = store.index_version(),
                 current = INDEX_SCHEMA_VERSION,
-                "the search index was built by an older kioku; run `kioku reindex` so search \
-                 matches this version (e.g. full-width / half-width text)"
+                "the search index was built by an older kioku; the server rebuilds it after \
+                 it starts listening (SPEC-M2.8 §5)"
             );
+        }
+        // SPEC-M2.8 §5: leftovers of interrupted writes, and pages whose row drifted.
+        if let Err(e) = store.startup_sweep() {
+            tracing::warn!(error = format!("{e:#}"), "startup sweep did not finish");
         }
         // Never fatal: a page that cannot move stays where it is and stays readable.
         if let Err(e) = store.migrate_session_pages() {
@@ -610,23 +626,12 @@ impl Store {
                 .ok_or_else(|| Error::not_found(format!("project {}", session.project_id)))?;
             // Read the high-water mark first: anything newer is not in this digest.
             let max_seq = db::max_seq(&conn, session_id)?;
-            let digest = digest_for(&conn, &session)?;
-            let delta = match &digest.agent_handoff {
-                Some(_)
-                    if db::tool_uses_since_handoff(&conn, session_id)?
-                        >= HANDOFF_STALE_TOOL_USES =>
-                {
-                    let mark = db::agent_handoff_mark(&conn, session_id)?;
-                    let obs = db::list_observations_after(&conn, session_id, mark.as_ref())?;
-                    let obs: Vec<Observation> =
-                        obs.into_iter().filter(|o| o.seq <= max_seq).collect();
-                    Some(SessionDigest::from_observations(
-                        &obs,
-                        session_root(&conn, &session)?.as_deref(),
-                    ))
-                }
-                _ => None,
-            };
+            // The addendum digest (§7.1 step 4) is needed only when work continued after
+            // the agent's handoff.
+            let with_delta = db::agent_handoff_mark(&conn, session_id)?.is_some()
+                && db::tool_uses_since_handoff(&conn, session_id)? >= HANDOFF_STALE_TOOL_USES;
+            // SPEC-M2.8 §1: the cached digest, extended with the new observations only.
+            let (digest, delta) = session_digests(&conn, &session, max_seq, with_delta)?;
             (session, project, digest, max_seq, delta)
         };
 
@@ -662,8 +667,9 @@ impl Store {
             (None, _) => digest.handoff_section(lang),
         };
         let page_path = session_page_path(&session);
+        let title = session_title(lang, &session, &digest);
         let fm = Frontmatter {
-            title: session_title(lang, &session, &digest),
+            title: title.clone(),
             project: Some(project.id.clone()),
             scope: PageScope::Project,
             kind: PageKind::Session,
@@ -673,10 +679,12 @@ impl Store {
             lane: session.lane.clone(),
             ..Frontmatter::default()
         };
-        self.put_page(
+        // Written together with STATE.md below: one git commit, one index commit (§2).
+        let session_write = self.prepare_page(
             &page_path,
             fm,
             &session_body(lang, &session, &digest, &handoff_md),
+            true,
         )?;
 
         // 4. rules handoff: one pending rules handoff per session (or per agent handoff, for
@@ -720,8 +728,15 @@ impl Store {
             }
         };
 
-        // 5. STATE.md
-        self.write_state(&project, Some(session_id))?;
+        // 5. STATE.md, then one commit for both pages (SPEC-M2.8 §2); an unchanged page
+        // (apart from `updated:`) is neither written, committed nor reindexed.
+        let state_write = self.state_page(&project, Some((session_id, &title)))?;
+        let message = match &session_write {
+            Some(_) => format!("kioku: session {page_path}"),
+            None => format!("kioku: state {}/STATE.md", project.id),
+        };
+        let writes: Vec<PageWrite> = session_write.into_iter().chain(state_write).collect();
+        self.store_pages(&writes, &message)?;
 
         // 6. mark finalized — unless an observation arrived meanwhile (then it stays open
         // and the next Stop / SessionEnd finalizes it with that observation included).
@@ -1059,8 +1074,9 @@ impl Store {
         Ok(docs.len())
     }
 
-    /// Counts for `kioku status`.
+    /// Counts and disk usage for `kioku status`.
     pub fn status(&self) -> Result<StatusReport> {
+        let storage = Some(self.storage()?);
         let conn = self.db.lock();
         Ok(StatusReport {
             data_dir: self.dirs.root().display().to_string(),
@@ -1075,6 +1091,7 @@ impl Store {
             index_schema_version: self.index_version_on_disk(),
             index_schema_expected: INDEX_SCHEMA_VERSION,
             aliases: db::list_aliases(&conn)?,
+            storage,
         })
     }
 
@@ -1176,17 +1193,40 @@ impl Store {
             &format!("kioku: merge project {from} into {}", into_row.id),
         );
         self.reindex_locked()?;
-        self.write_state(&into_row, None)?;
+        self.write_state(&into_row)?;
         Ok(report)
     }
 
     // ---------------------------------------------------------------- internals
 
     /// Writes a page file (keeping `created` and unknown keys of an existing file), then
-    /// updates SQLite, the index and git. Caller must hold the write lock.
-    fn put_page(&self, path: &str, mut fm: Frontmatter, body: &str) -> Result<Page> {
+    /// updates SQLite, the index and git (its own commit). Caller must hold the write lock.
+    fn put_page(&self, path: &str, fm: Frontmatter, body: &str) -> Result<Page> {
+        let write = self
+            .prepare_page(path, fm, body, false)?
+            .context("a page write without skip_unchanged always renders")?;
+        let page = write.page.clone();
+        self.store_pages(
+            std::slice::from_ref(&write),
+            &format!("kioku: {} {path}", page.frontmatter.kind.as_str()),
+        )?;
+        Ok(page)
+    }
+
+    /// Renders a page for [`Store::store_pages`], keeping `created` and unknown keys of an
+    /// existing file. With `skip_unchanged`, `None` when the file would only differ in its
+    /// `updated:` line (SPEC-M2.8 §2).
+    fn prepare_page(
+        &self,
+        path: &str,
+        mut fm: Frontmatter,
+        body: &str,
+        skip_unchanged: bool,
+    ) -> Result<Option<PageWrite>> {
         let file = self.dirs.wiki().join(path);
         let now = util::fmt_ts_secs(util::now());
+        let mut existing_text = None;
+        let mut old_updated = None;
         if let Ok(existing) = std::fs::read_to_string(&file)
             && let Ok(old) = Page::parse(path, &existing)
         {
@@ -1196,26 +1236,51 @@ impl Store {
             for (k, v) in old.frontmatter.extra {
                 fm.extra.entry(k).or_insert(v);
             }
+            old_updated = Some(old.frontmatter.updated);
+            existing_text = Some(existing);
         }
         if fm.created.is_empty() {
             fm.created = now.clone();
         }
-        fm.updated = now;
         let mut page = Page {
             revision: String::new(),
             path: path.to_string(),
             frontmatter: fm,
             body: body.to_string(),
         };
+        if skip_unchanged && let (Some(existing), Some(updated)) = (&existing_text, old_updated) {
+            page.frontmatter.updated = updated;
+            if page.render()? == *existing {
+                return Ok(None);
+            }
+        }
+        page.frontmatter.updated = now;
         let text = page.render()?;
         page.revision = sha256_hex(&text);
-        write_atomic(&file, &text)?;
-        let (row, doc) = page_records(&page, &text);
-        db::upsert_page(&self.db.lock(), &row)?;
-        if let Err(e) = self.index.upsert(&doc) {
-            // The file and its row are written; the next start rebuilds the index.
+        Ok(Some(PageWrite {
+            path: path.to_string(),
+            page,
+            text,
+        }))
+    }
+
+    /// Writes prepared pages: files, SQLite rows, **one** index commit and **one** git
+    /// commit with `message` (SPEC-M2.8 §2). Caller must hold the write lock.
+    fn store_pages(&self, writes: &[PageWrite], message: &str) -> Result<()> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let mut docs = Vec::new();
+        for w in writes {
+            write_atomic(&self.dirs.wiki().join(&w.path), &w.text)?;
+            let (row, doc) = page_records(&w.page, &w.text);
+            db::upsert_page(&self.db.lock(), &row)?;
+            docs.push(doc);
+        }
+        if let Err(e) = self.index.upsert_many(&docs, false) {
+            // The files and rows are written; the next start rebuilds the index.
             tracing::warn!(
-                %path,
+                paths = ?writes.iter().map(|w| w.path.as_str()).collect::<Vec<_>>(),
                 error = format!("{e:#}"),
                 "indexing failed; the index is rebuilt at the next start"
             );
@@ -1227,24 +1292,50 @@ impl Store {
                 )
                 .context("recording needs_reindex")?;
         }
-        self.git.commit(
-            &[path.to_string()],
-            &format!("kioku: {} {path}", page.frontmatter.kind.as_str()),
-        );
-        Ok(page)
+        let paths: Vec<String> = writes.iter().map(|w| w.path.clone()).collect();
+        self.git.commit(&paths, message);
+        Ok(())
     }
 
-    fn write_state(&self, project: &ProjectRow, include: Option<&str>) -> Result<()> {
+    /// Rewrites STATE.md with its own commit (merge, forget); unchanged → nothing happens.
+    fn write_state(&self, project: &ProjectRow) -> Result<()> {
+        let writes: Vec<PageWrite> = self.state_page(project, None)?.into_iter().collect();
+        self.store_pages(&writes, &format!("kioku: state {}/STATE.md", project.id))
+    }
+
+    /// STATE.md of `project` rendered for [`Store::store_pages`]; `None` when unchanged.
+    /// `include` is the session being finalized with its page title (its page may not be
+    /// written yet). Finalized sessions contribute their cached digests (SPEC-M2.8 §1).
+    fn state_page(
+        &self,
+        project: &ProjectRow,
+        include: Option<(&str, &str)>,
+    ) -> Result<Option<PageWrite>> {
         let lang = self.config.lang();
         let (latest, recent, digests) = {
             let conn = self.db.lock();
             // The project lane's handoff: STATE.md is shown to every session, and a branch
             // lane's handoff must not reach the default branch (M2.4 §1.4).
             let latest = db::newest_handoff(&conn, &project.id, None, false)?;
-            let recent = recent_sessions(&conn, &project.id, include, STATE_SESSIONS)?;
+            let mut recent = Vec::new();
+            for s in db::recent_substantive_sessions(
+                &conn,
+                &project.id,
+                include.map(|i| i.0),
+                STATE_SESSIONS,
+            )? {
+                match include {
+                    Some((id, title)) if id == s.id => recent.push((s, title.to_string())),
+                    _ => {
+                        if let Some(page) = db::get_page(&conn, &session_page_path(&s))? {
+                            recent.push((s, page.title));
+                        }
+                    }
+                }
+            }
             let mut digests = Vec::new();
             for (s, _) in &recent {
-                digests.push(digest_for(&conn, s)?);
+                digests.push(cached_digest(&conn, s)?);
             }
             (latest, recent, digests)
         };
@@ -1270,12 +1361,12 @@ impl Store {
             kind: PageKind::State,
             ..Frontmatter::default()
         };
-        self.put_page(
+        self.prepare_page(
             &format!("{}/STATE.md", project.id),
             fm,
             &state_body(lang, latest.as_ref(), &recent, &hot),
-        )?;
-        Ok(())
+            true,
+        )
     }
 
     fn state_excerpt(&self, project: &str) -> Option<String> {
@@ -1380,6 +1471,7 @@ fn session_root(conn: &Connection, session: &Session) -> Result<Option<String>> 
     Ok(db::get_project(conn, &session.project_id)?.and_then(|p| p.root_path))
 }
 
+/// A session digest built from scratch (no cache involved).
 fn digest_for(conn: &Connection, session: &Session) -> Result<SessionDigest> {
     let root = session_root(conn, session)?;
     let observations = db::list_observations(conn, &session.id)?;
@@ -1387,6 +1479,127 @@ fn digest_for(conn: &Connection, session: &Session) -> Result<SessionDigest> {
     digest.agent_handoff =
         db::newest_session_handoff(conn, &session.id, Some(HandoffSource::Agent), false)?;
     Ok(digest)
+}
+
+/// A page rendered and ready to be written by [`Store::store_pages`].
+#[derive(Clone, Debug)]
+struct PageWrite {
+    path: String,
+    page: Page,
+    text: String,
+}
+
+/// `sessions.digest_json` (SPEC-M2.8 §1): the digest as of `digest_seq` (without the
+/// agent handoff, which is read fresh), and the addendum digest of the observations after
+/// the agent handoff `handoff_id` (seq > `after`) when one was needed.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct DigestCache {
+    full: SessionDigest,
+    #[serde(default)]
+    delta: Option<DeltaCache>,
+}
+
+/// The cached addendum digest of [`DigestCache`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DeltaCache {
+    handoff_id: String,
+    after: i64,
+    digest: SessionDigest,
+}
+
+/// The session's digest up to observation `upto` (and, with `with_delta`, the digest of the
+/// observations after its agent handoff), from the cache extended with only the newer
+/// observations; a session without a usable cache is digested from scratch once. The cache
+/// is updated. Equal to [`digest_for`] by construction ([`SessionDigest::extend`]).
+fn session_digests(
+    conn: &Connection,
+    session: &Session,
+    upto: i64,
+    with_delta: bool,
+) -> Result<(SessionDigest, Option<SessionDigest>)> {
+    let root = session_root(conn, session)?;
+    let stored = db::digest_cache(conn, &session.id)?;
+    let cache = stored
+        .as_ref()
+        .and_then(|(json, seq)| {
+            serde_json::from_str::<DigestCache>(json)
+                .ok()
+                .map(|c| (c, *seq))
+        })
+        // A different root (the project's fallback root moved) or a cache ahead of `upto`
+        // cannot be extended: start over.
+        .filter(|(c, seq)| c.full.tally.root == root && *seq <= upto);
+    let (mut full, delta_cache, from) = match cache {
+        Some((c, seq)) => (c.full, c.delta, seq),
+        None => (
+            SessionDigest::from_observations(&[], root.as_deref()),
+            None,
+            0,
+        ),
+    };
+    let new = db::list_observations_between(conn, &session.id, from, upto)?;
+    full.extend(&new);
+    let agent = db::newest_session_handoff(conn, &session.id, Some(HandoffSource::Agent), false)?;
+    let mark = match (&agent, with_delta) {
+        (Some(_), true) => db::agent_handoff_mark(conn, &session.id)?,
+        _ => None,
+    };
+    let delta = match (&agent, mark) {
+        (Some(h), Some(mark)) => Some(match (delta_cache, mark.seq_at) {
+            (Some(d), Some(after)) if d.handoff_id == h.id && d.after == after => {
+                let mut digest = d.digest;
+                let newer: Vec<Observation> =
+                    new.iter().filter(|o| o.seq > after).cloned().collect();
+                digest.extend(&newer);
+                DeltaCache {
+                    handoff_id: h.id.clone(),
+                    after,
+                    digest,
+                }
+            }
+            (_, seq_at) => {
+                let obs: Vec<Observation> =
+                    db::list_observations_after(conn, &session.id, Some(&mark))?
+                        .into_iter()
+                        .filter(|o| o.seq <= upto)
+                        .collect();
+                DeltaCache {
+                    handoff_id: h.id.clone(),
+                    // Without `seq_at` (rows from before it existed) never reused.
+                    after: seq_at.unwrap_or(-1),
+                    digest: SessionDigest::from_observations(&obs, root.as_deref()),
+                }
+            }
+        }),
+        _ => None,
+    };
+    let json = serde_json::to_string(&DigestCache {
+        full: full.clone(),
+        delta: delta.clone(),
+    })
+    .context("serializing the session digest")?;
+    if stored.as_ref().map(|(j, s)| (j.as_str(), *s)) != Some((json.as_str(), upto)) {
+        db::set_digest_cache(conn, &session.id, &json, upto)?;
+    }
+    full.agent_handoff = agent;
+    Ok((full, delta.map(|d| d.digest)))
+}
+
+/// The digest of a finalized session for STATE.md: the cache as is when it is current,
+/// else [`session_digests`] (which brings it up to date).
+fn cached_digest(conn: &Connection, session: &Session) -> Result<SessionDigest> {
+    let upto = db::max_seq(conn, &session.id)?;
+    if let Some((json, seq)) = db::digest_cache(conn, &session.id)?
+        && seq == upto
+        && let Ok(cache) = serde_json::from_str::<DigestCache>(&json)
+        && cache.full.tally.root == session_root(conn, session)?
+    {
+        let mut full = cache.full;
+        full.agent_handoff =
+            db::newest_session_handoff(conn, &session.id, Some(HandoffSource::Agent), false)?;
+        return Ok(full);
+    }
+    Ok(session_digests(conn, session, upto, false)?.0)
 }
 
 fn page_records(page: &Page, text: &str) -> (PageRow, IndexDoc) {
@@ -1556,6 +1769,9 @@ fn remove_empty_dirs(dir: &Path) {
     let _ = std::fs::remove_dir(dir);
 }
 
+/// Writes `file` through a hidden `.<name>.<id>.tmp` sibling, fsync and rename (then fsyncs
+/// the directory on Unix). A crash leaves at most the temporary file, which the startup
+/// sweep removes.
 fn write_atomic(file: &Path, text: &str) -> Result<()> {
     let parent = file.parent().context("page path has no parent")?;
     std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
@@ -1573,6 +1789,11 @@ fn write_atomic(file: &Path, text: &str) -> Result<()> {
         .and_then(|f| f.sync_all())
         .context("syncing page")?;
     std::fs::rename(&tmp, file).with_context(|| format!("renaming into {}", file.display()))?;
+    // The rename itself is durable only once the directory entry is (SPEC-M2.8 §5).
+    #[cfg(unix)]
+    std::fs::File::open(parent)
+        .and_then(|d| d.sync_all())
+        .with_context(|| format!("syncing {}", parent.display()))?;
     Ok(())
 }
 

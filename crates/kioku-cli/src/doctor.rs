@@ -664,13 +664,13 @@ fn index_check(s: &StatusReport) -> Check {
             "index",
             Status::Warn,
             format!(
-                "index schema {} but the server expects v{}: run `kioku reindex`",
+                "index schema {} but the server expects v{}: the server rebuilds it in the background after it starts (SPEC-M2.8 §5); search uses the old index until then",
                 other
                     .map(|v| format!("v{v}"))
                     .unwrap_or_else(|| "missing".into()),
                 s.index_schema_expected
             ),
-            Some("kioku reindex".into()),
+            Some("if this persists, restart the server (kioku service start on the server machine) and see kioku service logs".into()),
         ),
     }
 }
@@ -807,6 +807,26 @@ fn service_check(env: &DoctorEnv, cfg: &Config, health: &Health) -> Check {
     }
     let st = manager.state();
     let what = manager.describe();
+    // SPEC-M2.8 §5: a Mac nobody is logged in to cannot run the LaunchAgent.
+    if matches!(manager.platform, Platform::Launchd) && !(st.installed && st.active) {
+        let daemon = Path::new(crate::service::LAUNCH_DAEMON_PATH);
+        if daemon.is_file() && up {
+            return check(
+                "service",
+                Status::Ok,
+                format!("LaunchDaemon {} (the server answers)", daemon.display()),
+                None,
+            );
+        }
+        if manager.gui_session() == Some(false) {
+            return check(
+                "service",
+                if up { Status::Warn } else { Status::Fail },
+                crate::service::headless_message().replace('\n', " / "),
+                Some("kioku service install --daemon".into()),
+            );
+        }
+    }
     if !st.installed {
         let msg = if up {
             format!(
@@ -1528,6 +1548,17 @@ fn hook_dump_check(cfg: &Config, env: &DoctorEnv) -> Check {
         home: Some(env.home.clone()),
         cwd: None,
     };
+    if crate::dump::dump_expired_at(cfg, &henv, kioku_core::util::now().timestamp()) {
+        return check(
+            "hook_dump",
+            Status::Warn,
+            "hook dump expired; re-enable to capture (capture stops 24 h after it began)",
+            Some(
+                "kioku hook-dump enable (another 24 h), or unset KIOKU_HOOK_DUMP / set [client] hook_dump = false"
+                    .into(),
+            ),
+        );
+    }
     if dump_enabled(cfg, &henv) {
         let path =
             dump_path(cfg).unwrap_or_else(|| log_dir(cfg, env).join(crate::dump::HOOK_DUMP_FILE));
@@ -1639,6 +1670,77 @@ mod tests {
     /// Regression (Mac mini, 2026-09-30): `kioku update` 0.6.5 -> 0.7.0 ran the old binary, so
     /// the plist kept no `KIOKU_SERVICE=1` and the server could never update itself, while
     /// doctor said "automatic updates on".
+    /// SPEC-M2.8 §5: doctor recognizes a Mac without a logged-in user.
+    #[test]
+    fn service_check_detects_a_headless_mac() {
+        let home = tempfile::tempdir().unwrap();
+        let data = home.path().join(".kioku");
+        std::fs::create_dir_all(&data).unwrap();
+        let cfg = Config::for_data_dir(&data);
+        let env = DoctorEnv {
+            vars: HashMap::new(),
+            home: home.path().to_path_buf(),
+            bin: home.path().join("bin/kioku").display().to_string(),
+            runner: Runner::recording(|argv| match argv.join(" ").as_str() {
+                "id -u" => crate::service::CmdOutput::ok("501\n"),
+                s if s.starts_with("launchctl print gui/501") => {
+                    crate::service::CmdOutput::fail("Could not find domain")
+                }
+                _ => crate::service::CmdOutput::ok(""),
+            }),
+            platform: Some(crate::service::Platform::Launchd),
+            hook_platform: crate::install::HookPlatform::current(),
+            timeout: Duration::from_secs(1),
+        };
+        let c = service_check(&env, &cfg, &Health::Down("connection refused".into()));
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(
+            c.message.contains(crate::service::HEADLESS_MAC_JA),
+            "{}",
+            c.message
+        );
+        assert!(c.message.contains("--daemon"));
+        assert_eq!(c.fix.as_deref(), Some("kioku service install --daemon"));
+    }
+
+    /// SPEC-M2.8 §7: an expired capture window is reported.
+    #[test]
+    fn hook_dump_check_reports_expiry() {
+        let home = tempfile::tempdir().unwrap();
+        let data = home.path().join(".kioku");
+        std::fs::create_dir_all(data.join("state")).unwrap();
+        let cfg = Config::for_data_dir(&data);
+        let env = DoctorEnv {
+            vars: [("KIOKU_HOOK_DUMP".to_string(), "1".to_string())].into(),
+            home: home.path().to_path_buf(),
+            bin: "kioku".into(),
+            runner: Runner::recording(|_| crate::service::CmdOutput::ok("")),
+            platform: None,
+            hook_platform: crate::install::HookPlatform::current(),
+            timeout: Duration::from_secs(1),
+        };
+        std::fs::write(
+            data.join("state").join(crate::dump::HOOK_DUMP_MARKER),
+            "2020-01-01T00:00:00Z\n",
+        )
+        .unwrap();
+        let c = hook_dump_check(&cfg, &env);
+        assert_eq!(c.status, Status::Warn);
+        assert!(
+            c.message
+                .contains("hook dump expired; re-enable to capture"),
+            "{}",
+            c.message
+        );
+        std::fs::write(
+            data.join("state").join(crate::dump::HOOK_DUMP_MARKER),
+            format!("{}\n", kioku_core::util::now_ts()),
+        )
+        .unwrap();
+        let c = hook_dump_check(&cfg, &env);
+        assert!(c.message.contains("capture is on"), "{}", c.message);
+    }
+
     #[test]
     fn update_check_warns_about_a_service_without_the_marker() {
         let home = tempfile::tempdir().unwrap();

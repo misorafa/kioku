@@ -33,8 +33,9 @@ pub struct ServerConfig {
     pub data_dir: Option<String>,
     /// Language of generated summaries (`ja` | `en`).
     pub summary_lang: Lang,
-    /// Snapshots `POST /api/v1/backup` keeps; the oldest go after a successful new one
-    /// (SPEC-M2.7 §12). Not written while it is the default.
+    /// Snapshots `POST /api/v1/backup` keeps (SPEC-M2.7 §12). Superseded by
+    /// `[retention] backups_keep` (SPEC-M2.8 §3) and read only when that is not set; see
+    /// [`Config::backups_keep`]. Not written while it is the default.
     #[serde(skip_serializing_if = "is_default_backup_keep")]
     pub backup_keep: usize,
 }
@@ -124,6 +125,51 @@ impl UpdateConfig {
     }
 }
 
+/// `[retention]` section (SPEC-M2.8 §3): how long the server keeps raw logs, observation
+/// payloads, backups and hook dumps. `0` days turns that category off.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RetentionConfig {
+    /// `raw/<project>/<session>.jsonl` older than this are gzipped, and deleted at twice
+    /// this age.
+    pub raw_days: u32,
+    /// Payloads of finalized sessions older than this are reduced to a stub.
+    pub observations_days: u32,
+    /// Backups kept (`None` = `[server] backup_keep`, which defaults to 10).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backups_keep: Option<usize>,
+    /// `logs/hook-dump.jsonl*` older than this are deleted.
+    pub hook_dump_days: u32,
+    /// Run the policy daily inside `kioku serve`.
+    pub auto: bool,
+}
+
+/// Default of `[retention] raw_days`.
+pub const DEFAULT_RAW_DAYS: u32 = 90;
+/// Default of `[retention] observations_days`.
+pub const DEFAULT_OBSERVATIONS_DAYS: u32 = 180;
+/// Default of `[retention] hook_dump_days`.
+pub const DEFAULT_HOOK_DUMP_DAYS: u32 = 7;
+
+impl Default for RetentionConfig {
+    fn default() -> RetentionConfig {
+        RetentionConfig {
+            raw_days: DEFAULT_RAW_DAYS,
+            observations_days: DEFAULT_OBSERVATIONS_DAYS,
+            backups_keep: None,
+            hook_dump_days: DEFAULT_HOOK_DUMP_DAYS,
+            auto: true,
+        }
+    }
+}
+
+impl RetentionConfig {
+    /// True when every field has its default (the table is then not written).
+    pub fn is_default(&self) -> bool {
+        *self == RetentionConfig::default()
+    }
+}
+
 /// Full configuration plus the resolved locations it was loaded from.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Config {
@@ -136,6 +182,9 @@ pub struct Config {
     /// `[update]` settings (not written while they are the defaults: setup never adds it).
     #[serde(default, skip_serializing_if = "UpdateConfig::is_default")]
     pub update: UpdateConfig,
+    /// `[retention]` settings (SPEC-M2.8 §3; not written while they are the defaults).
+    #[serde(default, skip_serializing_if = "RetentionConfig::is_default")]
+    pub retention: RetentionConfig,
     /// Resolved data directory (env > file `server.data_dir` > config dir).
     #[serde(skip)]
     pub data_dir: PathBuf,
@@ -159,6 +208,7 @@ impl Config {
             server: ServerConfig::default(),
             client: ClientConfig::default(),
             update: UpdateConfig::default(),
+            retention: RetentionConfig::default(),
             data_dir: dir.to_path_buf(),
             config_file: dir.join(CONFIG_FILE),
         }
@@ -295,6 +345,15 @@ impl Config {
     /// Summary language shortcut.
     pub fn lang(&self) -> Lang {
         self.server.summary_lang
+    }
+
+    /// Backups to keep: `[retention] backups_keep`, else the older `[server] backup_keep`
+    /// (SPEC-M2.8 §3); at least 1.
+    pub fn backups_keep(&self) -> usize {
+        self.retention
+            .backups_keep
+            .unwrap_or(self.server.backup_keep)
+            .max(1)
     }
 }
 
@@ -519,6 +578,35 @@ mod tests {
                 .unwrap()
                 .contains("auto = false")
         );
+    }
+
+    /// SPEC-M2.8 §3: `[retention]` with defaults; `backups_keep` falls back to the M2.7
+    /// `[server] backup_keep`.
+    #[test]
+    fn retention_table_and_backup_keep_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::load_from_dir(dir.path(), &HashMap::new()).unwrap();
+        assert_eq!(cfg.retention, RetentionConfig::default());
+        assert_eq!(cfg.backups_keep(), DEFAULT_BACKUP_KEEP);
+        assert!(!cfg.to_toml().unwrap().contains("[retention]"));
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            "[server]\nbackup_keep = 4\n\n[retention]\nraw_days = 30\nauto = false\n",
+        )
+        .unwrap();
+        let cfg = Config::load_from_dir(dir.path(), &HashMap::new()).unwrap();
+        assert_eq!(cfg.retention.raw_days, 30);
+        assert_eq!(cfg.retention.observations_days, DEFAULT_OBSERVATIONS_DAYS);
+        assert!(!cfg.retention.auto);
+        assert_eq!(cfg.backups_keep(), 4, "the old setting is still read");
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            "[server]\nbackup_keep = 4\n\n[retention]\nbackups_keep = 7\n",
+        )
+        .unwrap();
+        let cfg = Config::load_from_dir(dir.path(), &HashMap::new()).unwrap();
+        assert_eq!(cfg.backups_keep(), 7, "[retention] wins");
+        assert!(cfg.to_toml().unwrap().contains("backups_keep = 7"));
     }
 
     #[test]

@@ -108,6 +108,8 @@ pub fn protected_routes(store: Arc<Store>, update: SharedUpdateStatus) -> Router
         .route("/api/v1/diagnostics", get(diagnostics))
         .route("/api/v1/projects/merge", post(merge_projects))
         .route("/api/v1/reindex", post(reindex))
+        .route("/api/v1/prune", post(prune))
+        .route("/api/v1/forget", post(forget))
         .layer(Extension(update))
         .with_state(store)
 }
@@ -319,6 +321,54 @@ async fn merge_projects(
 async fn reindex(State(store): State<Arc<Store>>) -> ApiResult {
     let docs = blocking(&store, |s| s.reindex()).await?;
     Ok(Json(json!({ "docs": docs })))
+}
+
+/// Optional body of `POST /api/v1/prune`.
+#[derive(Debug, Default, Deserialize)]
+struct PruneBody {
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// `POST /api/v1/prune {dry_run?}` → the prune report (SPEC-M2.8 §3).
+async fn prune(State(store): State<Arc<Store>>, body: Bytes) -> ApiResult {
+    let b: PruneBody = if body.iter().all(u8::is_ascii_whitespace) {
+        PruneBody::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| ApiError::bad_request(format!("invalid prune body: {e}")))?
+    };
+    to_json(blocking(&store, move |s| s.prune(b.dry_run)).await?)
+}
+
+/// Body of `POST /api/v1/forget`: exactly one of `session` / `project`.
+#[derive(Debug, Deserialize)]
+struct ForgetBody {
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// `POST /api/v1/forget {session | project, dry_run?}` → the forget report (SPEC-M2.8 §3).
+async fn forget(
+    State(store): State<Arc<Store>>,
+    body: Result<Json<ForgetBody>, JsonRejection>,
+) -> ApiResult {
+    let Json(b) = body?;
+    match (b.session, b.project) {
+        (Some(id), None) => {
+            to_json(blocking(&store, move |s| s.forget_session(&id, b.dry_run)).await?)
+        }
+        (None, Some(id)) => {
+            to_json(blocking(&store, move |s| s.forget_project(&id, b.dry_run)).await?)
+        }
+        _ => Err(ApiError::bad_request(
+            "give exactly one of `session` or `project`",
+        )),
+    }
 }
 
 async fn backup(State(store): State<Arc<Store>>) -> ApiResult {
