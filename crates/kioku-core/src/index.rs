@@ -251,8 +251,13 @@ impl SearchIndex {
         self.upsert_many(std::slice::from_ref(doc), false)
     }
 
-    /// Adds/replaces many documents in one commit; `clear` first deletes everything.
+    /// Adds/replaces many documents in one commit; `clear` first deletes everything. With no
+    /// documents and no `clear` it does nothing.
     pub fn upsert_many(&self, docs: &[IndexDoc], clear: bool) -> anyhow::Result<()> {
+        // Nothing to do: do not open the writer (it holds the index lock files).
+        if docs.is_empty() && !clear {
+            return Ok(());
+        }
         let f = self.fields;
         self.with_writer(|w| {
             if clear {

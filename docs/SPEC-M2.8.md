@@ -182,7 +182,10 @@ What differs from §1–§7, or what the text left open, and why.
    and `.*.tmp` (not only `.md`), `wiki.bundle` the history, `wiki_head` the bundle's HEAD;
    no bundle when git is missing or the wiki has no commit yet. `VACUUM INTO` still runs
    under the write lock (it is the database snapshot); the lock-hold test measures the
-   whole locked section. Restore clones the bundle, removes checked-out files that are not
+   whole locked section. The pages are copied under the lock without fsync and synced
+   after it is released (per-file fsync made the Windows CI exceed 1 s). Found in CI: the
+   startup sweep opened the tantivy writer even with nothing to write, so its lock files
+   were held from the first start; an empty, non-clearing `upsert_many` now does nothing. Restore clones the bundle, removes checked-out files that are not
    among the copied pages (committed after the copy; the database snapshot does not know
    them), overlays the copied pages, and commits the difference as `kioku: restore backup`
    so the restored wiki is clean. A copied page whose content is in no commit of the bundle

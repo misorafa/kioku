@@ -171,7 +171,9 @@ fn copy_tree(from: &Path, into: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Copies the wiki working tree (everything but `.git` and `.*.tmp` leftovers) into `into`.
+/// Copies the wiki working tree (everything but `.git` and `.*.tmp` leftovers) into `into`,
+/// without fsync: this runs under the write lock (SPEC-M2.8 §4), [`sync_files`] follows
+/// after it is released.
 fn copy_wiki_files(from: &Path, into: &Path) -> anyhow::Result<()> {
     util::create_private_dir(into)?;
     let Ok(entries) = std::fs::read_dir(from) else {
@@ -185,14 +187,22 @@ fn copy_wiki_files(from: &Path, into: &Path) -> anyhow::Result<()> {
         }
         let ty = entry.file_type()?;
         if ty.is_dir() {
-            copy_tree(&entry.path(), &into.join(&name))?;
+            copy_wiki_files(&entry.path(), &into.join(&name))?;
         } else if ty.is_file() {
-            let dest = into.join(&name);
-            std::fs::copy(entry.path(), &dest)?;
-            std::fs::File::open(&dest)?.sync_all()?;
+            std::fs::copy(entry.path(), into.join(&name))?;
         } else {
             anyhow::bail!("special file refused: {}", entry.path().display());
         }
+    }
+    Ok(())
+}
+
+/// fsyncs every file under `root`.
+fn sync_files(root: &Path) -> anyhow::Result<()> {
+    let mut paths = Vec::new();
+    files(root, root, &mut paths)?;
+    for rel in paths {
+        std::fs::File::open(root.join(&rel))?.sync_all()?;
     }
     Ok(())
 }
@@ -342,6 +352,7 @@ impl Store {
                 let _ = held;
             }
             // Outside the write lock: commits made meanwhile only put the bundle ahead.
+            sync_files(&stage.join("wiki"))?;
             let wiki_head = self.git.bundle(&stage.join(WIKI_BUNDLE))?;
             copy_prefixes(&self.dirs.raw(), &stage.join("raw"), &raw_lengths)?;
             let manifest = BackupManifest {
