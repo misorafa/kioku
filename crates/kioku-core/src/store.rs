@@ -1154,7 +1154,7 @@ impl Store {
                 cache.full.files.clone()
             } else {
                 let mut e = cache.full.tally.edits.clone();
-                e.sort_by(|a, b| b.count.cmp(&a.count));
+                e.sort_by_key(|f| std::cmp::Reverse(f.count));
                 e
             };
             let files: Vec<String> = edits
