@@ -261,8 +261,10 @@ pub fn identify_and_lane(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::process::Command;
 
+    #[cfg(unix)]
     fn git(dir: &Path, args: &[&str]) -> bool {
         Command::new("git")
             .arg("-C")
@@ -273,6 +275,7 @@ mod tests {
             .unwrap_or(false)
     }
 
+    #[cfg(unix)]
     fn repo(dir: &Path) -> bool {
         std::fs::create_dir_all(dir).unwrap();
         git(dir, &["-c", "init.defaultBranch=main", "init", "-q"])
