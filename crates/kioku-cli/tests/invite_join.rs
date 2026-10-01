@@ -82,17 +82,26 @@ fn server_home(port: u16) -> tempfile::TempDir {
     home
 }
 
-/// The code in the `macOS / Linux / Git Bash:` line of `kioku invite` (the `curl … | sh` URL).
-fn code_of(invite_stdout: &str) -> String {
+/// `<host:port>/<CODE>` from the `KIOKU_JOIN='…'` of the `macOS / Linux / Git Bash:` line.
+fn join_of(invite_stdout: &str) -> String {
     let line = invite_stdout
         .lines()
         .find(|l| l.trim_start().starts_with("macOS / Linux"))
         .unwrap_or_else(|| panic!("{invite_stdout}"));
-    let url = line
-        .split_whitespace()
-        .find(|w| w.starts_with("http://"))
-        .unwrap_or_else(|| panic!("{line}"));
-    url.rsplit('/').next().unwrap().to_string()
+    line.split("KIOKU_JOIN='")
+        .nth(1)
+        .and_then(|rest| rest.split('\'').next())
+        .unwrap_or_else(|| panic!("{line}"))
+        .to_string()
+}
+
+/// The code in the `macOS / Linux / Git Bash:` line of `kioku invite`.
+fn code_of(invite_stdout: &str) -> String {
+    join_of(invite_stdout)
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_string()
 }
 
 #[test]
@@ -113,19 +122,18 @@ fn invite_then_join_writes_the_client_config_without_printing_the_token() {
     assert!(inv.stdout.contains("| iex"));
     assert!(!inv.stdout.contains(TOKEN) && !inv.stderr.contains(TOKEN));
     let code = code_of(&inv.stdout);
-    // SPEC-M2.3 §9: the Windows line passes the invite in KIOKU_JOIN to install.ps1 from GitHub.
-    // The host is the one `kioku invite` advertises (the LAN rule), as in the curl line.
-    let curl_url = inv
-        .stdout
-        .split_whitespace()
-        .find(|w| w.starts_with("http://") && w.contains("/i/"))
-        .unwrap()
-        .to_string();
-    let hostport = curl_url
-        .trim_start_matches("http://")
-        .split("/i/")
-        .next()
-        .unwrap();
+    // SPEC-M2.3 §9 / SPEC-M2.7 §4: both lines pass the invite in KIOKU_JOIN to the installer
+    // from GitHub over https; nothing is fetched from the server over plain http.
+    let join = join_of(&inv.stdout);
+    let hostport = join.rsplit_once('/').unwrap().0;
+    assert!(
+        inv.stdout.contains(&format!(
+            "KIOKU_JOIN='{join}' sh -c \"$(curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh)\""
+        )),
+        "{}",
+        inv.stdout
+    );
+    assert!(!inv.stdout.contains("/i/"), "{}", inv.stdout);
     assert!(
         inv.stdout.contains(&format!(
             "$env:KIOKU_JOIN='{hostport}/{code}'; irm https://raw.githubusercontent.com/misorafa/kioku/main/install.ps1 | iex"
@@ -134,6 +142,20 @@ fn invite_then_join_writes_the_client_config_without_printing_the_token() {
         inv.stdout
     );
     assert!(!inv.stdout.contains("Bypass"));
+    // `--host` replaces the advertised address (SPEC-M2.7 §4).
+    let other = kioku(server.path(), &["invite", "--host", "100.64.0.7"]);
+    assert_eq!(other.code, 0, "{}{}", other.stdout, other.stderr);
+    assert!(
+        join_of(&other.stdout).starts_with(&format!("100.64.0.7:{port}/")),
+        "{}",
+        other.stdout
+    );
+    assert!(
+        other
+            .stdout
+            .contains(&format!("$env:KIOKU_JOIN='100.64.0.7:{port}/"))
+    );
+    assert_eq!(kioku(server.path(), &["invite", "--host", "a b"]).code, 1);
 
     // The new machine: Claude Code installed, nothing else.
     let client = tempfile::tempdir().unwrap();
@@ -221,7 +243,8 @@ fn refusals() {
         ],
     );
     assert_eq!(docker.code, 0, "{}{}", docker.stdout, docker.stderr);
-    assert!(docker.stdout.contains("/i/"), "{}", docker.stdout);
+    assert!(docker.stdout.contains("KIOKU_JOIN='"), "{}", docker.stdout);
+    assert!(!docker.stdout.contains("/i/"), "{}", docker.stdout);
 
     // `invite` when the server is down.
     let down = server_home({

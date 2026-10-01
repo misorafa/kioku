@@ -14,12 +14,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
+use kioku_core::project::GitBudget;
 use kioku_core::sanitize::sanitize_payload;
 use kioku_core::strings::{fill, strings};
 use kioku_core::util::{home_dir_opt, now_ts, one_line};
 use kioku_core::{
     Config, DataDir, NewObservation, ObservationKind, ProjectIdentity, SessionInfo,
-    SessionStartRequest, SessionStartResponse, identify,
+    SessionStartRequest, SessionStartResponse,
 };
 use serde_json::{Map, Value, json};
 
@@ -332,9 +333,7 @@ impl Handler<'_> {
     /// older than SPEC-M2.5).
     fn start_with_version(&self, source: &str) -> anyhow::Result<(String, Option<String>)> {
         let cwd = self.cwd()?;
-        let project = identify(&cwd)?;
-        let deadline = hook_deadline_ms(self.agent, self.ev.event, self.cfg.client.timeout_ms);
-        let lane = kioku_core::project::lane(&cwd, Duration::from_millis(deadline));
+        let (project, lane) = self.locate(&cwd)?;
         let req = SessionStartRequest {
             session_id: self.ev.session_id.clone(),
             agent: self.ev.agent.clone(),
@@ -368,6 +367,20 @@ impl Handler<'_> {
             state: resp.state_excerpt,
         };
         render_session_start(self.cfg.client.lang, &ctx)
+    }
+
+    /// Project identity and handoff lane of `cwd` within the git budget of this hook
+    /// ([`git_budget_ms`]), through `state/projects.json` (SPEC-M2.7 §8).
+    fn locate(&self, cwd: &Path) -> anyhow::Result<(ProjectIdentity, Option<String>)> {
+        let deadline = hook_deadline_ms(self.agent, self.ev.event, self.cfg.client.timeout_ms);
+        let git = GitBudget::new(Duration::from_millis(git_budget_ms(deadline)));
+        let cache = client_state_root(self.cfg, self.env)
+            .map(|d| d.join("state").join(kioku_core::project::cache::CACHE_FILE));
+        Ok(kioku_core::project::cache::identify_and_lane(
+            cwd,
+            cache.as_deref(),
+            &git,
+        )?)
     }
 
     /// cwd per M2 §3.4: the parser's resolution, else the process cwd — except for
@@ -466,14 +479,15 @@ impl Handler<'_> {
     /// after a failure, so the project lookup (git) never slows the normal path.
     fn queue(&self, ev: &HookEvent, obs: &NewObservation) -> anyhow::Result<()> {
         let cwd = self.cwd()?;
-        let deadline = hook_deadline_ms(self.agent, self.ev.event, self.cfg.client.timeout_ms);
+        // The identity SessionStart cached (SPEC-M2.7 §8): no git but the lane's one call.
+        let (project, lane) = self.locate(&cwd)?;
         let session = SessionStartRequest {
             session_id: ev.session_id.clone(),
             agent: ev.agent.clone(),
             cwd: cwd.display().to_string(),
             source: kioku_core::store::OFFLINE_REPLAY_SOURCE.into(),
-            project: identify(&cwd)?,
-            lane: kioku_core::project::lane(&cwd, Duration::from_millis(deadline)),
+            project,
+            lane,
         };
         crate::outbox::enqueue(self.cfg, obs, session).map(|_| ())
     }
@@ -585,7 +599,8 @@ impl Handler<'_> {
             let name = self
                 .cwd()
                 .ok()
-                .and_then(|cwd| identify(&cwd).ok())
+                .and_then(|cwd| self.locate(&cwd).ok())
+                .map(|(p, _)| p)
                 .filter(|p: &ProjectIdentity| p.id == resp.project_id)
                 .map_or_else(|| resp.project_id.clone(), |p| p.name);
             Ok(self.block(&name, resp))
@@ -671,6 +686,16 @@ impl Handler<'_> {
             other => other.map(|_| ()),
         }
     }
+}
+
+/// Time the git calls of a hook may take together (identity + lane, SPEC-M2.7 §8): 40% of
+/// the hook's deadline, leaving at least 1.5 s for HTTP; on a very short deadline at least
+/// 40% of it up to 150 ms, so a cached identity still gets its lane.
+pub fn git_budget_ms(deadline_ms: u64) -> u64 {
+    let share = deadline_ms * 2 / 5;
+    share
+        .min(deadline_ms.saturating_sub(1500))
+        .max(share.min(150))
 }
 
 /// The client-side kioku dir: the data dir when it exists (and is absolute), else
@@ -1001,6 +1026,47 @@ mod tests {
             lines[1].contains(" session-start session=- error: "),
             "{log}"
         );
+    }
+
+    /// SPEC-M2.7 §8: git gets at most 40% of the hook deadline and leaves 1.5 s for HTTP.
+    #[test]
+    fn git_budget_is_a_share_of_the_deadline() {
+        assert_eq!(git_budget_ms(3000), 1200);
+        assert_eq!(git_budget_ms(10_000), 4000);
+        assert_eq!(git_budget_ms(2000), 500, "1.5 s stay for HTTP");
+        assert_eq!(git_budget_ms(1000), 150);
+        assert_eq!(git_budget_ms(200), 80);
+        for d in [1, 500, 1600, 2500, 3000, 9500, 60_000] {
+            assert!(git_budget_ms(d) * 5 <= d * 2, "{d}");
+        }
+    }
+
+    /// SPEC-M2.7 §1: the second guard — only a Stop nudge of Claude Code / Codex may exit
+    /// non-zero.
+    #[test]
+    fn only_a_stop_nudge_may_exit_non_zero() {
+        let nudge = HookOutcome {
+            exit_code: NUDGE_EXIT_CODE,
+            ..HookOutcome::default()
+        };
+        assert!(exit_allowed(Agent::ClaudeCode, HookEventKind::Stop, &nudge));
+        assert!(exit_allowed(Agent::Codex, HookEventKind::Stop, &nudge));
+        assert!(!exit_allowed(Agent::Cursor, HookEventKind::Stop, &nudge));
+        assert!(!exit_allowed(Agent::GeminiCli, HookEventKind::Stop, &nudge));
+        assert!(!exit_allowed(
+            Agent::ClaudeCode,
+            HookEventKind::SessionStart,
+            &nudge
+        ));
+        let other = HookOutcome {
+            exit_code: 1,
+            ..HookOutcome::default()
+        };
+        assert!(!exit_allowed(
+            Agent::ClaudeCode,
+            HookEventKind::Stop,
+            &other
+        ));
     }
 
     #[test]

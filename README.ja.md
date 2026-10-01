@@ -118,19 +118,22 @@ $ kioku invite
 Paste ONE of these on the machine to add (valid 10 minutes, once):
 
   Windows (PowerShell):  $env:KIOKU_JOIN='192.168.1.240:7391/K7Q2M9XD'; irm https://raw.githubusercontent.com/misorafa/kioku/main/install.ps1 | iex
-  macOS / Linux / Git Bash:  curl -sSL http://192.168.1.240:7391/i/K7Q2M9XD | sh
+  macOS / Linux / Git Bash:  KIOKU_JOIN='192.168.1.240:7391/K7Q2M9XD' sh -c "$(curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh)"
 
 (On this LAN you can also use http://mini-M2.local:7391/…; over a VPN use the IP.)
 ```
 
-追加するマシンで、合う方の 1 行を貼り付けるだけです。この 1 行が kioku をインストールし（上と同じ検証付き
+追加するマシンで、合う方の 1 行を貼り付けるだけです。どちらの行もインストーラーは GitHub から https で
+取得し、LAN を通るのは使い捨てのコードだけです。サーバーに複数のアドレス（LAN と Tailscale などの VPN）
+があるときは、`kioku invite` が行の下にほかのアドレスを並べます。`kioku invite --host <アドレス>` で
+そのアドレスの行を表示できます。この 1 行が kioku をインストールし（上と同じ検証付き
 ダウンロード）、`PATH` に追加し、使い捨てのコードでサーバーのトークンを受け取り（トークンは表示も
 コピーもされません）、クライアント用の `config.toml` を書き、見つかったすべてのエージェントを設定して、
 「kioku の準備ができました。Claude Code … を再起動してください。」で終わります。期限切れや使用済みの行は、
 `kioku invite` をもう一度実行するよう 1 文で伝えて終了します。`--ttl <分>`（最大 60）と `--uses <台数>`
 （最大 20）で、1 行を複数台に使えます。kioku が入っているマシンなら、同じことを `kioku join <url> <code>`
-で行えます。`kioku rotate-token` の後は、`kioku invite --uses <台数>` の行を各マシンに貼り付けてください
-（`join` は古いクライアント設定を置き換えます）。
+で行えます。`kioku rotate-token` は新しいトークンで作った招待の行（30 分間有効）をそのまま表示します。
+複数台なら `kioku invite --uses <台数>` を使ってください（`join` は古いクライアント設定を置き換えます）。
 
 手動の方法も使えます。サーバーで `kioku setup --print-client-command` を実行すると、トークン入りの
 コマンドが表示されます:
@@ -138,6 +141,11 @@ Paste ONE of these on the machine to add (valid 10 minutes, once):
 ```sh
 curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh -s -- --client-only http://<server>:7391 <token>
 ```
+
+kioku が入っているマシンでは、トークンをコマンドラインに載せずに渡せます:
+`KIOKU_CLIENT_TOKEN=<token> kioku setup --client-only http://<server>:7391`（標準入力から渡しても
+構いません）。`kioku setup --client-only <url> <token>` も動きますが非推奨です（コマンドラインの
+トークンはプロセス一覧とシェルの履歴に残ります）。
 
 ### 更新
 
@@ -167,6 +175,15 @@ winget でインストールしたものは winget に黙って置き換えず�
 古いものも含めて任意のタグを入れられます。`kioku update --check` は新しいリリースがあれば終了コード 10
 で終わります）、または 1 行のコマンドをもう一度実行します（古いバージョンのまま動いているサービスは、
 次の `kioku setup` が再起動します）。
+
+更新のたびに、置き換えた前のバイナリを `kioku.prev`（`kioku.exe.prev`）として隣に残します。自動更新した
+サーバーが 3 回続けて起動に失敗すると、自分でその前のバイナリに戻します（`kioku doctor` には古い
+サーバーのバージョンが表示されます）。手動で戻すには `kioku update --rollback`（サービスも再起動します。
+`.prev` が無ければ何もしません）。新しい kioku が書いたデータディレクトリを古い kioku が開くことは
+ありません。`kioku serve` は終了コード 78 で終わり、`kioku doctor` が対処法を表示します。
+
+リリースのミラーやフォーク（`KIOKU_DOWNLOAD_BASE`、`KIOKU_REPO`）は、`config.toml` の `[update]` に
+`allow_mirror = true` があるときだけ、https でのみ使われます。
 
 macOS では、インストール済みのバイナリに `cp` で上書きしないでください。カーネルが古いコード署名を
 キャッシュしているため、新しいバイナリが SIGKILL で落ちます（"zsh: killed"）。先に消してからコピーし
@@ -411,9 +428,9 @@ kioku status
 `kioku service stop && kioku service start`）。続いて、ほかのマシンごとに `kioku invite` を実行します
 （「インストール」を参照）。
 
-**接続先の選び方。** `kioku invite`（と `--print-client-command`）はサーバーの LAN の IP を表示します。
-貼り付けた行は、スクリプトのダウンロードに使ったアドレスをそのまま新しいマシンに渡すので、選んだ
-アドレスがそのまま使われます。
+**接続先の選び方。** `kioku invite`（と `--print-client-command`）はサーバーの LAN の IP を表示し、
+この機械のほかのアドレスも並べます。別のアドレスを使うなら `kioku invite --host <アドレス>`。
+新しいマシンは、貼り付けた行に書かれたアドレスをそのまま使います。
 - IP は、LAN を経由させる VPN（WireGuard など）の先からも使えます。ただしサーバーの IP が変わると、つながらなくなります。
 - `<ホスト名>.local` は、IP が変わっても使えます。ただし mDNS なので、同じ LAN の中でしか名前が引けません。
 - kioku のサーバーは `bind = "0.0.0.0"` のとき IPv4 と IPv6 の両方で待ち受けます。そのため、名前が IPv6 に解決されても届きます。
@@ -599,31 +616,47 @@ kioku project merge <from-id> <into-id>             # セッション・引き�
 
 ## セキュリティ
 
-- **認証**: トークン 1 つ、ユーザー 1 人。トークンが無いと、バインドアドレスに関係なく
-  `kioku serve` は起動しません。`GET /api/v1/health` と下の招待用ルート以外のすべてのルートで
+- **1 人で使う設計**: トークン 1 つ、使う人 1 人（その人の複数のマシン）。トークンを持つ人は記憶の
+  すべてを読み書きでき、ユーザーごとの権限はありません。1 台のサーバーを複数人で共有しないでください。
+- **記憶は信頼できないデータ**: エージェントが kioku に書いたもの（ページ、引き継ぎ、セッションの要約）は、
+  そのエージェントが読んだものと同じ程度にしか信頼できません。Web ページやファイルから拾ったプロンプト
+  インジェクションが保存され、以後すべてのマシンのすべてのセッションに表示されることがあり得ます。
+  kioku は保存された記憶を「指示ではなくデータ」として渡し（`<kioku>` ブロックと `kioku_read` /
+  `kioku_query` / `kioku_handoff_pending` の先頭に固定の注意書き）、保存された文章が `<kioku>` ブロックを
+  閉じられないようにし、ページと引き継ぎの秘密情報もフックのペイロードと同じように伏せ字にします。
+  記憶に書かれた手順をエージェントに実行させる前に、内容を確かめてください。
+- **認証**: トークンが無いと、バインドアドレスに関係なく `kioku serve` は起動しません。
+  `GET /api/v1/health`（`ok` 以外は何も返しません）と `POST /api/v1/join` 以外のすべてのルートで
   `Authorization: Bearer <token>` が必要です。`/mcp` も同様で、Host ヘッダの許可リストは無効に
-  してあるため、トークンが唯一の防御です。既定のバインドは `127.0.0.1` です。
+  してあるため、トークンが唯一の防御です。既定のバインドは `127.0.0.1` です。1 つのデータディレクトリを
+  使える `kioku serve` は 1 つだけです（`kioku.lock`）。
 - **招待**: `kioku invite`（トークン認証付きの `POST /api/v1/invites`）は 8 文字のコードを作ります。
-  コードはサーバーのメモリにだけあり、既定では 10 分間・1 回だけ有効です。`GET /i/<code>` と
-  `GET /i/<code>.ps1` はインストーラー（トークンは含みません）を返し、`POST /api/v1/join` がコードと
-  トークンを交換します。この 3 つはトークン不要です。1 つのアドレスから 1 分に 10 回（全体で 30 回）を
-  超えてコードの照合に失敗すると、60 秒間 HTTP 429 を返します。未使用の招待の行を見た人は参加できるので、
-  その 10 分間はトークンと同じように扱ってください。
-- **トークンの作り直し**: サーバーのマシンで `kioku rotate-token` を実行すると、新しいトークンを書き込み、
-  サービスを再起動します（以後、古いトークンは拒否されます）。続いて `kioku invite --uses <台数>` を
-  実行し、表示された行を各マシンに貼り付けます（手動用の `kioku setup --client-only <url> <新しいトークン>`
-  も表示されます）。
+  コードはサーバーのメモリにだけあり、既定では 10 分間・1 回だけ有効です。貼り付ける行はインストーラーを
+  GitHub から https で取得し、`POST /api/v1/join`（トークン不要）がコードとトークンを交換します。
+  1 つのアドレスから 1 分に 10 回（全体で 30 回）を超えてコードの照合に失敗すると、60 秒間 HTTP 429 を
+  返します。未使用の招待の行を見た人は参加できるので、その 10 分間はトークンと同じように扱ってください。
+- **トークンの作り直し**: サーバーのマシンで `kioku rotate-token` を実行すると、`config.toml` の
+  `auth_token` の行だけを書き換え（コメントなどはそのまま残ります）、サービスを再起動し（以後、古い
+  トークンは拒否されます）、新しいトークンで作った招待の行（30 分間有効）を表示します。トークン自体は
+  表示しません。`--show-token` を付けると手動用のコマンドも表示します。
   v0.4 からエージェントはトークンを持たない（`kioku mcp`）ので、作業はこれだけです。
+- **コマンドラインのトークン**: `kioku setup --client-only <url>` はトークンを `KIOKU_CLIENT_TOKEN` か
+  標準入力から読みます。引数で渡すこともできますが、警告が出ます（プロセス一覧とシェルの履歴に残るため）。
 - トークンを含むエージェントのファイル（`~/.claude.json`、`~/.codex/config.toml`、`~/.cursor/mcp.json`、
   `~/.gemini/settings.json`）は 0600 で作成します。ほかのユーザーが読める既存のファイルに kioku が
   トークンを追加するときは 0600 にします（1 行で報告し、トークン自体は表示しません）。
 - `config.toml` にはトークンが平文で入っています。kioku はこれをモード 0600 で書き、データディレクトリ・
   `raw/`・`logs/` を 0700 で作成します（unix）。
 - **サニタイザ** — フックのペイロードは送信前にクライアントで（サーバーでも再度）伏せ字にされます:
-  - AWS アクセスキー ID（`AKIA…`）、`sk-…` 形式のキー、Stripe の `sk_live_…` / `sk_test_…` キー、
+  - AWS アクセスキー ID（`AKIA…`、`ASIA…`）、`sk-…` 形式のキー、Stripe の `sk_live_…` / `sk_test_…` キー、
     GitHub の `ghp_` / `gho_` / `ghu_` / `ghs_` / `ghr_` / `github_pat_…` トークン、
-    Slack の `xoxb-` / `xoxa-` / `xoxp-` トークン、Google の `AIza…` キー、JWT 形式の文字列
-    （`eyJ….….…`）、PEM 形式の秘密鍵ブロック（`END` 行が無い場合はテキストの末尾まで）
+    Slack の `xoxb-` / `xoxa-` / `xoxp-` トークン、Google の `AIza…` キー、npm の `npm_…`、GitLab の
+    `glpat-…`、Hugging Face の `hf_…`、PyPI の `pypi-AgEI…`、SendGrid の `SG.….…`、age の
+    `AGE-SECRET-KEY-1…`、JWT 形式の文字列（`eyJ….….…`）、PEM 形式の秘密鍵ブロック（`END` 行が無い場合は
+    テキストの末尾まで）
+  - `Cookie:` / `Set-Cookie:` ヘッダの値。キー名が `pass`、`pwd`、`passphrase`、`*_key`
+    （`encryption_key`、`signing_key`、`master_key` など。`primary_key` のような識別子は除く）、
+    `AccountKey` のときの値
   - URL 内のパスワード（`postgres://user:[REDACTED]@host`）
   - `secret`、`token`、`password`/`passwd`、`api_key`、`access_key`、`private_key`、`credential`、
     `authorization` を*含む*キーに `:` か `=` が続く場合の値全体（`AWS_SECRET_ACCESS_KEY=…`、
@@ -631,14 +664,18 @@ kioku project merge <from-id> <into-id>             # セッション・引き�
     `--password` / `--token` / `--api-key` の後ろの値、およびそれらの語を含む名前のキーを持つ JSON の値
     （`max_tokens` のような件数は除く）
   - `tool_input` は 4 000 文字、`tool_response` は 2 000 文字に切り詰め
+  - ページのタイトルと本文（`kioku_write_page`）、引き継ぎ（`kioku_handoff_write`）も、保存・索引・
+    コミットの前に同じ伏せ字処理を通します
 - **伏せ字にならないもの**: 上記の形に一致しないもの全般 — 例: `-p secret` のように渡したパスワード、
   単独の高エントロピー文字列、個人情報。
   プロンプト、コマンド、ファイルパス、`Read`/`Bash`/編集系ツールの（切り詰められた）出力はサーバーに届き、
   `raw/`、SQLite、そして要約された形で `wiki/` の git 履歴に残ります。トランスクリプトは送信しません。
-- **フックは fail-open**: ネットワークやサーバーのエラー時、フックは `logs/hook.log`（上限 1 MiB、
-  `hook.log.1` に 1 世代だけローテート）に 1 行記録し、
-  何も出力せず、`timeout_ms` 以内に終了コード 0 で終わります。サーバーが落ちていてもエージェントは
-  止まりません。0 以外で終わるのは、意図的な Stop の催促（2）だけです。
+- **フックは fail-open**: ネットワークやサーバーのエラー時（このバージョンが知らないフックの引数を
+  渡されたときも）、フックは `logs/hook.log`（上限 1 MiB、`hook.log.1` に 1 世代だけローテート）に
+  1 行記録し、何も出力せず、`timeout_ms` 以内に終了コード 0 で終わります。サーバーが落ちていても
+  エージェントは止まりません。0 以外で終わるのは、意図的な Stop の催促（2）だけです。
+- **更新は検証済みのバイナリだけを実行**: リリースの SHA-256、続いて（macOS では）kioku の Developer ID
+  署名を確かめてから、初めて新しいバイナリを `--version` のために実行します。
 
 ## ほかのツールとの比較
 

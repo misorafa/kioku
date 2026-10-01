@@ -395,7 +395,10 @@ pub fn codex_specs(bin: &str, platform: HookPlatform) -> Vec<HookSpec> {
             }
             let mut group = Map::new();
             if event == HookEventKind::PostToolUse {
-                group.insert("matcher".into(), json!("^(Bash|apply_patch)$"));
+                group.insert(
+                    "matcher".into(),
+                    json!("^(Bash|shell|exec_command|apply_patch)$"),
+                );
             }
             group.insert("hooks".into(), json!([handler]));
             HookSpec {
@@ -918,9 +921,9 @@ pub fn install_agent(
             let token = ctx.token();
             let url = mcp_url(&ctx.client);
             let mcp = if opts.mcp_http {
-                block::CodexMcp::Http(&url, token.as_deref())
+                block::CodexMcp::http(&url, token.as_deref())
             } else {
-                block::CodexMcp::Stdio(&ctx.bin)
+                block::CodexMcp::stdio(&ctx.bin)
             };
             let c = block::install_codex_config(&path, mcp, opts.enable_hooks_feature, dry)?;
             r.file("MCP server `kioku`", &path, &c.outcome, dry);

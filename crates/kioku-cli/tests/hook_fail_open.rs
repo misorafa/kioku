@@ -5,10 +5,13 @@
 use std::process::{Command, Stdio};
 
 fn kioku(home: &std::path::Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_kioku"))
-        .args(args)
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_kioku"));
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("KIOKU_") {
+            cmd.env_remove(k);
+        }
+    }
+    cmd.args(args)
         .env("HOME", home)
         .env("USERPROFILE", home)
         .env("KIOKU_DATA_DIR", home.join(".kioku"))

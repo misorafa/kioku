@@ -4,7 +4,8 @@
 #   curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh
 #   curl -fsSL …/install.sh | sh -s -- --version v0.2.0 --no-setup
 #   curl -fsSL …/install.sh | sh -s -- --client-only http://home.lan:7391 <token>
-#   curl -sSL http://<server>:7391/i/<code> | sh      # the line `kioku invite` prints
+#   KIOKU_JOIN='<server>:7391/<code>' sh -c "$(curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh)"
+#                                                     # the line `kioku invite` prints
 #
 # Downloads the release binary for this machine, verifies its SHA-256 against the
 # release's SHA256SUMS, installs it to ~/.local/bin/kioku, puts that directory on PATH
@@ -65,7 +66,8 @@ usage: install.sh [--version <tag>] [--install-dir <dir>] [--repo <owner/name>]
                   [kioku setup options...] [-- kioku setup options...]
 
   curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh
-  curl -sSL http://<server>:7391/i/<code> | sh       (the line `kioku invite` prints)
+  KIOKU_JOIN='<server>:7391/<code>' sh -c "$(curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh)"
+                                                     (the line `kioku invite` prints)
 
 Every option this installer does not know is passed to `kioku setup` (or `kioku join`).
 EOF_USAGE
@@ -163,7 +165,7 @@ detect_targets() {
             [ -n "$ARCH" ] && TARGETS="$ARCH-apple-darwin"
             ;;
         MINGW* | MSYS* | CYGWIN* | Windows_NT)
-            die "on Windows, use PowerShell: run kioku invite on the server and paste its Windows line (irm http://<server>:7391/i/<code>.ps1 | iex); install.ps1 from https://raw.githubusercontent.com/$DEFAULT_REPO/main/install.ps1 is the manual alternative (inside WSL, this installer works as on Linux)"
+            die "on Windows, use PowerShell: run kioku invite on the server and paste its Windows line (\$env:KIOKU_JOIN='<server>:7391/<code>'; irm https://raw.githubusercontent.com/$DEFAULT_REPO/main/install.ps1 | iex); install.ps1 from https://raw.githubusercontent.com/$DEFAULT_REPO/main/install.ps1 is the manual alternative (inside WSL, this installer works as on Linux)"
             ;;
     esac
     if [ -z "$TARGETS" ]; then
@@ -369,7 +371,8 @@ main() {
     SETUP=1
     MODIFY_PATH=1
     PATH_ADDED=0
-    # Join mode (SPEC-M2.3 §4.1): `GET /i/<code>` prepends these two variables.
+    # Join mode (SPEC-M2.3 §4.1): these two variables (the server's former `GET /i/<code>`
+    # script set them; SPEC-M2.7 §4 removed it), or KIOKU_JOIN / --join below.
     JOIN_URL=${KIOKU_JOIN_URL:-}
     JOIN_CODE=${KIOKU_JOIN_CODE:-}
     PASS=""

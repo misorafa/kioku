@@ -101,11 +101,32 @@ pub fn run(cli: Cli) -> i32 {
             mcp_http,
             print_client_command,
         } => {
+            let client_only = match client_only.as_deref() {
+                None => None,
+                Some(args) => {
+                    let stdin = std::io::stdin();
+                    let tty = std::io::IsTerminal::is_terminal(&stdin);
+                    match crate::setup::client_token(
+                        args.get(1).map(String::as_str),
+                        &env_map(),
+                        &mut stdin.lock(),
+                        tty,
+                    ) {
+                        Ok((token, warning)) => {
+                            if let Some(w) = warning {
+                                eprintln!("{w}");
+                            }
+                            Some((args[0].clone(), token))
+                        }
+                        Err(err) => {
+                            eprintln!("kioku: error: {err:#}");
+                            return 1;
+                        }
+                    }
+                }
+            };
             let opts = crate::setup::SetupOptions {
-                client_only: client_only.and_then(|v| match v.as_slice() {
-                    [url, token] => Some((url.clone(), token.clone())),
-                    _ => None,
-                }),
+                client_only,
                 no_service,
                 no_agents,
                 agents,
@@ -117,10 +138,11 @@ pub fn run(cli: Cli) -> i32 {
             };
             return setup(&opts);
         }
-        Command::Invite { ttl, uses } => {
+        Command::Invite { ttl, uses, host } => {
             let opts = crate::invite::InviteOptions {
                 ttl_minutes: ttl,
                 uses,
+                host,
             };
             return with_setup_env(|env| crate::invite::run_invite(&opts, env));
         }
@@ -212,7 +234,10 @@ pub fn run(cli: Cli) -> i32 {
         }
         Command::Reindex => reindex(),
         Command::Status => status(),
-        Command::RotateToken { dry_run } => return rotate_token(dry_run),
+        Command::RotateToken {
+            dry_run,
+            show_token,
+        } => return rotate_token(dry_run, show_token),
         Command::Mcp => crate::bridge::run(kioku_core::util::env_vars()),
     };
     match result {
@@ -775,8 +800,9 @@ fn with_setup_env(f: impl FnOnce(&crate::setup::SetupEnv) -> crate::invite::Comm
     report.exit_code
 }
 
-/// `kioku rotate-token [--dry-run]` (M2 §21); returns the exit code.
-fn rotate_token(dry_run: bool) -> i32 {
+/// `kioku rotate-token [--dry-run] [--show-token]` (M2 §21, SPEC-M2.7 §10); returns the
+/// exit code.
+fn rotate_token(dry_run: bool, show_token: bool) -> i32 {
     let env = match current_binary().and_then(crate::setup::SetupEnv::from_process) {
         Ok(e) => e,
         Err(err) => {
@@ -784,7 +810,7 @@ fn rotate_token(dry_run: bool) -> i32 {
             return 1;
         }
     };
-    let report = crate::rotate::run_rotate(dry_run, &env);
+    let report = crate::rotate::run_rotate(dry_run, show_token, &env);
     for line in &report.lines {
         if line.starts_with("kioku: error") {
             eprintln!("{line}");

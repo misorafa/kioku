@@ -509,6 +509,18 @@ fn data_dir_check(cfg: &Config) -> Check {
             Some("run `kioku init` (or start the server once: it creates the data dir)".into()),
         );
     }
+    // SPEC-M2.7 §5: a database from a newer kioku makes `kioku serve` exit 78.
+    if let Some(newer) = kioku_core::newer_schema_on_disk(&kioku_core::DataDir::new(dir).db_file())
+    {
+        return check(
+            "data_dir",
+            Status::Fail,
+            format!("{}: {newer}", dir.display()),
+            Some(format!(
+                "this kioku (v{VERSION}) is older than the data: run `kioku update`, or `kioku restore <backup> --into <new dir>` and point KIOKU_DATA_DIR at it"
+            )),
+        );
+    }
     let mut warnings = Vec::new();
     let mut fix = None;
     if let Some(m) = mode(dir)
@@ -598,12 +610,9 @@ fn server_check(cfg: &Config, health: &Health, server_machine: bool) -> Check {
     match health {
         // The version is only told with a valid token (SPEC-M2.7 §11); the token check
         // reports a refused one.
-        Health::Kioku { version } if version.is_empty() => check(
-            "server",
-            Status::Ok,
-            format!("{url} is reachable"),
-            None,
-        ),
+        Health::Kioku { version } if version.is_empty() => {
+            check("server", Status::Ok, format!("{url} is reachable"), None)
+        }
         Health::Kioku { version } if version == VERSION => check(
             "server",
             Status::Ok,
@@ -1539,6 +1548,36 @@ fn hook_dump_check(cfg: &Config, env: &DoctorEnv) -> Check {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SPEC-M2.7 §5: a data directory written by a newer kioku is a FAIL with the way out.
+    #[test]
+    fn a_newer_schema_is_a_failed_data_dir_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config::for_data_dir(tmp.path());
+        let db = kioku_core::DataDir::new(tmp.path()).db_file();
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.pragma_update(None, "user_version", kioku_core::SCHEMA_VERSION)
+            .unwrap();
+        drop(conn);
+        assert_ne!(data_dir_check(&cfg).status, Status::Fail);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.pragma_update(None, "user_version", kioku_core::SCHEMA_VERSION + 1)
+            .unwrap();
+        drop(conn);
+        let c = data_dir_check(&cfg);
+        assert_eq!(c.status, Status::Fail);
+        assert!(
+            c.message.contains("written by a newer kioku"),
+            "{}",
+            c.message
+        );
+        let fix = c.fix.unwrap();
+        assert!(
+            fix.contains("kioku update") && fix.contains("kioku restore"),
+            "{fix}"
+        );
+    }
 
     /// SPEC-M2.5 §3.4: the `update` check (config, 24 h version mismatch, last result).
     #[test]

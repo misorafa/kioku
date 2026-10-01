@@ -403,7 +403,7 @@ fn exact_hook_shapes_on_an_empty_home() {
             "SessionStart": [{"hooks": [{"type": "command", "command": codex("session-start"),
                 "timeout": 10, "statusMessage": "kioku: loading handoff", "additionalContextLimit": 0}]}],
             "UserPromptSubmit": [{"hooks": [{"type": "command", "command": codex("user-prompt-submit"), "timeout": 5}]}],
-            "PostToolUse": [{"matcher": "^(Bash|apply_patch)$",
+            "PostToolUse": [{"matcher": "^(Bash|shell|exec_command|apply_patch)$",
                 "hooks": [{"type": "command", "command": codex("post-tool-use"), "timeout": 5}]}],
             "Stop": [{"hooks": [{"type": "command", "command": codex("stop"), "timeout": 10}]}],
             "PreCompact": [{"hooks": [{"type": "command", "command": codex("pre-compact"), "timeout": 5}]}],

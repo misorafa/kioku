@@ -158,3 +158,84 @@ Branch `m2.7-hardening`, draft PR against `main`, CI green on every job. README 
 README.ja: update the invite line, the security notes (memory is untrusted; single user),
 and `kioku update --rollback`. Record deviations here in a §14. Do not merge, tag or change
 secrets.
+
+## 14. Implementation notes (2026-10-01, branch `m2.7-hardening`)
+
+What differs from §1–§12, or what the text left open, and why.
+
+1. **Hook argument errors (§1).** `--help` / `--version` after `hook` keep clap's
+   behaviour (they are not failures and exit 0 anyway). The log line is
+   `<ts> hook agent=unknown session=- error: <clap message on one line>`. The event and agent
+   are closed enums, so no "unrecognised combination" can reach `run_hook`; its second
+   guard instead catches a panic and any non-zero exit other than the Stop nudge (exit 2,
+   `--agent claude-code` / `codex` only) and renders the agent's silent reply.
+2. **Signature before execution (§2).** `verify_signature` only exists on macOS (Linux and
+   Windows releases are not code-signed), so the "refused before `--version` runs" test is
+   macOS-only; CI runs it on `macos-latest`.
+3. **Removed invite routes (§4).** `GET /i/<code>[.ps1]` answers 404 from an explicit
+   handler whose body is `echo '<ja>' >&2; echo '<en>' >&2; exit 1`: without it the auth
+   layer would answer 401, and an old `curl -sSL … | sh` line (no `-f`) would execute
+   whatever body came back. Listing "every non-loopback IPv4" needs the interface list;
+   without a new crate or `unsafe` (`getifaddrs`) kioku parses `ip -4 -o addr show`, then
+   `ifconfig`, on Windows `ipconfig` (any language: the `IPv4` lines). Link-local
+   (169.254/16) addresses are skipped. The other addresses are printed below the two
+   lines, LAN (RFC 1918) first, with a pointer to `--host`, rather than as more full lines;
+   they are listed only when the server binds every interface.
+4. **One process per data directory (§6).** `Store::open` retries a held lock for up to
+   1 s (20 × 50 ms) before failing. Found in the test suite: right after `drop(store)` the
+   lock was still held now and then, because a child (git) forked by another thread keeps
+   a duplicate of the descriptor until its `exec`; a restarting service whose old process
+   is still exiting has the same window. The errors are typed (`store::DataDirLocked`,
+   `NewerSchema`) so `kioku serve` can tell them apart; neither counts as a failed boot
+   for §7 (a rollback would not help). The `needs_reindex` path is tested from the flag
+   on (a failing tantivy upsert cannot be provoked without a fault-injection hook).
+5. **Rollback (§7).** `<exe>.prev` is a *copy* of the binary being replaced, made by every
+   update (server, client background, manual), on every platform including Windows,
+   instead of reusing Windows' `.old` (which the next start deletes). `--rollback` and
+   the automatic rollback *move* `.prev` into place (Windows: the rename dance), so it is
+   used once. The counter counts starts: a start that finds 3 recorded failed starts of
+   its own version rolls back (so the fourth start runs the old binary). Without an older
+   `.prev` (missing, not runnable, or not older) it keeps counting and runs. On Windows the
+   `.prev` is probed for its version through a temporary `.exe` copy (`kioku.exe.prev` has
+   no executable extension). The rollback writes `last_error =
+   kioku: rolled back to vX after 3 failed starts of vY`.
+6. **SessionStart git budget (§8).** When git does not answer within the budget the
+   identity is an **error** (the hook fails open and logs it), never a path-derived
+   fallback: that would file the session under a new, wrong project id. The budget is
+   40% of the deadline, capped so 1.5 s stay for HTTP, but at least 40% of the deadline
+   up to 150 ms on very short deadlines so a cached identity still gets its lane. The
+   cache (`state/projects.json`, ≤ 256 entries, oldest dropped) stores an entry only when
+   it can be validated — a repository (`HEAD` + `config`; a linked worktree's own `HEAD`
+   and the common `config`) or a `.kioku.toml` (its mtime) — and only with a known default
+   branch; a `.kioku.toml` appearing above a git-derived entry invalidates it. Cursor's
+   late context and the offline queue use the same lookup.
+7. **Redaction (§9).** `pass`, `pwd`, `passphrase` match whole key names (`DB_PASS`,
+   `MYSQL_PWD`), never inside words (`compass`, `bypass`, `passing`). `*_key` skips
+   identifier names (`primary_key`, `foreign_key`, `sort_key`, `partition_key`,
+   `cache_key`, `public_key`, `map_key`, `hash_key`, `lookup_key`, `unique_key`,
+   `group_key`, `idempotency_key`). A cookie header's value is redacted to the end of the
+   line. Page tags are not redacted (the spec lists title, body and the handoff fields).
+8. **Tokens (§10).** `kioku init --client-only <url> <token>` is unchanged (the spec names
+   `setup`). install.sh / install.ps1 still forward a token given to them to `kioku setup`
+   as an argument, so installing an older release keeps working; that run prints the
+   deprecation warning. `--show-token` prints `KIOKU_CLIENT_TOKEN='<token>' kioku setup
+   --client-only <url>` (and the PowerShell form) rather than the deprecated argument
+   form. The invite is created only when `rotate-token` restarted the service itself;
+   otherwise the running server still has the old token, and the output says to run
+   `kioku invite` after restarting it.
+9. **Update source and health (§11).** The https rule applies to an allowed mirror
+   (loopback `http://` stays allowed for tests); without `allow_mirror` the variables are
+   ignored with a warning, whatever they say. Doctor, `service status`, `setup` and
+   `kioku status` take the server version from `/status` (with the token); an older
+   server's health still carries `version` and is used as is. Without a valid token the
+   version is unknown and `doctor` reports the server as reachable (the `auth` check
+   reports the token).
+10. **Small fixes (§12).** A refused second backup is `409 Conflict` (`Error::Conflict`; no
+    new error kind); `backup_keep` below 1 counts as 1. `save_auth_tokens` inserts an
+    `auth_token` line right after a section header that has none and appends a `[client]`
+    section only when the client follows the server's token. The Codex matcher change
+    alters `hooks.json`, so Codex asks to trust the hooks again after `kioku install`.
+11. **Not covered by automated tests on real machines:** the boot-failure rollback under
+    real launchd / systemd (tested with dummy binaries and a simulated manager loop), the
+    macOS signature order with a real Developer ID-signed release, `ipconfig` parsing on a
+    real (Japanese) Windows, and Codex re-trusting the new matcher.
