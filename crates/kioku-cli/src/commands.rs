@@ -523,6 +523,7 @@ fn serve(
     if let Some(w) = &mirror_warning {
         tracing::warn!("{w}");
     }
+    let boot_dir = state_dir.clone();
     runtime.block_on(async move {
         if managed {
             // SPEC-M2.7 §7: a start that survives a minute is a good one.
@@ -557,6 +558,11 @@ fn serve(
         }
         kioku_server::serve_with(store, bind, port, opts).await
     })?;
+    // A graceful stop (service restart, signal, update) is not a failed start (SPEC-M2.7
+    // §7): without this, a few quick restarts in a row would look like a crash loop.
+    if managed {
+        crate::auto_update::boot_succeeded(&boot_dir, kioku_core::VERSION);
+    }
     if *rx.borrow() {
         tracing::info!(
             "exiting with {} so the service manager starts the new binary",

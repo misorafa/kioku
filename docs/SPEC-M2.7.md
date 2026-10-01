@@ -194,7 +194,10 @@ What differs from §1–§12, or what the text left open, and why.
    instead of reusing Windows' `.old` (which the next start deletes). `--rollback` and
    the automatic rollback *move* `.prev` into place (Windows: the rename dance), so it is
    used once. The counter counts starts: a start that finds 3 recorded failed starts of
-   its own version rolls back (so the fourth start runs the old binary). Without an older
+   its own version rolls back (so the fourth start runs the old binary). Besides the 60 s
+   timer, a graceful stop (signal, service restart, update) also resets the counter, so a
+   few quick restarts in a row (`rotate-token`, `setup`) never look like a crash loop.
+   Without an older
    `.prev` (missing, not runnable, or not older) it keeps counting and runs. On Windows the
    `.prev` is probed for its version through a temporary `.exe` copy (`kioku.exe.prev` has
    no executable extension). The rollback writes `last_error =
