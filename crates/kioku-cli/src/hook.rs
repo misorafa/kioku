@@ -100,8 +100,46 @@ pub fn run_hook(event: HookEventKind, agent: Agent, stdin_json: &str, cfg: &Conf
 
 /// Runs one hook: parses `stdin_json` for `agent`, talks to the server within the
 /// per-agent deadline, and returns what to print. Never fails: errors are appended to
-/// `logs/hook.log` and yield the agent's silent reply with exit 0.
+/// `logs/hook.log` and yield the agent's silent reply with exit 0. A second guard (SPEC-M2.7
+/// §1): a panic, or a non-zero exit for anything but a Stop nudge of an agent that has one,
+/// becomes that agent's silent reply.
 pub fn run_hook_with_env(
+    event: HookEventKind,
+    agent: Agent,
+    stdin_json: &str,
+    cfg: &Config,
+    env: &HookEnv,
+) -> HookOutcome {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_hook_unguarded(event, agent, stdin_json, cfg, env)
+    }));
+    match outcome {
+        Ok(o) if o.exit_code == 0 || exit_allowed(agent, event, &o) => o,
+        Ok(o) => {
+            log_failure(
+                cfg,
+                event,
+                "-",
+                &anyhow::anyhow!("unexpected exit code {} for {agent:?}", o.exit_code),
+            );
+            render(agent, event, HookResult::Silent)
+        }
+        Err(_) => {
+            log_failure(cfg, event, "-", &anyhow::anyhow!("hook handler panicked"));
+            render(agent, event, HookResult::Silent)
+        }
+    }
+}
+
+/// The only non-zero exit a hook may produce: the Stop nudge (exit 2) of an agent that reads
+/// it (`--agent claude-code`, also when that hook runs inside Cursor, and Codex).
+pub fn exit_allowed(agent: Agent, event: HookEventKind, o: &HookOutcome) -> bool {
+    event == HookEventKind::Stop
+        && o.exit_code == NUDGE_EXIT_CODE
+        && matches!(agent, Agent::ClaudeCode | Agent::Codex)
+}
+
+fn run_hook_unguarded(
     event: HookEventKind,
     agent: Agent,
     stdin_json: &str,

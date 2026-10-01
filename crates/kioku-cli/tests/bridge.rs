@@ -1,6 +1,7 @@
 //! `kioku mcp` (M2 §20): the stdio bridge serves exactly the server's `/mcp` tools, and every
 //! tool works through REST against a real server — including over the actual binary's stdio.
 
+use kioku_core::strings::memory_note;
 use std::sync::Arc;
 
 use kioku_cli::bridge::KiokuBridge;
@@ -147,7 +148,7 @@ async fn bridge_serves_the_server_tools_over_rest() {
         .await
         .unwrap();
     assert!(
-        text(&hits).starts_with(&format!("1. {path} — 引き継ぎの設計 (")),
+        text(&hits).starts_with(&format!("{}1. {path} — 引き継ぎの設計 (", memory_note())),
         "{}",
         text(&hits)
     );
@@ -155,7 +156,7 @@ async fn bridge_serves_the_server_tools_over_rest() {
         .call_tool(call("kioku_query", json!({"query": "Postgres"})))
         .await
         .unwrap();
-    assert_eq!(text(&none), "no hits");
+    assert_eq!(text(&none), format!("{}no hits", memory_note()));
 
     let read = bridge
         .call_tool(call("kioku_read", json!({"path": path})))
@@ -222,7 +223,7 @@ async fn bridge_serves_the_server_tools_over_rest() {
         .call_tool(call("kioku_handoff_pending", json!({"project": PROJECT})))
         .await
         .unwrap();
-    assert_eq!(text(&after), "none");
+    assert_eq!(text(&after), format!("{}none", memory_note()));
 
     // lanes (M2.4 §1.4): a branch without its own handoff gets the main line's as a
     // reference, which stays pending
@@ -241,7 +242,10 @@ async fn bridge_serves_the_server_tools_over_rest() {
         .await
         .unwrap();
     let out = text(&lane);
-    assert!(out.starts_with("no handoff on this lane."), "{out}");
+    assert!(
+        out.starts_with(&format!("{}no handoff on this lane.", memory_note())),
+        "{out}"
+    );
     assert!(out.contains("メインの引き継ぎ"), "{out}");
     let main = bridge
         .call_tool(call("kioku_handoff_pending", json!({"project": PROJECT})))

@@ -196,12 +196,14 @@ pub fn run(cli: Cli) -> i32 {
             check,
             background,
             require_signature,
+            rollback,
         } => {
             let args = crate::update::UpdateArgs {
                 version,
                 check,
                 background,
                 require_signature,
+                rollback,
             };
             match crate::update::run_update(args) {
                 Ok(code) => return code,
@@ -219,6 +221,25 @@ pub fn run(cli: Cli) -> i32 {
             eprintln!("kioku: error: {err:#}");
             1
         }
+    }
+}
+
+/// True when `argv` (with the program name first) runs `kioku hook …`.
+pub fn is_hook_invocation(argv: &[String]) -> bool {
+    argv.get(1).is_some_and(|a| a == "hook")
+}
+
+/// Appends a hook command line that did not parse to `hook.log` (agent `unknown`), as one
+/// line; never fails and prints nothing (SPEC-M2.7 §1).
+pub fn log_hook_parse_failure(message: &str) {
+    let cfg = Config::load().unwrap_or_else(|_| Config::for_data_dir(&home_dir().join(".kioku")));
+    if let Some(path) = crate::hook::hook_log_path(&cfg) {
+        let line = format!(
+            "{} hook agent=unknown session=- error: {}\n",
+            kioku_core::util::now_ts(),
+            kioku_core::util::one_line(message)
+        );
+        let _ = crate::hook::append_line(&path, &line, crate::hook::HOOK_LOG_MAX_BYTES, false);
     }
 }
 
@@ -375,7 +396,11 @@ fn init_client_only(url: &str, token: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `kioku serve`; returns the exit code (75 after an automatic update, SPEC-M2.5 §3.1).
+/// Exit code of `kioku serve` for a data directory written by a newer kioku (EX_CONFIG).
+pub const SCHEMA_EXIT_CODE: i32 = 78;
+
+/// `kioku serve`; returns the exit code (75 after an automatic update, SPEC-M2.5 §3.1, or
+/// a rollback, SPEC-M2.7 §7; 78 for a newer data directory, SPEC-M2.7 §5).
 fn serve(
     bind: Option<String>,
     port: Option<u16>,
@@ -403,7 +428,55 @@ fn serve(
     let (bind, port) = (cfg.server.bind.clone(), cfg.server.port);
     let data_dir = cfg.data_dir.clone();
     let auto = cfg.update.auto;
-    let store = Arc::new(Store::open(cfg).context("opening the data directory")?);
+    // Only a server started by the service manager updates itself (§3.1 step 5): a
+    // foreground `kioku serve` would just exit.
+    let managed = std::env::var(crate::service::SERVICE_MARKER_ENV).is_ok_and(|v| v == "1");
+    let state_dir = data_dir.join("state");
+    let exe = std::env::current_exe().context("locating the kioku binary")?;
+    let exe = kioku_core::util::canonical_plain(&exe).unwrap_or(exe);
+    // SPEC-M2.7 §7: count this start before anything can fail; after repeated failed starts
+    // of this version, go back to the previous binary.
+    if managed
+        && let Some(version) = crate::auto_update::boot_check(&exe, &state_dir, kioku_core::VERSION)
+    {
+        let msg = format!(
+            "kioku: rolled back to v{version} after {} failed starts",
+            crate::auto_update::BOOT_FAILURE_LIMIT
+        );
+        tracing::error!("{msg}");
+        eprintln!("{msg}");
+        return Ok(crate::service::UPDATE_EXIT_CODE);
+    }
+    let (base, mirror_warning) = match crate::update::release_base(&cfg) {
+        Ok((b, w)) => (Some(b), w),
+        Err(e) => (
+            None,
+            Some(format!("kioku: warning: {e:#}; automatic updates are off")),
+        ),
+    };
+    let store = match Store::open(cfg) {
+        Ok(s) => Arc::new(s),
+        // SPEC-M2.7 §5: an older binary never touches a newer data directory.
+        Err(kioku_core::Error::Internal(e))
+            if e.downcast_ref::<kioku_core::NewerSchema>().is_some() =>
+        {
+            // Not this binary's fault: a rollback would not help (SPEC-M2.7 §5, §7).
+            if managed {
+                crate::auto_update::boot_succeeded(&state_dir, kioku_core::VERSION);
+            }
+            tracing::error!("{e:#}");
+            eprintln!("kioku: error: {e:#}");
+            return Ok(SCHEMA_EXIT_CODE);
+        }
+        Err(e) => {
+            let locked = matches!(&e, kioku_core::Error::Internal(i)
+                if i.downcast_ref::<kioku_core::store::DataDirLocked>().is_some());
+            if managed && locked {
+                crate::auto_update::boot_succeeded(&state_dir, kioku_core::VERSION);
+            }
+            return Err(anyhow::Error::from(e).context("opening the data directory"));
+        }
+    };
     let host = if bind.contains(':') && !bind.starts_with('[') {
         format!("[{bind}]")
     } else {
@@ -415,9 +488,6 @@ fn serve(
         .enable_all()
         .build()
         .context("starting the async runtime")?;
-    // Only a server started by the service manager updates itself (§3.1 step 5): a
-    // foreground `kioku serve` would just exit.
-    let managed = std::env::var(crate::service::SERVICE_MARKER_ENV).is_ok_and(|v| v == "1");
     let update = kioku_server::UpdateStatus::shared_for(&store);
     update.lock().managed = managed;
     let (tx, rx) = tokio::sync::watch::channel(false);
@@ -425,27 +495,40 @@ fn serve(
         update: update.clone(),
         shutdown: Some(rx.clone()),
     };
+    if let Some(w) = &mirror_warning {
+        tracing::warn!("{w}");
+    }
     runtime.block_on(async move {
         if managed {
-            let exe = std::env::current_exe().context("locating the kioku binary")?;
-            let exe = kioku_core::util::canonical_plain(&exe).unwrap_or(exe);
-            let check = crate::auto_update::ServerCheck {
-                base: crate::update::release_base(),
-                exe,
-                current: kioku_core::VERSION.to_string(),
-                auto,
-                verify: crate::update::Verify::automatic(),
-                state_dir: Some(data_dir.join("state")),
-            };
-            tokio::spawn(crate::auto_update::server_update_task(
-                check,
-                update,
-                tx,
-                crate::auto_update::FIRST_CHECK,
-            ));
-        } else {
+            // SPEC-M2.7 §7: a start that survives a minute is a good one.
+            let dir = state_dir.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(crate::auto_update::BOOT_OK_AFTER).await;
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::auto_update::boot_succeeded(&dir, kioku_core::VERSION)
+                })
+                .await;
+            });
+        }
+        match (managed, base) {
+            (true, Some(base)) => {
+                let check = crate::auto_update::ServerCheck {
+                    base,
+                    exe,
+                    current: kioku_core::VERSION.to_string(),
+                    auto,
+                    verify: crate::update::Verify::automatic(),
+                    state_dir: Some(state_dir),
+                };
+                tokio::spawn(crate::auto_update::server_update_task(
+                    check,
+                    update,
+                    tx,
+                    crate::auto_update::FIRST_CHECK,
+                ));
+            }
             // No update task: nothing will request a shutdown.
-            std::mem::drop(tx);
+            _ => std::mem::drop(tx),
         }
         kioku_server::serve_with(store, bind, port, opts).await
     })?;
@@ -537,12 +620,13 @@ pub fn format_hits(hits: &[Hit]) -> String {
 
 fn status() -> anyhow::Result<()> {
     let (cfg, client) = command_client()?;
-    let version = client
-        .get(&["health"], &[])
-        .ok()
-        .and_then(|v| v.get("version").and_then(Value::as_str).map(str::to_string))
-        .unwrap_or_else(|| "?".to_string());
     let body = client.get(&["status"], &[])?;
+    let version = body
+        .get("version")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("?")
+        .to_string();
     let s: StatusReport =
         serde_json::from_value(body.clone()).context("unexpected status response")?;
     println!("server       : {} (kioku {version})", cfg.client.server_url);

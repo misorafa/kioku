@@ -424,6 +424,10 @@ try {
             $script:Out = "stdout: $stdout`nhook.log: $logText"
             Check 'real: hook reads BOM + CRLF + Japanese stdin as JSON, fails open' ($p.ExitCode -eq 0 -and -not $logText.Contains('not JSON'))
 
+            # SPEC-M2.7 section 11: KIOKU_DOWNLOAD_BASE counts only with [update] allow_mirror.
+            $cfgDir = Join-Path $Home0 '.kioku'
+            New-Item -ItemType Directory -Force -Path $cfgDir | Out-Null
+            Set-Content -LiteralPath (Join-Path $cfgDir 'config.toml') -Value "[update]`nallow_mirror = true`n" -Encoding ASCII
             Run-Exe @('update', '--version', 'v9.9.2')
             $updated = ($script:Rc -eq 0 -and (Has 'updated') -and (Test-Path -LiteralPath "$Exe.old") -and -not (Test-Path -LiteralPath "$Exe.new"))
             Check 'real: kioku update renames the running kioku.exe aside' $updated

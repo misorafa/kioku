@@ -24,7 +24,7 @@ pub mod strings;
 pub mod util;
 
 pub use config::{ClientConfig, Config, ServerConfig, UpdateConfig};
-pub use db::{ProjectAlias, ProjectRow};
+pub use db::{NewerSchema, ProjectAlias, ProjectRow, SCHEMA_VERSION, newer_schema_on_disk};
 pub use digest::{FileCount, SessionDigest};
 pub use error::{Error, Result};
 pub use handoff::{Handoff, HandoffInput, HandoffSource, PendingHandoff};

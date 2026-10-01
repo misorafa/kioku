@@ -1,7 +1,7 @@
 //! One-command join (SPEC-M2.3 §3): in-memory invite codes, the rate limiter for the
-//! unauthenticated invite routes, the installer scripts served at `GET /i/<code>[.ps1]`
-//! (the repo's install.sh / install.ps1, embedded, with the join variables prepended) and
-//! the handlers of `POST /api/v1/invites` (bearer) and `POST /api/v1/join` (public).
+//! unauthenticated join route and the handlers of `POST /api/v1/invites` (bearer) and
+//! `POST /api/v1/join` (public). The installer itself always comes from GitHub over https;
+//! `GET /i/<code>[.ps1]`, which served it over plain HTTP, is gone (SPEC-M2.7 §4).
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -10,20 +10,15 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{ConnectInfo, Path, Request, State},
+    extract::{ConnectInfo, Request, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::post,
 };
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::json;
-
-/// install.sh from the repository root, served (with the join variables) at `GET /i/<code>`.
-pub const INSTALL_SH: &str = include_str!("../../../install.sh");
-/// install.ps1 from the repository root, served at `GET /i/<code>.ps1`.
-pub const INSTALL_PS1: &str = include_str!("../../../install.ps1");
 
 /// Crockford base32 without the ambiguous letters I, L, O and U (32 symbols).
 pub const CODE_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
@@ -274,38 +269,10 @@ fn valid_port(p: &str) -> bool {
     !p.is_empty() && p.len() <= 5 && p.parse::<u16>().is_ok()
 }
 
-/// install.sh with `KIOKU_JOIN_URL` / `KIOKU_JOIN_CODE` set right after the shebang.
-pub fn sh_script(url: &str, code: &str) -> String {
-    // LF only: a checkout with CRLF endings (Windows, autocrlf) must still serve a valid sh script.
-    let body = INSTALL_SH
-        .trim_start_matches('\u{feff}')
-        .replace("\r\n", "\n");
-    let body = body.as_str();
-    let (first, rest) = match body.split_once('\n') {
-        Some((f, r)) if f.starts_with("#!") => (format!("{f}\n"), r),
-        _ => (String::new(), body),
-    };
-    format!(
-        "{first}# kioku invite (SPEC-M2.3): install kioku and join {url}\nKIOKU_JOIN_URL='{url}'\nKIOKU_JOIN_CODE='{code}'\n{rest}"
-    )
-}
-
-/// install.ps1 with `$KiokuJoinUrl` / `$KiokuJoinCode` set, all inside one script block so
-/// `irm … | iex` leaves no variables, functions or preferences behind in the window.
-pub fn ps1_script(url: &str, code: &str) -> String {
-    let body = INSTALL_PS1.trim_start_matches('\u{feff}');
-    format!(
-        "& {{\n# kioku invite (SPEC-M2.3): install kioku and join {url}\n$KiokuJoinUrl = '{url}'\n$KiokuJoinCode = '{code}'\n{body}\n}}\n"
-    )
-}
-
-/// The one sentence (ja + en) for a link that does not work.
-const INVALID_JA: &str = "この招待は無効か、期限切れか、使用済みです。サーバーで kioku invite をもう一度実行し、表示された行を貼り付けてください。";
+/// The answer for an invite that does not work.
 const INVALID_EN: &str = "This invite is invalid, expired or already used: run kioku invite on the server again and paste the new line.";
-const LIMITED_JA: &str = "失敗した試行が多すぎます。1 分待ってから、サーバーで kioku invite をもう一度実行してください。";
 const LIMITED_EN: &str =
     "Too many failed attempts: wait a minute, then run kioku invite on the server again.";
-const HOST_JA: &str = "リクエストに正しい Host ヘッダーがありません。kioku invite が表示した行をそのまま使ってください。";
 const HOST_EN: &str =
     "The request has no valid Host header: use the line kioku invite printed as it is.";
 
@@ -318,12 +285,27 @@ pub struct JoinState {
     pub token: Arc<str>,
 }
 
-/// `GET /i/{code}` and `POST /api/v1/join` (no token).
+/// `POST /api/v1/join` (no token), plus a 404 at the former `GET /i/<code>[.ps1]` that
+/// explains itself instead of a 401.
 pub fn public_routes(state: JoinState) -> Router {
     Router::new()
-        .route("/i/{code}", get(script))
         .route("/api/v1/join", post(join))
+        .route("/i/{code}", axum::routing::any(removed_installer_route))
         .with_state(state)
+}
+
+/// The former installer route (SPEC-M2.7 §4): always 404. Written so that an old
+/// `curl … | sh` line prints the sentence and stops instead of running anything.
+async fn removed_installer_route() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        "echo 'kioku: この形式の招待行は廃止されました。サーバーで kioku invite をもう一度実行し、新しい行を貼り付けてください。' >&2; echo 'kioku: This invite line format was removed: run kioku invite on the server again and paste the new line.' >&2; exit 1\n",
+    )
+        .into_response()
 }
 
 /// `POST /api/v1/invites` (goes behind the bearer middleware).
@@ -340,68 +322,6 @@ fn peer(req_ext: &axum::http::Extensions) -> IpAddr {
         .get::<ConnectInfo<SocketAddr>>()
         .map(|c| c.0.ip().to_canonical())
         .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Flavor {
-    Sh,
-    Ps1,
-}
-
-fn text(status: StatusCode, body: String) -> Response {
-    (
-        status,
-        [
-            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        body,
-    )
-        .into_response()
-}
-
-/// A failure body: for sh a one-line script that explains and exits 1 (`curl … | sh` without
-/// `-f` runs it); for PowerShell the plain sentences (`irm` shows the body of an error
-/// response as the error message).
-fn failure(flavor: Flavor, status: StatusCode, ja: &str, en: &str) -> Response {
-    let body = match flavor {
-        Flavor::Sh => format!("echo 'kioku: {ja}' >&2; echo 'kioku: {en}' >&2; exit 1\n"),
-        Flavor::Ps1 => format!("kioku: {ja}\nkioku: {en}\n"),
-    };
-    text(status, body)
-}
-
-/// `GET /i/{code}` (sh) and `GET /i/{code}.ps1` (PowerShell): the installer with the join
-/// variables for a valid invite. Does not consume a use.
-async fn script(State(st): State<JoinState>, Path(raw): Path<String>, req: Request) -> Response {
-    let (code, flavor) = match raw.strip_suffix(".ps1") {
-        Some(c) => (c.to_string(), Flavor::Ps1),
-        None => (
-            raw.strip_suffix(".sh").unwrap_or(&raw).to_string(),
-            Flavor::Sh,
-        ),
-    };
-    let Some(url) = join_url(req.headers(), req.uri()) else {
-        return failure(flavor, StatusCode::BAD_REQUEST, HOST_JA, HOST_EN);
-    };
-    let peer = peer(req.extensions());
-    let (lookup, canonical) = st.invites.lookup(&code, peer, false);
-    match (lookup, canonical) {
-        (Lookup::Valid, Some(code)) => {
-            let body = match flavor {
-                Flavor::Sh => sh_script(&url, &code),
-                Flavor::Ps1 => ps1_script(&url, &code),
-            };
-            text(StatusCode::OK, body)
-        }
-        (Lookup::Limited, _) => failure(
-            flavor,
-            StatusCode::TOO_MANY_REQUESTS,
-            LIMITED_JA,
-            LIMITED_EN,
-        ),
-        _ => failure(flavor, StatusCode::NOT_FOUND, INVALID_JA, INVALID_EN),
-    }
 }
 
 fn json_error(status: StatusCode, message: String) -> Response {
@@ -599,21 +519,5 @@ mod tests {
             assert_eq!(h(bad), None, "{bad}");
         }
         assert_eq!(join_url(&HeaderMap::new(), &uri), None);
-    }
-
-    #[test]
-    fn scripts_get_the_variables() {
-        let sh = sh_script("http://192.168.1.240:7391", "K7Q2M9XD");
-        let mut lines = sh.lines();
-        assert_eq!(lines.next(), Some("#!/bin/sh"));
-        assert!(!sh.contains('\r'), "LF only, whatever the checkout");
-        assert!(sh.contains("\nKIOKU_JOIN_URL='http://192.168.1.240:7391'\n"));
-        assert!(sh.contains("\nKIOKU_JOIN_CODE='K7Q2M9XD'\n"));
-        assert!(sh.trim_end().ends_with("main \"$@\""));
-        let ps = ps1_script("http://192.168.1.240:7391", "K7Q2M9XD");
-        assert!(ps.starts_with("& {\n"));
-        assert!(ps.contains("\n$KiokuJoinUrl = 'http://192.168.1.240:7391'\n"));
-        assert!(ps.contains("\n$KiokuJoinCode = 'K7Q2M9XD'\n"));
-        assert!(ps.trim_end().ends_with('}'));
     }
 }

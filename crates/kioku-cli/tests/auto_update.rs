@@ -155,6 +155,12 @@ fn session_start_spawns_one_background_updater() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     std::fs::create_dir_all(home.join(".kioku")).unwrap();
+    // SPEC-M2.7 §11: KIOKU_DOWNLOAD_BASE counts only with allow_mirror.
+    std::fs::write(
+        home.join(".kioku/config.toml"),
+        "[update]\nallow_mirror = true\n",
+    )
+    .unwrap();
     let bin = copy_binary(tmp.path(), "bin");
     let original = std::fs::read(&bin).unwrap();
 

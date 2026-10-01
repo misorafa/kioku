@@ -1,4 +1,5 @@
-//! SPEC-M2.3 §6 (server): invites, the installer scripts at `/i/<code>`, `POST /api/v1/join`,
+//! SPEC-M2.3 §6 (server): invites, `POST /api/v1/join` (the `/i/<code>` scripts are gone,
+//! SPEC-M2.7 §4),
 //! expiry on an injected clock and the rate limit, over a real socket with connect info.
 
 use std::net::SocketAddr;
@@ -125,46 +126,26 @@ async fn creating_an_invite_needs_the_token() {
     assert_eq!(capped["uses"], 20);
 }
 
+/// SPEC-M2.7 §4: the plain-HTTP installer routes are gone; the code only travels in the
+/// join call, and the token only in its answer.
 #[tokio::test]
-async fn scripts_carry_the_code_and_the_host_derived_url() {
+async fn the_installer_routes_are_gone_and_join_hands_out_the_token() {
     let srv = spawn().await;
     let (_, body) = srv.invite(json!({})).await;
     let code = body["code"].as_str().unwrap().to_string();
-    let lower = code.to_lowercase();
-
-    let (status, ctype, sh) = srv
-        .script(&format!("/i/{lower}"), Some("192.168.1.240:7391"))
-        .await;
-    assert_eq!(status, 200, "{sh}");
-    assert!(ctype.starts_with("text/plain"), "{ctype}");
-    assert!(sh.starts_with("#!/bin/sh\n"));
-    assert!(sh.contains("\nKIOKU_JOIN_URL='http://192.168.1.240:7391'\n"));
-    assert!(sh.contains(&format!("\nKIOKU_JOIN_CODE='{code}'\n")));
-    assert!(!sh.contains(TOKEN), "the script never holds the token");
-
-    let (status, _, ps) = srv
-        .script(&format!("/i/{code}.ps1"), Some("mini-M2.local:7391"))
-        .await;
-    assert_eq!(status, 200);
-    assert!(ps.contains("$KiokuJoinUrl = 'http://mini-M2.local:7391'"));
-    assert!(ps.contains(&format!("$KiokuJoinCode = '{code}'")));
-    assert!(ps.contains("function Invoke-KiokuInstall"));
-    assert!(!ps.contains(TOKEN));
-
-    // Without an explicit header reqwest sends the address it connected to.
-    let (_, _, sh) = srv.script(&format!("/i/{code}.sh"), None).await;
-    assert!(
-        sh.contains(&format!("KIOKU_JOIN_URL='{}'", srv.base)),
-        "{sh}"
-    );
-
-    // A malformed Host is a 400 (never pasted into a script).
-    let (status, _, text) = srv.script(&format!("/i/{code}"), Some("evil';x")).await;
-    assert_eq!(status, 400);
-    assert!(text.contains("exit 1"));
-
-    // Fetching the script did not use the invite up.
-    let (status, joined) = srv.join(&lower).await;
+    for path in [
+        format!("/i/{code}"),
+        format!("/i/{code}.ps1"),
+        format!("/i/{code}.sh"),
+        "/i/x".to_string(),
+    ] {
+        let (status, _, text) = srv.script(&path, Some("192.168.1.240:7391")).await;
+        assert_eq!(status, 404, "{path}");
+        assert!(!text.contains(TOKEN));
+        assert!(!text.contains("KIOKU_JOIN"), "{path}: {text}");
+    }
+    // Fetching those did not use the invite up (lower case works too).
+    let (status, joined) = srv.join(&code.to_lowercase()).await;
     assert_eq!(status, 200, "{joined}");
     assert_eq!(joined["token"], TOKEN);
     assert_eq!(joined["server_url"], srv.base);
@@ -173,22 +154,13 @@ async fn scripts_carry_the_code_and_the_host_derived_url() {
 #[tokio::test]
 async fn bad_or_expired_codes_get_404_with_one_clear_sentence() {
     let srv = spawn().await;
-    let (status, _, sh) = srv.script("/i/AAAAAAAA", None).await;
-    assert_eq!(status, 404);
-    assert!(sh.contains("kioku invite") && sh.contains("exit 1"), "{sh}");
-    assert!(sh.contains("招待"), "Japanese first: {sh}");
-    let (status, _, ps) = srv.script("/i/AAAAAAAA.ps1", None).await;
-    assert_eq!(status, 404);
-    assert!(ps.contains("run kioku invite on the server again"), "{ps}");
     let (status, body) = srv.join("not-a-code").await;
     assert_eq!(status, 404);
     assert!(body["error"].as_str().unwrap().contains("kioku invite"));
 
     let (_, body) = srv.invite(json!({"ttl_minutes": 5})).await;
     let code = body["code"].as_str().unwrap().to_string();
-    assert_eq!(srv.script(&format!("/i/{code}"), None).await.0, 200);
     srv.clock.store(5 * 60, Ordering::SeqCst);
-    assert_eq!(srv.script(&format!("/i/{code}"), None).await.0, 404);
     assert_eq!(srv.join(&code).await.0, 404, "expired");
 }
 
@@ -205,7 +177,6 @@ async fn join_consumes_uses() {
     }
     let (status, j) = srv.join(&code).await;
     assert_eq!(status, 404, "{j}");
-    assert_eq!(srv.script(&format!("/i/{code}"), None).await.0, 404);
     // Malformed body.
     let resp = srv
         .http
@@ -223,17 +194,14 @@ async fn failed_lookups_are_rate_limited() {
     let (_, body) = srv.invite(json!({})).await;
     let code = body["code"].as_str().unwrap().to_string();
     for i in 0..10 {
-        let path = if i % 2 == 0 {
-            "/i/AAAAAAAA"
-        } else {
-            "/i/ZZZZZZZZ.ps1"
-        };
-        assert_eq!(srv.script(path, None).await.0, 404, "failure {i}");
+        let bad = if i % 2 == 0 { "AAAAAAAA" } else { "ZZZZZZZZ" };
+        assert_eq!(srv.join(bad).await.0, 404, "failure {i}");
     }
-    let (status, _, sh) = srv.script(&format!("/i/{code}"), None).await;
-    assert_eq!(status, 429, "blocked even for a valid code");
-    assert!(sh.contains("exit 1"));
-    assert_eq!(srv.join(&code).await.0, 429);
+    assert_eq!(
+        srv.join(&code).await.0,
+        429,
+        "blocked even for a valid code"
+    );
     srv.clock.store(61, Ordering::SeqCst);
     assert_eq!(srv.join(&code).await.0, 200, "the block lasts 60 s");
 }
@@ -263,4 +231,7 @@ async fn other_routes_still_need_the_token() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+    // SPEC-M2.7 §11: health tells an anonymous caller nothing about the version.
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body, json!({"ok": true, "observation_dedup": true}));
 }

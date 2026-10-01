@@ -24,7 +24,7 @@ pub use mcp::{INSTRUCTIONS, KiokuMcp};
 pub use update::{SHUTDOWN_GRACE, ServeOptions, SharedUpdateStatus, UpdateStatus};
 
 /// Builds the full router: `/api/v1/*` + `/mcp`, bearer auth on everything but health and
-/// the invite routes `GET /i/<code>` and `POST /api/v1/join` (SPEC-M2.3 §3.2).
+/// the join route `POST /api/v1/join` (SPEC-M2.3 §3.2; `GET /i/<code>` is gone, SPEC-M2.7 §4).
 ///
 /// An empty `auth_token` disables auth (spec §9: auth is enforced when a token is set);
 /// `serve` refuses that combination on non-loopback binds.

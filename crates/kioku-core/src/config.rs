@@ -33,6 +33,17 @@ pub struct ServerConfig {
     pub data_dir: Option<String>,
     /// Language of generated summaries (`ja` | `en`).
     pub summary_lang: Lang,
+    /// Snapshots `POST /api/v1/backup` keeps; the oldest go after a successful new one
+    /// (SPEC-M2.7 §12). Not written while it is the default.
+    #[serde(skip_serializing_if = "is_default_backup_keep")]
+    pub backup_keep: usize,
+}
+
+/// Default of `[server] backup_keep`.
+pub const DEFAULT_BACKUP_KEEP: usize = 10;
+
+fn is_default_backup_keep(n: &usize) -> bool {
+    *n == DEFAULT_BACKUP_KEEP
 }
 
 impl Default for ServerConfig {
@@ -43,6 +54,7 @@ impl Default for ServerConfig {
             auth_token: None,
             data_dir: None,
             summary_lang: Lang::Ja,
+            backup_keep: DEFAULT_BACKUP_KEEP,
         }
     }
 }
@@ -90,6 +102,9 @@ pub struct UpdateConfig {
     pub auto: bool,
     /// Release channel; only `stable` (tags without `-`) exists in M2.5.
     pub channel: String,
+    /// Honour `KIOKU_DOWNLOAD_BASE` / `KIOKU_REPO` (a release mirror or fork; SPEC-M2.7 §11).
+    /// Off by default: an environment variable alone cannot redirect updates.
+    pub allow_mirror: bool,
 }
 
 impl Default for UpdateConfig {
@@ -97,6 +112,7 @@ impl Default for UpdateConfig {
         UpdateConfig {
             auto: true,
             channel: "stable".to_string(),
+            allow_mirror: false,
         }
     }
 }
@@ -282,6 +298,110 @@ impl Config {
     }
 }
 
+/// `text` (a config.toml) with the `auth_token` of `[server]` and, when given, of `[client]`
+/// replaced; every other byte (comments, order, line endings) is kept (SPEC-M2.7 §12). A
+/// section without an `auth_token` line gets one right after its header; a missing
+/// `[client]` section is appended.
+pub fn replace_auth_tokens(text: &str, server: &str, client: Option<&str>) -> String {
+    fn header(line: &str) -> Option<String> {
+        let t = line.trim();
+        (t.starts_with('[') && !t.starts_with("[[")).then(|| {
+            t.trim_start_matches('[')
+                .split(']')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        })
+    }
+    fn is_token_line(line: &str) -> bool {
+        line.trim()
+            .strip_prefix("auth_token")
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    }
+    fn eol_of(line: &str) -> &'static str {
+        if line.ends_with("\r\n") { "\r\n" } else { "\n" }
+    }
+    let token_line = |indent: &str, token: &str, eol: &str| {
+        format!(
+            "{indent}auth_token = {}{eol}",
+            toml::Value::String(token.to_string())
+        )
+    };
+    let want = |section: &str| match section {
+        "server" => Some(server),
+        "client" => client,
+        _ => None,
+    };
+    // Sections that already have an `auth_token` line.
+    let mut has_line: Vec<String> = Vec::new();
+    let mut section = String::new();
+    for line in text.split_inclusive('\n') {
+        if let Some(name) = header(line) {
+            section = name;
+        } else if is_token_line(line) {
+            has_line.push(section.clone());
+        }
+    }
+    let mut out = String::with_capacity(text.len() + 64);
+    let mut done: Vec<String> = Vec::new();
+    section.clear();
+    for line in text.split_inclusive('\n') {
+        if let Some(name) = header(line) {
+            section = name;
+            out.push_str(line);
+            if let Some(token) = want(&section)
+                && !has_line.contains(&section)
+                && !done.contains(&section)
+            {
+                if !line.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str(&token_line("", token, eol_of(line)));
+                done.push(section.clone());
+            }
+            continue;
+        }
+        if is_token_line(line)
+            && let Some(token) = want(&section)
+            && !done.contains(&section)
+        {
+            let indent = &line[..line.len() - line.trim_start().len()];
+            let eol = if line.ends_with('\n') {
+                eol_of(line)
+            } else {
+                ""
+            };
+            out.push_str(&token_line(indent, token, eol));
+            done.push(section.clone());
+            continue;
+        }
+        out.push_str(line);
+    }
+    if let Some(token) = client
+        && !done.iter().any(|s| s == "client")
+    {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&format!("\n[client]\n{}", token_line("", token, "\n")));
+    }
+    out
+}
+
+impl Config {
+    /// Writes new auth tokens into `config_file` by editing only the `auth_token` lines
+    /// ([`replace_auth_tokens`]); the rest of the file stays byte-identical.
+    pub fn save_auth_tokens(&self, server: &str, client: Option<&str>) -> Result<()> {
+        let text = std::fs::read_to_string(&self.config_file)
+            .with_context(|| format!("reading {}", self.config_file.display()))?;
+        write_file(
+            &self.config_file,
+            &replace_auth_tokens(&text, server, client),
+        )
+    }
+}
+
 fn has_server_section(path: &Path) -> bool {
     std::fs::read_to_string(path)
         .map(|t| t.lines().any(|l| l.trim() == "[server]"))
@@ -418,6 +538,39 @@ mod tests {
         let d = dir.path().to_str().unwrap();
         let c = Config::load_with_env(&env(&[("KIOKU_DATA_DIR", d)])).unwrap();
         assert_eq!(c.data_dir, dir.path());
+    }
+
+    /// SPEC-M2.7 §12: rotating the token keeps comments and everything else byte-identical.
+    #[test]
+    fn replacing_auth_tokens_keeps_the_rest_of_the_file() {
+        let text = "# kioku の設定（手で書いたコメント）\n[server]\nbind = \"0.0.0.0\"   # LAN\nauth_token = \"old\"\n\n[client]\n  auth_token=\"old\"\nserver_url = \"http://127.0.0.1:7391\"\n\n[update]\nauto = false # 手動\n";
+        let out = replace_auth_tokens(text, "new-s", Some("new-c"));
+        assert_eq!(
+            out,
+            text.replace("auth_token = \"old\"", "auth_token = \"new-s\"")
+                .replace("  auth_token=\"old\"", "  auth_token = \"new-c\"")
+        );
+        // Without the client: only [server] changes.
+        let out = replace_auth_tokens(text, "new-s", None);
+        assert!(out.contains("  auth_token=\"old\"\n"));
+        // CRLF files stay CRLF; a section without the line gets it after its header; a
+        // missing [client] is appended.
+        let crlf = "[server]\r\nport = 7391\r\n# auth_token = \"commented\"\r\n";
+        let out = replace_auth_tokens(crlf, "t", Some("c"));
+        assert_eq!(
+            out,
+            "[server]\r\nauth_token = \"t\"\r\nport = 7391\r\n# auth_token = \"commented\"\r\n\n[client]\nauth_token = \"c\"\n"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = Config::for_data_dir(dir.path());
+        std::fs::write(&c.config_file, text).unwrap();
+        c.save_auth_tokens("x", Some("x")).unwrap();
+        c = Config::load_file(&c.config_file).unwrap();
+        assert_eq!(c.server.auth_token.as_deref(), Some("x"));
+        assert_eq!(c.client.auth_token.as_deref(), Some("x"));
+        assert!(!c.update.auto);
+        let saved = std::fs::read_to_string(&c.config_file).unwrap();
+        assert!(saved.starts_with("# kioku の設定（手で書いたコメント）\n"));
     }
 
     #[test]

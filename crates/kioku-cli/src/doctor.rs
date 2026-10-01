@@ -596,6 +596,14 @@ fn lan_check(cfg: &Config, env: &DoctorEnv) -> Option<Check> {
 fn server_check(cfg: &Config, health: &Health, server_machine: bool) -> Check {
     let url = &cfg.client.server_url;
     match health {
+        // The version is only told with a valid token (SPEC-M2.7 §11); the token check
+        // reports a refused one.
+        Health::Kioku { version } if version.is_empty() => check(
+            "server",
+            Status::Ok,
+            format!("{url} is reachable"),
+            None,
+        ),
         Health::Kioku { version } if version == VERSION => check(
             "server",
             Status::Ok,

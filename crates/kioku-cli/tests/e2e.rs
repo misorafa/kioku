@@ -72,6 +72,15 @@ fn project_dir() -> tempfile::TempDir {
     dir
 }
 
+/// Start of every `<kioku>` block: the untrusted-memory note (SPEC-M2.7 §3), then the
+/// project line.
+fn block_head() -> String {
+    format!(
+        "<kioku>\n{}project: e2e (id: e2e-proj)",
+        kioku_core::strings::memory_note()
+    )
+}
+
 fn hook(cfg: &Config, event: HookEventKind, payload: Value) -> HookOutcome {
     run_hook(event, Agent::ClaudeCode, &payload.to_string(), cfg)
 }
@@ -169,12 +178,7 @@ fn full_session_lifecycle_with_nudge_and_handoff() {
         ),
     );
     assert_eq!(out.exit_code, 0);
-    assert!(
-        out.stdout
-            .starts_with("<kioku>\nproject: e2e (id: e2e-proj)"),
-        "{}",
-        out.stdout
-    );
+    assert!(out.stdout.starts_with(&block_head()), "{}", out.stdout);
     assert!(out.stdout.contains(&format!("server: {}", server.base)));
     assert!(
         out.stdout.contains("\nsession: e2e-session-1  ←"),
@@ -369,12 +373,7 @@ fn stop_without_nudge_finalizes_and_failures_are_logged() {
         ),
     );
     assert_eq!(out.exit_code, 0);
-    assert!(
-        out.stdout
-            .starts_with("<kioku>\nproject: e2e (id: e2e-proj)"),
-        "{}",
-        out.stdout
-    );
+    assert!(out.stdout.starts_with(&block_head()), "{}", out.stdout);
     assert!(
         out.stdout.contains("## 前回からの引き継ぎ"),
         "{}",
@@ -606,10 +605,7 @@ fn agent_lifecycle(agent: Agent) {
         &p("session_start", json!({})),
     );
     let block = context_of(agent, &out).expect("session start context");
-    assert!(
-        block.starts_with("<kioku>\nproject: e2e (id: e2e-proj)"),
-        "{block}"
-    );
+    assert!(block.starts_with(&block_head()), "{block}");
     assert!(block.contains(&format!("session: {sid}  ←")), "{block}");
     assert!(!block.contains("## 前回からの引き継ぎ"));
 
@@ -635,10 +631,7 @@ fn agent_lifecycle(agent: Agent) {
             // Cursor late context: the block again, via postToolUse additional_context — on
             // the first native postToolUse (the afterFileEdit before it cannot carry it)
             let late = context_of(agent, &out).expect("cursor late context");
-            assert!(
-                late.starts_with("<kioku>\nproject: e2e (id: e2e-proj)"),
-                "{late}"
-            );
+            assert!(late.starts_with(&block_head()), "{late}");
             assert!(late.contains(&format!("session: {sid}  ←")));
         } else {
             assert_silent(agent, HookEventKind::PostToolUse, &out);
@@ -825,10 +818,7 @@ fn antigravity_lifecycle() {
                "content": "<USER_REQUEST>\n引き継ぎを読んで続きをやって\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-09-27T19:52:14+09:00.\n</ADDITIONAL_METADATA>"}),
     );
     let block = context_of(a, &invoke(0)).expect("late context on the first model call");
-    assert!(
-        block.starts_with("<kioku>\nproject: e2e (id: e2e-proj)"),
-        "{block}"
-    );
+    assert!(block.starts_with(&block_head()), "{block}");
     assert!(block.contains(&format!("session: {sid}  ←")), "{block}");
     // 3. Tool rounds: later model calls are silent, record no prompt again, count a round each.
     transcript_step(
@@ -947,10 +937,7 @@ fn implicit_session_start_per_agent() {
             &fixture_payload(agent, prompt, &sid, cwd),
         );
         let block = context_of(agent, &out).expect("implicit start block");
-        assert!(
-            block.starts_with("<kioku>\nproject: e2e (id: e2e-proj)"),
-            "{block}"
-        );
+        assert!(block.starts_with(&block_head()), "{block}");
         let info = api_get(&server.base, &format!("sessions/{sid}"));
         assert_eq!(
             info["counts"]["prompts"], 1,

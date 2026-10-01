@@ -15,7 +15,7 @@ use axum::{
     routing::{get, post, put},
 };
 use kioku_core::{
-    Error, HandoffInput, NewObservation, SessionStartRequest, Store, VERSION, WritePageRequest,
+    Error, HandoffInput, NewObservation, SessionStartRequest, Store, WritePageRequest,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -117,9 +117,11 @@ pub fn public_routes() -> Router {
     Router::new().route("/api/v1/health", get(health))
 }
 
-/// `GET /api/v1/health` → `{ok, version}`.
+/// `GET /api/v1/health` → `{ok, observation_dedup}`. No version: an unauthenticated
+/// caller learns nothing about which release runs here (SPEC-M2.7 §11); it is in
+/// `/status` and the SessionStart response.
 async fn health() -> Json<Value> {
-    Json(json!({ "ok": true, "version": VERSION, "observation_dedup": true }))
+    Json(json!({ "ok": true, "observation_dedup": true }))
 }
 
 /// `POST /api/v1/sessions/start` (+ `server_version`, SPEC-M2.5 §3.2: clients follow it).

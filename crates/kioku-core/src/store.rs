@@ -130,6 +130,12 @@ pub struct MergeReport {
     pub pages: Vec<(String, String)>,
 }
 
+/// File in the data directory locked by the process that has it open (SPEC-M2.7 §6).
+pub const LOCK_FILE: &str = "kioku.lock";
+
+/// `reliability_meta` key set when a page reached disk and SQLite but not the index.
+const NEEDS_REINDEX: &str = "needs_reindex";
+
 /// The kioku store. `Send + Sync`; share it as `Arc<Store>`.
 pub struct Store {
     config: Config,
@@ -138,13 +144,82 @@ pub struct Store {
     index: SearchIndex,
     git: Git,
     write_lock: Mutex<()>,
+    /// Held (OS file lock) for the store's lifetime: one process per data directory.
+    _lock: std::fs::File,
+}
+
+/// Retries of a held `kioku.lock` before giving up ([`LOCK_RETRY_DELAY`] apart).
+const LOCK_RETRIES: u32 = 20;
+/// Delay between [`LOCK_RETRIES`].
+const LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Another process holds the data directory's `kioku.lock` (SPEC-M2.7 §6).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("another kioku is using {dir}{pid}; stop it first (kioku service stop)")]
+pub struct DataDirLocked {
+    /// The data directory.
+    pub dir: String,
+    /// ` (pid N)` when the lock file could be read, else empty.
+    pub pid: String,
+}
+
+/// Takes `<data_dir>/kioku.lock` without waiting and writes this pid into it; fails when
+/// another process holds it. The file is never deleted (deleting a lock file races).
+fn lock_data_dir(root: &Path) -> anyhow::Result<std::fs::File> {
+    let path = root.join(LOCK_FILE);
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    // A short grace period: a process that is just exiting (a service restart), or a child
+    // forked by another thread that has not reached exec yet, still holds the lock briefly.
+    let mut attempt = 0;
+    let locked = loop {
+        match file.try_lock() {
+            Err(std::fs::TryLockError::WouldBlock) if attempt < LOCK_RETRIES => {
+                attempt += 1;
+                std::thread::sleep(LOCK_RETRY_DELAY);
+            }
+            other => break other,
+        }
+    };
+    match locked {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            let pid = std::fs::read_to_string(&path)
+                .ok()
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()))
+                .map(|p| format!(" (pid {p})"))
+                .unwrap_or_default();
+            return Err(DataDirLocked {
+                dir: root.display().to_string(),
+                pid,
+            }
+            .into());
+        }
+        Err(std::fs::TryLockError::Error(e)) => {
+            return Err(e).with_context(|| format!("locking {}", path.display()));
+        }
+    }
+    // Best effort: the pid only makes the error message above more helpful.
+    let _ = file.set_len(0);
+    let _ = write!(file, "{}", std::process::id());
+    let _ = file.flush();
+    Ok(file)
 }
 
 impl Store {
     /// Opens the store for `config.data_dir`, creating the layout, schema and index as needed.
+    /// Fails when another process has the directory open (`kioku.lock`) or when its database
+    /// was written by a newer kioku ([`crate::NewerSchema`]).
     pub fn open(config: Config) -> Result<Store> {
         let dirs = DataDir::new(&config.data_dir);
         dirs.ensure()?;
+        let lock = lock_data_dir(&dirs.root())?;
         let git = Git::open(&dirs.wiki());
         let conn = db::open(&dirs.db_file())?;
         let (index, fresh) = SearchIndex::open(&dirs.index_dir())?;
@@ -155,7 +230,16 @@ impl Store {
             index,
             git,
             write_lock: Mutex::new(()),
+            _lock: lock,
         };
+        if !fresh && store.needs_reindex()? {
+            // A page reached disk but not the index last time (SPEC-M2.7 §6): self-heal.
+            let n = store.reindex()?;
+            tracing::warn!(
+                pages = n,
+                "rebuilt the search index after an earlier index failure"
+            );
+        }
         if fresh {
             if list_wiki_pages(&store.dirs.wiki())?.is_empty() {
                 store.write_index_version()?;
@@ -193,6 +277,21 @@ impl Store {
     /// True when the index predates [`INDEX_SCHEMA_VERSION`] and needs `kioku reindex`.
     pub fn index_outdated(&self) -> bool {
         self.index_version() < INDEX_SCHEMA_VERSION
+    }
+
+    /// True when a page write left the index behind (`reliability_meta.needs_reindex`).
+    fn needs_reindex(&self) -> Result<bool> {
+        let v: Option<String> = self
+            .db
+            .lock()
+            .query_row(
+                "SELECT value FROM reliability_meta WHERE key=?1",
+                [NEEDS_REINDEX],
+                |r| r.get(0),
+            )
+            .optional()
+            .context("reading needs_reindex")?;
+        Ok(v.as_deref() == Some("1"))
     }
 
     fn write_index_version(&self) -> Result<()> {
@@ -639,10 +738,20 @@ impl Store {
 
     /// Records an agent-written handoff (spec §7.5); when `session` is omitted it attaches to
     /// the open session of the project with the newest observation.
+    /// Every text field is redacted like an observation before it is stored (SPEC-M2.7 §9).
     pub fn write_handoff(&self, input: &HandoffInput) -> Result<Handoff> {
         if input.summary.trim().is_empty() {
             return Err(Error::invalid("summary must not be empty"));
         }
+        let redact_all = |v: &[String]| v.iter().map(|s| redact(s)).collect::<Vec<_>>();
+        let input = &HandoffInput {
+            project: input.project.clone(),
+            session: input.session.clone(),
+            summary: redact(&input.summary),
+            next_steps: redact_all(&input.next_steps),
+            open_questions: redact_all(&input.open_questions),
+            decisions: redact_all(&input.decisions),
+        };
         let conn = self.db.lock();
         let project_id = resolve_id(&conn, &input.project)?;
         db::get_project(&conn, &project_id)?
@@ -756,9 +865,12 @@ impl Store {
 
     // ---------------------------------------------------------------- pages
 
-    /// Writes a page (spec §6.1 path rules); returns its wiki-relative path.
+    /// Writes a page (spec §6.1 path rules); returns its wiki-relative path. Title and body
+    /// are redacted like observations before anything is written (SPEC-M2.7 §9).
     pub fn write_page(&self, req: &WritePageRequest) -> Result<String> {
-        let title = req.title.trim();
+        let title = redact(req.title.trim());
+        let title = title.as_str();
+        let content = redact(&req.content);
         if title.is_empty() {
             return Err(Error::invalid("title must not be empty"));
         }
@@ -822,7 +934,7 @@ impl Store {
                 )));
             }
         }
-        self.put_page(&path, fm, &req.content)?;
+        self.put_page(&path, fm, &content)?;
         Ok(path)
     }
 
@@ -940,6 +1052,10 @@ impl Store {
         }
         self.index.upsert_many(&docs, true)?;
         self.write_index_version()?;
+        self.db
+            .lock()
+            .execute("DELETE FROM reliability_meta WHERE key=?1", [NEEDS_REINDEX])
+            .context("recording needs_reindex")?;
         Ok(docs.len())
     }
 
@@ -1096,7 +1212,21 @@ impl Store {
         write_atomic(&file, &text)?;
         let (row, doc) = page_records(&page, &text);
         db::upsert_page(&self.db.lock(), &row)?;
-        self.index.upsert(&doc)?;
+        if let Err(e) = self.index.upsert(&doc) {
+            // The file and its row are written; the next start rebuilds the index.
+            tracing::warn!(
+                %path,
+                error = format!("{e:#}"),
+                "indexing failed; the index is rebuilt at the next start"
+            );
+            self.db
+                .lock()
+                .execute(
+                    "INSERT OR REPLACE INTO reliability_meta VALUES (?1, '1')",
+                    [NEEDS_REINDEX],
+                )
+                .context("recording needs_reindex")?;
+        }
         self.git.commit(
             &[path.to_string()],
             &format!("kioku: {} {path}", page.frontmatter.kind.as_str()),
@@ -2849,4 +2979,59 @@ mod tests {
         let log = String::from_utf8_lossy(&out.stdout);
         assert_eq!(log.trim(), "kioku kioku: page _global/tips.md");
     }
+
+    /// SPEC-M2.7 §9: pages and handoffs are redacted before they reach disk, SQLite, the
+    /// index or git.
+    #[test]
+    fn pages_and_handoffs_are_redacted_before_storing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path());
+        let token = format!("ghp_{}", "a1B2".repeat(9));
+        let path = store
+            .write_page(&WritePageRequest {
+                title: "環境変数のメモ".into(),
+                content: format!("CI では GITHUB_TOKEN={token} を使う\n秘密鍵: {token}\n"),
+                ..WritePageRequest::default()
+            })
+            .unwrap();
+        let file = std::fs::read_to_string(tmp.path().join("wiki").join(&path)).unwrap();
+        assert!(!file.contains(&token), "{file}");
+        assert!(file.contains("GITHUB_TOKEN=[REDACTED]"), "{file}");
+        let page = store.read_page(&path).unwrap();
+        assert!(!page.body.contains(&token));
+        // The search index has the redacted text too (Japanese query).
+        let hits = store.search("環境変数", &SearchScope::All, 3).unwrap();
+        assert_eq!(hits[0].path, path);
+        assert!(!hits[0].snippet.contains(&token));
+
+        start(&store, "s-redact");
+        let h = store
+            .write_handoff(&HandoffInput {
+                project: project().id,
+                session: Some("s-redact".into()),
+                summary: format!("token は {token}"),
+                next_steps: vec![format!("export NPM_TOKEN=npm_{}", "x1Y2z3".repeat(6))],
+                open_questions: vec!["DB_PASS=hunter2 を変える？".into()],
+                decisions: vec![format!("Cookie: sid={token}")],
+            })
+            .unwrap();
+        assert!(!h.content_md.contains(&token), "{}", h.content_md);
+        assert!(!h.content_md.contains("hunter2"), "{}", h.content_md);
+        assert!(!h.content_md.contains("x1Y2z3x1Y2z3"), "{}", h.content_md);
+        assert!(h.content_md.contains(REDACTED_MARK));
+
+        if crate::git::git_available() {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(tmp.path().join("wiki"))
+                .args(["log", "-p", "--all"])
+                .output()
+                .unwrap();
+            let log = String::from_utf8_lossy(&out.stdout);
+            assert!(log.contains("GITHUB_TOKEN=[REDACTED]"), "{log}");
+            assert!(!log.contains(&token), "{log}");
+        }
+    }
+
+    const REDACTED_MARK: &str = crate::sanitize::REDACTED;
 }
