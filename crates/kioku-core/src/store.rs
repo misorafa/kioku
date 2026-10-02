@@ -11,6 +11,7 @@ mod finalize_tests;
 #[cfg(test)]
 mod handoff_tests;
 mod maintenance;
+mod metrics;
 mod reliability;
 #[cfg(test)]
 mod search_tests;
@@ -18,6 +19,7 @@ pub use maintenance::{
     ForgetReport, PruneCount, PruneReport, StorageReport, SweepReport, dir_bytes,
     purge_history_commands,
 };
+pub use metrics::MetricsSnapshot;
 pub use reliability::{
     BACKUP_FORMAT, BackupManifest, ReliabilityReport, WIKI_BUNDLE, restore_backup,
 };

@@ -28,6 +28,8 @@ tests. Users should never have to think about updates.
 
 ## 2. Configuration
 
+> Amended by SPEC-M2.7 §11 (`allow_mirror`) and v0.8.2 / v0.9.1 (`interval_hours`, default 1; see §3.1).
+
 New table in `config.toml` (both roles read it):
 
 ```toml
@@ -72,6 +74,8 @@ A task inside `kioku serve` (tokio interval, runs the blocking work in `spawn_bl
    interval; the running server is never affected.
 
 ### 3.2 Server version in responses
+
+> Amended by SPEC-M2.7 §11: `/health` no longer has `version`; it is in `/status` and the SessionStart answer.
 
 - `POST /api/v1/sessions/start` response gains `server_version` (additive; older clients
   ignore it). `GET /api/v1/health` already has `version`.

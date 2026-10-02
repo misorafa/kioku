@@ -2,9 +2,9 @@
 
 [日本語](README.ja.md) | English
 
-**Status: under active development (v0.x, M2.1).** It works day to day on the
-author's machines, but expect rough edges, and config formats and APIs may still
-change between minor versions.
+**Status: v0.9 — in daily use on the author's machines; M2.1–M3.1 shipped, M3.2 in
+progress (see [Roadmap](#roadmap) and [CHANGELOG.md](CHANGELOG.md)).** Expect rough
+edges; config formats and APIs may still change between minor versions.
 
 kioku is a self-hosted memory server shared by all your AI coding agents on all
 your machines. It is a single Rust binary. Everything it remembers is plain
@@ -13,8 +13,34 @@ tantivy index makes it searchable, with Japanese segmented properly by lindera
 (IPADIC) — Japanese is the primary language, English works too. Agents reach it
 through MCP (streamable HTTP) and lifecycle hooks: sessions are captured
 automatically, and the next session — in another agent or on another machine —
-starts with the previous session's handoff. By default it makes zero LLM calls:
-summaries and handoffs are built by rules.
+starts with the previous session's handoff. It makes no LLM calls: summaries
+and handoffs are built by rules.
+
+## What it does in 30 seconds
+
+```
+1. capture    hooks in Claude Code / Codex / Cursor / Antigravity send each prompt,
+              tool use and the agent's last reply (secrets redacted) to your kioku server
+2. summarize  the server turns them — by rules, no LLM calls — into a session page,
+              STATE.md and a handoff (summary / next steps / open questions / decisions),
+              Markdown in git, searchable in Japanese and English
+3. inject     the next session — any agent, any of your machines — starts with a <kioku>
+              block: the handoff, carried decisions, pinned pages, recent sessions;
+              agents search and write memory through MCP tools (kioku_query, …)
+```
+
+Install on the machine that will be the server (macOS / Linux, no sudo):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh
+```
+
+Add every other machine: run `kioku invite` on the server and paste the one line it
+prints on the new machine (valid 10 minutes, once):
+
+```sh
+KIOKU_JOIN='192.168.1.240:7391/K7Q2M9XD' sh -c "$(curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh)"
+```
 
 ## The problem
 
@@ -405,6 +431,32 @@ existing binary, the MCP entry (the stdio bridge's binary, or for the URL form i
 agent-specific switches, and the instruction snippet. Also flags recent hook
 errors in `hook.log` and an enabled payload dump. Exit 1 if any check fails.
 
+**Is it working?** For every agent whose hooks are installed, `hooks.liveness.<agent>`
+shows its last *successful* hook (from `~/.kioku/state/last-hook.json`, written by each
+hook). It warns only when an agent that is actually present on this machine (its binary
+or app) has had no successful hook for 7 days. `kioku status --agents` prints the same
+lines.
+
+**`kioku doctor --fix`** applies the safe fixes doctor proposes and prints what it did:
+`chmod 600` / `700` of `config.toml` and the data dir, re-registering missing hooks or MCP
+entries (`kioku install <agent>`), `kioku service install` when the definition is missing
+or predates automatic updates, `kioku reindex` when the index is outdated or
+inconsistent, and turning off an expired hook dump. It never rotates the token, never
+changes `[server] bind`, and never writes the Claude desktop app's config while the app
+runs (it tells you to quit it first). Running it twice changes nothing the second time;
+it exits 0 when every proposed fix was applied.
+
+**A client that alone cannot reach the server.** If every `kioku` request from one Mac
+fails with `No route to host (os error 65)` while `curl`, `ping` or `nc` reach the
+server, the cause is macOS's per-app *Local Network* permission (or a Little Snitch
+rule), not the server: the permission belongs to the app that launched kioku (terminal,
+IDE, agent app). `kioku doctor` probes the server with the system `/usr/bin/nc`, names
+that app, and says what to do: allow it in System Settings › Privacy & Security › Local
+Network; if it already looks allowed, turn it off and on again and relaunch the app (this
+happens after an app update — doctor also says so when the app's processes are older
+than its last update). With Little Snitch, allow the kioku binary itself. Hooks keep
+failing open meanwhile, and queued observations are sent once it can connect.
+
 ## `kioku service`
 
 ```sh
@@ -439,6 +491,29 @@ two `sudo` commands that install it (`sudo install … /Library/LaunchDaemons/�
 `sudo launchctl bootstrap system …`). kioku never runs `sudo` itself. Remove the
 LaunchAgent first (`kioku service uninstall`) if one is installed; `kioku service
 start|stop` manage the LaunchAgent only.
+
+## Monitoring
+
+```sh
+kioku status                # counts, sizes, update state
+kioku status --watch 5      # redraw every 5 s: sessions open, last observation, outbox, update, sizes
+kioku status --agents       # each installed agent's last successful hook (no server needed)
+```
+
+`GET /api/v1/metrics` (bearer token, like every API route) serves Prometheus text:
+gauges `kioku_sessions_open`, `kioku_sessions_total`, `kioku_observations_total`,
+`kioku_handoffs_pending`, `kioku_index_docs`, `kioku_outbox_queued` (always 0 on the
+server), `kioku_{db,raw,wiki,backups}_bytes`, `kioku_last_backup_age_seconds`,
+`kioku_last_prune_age_seconds`, `kioku_last_observation_age_seconds`,
+`kioku_update_last_check_age_seconds` (`-1` = never) and `kioku_version_info{version}`;
+counters since start `kioku_http_requests_total{route,status}`,
+`kioku_http_request_seconds_sum/count{route}`, `kioku_mcp_tool_calls_total{tool,ok}`
+and `kioku_git_commit_failures_total`. Scrape it with the token as a bearer credential
+(Prometheus `authorization: {credentials_file: …}`).
+
+A request log — one line per request, `method route status ms`, never headers or the
+token — goes to `serve.log` with `[server] request_log = true` (or
+`RUST_LOG=kioku_http=info`); it is off by default.
 
 ## Agents
 
@@ -482,6 +557,18 @@ uninstall <agent>` removes exactly what kioku added. Common to all:
 kioku does not run `claude mcp add`, so the token never appears on a command
 line.
 
+### Claude desktop app (chat and Cowork)
+
+The Code tab of the Claude desktop app uses Claude Code's files above. The app's chat and
+Cowork read local MCP servers only from `claude_desktop_config.json`, so `kioku install
+claude-code` (and `setup`) also adds `mcpServers.kioku` = the `kioku mcp` bridge there —
+on macOS `~/Library/Application Support/Claude/`, on Windows `%APPDATA%\Claude\` or the
+Microsoft Store build's package folder — only when that `Claude` folder exists; other keys
+are kept. **The app rewrites this file from memory while it runs** and drops an entry
+added meanwhile: quit the app completely (also from the menu bar / tray), run the install
+(or `kioku doctor --fix`) again, then start it. `kioku doctor` checks it as
+`agent.claude-code.desktop`.
+
 ### Codex CLI
 
 | what | where |
@@ -518,7 +605,7 @@ always delivered, kioku also adds its context on the first tool use of each
 session (`postToolUse`; file edits and failed tools cannot carry it;
 `[client] cursor_late_context = false` turns that off).
 
-### Gemini CLI
+### Gemini CLI (legacy)
 
 Google retired Gemini CLI for personal accounts on 2026-06-18 (it still serves
 Code Assist Standard/Enterprise and paid API keys); its successor is
@@ -655,8 +742,8 @@ the container speaks plain HTTP.
 | tool | input | what it does |
 |------|-------|--------------|
 | `kioku_query` | `query`, `project?`, `scope?` (`project`/`global`/`all`), `limit?` (default 8), `since?` (`YYYY-MM-DD`), `kinds?` (`page`/`session`/`state`), `path_prefix?` | full-text search (Japanese and English; see [Search](#search)); `project` narrows to that project plus global pages; each hit reads `1. <path> — <title> (session, 2026-09-28, @mini)`; with `path_prefix` it lists the sessions that edited files under that path |
-| `kioku_read` | `path` | reads a page by its wiki-relative path (as shown in query results) |
-| `kioku_write_page` | `title`, `content`, `project?`, `scope?` (`project`/`global`), `tags?`, `path?` | saves a searchable Markdown page; the same title/path replaces it; tag it `pinned` to show it in every SessionStart block of the project (or of every project, for a global page) |
+| `kioku_read` | `path` | reads a page by its wiki-relative path (as shown in query results), with its `revision` |
+| `kioku_write_page` | `title`, `content`, `project?`, `scope?` (`project`/`global`), `tags?`, `path?`, `expected_revision?` | saves a searchable Markdown page; the same title/path replaces it — with `expected_revision` (the `revision` from `kioku_read`) only if nobody changed it since (else a conflict error); tag it `pinned` to show it in every SessionStart block of the project (or of every project, for a global page) |
 | `kioku_handoff_write` | `project`, `session?` (from the SessionStart block), `summary`, `next_steps`, `open_questions`, `decisions`, `verified?`, `gotchas?` | records the handoff the next session of the project receives; decisions, verified facts (確認済みの事実), open questions and gotchas (落とし穴・注意点) are also carried into later sessions |
 | `kioku_handoff_pending` | `project`, `accept?` (default false), `session?`, `lane?`, `history?` (≤ 20) | peeks at (or consumes) the pending handoff of the main line, or of a session's / named branch lane; `history` adds the lane's last handoffs with their status |
 | `kioku_status` | — | counts, data dir and known project ids |
@@ -709,8 +796,23 @@ write a handoff before stopping.
   index/tantivy-v3/             # derived; `kioku reindex` rebuilds it from wiki/
   index/schema-version          # index format; an older one is rebuilt by the server at start
   backups/<id>/                 # `kioku backup` snapshots (the newest [retention] backups_keep)
+  outbox/<server>/              # observations waiting to be resent (`kioku sync`); failed/ = refused
+  state/                        # small client/server state files:
+    last-hook.json              #   each agent's last hook and last success (doctor, status --agents)
+    projects.json               #   project identity cache of the SessionStart hook
+    server-addrs.json           #   last-good server addresses
+    auto-update.json            #   automatic update / rollback bookkeeping
+    hook-dump-enabled-at        #   start of the 24 h payload capture window
+    nudge-<session>, cursor-ctx/, antigravity/   # Stop nudge throttle, late-context markers
+  captures/<date>/              # `kioku hook-dump extract` output
+  logs/serve.log                # server log (service; rotated at 10 MiB)
+  logs/update.log               # background update results
   logs/hook.log                 # client-side hook failures
+  kioku.lock                    # held by the process that has the data dir open
 ```
+
+On a client-only machine `~/.kioku` holds just `config.toml`, `outbox/`, `state/`,
+`captures/` and `logs/`.
 
 Pages are Markdown with YAML frontmatter; you can read and edit them with any
 editor (run `kioku reindex` afterwards so search sees the change). kioku commits but never pushes.
@@ -740,6 +842,7 @@ port = 7391
 auth_token = "…"        # generated by `kioku init`; serve refuses to start without one
 # data_dir = "~/.kioku" # optional override of the data location
 summary_lang = "ja"     # ja | en — session pages, STATE.md, generated handoffs
+# request_log = true    # one `method route status ms` line per request in serve.log
 
 [client]                # used by `kioku hook`, `search`, `status`, `reindex`, `install`
 server_url = "http://127.0.0.1:7391"
@@ -775,7 +878,7 @@ Environment variables (env beats the file):
 | `KIOKU_STOP_NUDGE` | `0` / `false` / `off` / `no` disables the Stop nudge |
 | `KIOKU_MACHINE` | the machine name sent at session start (default: the host name up to its first dot, ≤ 64 chars); shown as `@machine` in recent sessions, session pages and handoff headings |
 | `KIOKU_AUTO_UPDATE` | `[update] auto` (`0` turns automatic updates off) |
-| `RUST_LOG` | server log filter (default `info,tantivy=warn`) |
+| `RUST_LOG` | server log filter (default `info,tantivy=warn`, plus `kioku_http=off` unless `request_log = true`) |
 
 `kioku serve --bind <addr> --port <port>` overrides both.
 
@@ -928,14 +1031,27 @@ self-hosted server shared by every machine. On the roadmap: whole-life ingest
 
 ## Roadmap
 
-- **M1**: server, Markdown/git store, Japanese search, MCP tools, Claude Code
-  hooks and handoffs, rule-based summaries.
-- **M2** (this release): Codex CLI, Cursor and Gemini CLI; `install.sh`,
-  `kioku setup` / `doctor` / `service` / `update`.
-- **Later**: web UI.
-- **M3**: embeddings + bi-temporal facts.
-- **M4**: ingest adapters.
-- **M5**: eval harness (Japanese retrieval and failure regression baseline delivered early in M2.6).
+Shipped (details in [CHANGELOG.md](CHANGELOG.md), specs in [docs/INDEX.md](docs/INDEX.md)):
+
+- **M1 / M2**: server, Markdown/git store, Japanese search, MCP tools, rule-based
+  summaries; Claude Code, Codex CLI, Cursor and Gemini CLI; `install.sh`, `kioku setup` /
+  `doctor` / `service` / `update`.
+- **M2.1** (v0.3.0) Antigravity CLI · **M2.2** (v0.5.0) Windows client · **M2.3** (v0.6.0)
+  `kioku invite` / `join` · **M2.4** (v0.6.4) handoff lanes per branch, project aliases ·
+  **M2.5** (v0.7.0) automatic updates · **M2.6** (v0.8.0) backup / restore, offline queue ·
+  **M2.7** (v0.8.1) hardening · **M2.8** (v0.8.2) per-turn cost, retention · **M3.0**
+  (v0.9.0) richer session-start block · **M3.1** (v0.9.1) handoff consumption rules,
+  better search.
+
+Planned:
+
+- **M3.2** (in progress): metrics endpoint and request log, `status --watch` / `--agents`,
+  hook liveness, `doctor --fix`, Local Network diagnosis, one document index.
+- **M3.3**: Homebrew tap, Docker image, `kioku uninstall`, fixture freshness checks.
+
+Ideas for M4 and later (not committed): web UI, embeddings and bi-temporal facts, optional
+LLM consolidation, ingest adapters (mail, calendar), an evaluation harness beyond the
+Japanese retrieval baseline.
 
 ## Reliable memory and recovery (M2.6)
 

@@ -470,7 +470,7 @@ pub fn spawn_detached(args: &[&str]) -> anyhow::Result<()> {
 }
 
 /// Appends `line` (timestamped) to `<kioku dir>/logs/update.log`.
-fn log_update(root: Option<&Path>, line: &str) {
+pub fn log_update(root: Option<&Path>, line: &str) {
     if let Some(root) = root {
         let path = root.join("logs").join(UPDATE_LOG);
         let _ = append_line(

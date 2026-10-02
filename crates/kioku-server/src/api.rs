@@ -21,6 +21,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::mcp::QueryRequest;
+use crate::metrics::{Metrics, RenderInput};
 use crate::shared::{DEFAULT_HTTP_LIMIT, blocking, clamp_limit, resolve_scope, with_project_hint};
 use crate::update::SharedUpdateStatus;
 
@@ -92,7 +93,11 @@ fn to_json<T: serde::Serialize>(value: T) -> ApiResult {
 }
 
 /// Routes that require the bearer token (everything except health).
-pub fn protected_routes(store: Arc<Store>, update: SharedUpdateStatus) -> Router {
+pub fn protected_routes(
+    store: Arc<Store>,
+    update: SharedUpdateStatus,
+    metrics: Arc<Metrics>,
+) -> Router {
     Router::new()
         .route("/api/v1/sessions/start", post(start_session))
         .route("/api/v1/sessions/{id}", get(session_info))
@@ -111,7 +116,9 @@ pub fn protected_routes(store: Arc<Store>, update: SharedUpdateStatus) -> Router
         .route("/api/v1/reindex", post(reindex))
         .route("/api/v1/prune", post(prune))
         .route("/api/v1/forget", post(forget))
+        .route("/api/v1/metrics", get(metrics_text))
         .layer(Extension(update))
+        .layer(Extension(metrics))
         .with_state(store)
 }
 
@@ -336,6 +343,30 @@ async fn status(
     v["project_ids"] = json!(projects);
     v["update"] = json!(update.lock().clone());
     Ok(Json(v))
+}
+
+/// `GET /api/v1/metrics`: Prometheus text (SPEC-M3.2 §1), bearer-authenticated like the
+/// rest of the API.
+async fn metrics_text(
+    State(store): State<Arc<Store>>,
+    Extension(update): Extension<SharedUpdateStatus>,
+    Extension(metrics): Extension<Arc<Metrics>>,
+) -> Result<Response, ApiError> {
+    let snap = blocking(&store, |s| s.metrics_snapshot()).await?;
+    let input = RenderInput {
+        version: SERVER_VERSION.to_string(),
+        update_last_check: update.lock().last_check.clone(),
+        outbox_queued: 0,
+    };
+    let body = crate::metrics::render(&snap, &metrics, &input, kioku_core::util::now());
+    Ok((
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response())
 }
 
 /// Body of `POST /api/v1/projects/merge`.

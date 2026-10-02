@@ -40,6 +40,8 @@ dependency, service, model or database.
 
 ## 2. Backup and restore
 
+> Amended by SPEC-M2.8 §4 (history as `wiki.bundle`, short write lock) and SPEC-M2.8 §3 (`[retention] backups_keep`).
+
 SQLite is authoritative for sessions, observations, handoffs, aliases, receipts and
 redirects; Markdown for page content. A complete backup is wiki + SQLite + raw.
 
@@ -82,7 +84,9 @@ not fatal. `--verify` is accepted (verification always runs). Then
 - A delivery that failed with no HTTP answer (connect error, timeout) or a 5xx, to a dedup
   server, is queued: `outbox/<sha256(url)>/<id>.json` (0600; observation exactly as sent,
   plus the SessionStartRequest needed to re-create the session — project and lane are
-  computed only now, after the failure). Bounded to 50 MiB / 10,000 entries; a full or
+  computed only now, after the failure, with a git budget of at least 1.5 s even when the
+  hook deadline is spent — a cold identity cache must not lose the entry). Bounded to 50
+  MiB / 10,000 entries; a full or
   busy queue is reported in the hook's error, never evicts. A server without dedup never
   gets anything queued.
 - Replay (`kioku sync`, and detached after a hook when something is queued — not within
@@ -116,6 +120,8 @@ distractors, NFKC / half-width queries and top-1 requirements; Recall@3 ≥ 0.90
 MRR@3 ≥ 0.75 in every CI run. It is a regression guard, not a quality claim.
 
 ## 6. Differences from ca8afe5
+
+> Amended by SPEC-M3.1 §1: a compact / resume of a known session again gets back the handoff it accepted (decided by `source`, not by a retry).
 
 - Page names: date + id prefix + 12-hex hash instead of the full 64-hex hash.
 - Migration: once, non-fatal, one commit, no regeneration of missing pages (which re-issued

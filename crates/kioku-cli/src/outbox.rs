@@ -577,30 +577,33 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let mut cfg = client_cfg(client_dir.path(), &listener);
         cfg.client.timeout_ms = 300;
-        let prompt = |text: &str| {
+        let prompt = |cfg: &Config, text: &str| {
             let payload = json!({"session_id":"hook-s1", "cwd":repo.path().display().to_string(), "prompt":text});
             let out = crate::hook::run_hook(
                 crate::event::HookEventKind::UserPromptSubmit,
                 crate::event::Agent::ClaudeCode,
                 &payload.to_string(),
-                &cfg,
+                cfg,
             );
             assert_eq!(out.exit_code, 0);
         };
-        prompt("サーバーの対応が不明");
+        prompt(&cfg, "サーバーの対応が不明");
         assert_eq!(
             count(&cfg).unwrap(),
             0,
             "an old server's deliveries are never queued"
         );
         remember_dedup(&cfg, true);
-        prompt("日本語の引き継ぎ password=hunter2");
+        prompt(&cfg, "日本語の引き継ぎ password=hunter2");
         assert_eq!(count(&cfg).unwrap(), 1);
         let queued = std::fs::read_to_string(&pending(&directory(&cfg)).unwrap()[0]).unwrap();
         assert!(!queued.contains("hunter2"));
 
         let _server = serve(listener, store.clone());
-        prompt("オンラインでの記録");
+        // Online now: give the delivery (implicit session start + POST) a normal budget; the
+        // 300 ms above only made the offline attempts fail fast (Windows CI is slow).
+        cfg.client.timeout_ms = 10_000;
+        prompt(&cfg, "オンラインでの記録");
         assert_eq!(
             count(&cfg).unwrap(),
             1,

@@ -20,5 +20,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 reqwest.workspace = true
+tracing-subscriber.workspace = true
 rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest"] }
 tempfile.workspace = true

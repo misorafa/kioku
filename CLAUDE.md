@@ -5,7 +5,8 @@ agents (Claude Code, Codex CLI, Cursor, Gemini CLI, …). Single Rust binary,
 Markdown-in-git as the source of truth, tantivy + lindera for full-text search,
 MCP over streamable HTTP, lifecycle hooks for automatic capture and handoffs.
 
-Read `docs/SPEC-M1.md` before touching code. It is the contract; when the spec
+Read `docs/SPEC-M1.md` before touching code, and `docs/INDEX.md` for the section that is
+currently authoritative on a topic. The specs are the contract; when the spec
 and the code disagree, the spec wins unless the spec is impossible — then fix
 the spec in the same change and say so in the commit message.
 
@@ -60,6 +61,9 @@ the spec in the same change and say so in the commit message.
 ```
 crates/kioku-core     store, index, project identity, observations, handoffs, summary rules
 crates/kioku-server   axum HTTP API + MCP (rmcp) — no business logic here
-crates/kioku-cli      the `kioku` binary: serve / init / hook / install / setup / service / doctor / update / search / status
-docs/                 SPEC-M1.md and later specs; ADRs in docs/adr/
+crates/kioku-cli      the `kioku` binary: serve / init / setup / service / doctor [--fix] / status [--watch|--agents] /
+                      hook / hook-dump / install / uninstall / mcp / search / reindex / project / invite / join /
+                      update / backup / restore / prune / forget / sync / rotate-token
+docs/                 SPEC-M1.md and later specs; docs/INDEX.md says which section is authoritative
+                      for each topic (checked by scripts/check-docs.sh); ADRs in docs/adr/
 ```

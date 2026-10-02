@@ -57,6 +57,8 @@ Git runs with the per-call hook deadline (quiet, CREATE_NO_WINDOW on Windows; on
 
 ### 1.4 Which handoff a session gets
 
+> Superseded by SPEC-M3.1 §1 (compact / resume, own handoff, concurrent sessions on a lane, `superseded`).
+
 At session start (and `GET /sessions/{id}/context`, `kioku_handoff_pending` with a
 `session`), for a session on lane L:
 

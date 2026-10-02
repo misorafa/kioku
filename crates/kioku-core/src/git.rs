@@ -14,6 +14,9 @@ pub struct Git {
     root: PathBuf,
     enabled: bool,
     last_error: std::sync::Arc<parking_lot::Mutex<Option<String>>>,
+    /// Failed `git add` / `git commit` runs since this process opened the repository
+    /// (`kioku_git_commit_failures_total`, SPEC-M3.2 §1).
+    failures: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// True when a `git` executable can be run (checked once per process; warns once if not).
@@ -40,6 +43,7 @@ impl Git {
             root: root.to_path_buf(),
             enabled,
             last_error: Default::default(),
+            failures: Default::default(),
         };
         if enabled && !root.join(".git").exists() {
             let ok = git.run(&["-c", "init.defaultBranch=main", "init", "-q"]);
@@ -57,6 +61,17 @@ impl Git {
     /// Whether commits are actually made.
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Failed `git add` / `git commit` runs since the repository was opened.
+    pub fn commit_failures(&self) -> u64 {
+        self.failures.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn count_failure(&self, what: &str) {
+        self.failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *self.last_error.lock() = Some(what.to_string());
     }
 
     /// Failure of the most recent commit attempt.
@@ -92,7 +107,7 @@ impl Git {
         let mut add = vec!["add", "-A", "--"];
         add.extend(paths.iter().map(String::as_str));
         if !self.run(&add) {
-            *self.last_error.lock() = Some("git add failed".into());
+            self.count_failure("git add failed");
             tracing::warn!(?paths, "git add failed");
             return;
         }
@@ -119,7 +134,7 @@ impl Git {
         ];
         commit.extend(paths.iter().map(String::as_str));
         if !self.run(&commit) {
-            *self.last_error.lock() = Some("git commit failed".into());
+            self.count_failure("git commit failed");
             tracing::warn!(message, "git commit failed");
         } else {
             *self.last_error.lock() = None;
@@ -215,5 +230,26 @@ mod tests {
         let log = String::from_utf8_lossy(&log.stdout);
         assert_eq!(log.lines().count(), 1, "{log}");
         assert!(log.contains("kioku <kioku@localhost> kioku: page a.md"));
+    }
+
+    /// SPEC-M3.2 §1: a failed commit counts towards `kioku_git_commit_failures_total`.
+    #[test]
+    fn failed_commits_are_counted() {
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let git = Git::open(tmp.path());
+        assert_eq!(git.commit_failures(), 0);
+        // A leftover index lock makes `git add` fail.
+        std::fs::write(tmp.path().join(".git").join("index.lock"), "").unwrap();
+        std::fs::write(tmp.path().join("記憶.md"), "一").unwrap();
+        git.commit(&["記憶.md".to_string()], "kioku: page");
+        assert_eq!(git.commit_failures(), 1);
+        assert!(git.last_error().is_some());
+        // Clones share the counter (the store hands its Git to background work).
+        let clone = git.clone();
+        clone.commit(&["記憶.md".to_string()], "kioku: page");
+        assert_eq!(git.commit_failures(), 2);
     }
 }

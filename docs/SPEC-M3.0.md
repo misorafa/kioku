@@ -90,6 +90,8 @@ ignore unknown fields (serde default). Tests: round trip and rendering.
 
 ## 5. Search result lines show time and kind (audit PROD-4, part)
 
+> Amended by SPEC-M3.1 §2 (`@machine` for sessions, re-ranking).
+
 `format_hits` (MCP) and `kioku search` print `YYYY-MM-DD` and `kind` per hit:
 `1. <path> — <title> (session, 2026-09-28) …`. Re-ranking itself is M3.1.
 

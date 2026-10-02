@@ -138,6 +138,11 @@ pub enum Command {
         /// Only check this agent (other agents are skipped).
         #[arg(long, value_enum)]
         agent: Option<Agent>,
+        /// Apply the safe fixes (permissions, re-registering hooks / MCP, service install,
+        /// reindex, an expired hook dump); prints what it did. Never touches tokens or the
+        /// bind address.
+        #[arg(long)]
+        fix: bool,
     },
     /// Search the wiki through the server.
     Search {
@@ -275,7 +280,14 @@ pub enum Command {
         yes: bool,
     },
     /// Show server status and counts.
-    Status,
+    Status {
+        /// Redraw every N seconds (sessions open, last observation, outbox, update, sizes).
+        #[arg(long, value_name = "SECONDS")]
+        watch: Option<u64>,
+        /// Show each installed agent's last successful hook instead (no server needed).
+        #[arg(long, conflicts_with = "watch")]
+        agents: bool,
+    },
     /// Replace the server's auth token (run on the server machine), restart the service and
     /// print the command for the other machines.
     RotateToken {
@@ -595,10 +607,30 @@ mod tests {
                 .command,
             Command::Doctor {
                 json: true,
-                agent: Some(Agent::GeminiCli)
+                agent: Some(Agent::GeminiCli),
+                fix: false,
             }
         ));
         assert!(p(&["doctor", "--agent", "all"]).is_err());
+        assert!(matches!(
+            p(&["doctor", "--fix"]).unwrap().command,
+            Command::Doctor { fix: true, .. }
+        ));
+        assert!(matches!(
+            p(&["status", "--watch", "5"]).unwrap().command,
+            Command::Status {
+                watch: Some(5),
+                agents: false
+            }
+        ));
+        assert!(matches!(
+            p(&["status", "--agents"]).unwrap().command,
+            Command::Status {
+                watch: None,
+                agents: true
+            }
+        ));
+        assert!(p(&["status", "--agents", "--watch", "5"]).is_err());
         assert!(p(&["project", "id", "/tmp"]).is_ok());
         assert!(matches!(
             p(&[

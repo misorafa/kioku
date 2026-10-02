@@ -78,6 +78,8 @@ ssh and no token handling.
 
 ### 3.2 Routes
 
+> Amended by SPEC-M2.7 §4: `GET /i/<code>` and `GET /i/<code>.ps1` are gone; only `POST /api/v1/join` remains.
+
 | route | auth | does |
 |-------|------|------|
 | `POST /api/v1/invites` `{ttl_minutes?, uses?}` | **bearer token** | creates an invite and returns `{code, expires_at, uses}` |
