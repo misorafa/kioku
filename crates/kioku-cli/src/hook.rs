@@ -412,7 +412,16 @@ impl Handler<'_> {
     /// ([`git_budget_ms`]), through `state/projects.json` (SPEC-M2.7 §8).
     fn locate(&self, cwd: &Path) -> anyhow::Result<(ProjectIdentity, Option<String>)> {
         let deadline = hook_deadline_ms(self.agent, self.ev.event, self.cfg.client.timeout_ms);
-        let git = GitBudget::new(Duration::from_millis(git_budget_ms(deadline)));
+        self.locate_within(cwd, git_budget_ms(deadline))
+    }
+
+    /// [`Handler::locate`] with an explicit git budget in milliseconds.
+    fn locate_within(
+        &self,
+        cwd: &Path,
+        budget_ms: u64,
+    ) -> anyhow::Result<(ProjectIdentity, Option<String>)> {
+        let git = GitBudget::new(Duration::from_millis(budget_ms));
         let cache = client_state_root(self.cfg, self.env)
             .map(|d| d.join("state").join(kioku_core::project::cache::CACHE_FILE));
         Ok(kioku_core::project::cache::identify_and_lane(
@@ -519,7 +528,11 @@ impl Handler<'_> {
     fn queue(&self, ev: &HookEvent, obs: &NewObservation) -> anyhow::Result<()> {
         let cwd = self.cwd()?;
         // The identity SessionStart cached (SPEC-M2.7 §8): no git but the lane's one call.
-        let (project, lane) = self.locate(&cwd)?;
+        // The delivery already spent the hook's budget; recording it durably is worth up
+        // to QUEUE_GIT_BUDGET_MS more on a cold cache (a wrong id would misfile the replay).
+        let deadline = hook_deadline_ms(self.agent, self.ev.event, self.cfg.client.timeout_ms);
+        let (project, lane) =
+            self.locate_within(&cwd, git_budget_ms(deadline).max(QUEUE_GIT_BUDGET_MS))?;
         let session = SessionStartRequest {
             session_id: ev.session_id.clone(),
             agent: ev.agent.clone(),
@@ -786,6 +799,10 @@ impl Handler<'_> {
 
 /// Time the git calls of a hook may take together (identity + lane, SPEC-M2.7 §8): 40% of
 /// the hook's deadline, leaving at least 1.5 s for HTTP; on a very short deadline at least
+/// Git budget of the offline-queue path (SPEC-M2.6 §3): at least this, whatever the hook
+/// deadline, because the failed delivery has already used that deadline.
+pub const QUEUE_GIT_BUDGET_MS: u64 = 1500;
+
 /// 40% of it up to 150 ms, so a cached identity still gets its lane.
 pub fn git_budget_ms(deadline_ms: u64) -> u64 {
     let share = deadline_ms * 2 / 5;

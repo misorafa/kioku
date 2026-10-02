@@ -84,7 +84,9 @@ not fatal. `--verify` is accepted (verification always runs). Then
 - A delivery that failed with no HTTP answer (connect error, timeout) or a 5xx, to a dedup
   server, is queued: `outbox/<sha256(url)>/<id>.json` (0600; observation exactly as sent,
   plus the SessionStartRequest needed to re-create the session — project and lane are
-  computed only now, after the failure). Bounded to 50 MiB / 10,000 entries; a full or
+  computed only now, after the failure, with a git budget of at least 1.5 s even when the
+  hook deadline is spent — a cold identity cache must not lose the entry). Bounded to 50
+  MiB / 10,000 entries; a full or
   busy queue is reported in the hook's error, never evicts. A server without dedup never
   gets anything queued.
 - Replay (`kioku sync`, and detached after a hook when something is queued — not within
