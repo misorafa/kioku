@@ -96,6 +96,8 @@ adding it.
 
 ## 5. `kioku update` on Windows
 
+> Amended by SPEC-M2.5 (automatic updates) and SPEC-M2.7 §7 (the replaced binary is kept as `<exe>.prev`).
+
 A running `kioku.exe` cannot be overwritten, but it can be renamed. So:
 
 1. download the asset, verify it and extract it next to the exe

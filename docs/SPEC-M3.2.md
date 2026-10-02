@@ -107,3 +107,86 @@ message), and the ppid walk on a fixture.
 
 Branch `m3.2-observability-docs`, draft PR against `main`, CI green. Record deviations in
 §6. Do not merge, tag or change secrets.
+
+## 6. Implementation notes (2026-10-02, branch `m3.2-observability-docs`)
+
+### Metrics and request log (§1)
+
+- No new crate: `axum::middleware::from_fn_with_state` (tower stays transitive) wraps the
+  whole router, outside the bearer check, so refused requests are counted too. The route
+  label is axum's `MatchedPath` (`/api/v1/pages/{*path}`), `/mcp` for everything under the
+  MCP endpoint, `unmatched` for 404s of no route — a page path or id never becomes a label.
+- Age gauges are `-1` when the event never happened (no backup, no prune, no observation,
+  no release check yet). `kioku_http_request_seconds` is declared `summary` with `_sum` /
+  `_count`. Counters live in memory since process start. `kioku_git_commit_failures_total`
+  counts failed `git add` and `git commit` runs (`Git::commit_failures`, shared by clones).
+- Request log line: `GET /api/v1/status 200 3ms` at `target = "kioku_http"`; `kioku serve`
+  without `RUST_LOG` uses `info,tantivy=warn,kioku_http=off` unless `[server] request_log =
+  true` (`commands::default_log_filter`). Headers and query strings are never logged.
+- The request-log test lives in its own test binary (`kioku-server/tests/request_log.rs`):
+  tracing caches callsite interest process-wide, and a parallel test without a subscriber
+  made the scoped subscriber miss events. The token regression (`kioku-cli/tests/
+  log_hygiene.rs`) installs the global subscriber `kioku serve` uses and checks serve.log,
+  hook.log and update.log (`auto_update::log_update` became public for it).
+- `kioku status --watch N` reads `/status` and, when present, `/metrics`; against an older
+  server the metric lines say `? (server without /api/v1/metrics)`.
+
+### Liveness (§2)
+
+- Check ids are `hooks.liveness.<agent>` (one per installed agent), not one shared
+  `hooks.liveness` id: `--json` consumers and the tests key checks by id.
+- `last-hook.json` entries carry `last_ok` besides `{event, at, ok}`, so a failing hook does
+  not erase the time of the last success. Written as a temp file renamed over the old one;
+  errors are ignored. "Installed" = kioku hooks registered in the agent's user config;
+  "present" = the agent's binary on `PATH` / `~/.local/bin` / `~/.claude/local`
+  (`claude`, `codex`, `cursor`, `cursor-agent`, `gemini`, `agy`) or its app in
+  `/Applications`, `~/Applications` (macOS). A hook that failed after a recent success is
+  OK with a note pointing at hook.log.
+
+### doctor --fix (§3)
+
+- Each check carries an optional `FixAction` (`Chmod`, `Install(agent)`, `ServiceInstall`,
+  `Reindex`, `ClearHookDump`, `Manual(text)`); `--fix` applies the distinct actions, prints
+  `fixed:` / `failed:` / `manual:` lines, re-runs doctor and prints the result. Exit 0 when
+  no action failed; `manual:` instructions (TCC, a running Claude app, `KIOKU_HOOK_DUMP` in
+  the environment) do not count as failures.
+- A detected agent without any kioku hooks is re-installed too (doctor already proposed
+  `kioku install <agent>` for it). The index schema-mismatch warning also maps to reindex.
+- Claude app running: `pgrep -x Claude` (macOS) / `tasklist` (Windows); an unanswerable
+  query counts as running. Then `kioku install claude-code` runs with the new
+  `InstallOptions::skip_desktop`, and the quit-first instruction is printed.
+- Expired hook dump: `hook_dump = true` in `[client]` is rewritten line by line to
+  `hook_dump = false` (comments and the token line untouched, permissions kept) and the
+  window marker removed.
+
+### Reachability (§3.1)
+
+- The error kind is read from the error text (reqwest hides the `io::Error`): errno 65/51
+  (macOS), 113/101 (Linux), 10065/10051 (Windows) or the strerror text. Private = RFC 1918,
+  link-local, IPv6 ULA / link-local, `.local`, or a name resolving to one of those.
+- Probe: `/usr/bin/nc -z -G 3 -w 3 host port` (macOS; `-G` dropped elsewhere). Without
+  `/usr/bin/nc` the message says what to compare instead.
+- Responsible app: `ps -o ppid=,etime=,comm= -p <pid>` up the chain (≤ 32 steps); the
+  first process whose path contains a `.app` component; the bundle is the outermost
+  `.app`. **Stale app** (the 2026-10-02 cause): that process started (now − etime) more
+  than 2 s before the bundle's `Contents/Info.plist` mtime → "<App> was updated while its
+  old processes kept running: quit it completely and start it again" (ja/en).
+- The `server` check stays FAIL in this case (kioku really cannot reach the server), with
+  the Local Network fix and a `Manual` action so `--fix` prints the Settings path.
+- Extra: a server version that is unknown or empty prints `reachable; version unknown
+  (older client)` and is never compared (an older client printed "runs v, this client is
+  v0.7.0" against ≥ 0.8.1).
+
+### Documents (§4)
+
+- `docs/INDEX.md` (81 rows), one-line amendment notes in the older specs, SPEC-M1 §5 /
+  §7.1 / §8.3 / §8.5 / §9 / §11 as asked, ADR-0001/0002, AGENTS.md → CLAUDE.md,
+  `scripts/check-docs.sh` (CI step "docs index", Linux), plus SECURITY.md, CONTRIBUTING.md,
+  CHANGELOG.md (v0.3.0 … v0.9.1, Unreleased = M3.2) and issue templates.
+- Contradictions found while indexing (now noted at the sections): SPEC-M1 §6.2 vs
+  SPEC-M2.8 §5 (outdated index is rebuilt automatically); SPEC-M1 §9 lacked 429 (invite
+  lookups); SPEC-M2.5 §3.2 still listed `version` in `/health` (removed by SPEC-M2.7 §11);
+  SPEC-M2.5 §1 "once a day" vs §3.1 hourly (v0.9.1); SPEC-M2.6 §6 dropped the
+  "retried SessionStart returns the accepted handoff" rule that SPEC-M3.1 §1 restores for
+  compact/resume; SPEC-M2.7 §5 starts `user_version` at 3 but the code is at 5 (M2.8 = 4,
+  M3.0 = 5) — SPEC-M1 §5 now records the numbering.

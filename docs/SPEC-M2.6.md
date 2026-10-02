@@ -40,6 +40,8 @@ dependency, service, model or database.
 
 ## 2. Backup and restore
 
+> Amended by SPEC-M2.8 §4 (history as `wiki.bundle`, short write lock) and SPEC-M2.8 §3 (`[retention] backups_keep`).
+
 SQLite is authoritative for sessions, observations, handoffs, aliases, receipts and
 redirects; Markdown for page content. A complete backup is wiki + SQLite + raw.
 
@@ -116,6 +118,8 @@ distractors, NFKC / half-width queries and top-1 requirements; Recall@3 ≥ 0.90
 MRR@3 ≥ 0.75 in every CI run. It is a regression guard, not a quality claim.
 
 ## 6. Differences from ca8afe5
+
+> Amended by SPEC-M3.1 §1: a compact / resume of a known session again gets back the handoff it accepted (decided by `source`, not by a retry).
 
 - Page names: date + id prefix + 12-hex hash instead of the full 64-hex hash.
 - Migration: once, non-fatal, one commit, no regeneration of missing pages (which re-issued

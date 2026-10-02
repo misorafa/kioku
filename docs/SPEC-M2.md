@@ -63,6 +63,8 @@ packaging, Homebrew tap, writing Codex hook trust on the user's behalf (§4.7).
 
 ## 3. Neutral event model (changes to M1 §8.1)
 
+> Stop nudge conditions superseded by SPEC-M3.0 §4; hooks are always fail-open (SPEC-M2.7 §1).
+
 ### 3.1 Agents
 
 `kioku_cli::event::Agent` gains three variants. The string is the `--agent`
@@ -234,6 +236,8 @@ indistinguishable from one).
 
 ### 3.8 `KIOKU_HOOK_DUMP` (payload capture)
 
+> Amended by SPEC-M2.8 §7: capture stops 24 h after it began; `kioku hook-dump enable` / `extract`.
+
 When `KIOKU_HOOK_DUMP=1` is in the hook's environment **or** `[client]
 hook_dump = true` in config.toml (GUI apps such as Cursor do not inherit shell
 env), every `kioku hook` invocation appends one JSON line to
@@ -292,6 +296,8 @@ an error in `hook.log` — and a doctor WARN — for every such Stop. A connecti
 fails, or an error response, is still logged.
 
 ### 3.10 Per-agent deadlines
+
+> Amended by SPEC-M2.7 §8 (git budget: at most 40 % of the deadline, identity cache).
 
 M1's single deadline stays `timeout_ms`, capped per invocation at the
 registered agent timeout minus 500 ms: Codex SessionEnd 2 500 ms (C1: SessionEnd
@@ -643,6 +649,8 @@ duplicate text when Codex's `--project` snippet is there too).
 
 ## 6. Gemini CLI
 
+> Legacy: Gemini CLI was retired for personal accounts on 2026-06-18; its successor Antigravity CLI is SPEC-M2.1.
+
 > **2026-09-27:** Google retired Gemini CLI for personal accounts on
 > 2026-06-18; its successor Antigravity CLI is specified in `SPEC-M2.1.md`,
 > which also moves Gemini CLI detection from `~/.gemini` to `~/.gemini/tmp`
@@ -789,6 +797,8 @@ Size < 1 KiB.
 
 ## 8. Installers
 
+> Amended by SPEC-M2.1 §4 (Antigravity), SPEC-M2.2 §7 (Windows; the Claude desktop app in SPEC-M2.2 §7.3a) and SPEC-M2 §20.2 (the `kioku mcp` bridge is the default MCP entry).
+
 ### 8.1 Common rules (extend M1 §8.5 to every agent)
 
 - `kioku install <agent> [--project] [--no-instructions|--instructions]
@@ -858,6 +868,8 @@ detected or not.
 
 ## 9. Server and core changes
 
+> Amended by SPEC-M2.7 §11 (`/health` has no version) and SPEC-M3.2 §1 (`GET /api/v1/metrics`).
+
 ### 9.1 `GET /api/v1/sessions/{id}/context`
 
 Returns the `SessionStartResponse` shape for an existing session without
@@ -894,6 +906,8 @@ empty, `index_schema_version` null, `index_schema_expected` 0). The MCP
 this needed tests only.)
 
 ## 10. Service management
+
+> Amended by SPEC-M2.5 §3.1 (`KIOKU_SERVICE=1` marker, exit 75 restarts) and SPEC-M2.8 §5 (headless Mac: `--daemon`).
 
 ### 10.1 `kioku serve --log-file <path>`
 
@@ -1168,6 +1182,8 @@ under each line; the service line lists the file write and commands.
 
 ## 12. `kioku doctor`
 
+> Amended by SPEC-M2.5 §3.4 (`update`), SPEC-M2.6 §4 (storage), SPEC-M3.2 §2 (`hooks.liveness`), SPEC-M3.2 §3 (`--fix`) and SPEC-M3.2 §3.1 (Local Network diagnosis).
+
 ```
 kioku doctor [--json] [--agent <name>]
 ```
@@ -1307,6 +1323,8 @@ curl carry no quarantine attribute, so Gatekeeper does not block the binary
 
 ### 13.3 `kioku update` (optional in M2)
 
+> Superseded by SPEC-M2.5 (automatic updates) and SPEC-M2.7 §2, §7, §11 (verification order, rollback, mirrors).
+
 Implemented in Step 5 (`crates/kioku-cli/src/update.rs`; honours `KIOKU_REPO`
 and `KIOKU_DOWNLOAD_BASE` like install.sh).
 
@@ -1325,6 +1343,8 @@ installed by root) → print the install.sh command instead; never sudo.
 
 ## 14. CLI summary (additions to M1 §11)
 
+> The current command list: CLAUDE.md "Directory layout" and [INDEX.md](INDEX.md).
+
 ```
 kioku setup [--client-only <url> <token>] [--no-service] [--no-agents] [--agents a,b] [--bind addr]
             [--no-instructions] [--dry-run] [--print-client-command]
@@ -1342,6 +1362,8 @@ kioku update [--version <tag>] [--check]
 New `[client]` keys: `hook_dump = false`, `cursor_late_context = true`.
 
 ## 15. Security notes
+
+> Amended by SPEC-M2.7 §3 (memory is untrusted data), SPEC-M2.7 §10 (tokens never on argv / stdout) and SPEC-M3.0 §6 (one server = one person); see SECURITY.md.
 
 - Tokens only in user-level files (0600 when kioku creates them), never on argv,
   never in a repository, never printed except by `--print-client-command` and

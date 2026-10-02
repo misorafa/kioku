@@ -2,8 +2,9 @@
 
 日本語 | [English](README.md)
 
-**ステータス: 開発中（v0.x、M2.1）。** 作者のマシンでは日常的に動いていますが、粗い部分があり、
-マイナーバージョンの間でも設定の形式や API が変わることがあります。
+**ステータス: v0.9 — 作者のマシンで日常的に使用中。M2.1〜M3.1 を出荷済み、M3.2 を作業中
+（[ロードマップ](#ロードマップ)と [CHANGELOG.md](CHANGELOG.md)）。** 粗い部分があり、マイナーバージョンの間でも
+設定の形式や API が変わることがあります。
 
 kioku は、あなたのすべてのマシンで動くすべての AI コーディングエージェントが共有する、
 セルフホスト型の記憶サーバーです。Rust 製のシングルバイナリで動きます。記憶する内容は
@@ -11,8 +12,32 @@ kioku は、あなたのすべてのマシンで動くすべての AI コーデ�
 tantivy のインデックスが検索を受け持ち、日本語は lindera（IPADIC）で正しく分かち書きされます。
 主な対象は日本語ですが、英語も使えます。エージェントとは MCP（streamable HTTP）とライフサイクル
 フックでつながり、セッションは自動で記録され、次のセッションは（別のエージェントでも別のマシンでも）
-前回の引き継ぎを受け取った状態で始まります。既定では LLM を一切呼びません。要約と引き継ぎは
+前回の引き継ぎを受け取った状態で始まります。LLM は一切呼びません。要約と引き継ぎは
 ルールベースで生成します。
+
+## 30 秒でわかる kioku
+
+```
+1. 記録  Claude Code / Codex / Cursor / Antigravity のフックが、指示・ツール操作・エージェントの
+         最後の回答を（秘密情報を伏せて）自分の kioku サーバーへ送る
+2. 要約  サーバーがルールで（LLM を呼ばずに）セッションページ・STATE.md・引き継ぎ（要約 /
+         次にやること / 未解決の質問 / 決定事項）にまとめる。git 管理の Markdown で、日本語でも検索できる
+3. 注入  次のセッションは（どのエージェントでも、どのマシンでも）<kioku> ブロック付きで始まる:
+         引き継ぎ、これまでの決定事項、ピン留めページ、最近のセッション。記憶の検索と保存は MCP ツール（kioku_query など）
+```
+
+サーバーにするマシンで（macOS / Linux、sudo 不要）:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh
+```
+
+ほかのマシンを追加するには、サーバーで `kioku invite` を実行し、表示された 1 行を新しいマシンに貼り付けます
+（10 分間・1 回だけ有効）:
+
+```sh
+KIOKU_JOIN='192.168.1.240:7391/K7Q2M9XD' sh -c "$(curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh)"
+```
 
 ## 解決する問題
 
@@ -369,6 +394,28 @@ kioku doctor --json           # {"checks":[{id, status, message, fix?}]}
 だけで表示しません）、エージェント固有のスイッチ、指示スニペットを確認します。`hook.log` の最近のフックエラーと、
 ペイロードダンプが有効になっていることも指摘します。FAIL が 1 つでもあれば終了コード 1 です。
 
+**ちゃんと動いているか。** フックを入れた各エージェントについて、`hooks.liveness.<agent>` が最後に
+*成功した*フックの時刻を表示します（各フックが書く `~/.kioku/state/last-hook.json` から）。警告するのは、
+このマシンに実際にあるエージェント（実行ファイルかアプリ）で 7 日間 1 度もフックが成功していないときだけです。
+`kioku status --agents` でも同じ行を表示します。
+
+**`kioku doctor --fix`** は doctor が提案する安全な修正を実行し、何をしたかを表示します: `config.toml` と
+データディレクトリの `chmod 600` / `700`、欠けたフックや MCP エントリの再登録（`kioku install <agent>`）、
+サービス定義が無いか自動更新以前のものなら `kioku service install`、索引が古いか食い違っていれば
+`kioku reindex`、期限切れのフックダンプの停止。トークンの再発行、`[server] bind` の変更、起動中の Claude
+デスクトップアプリの設定の書き換えは決してしません（先にアプリを終了するよう表示します）。2 回目は何も
+変えません。提案した修正をすべて適用できれば終了コード 0 です。
+
+**このマシンの kioku だけがサーバーに届かないとき。** ある Mac からの `kioku` の通信がすべて
+`No route to host (os error 65)` で失敗し、`curl`・`ping`・`nc` では届く場合、原因はサーバーではなく macOS の
+アプリごとの「ローカルネットワーク」の許可（または Little Snitch のルール）です。許可は kioku を起動した
+アプリ（ターミナル、IDE、エージェントのアプリ）に付きます。`kioku doctor` はシステムの `/usr/bin/nc` で
+サーバーに接続を試し、そのアプリの名前と対処を表示します: 「システム設定 › プライバシーとセキュリティ ›
+ローカルネットワーク」でそのアプリを許可してください。既に許可済みに見える場合は一度オフにしてからオンにし、
+アプリを再起動してください（アプリの更新後に起きます。アプリのプロセスが最後の更新より古いときは doctor が
+そう伝えます）。Little Snitch では kioku の実行ファイル自体を許可してください。その間もフックはエージェントを
+止めず、届かなかった観測は接続できるようになってから送られます。
+
 ## `kioku service`
 
 ```sh
@@ -402,6 +449,26 @@ Mac（棚に置いた Mac mini など）では、`kioku service install` と `ki
 `sudo launchctl bootstrap system …`）を表示します。kioku 自身が `sudo` を実行することはありません。
 LaunchAgent が入っている場合は先に `kioku service uninstall` で外してください。`kioku service start|stop`
 が扱うのは LaunchAgent だけです。
+
+## 監視
+
+```sh
+kioku status                # 件数、サイズ、更新の状態
+kioku status --watch 5      # 5 秒ごとに再表示: 進行中のセッション、最後の観測、未送信、更新、サイズ
+kioku status --agents       # 各エージェントの最後に成功したフック（サーバー不要）
+```
+
+`GET /api/v1/metrics`（ほかの API と同じくベアラートークンが必要）は Prometheus のテキスト形式を返します:
+ゲージ `kioku_sessions_open`、`kioku_sessions_total`、`kioku_observations_total`、`kioku_handoffs_pending`、
+`kioku_index_docs`、`kioku_outbox_queued`（サーバーでは常に 0）、`kioku_{db,raw,wiki,backups}_bytes`、
+`kioku_last_backup_age_seconds`、`kioku_last_prune_age_seconds`、`kioku_last_observation_age_seconds`、
+`kioku_update_last_check_age_seconds`（`-1` = まだ無い）、`kioku_version_info{version}`。起動以降のカウンタ
+`kioku_http_requests_total{route,status}`、`kioku_http_request_seconds_sum/count{route}`、
+`kioku_mcp_tool_calls_total{tool,ok}`、`kioku_git_commit_failures_total`。Prometheus からはトークンを
+ベアラー認証情報として渡して取得します（`authorization: {credentials_file: …}`）。
+
+リクエストログ（1 リクエスト 1 行、`method route status ms`。ヘッダーやトークンは出しません）は、
+`[server] request_log = true`（または `RUST_LOG=kioku_http=info`）のとき `serve.log` に出ます。既定は無効です。
 
 ## エージェント
 
@@ -439,6 +506,17 @@ LaunchAgent が入っている場合は先に `kioku service uninstall` で外�
 
 kioku は `claude mcp add` を実行しないので、トークンがコマンドラインに現れることはありません。
 
+### Claude デスクトップアプリ（チャットと Cowork）
+
+Claude デスクトップアプリの Code タブは上の Claude Code のファイルを使います。アプリのチャットと Cowork は
+ローカルの MCP サーバーを `claude_desktop_config.json` からしか読まないので、`kioku install claude-code`
+（と `setup`）はそこにも `mcpServers.kioku` = `kioku mcp` の中継を追加します（macOS は
+`~/Library/Application Support/Claude/`、Windows は `%APPDATA%\Claude\` か Microsoft Store 版のパッケージ
+フォルダ。その `Claude` フォルダがあるときだけ。ほかのキーはそのまま）。**アプリは起動中にこのファイルを
+メモリ上の内容で書き戻す**ため、その間に追加したエントリは消えます。アプリを完全に終了し（メニューバー /
+タスクトレイからも）、もう一度インストール（または `kioku doctor --fix`）してから起動してください。
+`kioku doctor` は `agent.claude-code.desktop` として確認します。
+
 ### Codex CLI
 
 | 内容 | 場所 |
@@ -471,7 +549,7 @@ kioku は `claude mcp add` を実行しないので、トークンがコマン�
 kioku は各セッションの最初のツール使用時（`postToolUse`。ファイル編集と失敗したツールでは渡せません）
 にもコンテキストを追加します（`[client] cursor_late_context = false` で無効）。
 
-### Gemini CLI
+### Gemini CLI（レガシー）
 
 Gemini CLI は 2026-06-18 に個人アカウント向けの提供を終了しました（Code Assist Standard/Enterprise と
 有料 API キーでは引き続き使えます）。後継は下の Antigravity CLI です。Gemini CLI の検出には `~/.gemini`
@@ -594,8 +672,8 @@ Compose の場合（`docker-compose.yml` 参照）は、同じ場所の `.env` �
 | ツール | 入力 | 内容 |
 |--------|------|------|
 | `kioku_query` | `query`、`project?`、`scope?`（`project`/`global`/`all`）、`limit?`（既定 8）、`since?`（`YYYY-MM-DD`）、`kinds?`（`page`/`session`/`state`）、`path_prefix?` | 全文検索（日本語・英語。下の「検索」を参照）。`project` を渡すとそのプロジェクトとグローバルのページに絞る。各結果は `1. <path> — <title> (session, 2026-09-28, @mini)` の形。`path_prefix` を渡すと、そのパス以下のファイルを編集したセッションを返す |
-| `kioku_read` | `path` | wiki 内の相対パス（検索結果に表示されるもの）でページを読む |
-| `kioku_write_page` | `title`、`content`、`project?`、`scope?`（`project`/`global`）、`tags?`、`path?` | 検索可能な Markdown ページを保存する。同じ title/path なら置き換える。`pinned` タグを付けると、そのプロジェクト（グローバルなら全プロジェクト）の SessionStart のブロックに毎回表示される |
+| `kioku_read` | `path` | wiki 内の相対パス（検索結果に表示されるもの）でページを読む。`revision` も返す |
+| `kioku_write_page` | `title`、`content`、`project?`、`scope?`（`project`/`global`）、`tags?`、`path?`、`expected_revision?` | 検索可能な Markdown ページを保存する。同じ title/path なら置き換える。`expected_revision`（`kioku_read` の `revision`）を渡すと、その後に誰かが変更していた場合は置き換えずに競合エラーになる。`pinned` タグを付けると、そのプロジェクト（グローバルなら全プロジェクト）の SessionStart のブロックに毎回表示される |
 | `kioku_handoff_write` | `project`、`session?`（SessionStart のブロックにある id）、`summary`、`next_steps`、`open_questions`、`decisions`、`verified?`、`gotchas?` | そのプロジェクトの次のセッションが受け取る引き継ぎを記録する。決定事項・確認済みの事実（`verified`）・未解決の質問・落とし穴（`gotchas`）は後のセッションにも引き継がれる |
 | `kioku_handoff_pending` | `project`、`accept?`（既定 false）、`session?`、`lane?`、`history?`（最大 20） | 未受領の引き継ぎを覗く（または受領する）。既定はメインライン、`session` / `lane` でブランチのレーンを読む。`history` でそのレーンの直近の引き継ぎを状態つきで返す |
 | `kioku_status` | — | 件数、データディレクトリ、登録済みプロジェクト id |
@@ -641,8 +719,22 @@ Compose の場合（`docker-compose.yml` 参照）は、同じ場所の `.env` �
   index/tantivy-v3/             # 派生データ。`kioku reindex` で wiki/ から再構築
   index/schema-version          # 索引の形式。古ければサーバーが起動時に作り直す
   backups/<id>/                 # `kioku backup` のスナップショット（新しい順に [retention] backups_keep 個）
+  outbox/<server>/              # 再送待ちの観測（`kioku sync`）。failed/ はサーバーが拒否したもの
+  state/                        # クライアント / サーバーの小さな状態ファイル:
+    last-hook.json              #   各エージェントの最後のフックと最後の成功（doctor、status --agents）
+    projects.json               #   SessionStart フックのプロジェクト識別キャッシュ
+    server-addrs.json           #   最後につながったサーバーのアドレス
+    auto-update.json            #   自動更新・ロールバックの記録
+    hook-dump-enabled-at        #   24 時間のペイロード記録期間の開始時刻
+    nudge-<session>, cursor-ctx/, antigravity/   # Stop の催促の間隔、遅延コンテキストの印
+  captures/<date>/              # `kioku hook-dump extract` の出力
+  logs/serve.log                # サーバーのログ（サービス。10 MiB でローテーション）
+  logs/update.log               # バックグラウンド更新の結果
   logs/hook.log                 # クライアント側フックの失敗ログ
+  kioku.lock                    # データディレクトリを開いているプロセスが保持
 ```
+
+クライアント専用のマシンの `~/.kioku` には `config.toml`、`outbox/`、`state/`、`captures/`、`logs/` だけがあります。
 
 ページは YAML frontmatter 付きの Markdown なので、どのエディタでも読み書きできます（手で編集したら
 `kioku reindex` を実行すると検索に反映されます）。kioku はコミットはしますが push はしません。
@@ -668,6 +760,7 @@ port = 7391
 auth_token = "…"        # `kioku init` が生成。無いと serve は起動を拒否する
 # data_dir = "~/.kioku" # データの置き場所を変える場合（任意）
 summary_lang = "ja"     # ja | en — セッションページ、STATE.md、生成される引き継ぎ
+# request_log = true    # serve.log に 1 リクエスト 1 行（method route status ms）を出す
 
 [client]                # `kioku hook`、`search`、`status`、`reindex`、`install` が使う
 server_url = "http://127.0.0.1:7391"
@@ -703,7 +796,7 @@ auto = true             # `kioku serve` が毎日この方針を適用する
 | `KIOKU_STOP_NUDGE` | `0` / `false` / `off` / `no` で Stop の催促を無効化 |
 | `KIOKU_MACHINE` | セッション開始時に送るマシン名（既定はホスト名の最初の `.` まで、64 文字以内）。最近のセッション・セッションページ・引き継ぎの見出しに `@マシン名` として表示 |
 | `KIOKU_AUTO_UPDATE` | `[update] auto`（`0` で自動更新を止める） |
-| `RUST_LOG` | サーバーのログフィルタ（既定 `info,tantivy=warn`） |
+| `RUST_LOG` | サーバーのログフィルタ（既定 `info,tantivy=warn`。`request_log = true` でなければ `kioku_http=off` も付く） |
 
 `kioku serve --bind <addr> --port <port>` はそのどちらよりも優先されます。
 
@@ -830,14 +923,24 @@ memorix など）、一見の価値があります。kioku の違いは、日本
 
 ## ロードマップ
 
-- **M1**: サーバー、Markdown/git ストア、日本語検索、MCP ツール、Claude Code のフックと引き継ぎ、
-  ルールベースの要約。
-- **M2**（このリリース）: Codex CLI、Cursor、Gemini CLI。`install.sh`、
-  `kioku setup` / `doctor` / `service` / `update`。
-- **今後**: Web UI。
-- **M3**: 埋め込み（embeddings）+ bi-temporal な事実管理。
-- **M4**: 取り込みアダプタ。
-- **M5**: 評価ハーネス。日本語検索の固定コーパス評価と障害時の回帰テストは M2.6 で前倒し実装。
+出荷済み（詳細は [CHANGELOG.md](CHANGELOG.md)、仕様は [docs/INDEX.md](docs/INDEX.md)）:
+
+- **M1 / M2**: サーバー、Markdown/git ストア、日本語検索、MCP ツール、ルールベースの要約。Claude Code、
+  Codex CLI、Cursor、Gemini CLI。`install.sh`、`kioku setup` / `doctor` / `service` / `update`。
+- **M2.1**（v0.3.0）Antigravity CLI · **M2.2**（v0.5.0）Windows クライアント · **M2.3**（v0.6.0）
+  `kioku invite` / `join` · **M2.4**（v0.6.4）ブランチごとの引き継ぎレーン、プロジェクト別名 · **M2.5**（v0.7.0）
+  自動更新 · **M2.6**（v0.8.0）バックアップ / 復元、オフラインキュー · **M2.7**（v0.8.1）堅牢化 · **M2.8**
+  （v0.8.2）1 ターンあたりのコスト、保持期間 · **M3.0**（v0.9.0）セッション開始ブロックの充実 · **M3.1**
+  （v0.9.1）引き継ぎの消費ルール、検索の改善。
+
+予定:
+
+- **M3.2**（作業中）: メトリクスとリクエストログ、`status --watch` / `--agents`、フックの稼働確認、
+  `doctor --fix`、ローカルネットワークの診断、ドキュメントの索引。
+- **M3.3**: Homebrew tap、Docker イメージ、`kioku uninstall`、フィクスチャの鮮度チェック。
+
+M4 以降のアイデア（未確定）: Web UI、埋め込みと bi-temporal な事実管理、任意の LLM による整理、
+取り込みアダプタ（メール、カレンダー）、日本語検索の基準を超える評価ハーネス。
 
 ## 記憶の信頼性と復旧（M2.6）
 

@@ -29,6 +29,8 @@ Gemini installers (the hook *handlers* must not assume Claude Code though — se
 
 ## 2. Data directory
 
+> Amended by SPEC-M2.6 §2 (`backups/`, `outbox/`), SPEC-M2.8 §3, SPEC-M3.1 §2 (`dict/`) and SPEC-M3.2 §2 (`state/last-hook.json`); the current layout is in README "Data layout" — see [INDEX.md](INDEX.md).
+
 `$KIOKU_DATA_DIR`, default `~/.kioku`. Created by `kioku init`.
 
 ```
@@ -58,6 +60,8 @@ absent, log a warning once and continue without commits). Every page write
 commits with message `kioku: <kind> <path>` as author `kioku <kioku@localhost>`.
 
 ## 3. config.toml
+
+> Amended by SPEC-M2.5 §2 (`[update]`), SPEC-M2.8 §3 (`[retention]`), SPEC-M3.0 §4 (`nudge`, `nudge_min_minutes`) and SPEC-M3.2 §1 (`[server] request_log`).
 
 ```toml
 [server]
@@ -123,26 +127,43 @@ memory. Document this in the README later.
 
 ## 5. SQLite schema (rusqlite, WAL mode, `PRAGMA foreign_keys=ON`)
 
+> Updated by SPEC-M3.2 §4 to the current schema (`PRAGMA user_version` = 5). The SPEC that
+> added each table or column is noted on its line; columns added after M1 are added with
+> `ALTER TABLE` when an older database is opened (`ADDED_COLUMNS` in `db.rs`).
+
 ```sql
-projects(id TEXT PK, name TEXT, root_path TEXT, remote_url TEXT, created_at TEXT);
-sessions(id TEXT PK, project_id TEXT FK, agent TEXT, cwd TEXT, source TEXT,
-         started_at TEXT, ended_at TEXT, status TEXT, -- open|finalized
-         root_path TEXT  -- project root on the machine that ran the session
-        );
-observations(id INTEGER PK, session_id TEXT FK, project_id TEXT, seq INTEGER,
-             kind TEXT,      -- prompt|tool_use|stop|compact|note
-             ts TEXT, payload TEXT /*json*/, text TEXT /*sanitized, searchable*/);
-handoffs(id TEXT PK, project_id TEXT, session_id TEXT, source TEXT, -- agent|rules
-         content_md TEXT, created_at TEXT, accepted_at TEXT, accepted_by TEXT,
-         updated_at TEXT,  -- last in-place refresh (rules); created_at never moves
-         seq_at INTEGER);  -- session's MAX(observations.seq) when written
-pages(path TEXT PK, project_id TEXT, scope TEXT, kind TEXT, title TEXT,
-      tags TEXT /*json array*/, created_at TEXT, updated_at TEXT, hash TEXT);
+projects(id TEXT PK, name TEXT, root_path TEXT, remote_url TEXT, created_at TEXT);   -- M1
+sessions(id TEXT PK, project_id TEXT FK, agent TEXT, cwd TEXT, source TEXT,          -- M1
+         started_at TEXT, ended_at TEXT, status TEXT,   -- open|finalized (M1)
+         root_path TEXT,     -- project root on the machine that ran the session (M2 §9.4)
+         lane TEXT,          -- handoff lane = branch; NULL = main line (SPEC-M2.4 §1.3)
+         digest_json TEXT,   -- cached SessionDigest … (SPEC-M2.8 §1)
+         digest_seq INTEGER, -- … as of this observation seq (SPEC-M2.8 §1)
+         machine TEXT);      -- client host name (SPEC-M3.0 §6)
+observations(id INTEGER PK, session_id TEXT FK, project_id TEXT, seq INTEGER,        -- M1
+             kind TEXT,      -- prompt|tool_use|stop|compact|note (M1), assistant (SPEC-M3.0 §3)
+             ts TEXT, payload TEXT /*json*/, text TEXT /*sanitized, searchable*/,
+             UNIQUE(session_id, seq));  -- payload reduced to a stub by retention (SPEC-M2.8 §3)
+handoffs(id TEXT PK, project_id TEXT, session_id TEXT, source TEXT, -- agent|rules (M1)
+         content_md TEXT, created_at TEXT, accepted_at TEXT,
+         accepted_by TEXT,   -- session id, or "superseded" (SPEC-M3.1 §1)
+         updated_at TEXT,    -- last in-place refresh of a rules handoff (M1 §7.1 amendment)
+         seq_at INTEGER,     -- session's MAX(observations.seq) when written (M1 §7.1 amendment)
+         lane TEXT);         -- SPEC-M2.4 §1.3
+pages(path TEXT PK, project_id TEXT, scope TEXT, kind TEXT, title TEXT,              -- M1
+      tags TEXT /*json array*/, created_at TEXT, updated_at TEXT,
+      hash TEXT);            -- content hash = the page `revision` (SPEC-M2.6 §1)
+project_aliases(alias TEXT PK, project_id TEXT, created_at TEXT);                    -- SPEC-M2.4 §2
+observation_receipts(session_id TEXT, event_id TEXT, seq INTEGER, request_hash TEXT, -- SPEC-M2.6 §3
+                     PRIMARY KEY(session_id, event_id));
+page_redirects(old_path TEXT PK, new_path TEXT);                                     -- SPEC-M2.6 §1
+reliability_meta(key TEXT PK, value TEXT);  -- SPEC-M2.6 §4: last_received, last_backup;
+                                            -- needs_reindex (SPEC-M2.7 §6); last_prune (SPEC-M2.8 §3)
+-- indexes: sessions(project_id, started_at), handoffs(project_id, created_at),
+--          handoffs(session_id), pages(project_id, kind, created_at)
+PRAGMA user_version = 5;  -- M1 = 1, M2.4 = 2, M2.6 = 3, M2.8 = 4, M3.0 = 5 (SPEC-M2.7 §5)
 ```
 
-Columns added after the first M1 release (`sessions.root_path`,
-`handoffs.updated_at`, `handoffs.seq_at`) are added with `ALTER TABLE` when an
-older database is opened.
 
 Timestamps are RFC 3339 UTC. IDs: sessions use the agent's session id
 verbatim; handoffs/pages use ULID-like `chrono` ms + 6 random hex.
@@ -183,6 +204,8 @@ keeps `created`, bumps `updated`. Reject paths containing `..` or absolute.
 
 ### 6.2 tantivy schema
 
+> Amended by SPEC-M3.1 §2 (index schema v3: `code` and `ja_bigram` fields, user dictionary) and SPEC-M2.8 §5 (an outdated index is rebuilt by the server after it starts; no manual `kioku reindex`).
+
 | field       | type   | options                                  |
 |-------------|--------|------------------------------------------|
 | path        | STRING | stored, indexed (exact)                  |
@@ -211,6 +234,8 @@ Index writes happen synchronously in the same `spawn_blocking` as the page
 write (M1 scale is thousands of pages; keep it simple).
 
 ### 6.3 Query
+
+> Amended by SPEC-M3.1 §2 (re-rank, `since` / `kinds`, identifiers, partial-match fallback) and SPEC-M3.1 §3 (`path_prefix`).
 
 `search(query, project: Option<&str>, scope: Scope, limit) -> Vec<Hit>`
 
@@ -255,70 +280,16 @@ Index these three bodies in a temp dir and assert:
 
 ### 7.1 Lifecycle
 
-```
-SessionStart hook ─► POST /api/v1/sessions/start ─► {project, pending handoff, state, recent}
-   (stdout: injected context — see §8.3)
-UserPromptSubmit / PostToolUse / PreCompact ─► POST /api/v1/observations (fire-and-forget)
-agent may call MCP kioku_handoff_write at any time (source = agent)
-Stop hook ─► GET /api/v1/sessions/{id}
-   if tool_uses_since_handoff >= 3 && !stop_hook_active && nudge enabled
-      → exit 2, stderr = nudge text (§8.4)   [agent writes handoff, stops again]
-   else → POST /api/v1/sessions/{id}/finalize
-SessionEnd hook ─► POST /api/v1/sessions/{id}/finalize (idempotent)
-```
-
-`tool_uses_since_handoff` = the session's `tool_use` observations with
-`seq > seq_at` of its latest agent handoff (all of them when it has none; for
-rows without `seq_at`, those with `ts > created_at`). A sequence mark rather
-than timestamps, because observation `ts` comes from the client's clock.
-`GET /api/v1/sessions/{id}` returns it; the constant 3 is
-`HANDOFF_STALE_TOOL_USES`.
-
-`finalize` (idempotent; second call is a no-op returning the same result):
-1. Record `MAX(seq)` of the session's observations, then build
-   `SessionDigest` from observations (§7.2).
-2. If the session has < 1 prompt and < 1 tool_use → mark finalized (step 6
-   rule), write nothing, return `{substantive: false}`.
-3. Write session page `<project>/sessions/YYYY-MM-DD-<first 8 of session>.md`
-   (§7.3), index it, commit.
-4. If no agent handoff exists for this session → create one from rules
-   (`source = rules`, content = digest "Handoff" section). If one exists but
-   `tool_uses_since_handoff >= 3` → create (or refresh) a rules handoff whose
-   content is the agent handoff followed by the Handoff section of a digest of
-   only the observations after it, headed `## 引き継ぎ（自動生成・追記）`
-   (`## Handoff (auto-generated addendum)`); the session page shows the same.
-5. Rewrite `<project>/STATE.md` (§7.4), index, commit.
-6. Mark session finalized — only if `MAX(seq)` is still the value from step 1
-   (one conditional `UPDATE`). Observations do not take the write lock, so one
-   that arrived meanwhile keeps the session open for the next finalize instead
-   of being silently left out.
-
-Claude Code fires Stop after every turn, so finalize runs many times per
-session: a `prompt`/`tool_use` observation on a finalized session reopens it,
-and the next finalize rewrites the same session page, refreshes the session's
-pending rules handoff in place (no pile-up; `created_at` kept, `updated_at`
-set — an addendum is refreshed only if it is newer than the agent handoff it
-extends, otherwise a new one is created), and rewrites STATE.md.
-
-Handoff order ("newest"): `created_at` descending, and on a tie an agent
-handoff before a rules one. Because refreshes keep `created_at`, a rules
-handoff never outranks a newer agent handoff from another session; within a
-session a rules handoff outranks the agent's only when it is the addendum
-created after it (which embeds the agent's text).
-
-Handoffs are single-use per project: `sessions/start` returns the newest
-unaccepted handoff for the project and marks it accepted by the new session;
-older unaccepted handoffs for the same project are marked accepted too
-(superseded). `kioku_handoff_pending` with `accept=false` peeks without
-consuming.
-
-> Amended by **SPEC-M2.4 §1.4** (per-lane routing) and **SPEC-M3.1 §1**: a resumed /
-> compacted / cleared session gets back what it accepted and accepts nothing new; a
-> session never accepts its own handoff; a lane with another active session only shows
-> the pending handoff for reference; superseded rows carry `accepted_by = "superseded"`;
-> `kioku_handoff_pending(history: N)` lists a lane's recent handoffs with their status.
+> Replaced by pointers (SPEC-M3.2 §4). The lifecycle (SessionStart → observations → Stop
+> → finalize → SessionEnd) is split over several specs; see [INDEX.md](INDEX.md): routing
+> and consumption of handoffs SPEC-M3.1 §1 (lanes SPEC-M2.4 §1), finalize SPEC-M2.8 §1–§2
+> and SPEC-M3.0 §4, the Stop nudge SPEC-M3.0 §4, the last reply SPEC-M3.0 §3.
+> `tool_uses_since_handoff` (`HANDOFF_STALE_TOOL_USES` = 3) counts the session's `tool_use`
+> observations with `seq > seq_at` of its latest agent handoff.
 
 ### 7.2 SessionDigest (rule-based, no LLM)
+
+> Amended by SPEC-M2.8 §1 (cached, incremental digest), SPEC-M2.8 §6 (error detection, prompt titles) and SPEC-M3.0 §3 (the last reply).
 
 From the session's observations, in order:
 
@@ -356,6 +327,8 @@ switches to English strings. Keep all strings in one `strings.rs` module.
 
 ### 7.3 Session page
 
+> Amended by SPEC-M2.6 §1 (file name `YYYY-MM-DD-<8>-<12 hex>.md`), SPEC-M2.8 §2 (written only on change) and SPEC-M3.0 §3 (「最後の回答」).
+
 ```markdown
 ---
 title: <YYYY-MM-DD HH:MM> <agent> — <first prompt truncated 60>
@@ -373,6 +346,8 @@ project/scope/kind=session/tags=[<agent>]/created/updated/session/agent
 
 ### 7.4 STATE.md
 
+> Amended by SPEC-M3.0 §1 (block sections 3–6 also in STATE.md) and SPEC-M2.8 §2 (rewritten only when its content changed).
+
 ```markdown
 ---
 title: <project name> — 現在の状態
@@ -388,6 +363,8 @@ kind: state, scope: project, project, updated
 ```
 
 ### 7.5 Agent-written handoff (MCP `kioku_handoff_write`)
+
+> Amended by SPEC-M3.0 §2 (`gotchas`, `verified`) and SPEC-M2.7 §9 (redacted before storing).
 
 Input: `{ project: String, session?: String, summary: String,
 next_steps: Vec<String>, open_questions: Vec<String>, decisions: Vec<String> }`
@@ -415,6 +392,8 @@ cwd), falling back to the newest started. Store `source = agent` and
 ## 8. Hooks (client side, `kioku hook <event>`)
 
 ### 8.1 Design
+
+> Amended by SPEC-M2 §3 (neutral event model, every agent), SPEC-M2.7 §1 (always fail-open) and SPEC-M3.0 §3 (Stop records the agent's last reply).
 
 Hook handlers are thin HTTP clients: read JSON on stdin, POST to the server,
 print to stdout what the agent should see, exit. They must be **fail-open**:
@@ -458,6 +437,8 @@ Claude Code stdin fields: `session_id`, `transcript_path`, `cwd`,
 
 ### 8.2 Sanitization (before anything leaves the machine)
 
+> Amended by SPEC-M2.7 §9 (more patterns; pages and handoffs redacted too).
+
 Apply to `prompt`, `tool_input`, `tool_response` text (serialized):
 - Replace matches of these with `[REDACTED]`: `AKIA[0-9A-Z]{16}`,
   `sk-[A-Za-z0-9_-]{16,}`, `sk_(live|test)_[A-Za-z0-9]{10,}`,
@@ -482,41 +463,13 @@ Apply to `prompt`, `tool_input`, `tool_response` text (serialized):
 
 ### 8.3 SessionStart output
 
-> **Superseded by [SPEC-M3.0 §1](SPEC-M3.0.md)** (2026-10-01): the block now carries the
-> handoff, decisions / open questions carried from earlier handoffs, pinned pages, recent
-> sessions and the previous session's last reply, each section with its own cap, within
-> 8,000 chars; the STATE.md excerpt is no longer printed. The layout below is what a client
-> still prints for an older server's response (no `context_version`).
-
-Print plain text (Claude Code adds stdout of SessionStart hooks as context):
-
-```
-<kioku>
-project: <name> (id: <id>)  ← pass this id as `project` to kioku_* tools   (localized, strings.rs)
-session: <session id>  ← pass this id as `session` to kioku_handoff_write     (localized)
-server: <url>
-
-## 前回からの引き継ぎ            (only if a pending handoff existed)
-<handoff content>
-
-## 現在の状態（STATE.md 抜粋）    (first 60 lines of STATE.md, if any)
-…
-
-セッション終了前に kioku_handoff_write（上の project と session を渡す）で要約・次の一手・未解決点を書くこと。
-関連する過去の記録は kioku_query で検索できる。
-</kioku>
-```
-
-When a pending handoff is printed, the STATE excerpt omits its
-`## 最新の引き継ぎ` / `## Latest handoff` section (heading up to the next `## `
-heading, either language) — it repeats the same handoff; `最近のセッション` and
-`よく触るファイル` stay. If nothing is left, the STATE section is omitted.
-
-Cap the whole block at 6 000 chars (truncate STATE excerpt first, at line
-boundaries with a `…` marker, then the handoff; a section with < 40 chars of
-budget left is dropped). Text comes from `strings.rs` in `[client] lang`.
+> **Superseded by [SPEC-M3.0 §1](SPEC-M3.0.md)** — the `<kioku>` block (header, untrusted
+> memory note SPEC-M2.7 §3, handoff, carried decisions / open questions, pinned pages,
+> recent sessions, last reply; 8,000 chars). See [INDEX.md](INDEX.md).
 
 ### 8.4 Stop nudge
+
+> Superseded by SPEC-M3.0 §4: ≥ 3 tool uses **and** ≥ `nudge_min_minutes` since the handoff (or start) **and** no nudge in the last 10 minutes.
 
 Conditions in §7.1 (`tool_uses_since_handoff >= 3`, so the nudge returns when
 work continued after a handoff; a server response without that field — an
@@ -534,37 +487,13 @@ and exit 2. Claude Code feeds stderr back to the model and lets it continue;
 
 ### 8.5 `kioku install claude-code`
 
-- Merge into `~/.claude/settings.json` (`--project` → `.claude/settings.json`)
-  a `hooks` block registering `kioku hook <event>` for SessionStart (matcher
-  `startup|resume|clear|compact`), UserPromptSubmit, PostToolUse (matcher
-  `Edit|Write|MultiEdit|NotebookEdit|Read|Bash`), Stop, PreCompact,
-  SessionEnd. Use the absolute path of the running binary. Preserve every
-  existing hook; be idempotent (detect our entries by the command prefix).
-- MCP: set `mcpServers.kioku` in `~/.claude.json` (Claude Code's user-scope
-  MCP config) directly to
-  `{"type":"http","url":"<server_url>/mcp","headers":{"Authorization":"Bearer <token>"}}`,
-  preserving every other key and their order; idempotent (no write when
-  already equal). The `claude` CLI is never run: `claude mcp add --header …`
-  would put the token on a command line visible in `ps`. If `~/.claude.json`
-  is not valid JSON (or `mcpServers` is not an object) it is left untouched and
-  the snippet below is printed instead. A new `~/.claude.json` is created 0600;
-  an existing one keeps its mode (written via temp file + rename).
-- Print what was changed (never the token). `kioku uninstall claude-code`
-  reverses both: it removes exactly the hook entries whose command contains
-  `kioku hook` (event lists / `hooks` left empty by that are removed; foreign
-  hooks, even in the same matcher group, stay) and only
-  `mcpServers.kioku` from `~/.claude.json`.
-- Entry shape: `{matcher?, hooks:[{type:"command", command:"<abs bin> hook
-  <event>"}]}`; the SessionStart entry also has `"timeout": 10`. Re-installing
-  replaces our entry in place (e.g. after the binary moved) — never a second
-  one. The fallback snippet is
-  `{"mcpServers":{"kioku":{"type":"http","url":"<server_url>/mcp","headers":{"Authorization":"Bearer <token>"}}}}`.
-  Server URL and token come from `[client]`.
-- Back up the settings file to `settings.json.kioku-bak` (and `~/.claude.json`
-  to `.claude.json.kioku-bak`) before the first modification (only if the
-  file existed; an existing backup is never overwritten).
+> Replaced by pointers (SPEC-M3.2 §4): installer rules for every agent are SPEC-M2 §8;
+> the MCP entry is the `kioku mcp` stdio bridge (SPEC-M2 §20.2); Windows and the Claude
+> desktop app are SPEC-M2.2 §7.1 and §7.3a. See [INDEX.md](INDEX.md).
 
 ## 9. HTTP API (axum, JSON, `Authorization: Bearer <token>`)
+
+> Amended by SPEC-M2 §9, SPEC-M2.3 §3.2 (invites, join), SPEC-M2.6 §2–§4, SPEC-M2.7 §11 (health without version), SPEC-M2.8 §3 (prune, forget), SPEC-M3.1 §2 (search parameters) and SPEC-M3.2 §1 (metrics); see [INDEX.md](INDEX.md).
 
 Auth is enforced when `auth_token` is set (always set by `kioku init`).
 Loopback requests without a token are rejected too — simpler, one rule.
@@ -602,7 +531,23 @@ Errors: `{error: "<message>"}` with 400/401/404/409/500 (core `NotFound` → 404
 `InvalidInput` and malformed JSON / query strings → 400, `Conflict` → 409 — a stale
 `expected_revision`, a delivery id reused with other contents, a second backup within
 60 s (SPEC-M2.6, SPEC-M2.7 §12) — anything else → 500).
-Unknown session on `observations` → 404 (hook then silently drops). An unknown
+Unknown session on `observations` → 404 (hook then silently drops).
+
+| HTTP status | when |
+|-------------|------|
+| 400 | `InvalidInput`, malformed JSON or query string |
+| 401 | missing or wrong bearer token |
+| 404 | `NotFound` (unknown session, page, project — the message lists known project ids) |
+| 409 | `Conflict`: stale `expected_revision` (SPEC-M2.6 §1), a delivery id reused with other contents (SPEC-M2.6 §3), a second backup within 60 s (SPEC-M2.7 §12) |
+| 429 | too many failed invite-code lookups (SPEC-M2.3 §3.2) |
+| 500 | anything else |
+
+Process exit codes of `kioku`: 0 success; 1 any command error (`kioku: error: …`), and
+`kioku doctor` with a failed check (`doctor --fix`: a fix that could not be applied,
+SPEC-M3.2 §3); 2 the Stop nudge of a hook (§8.4, SPEC-M3.0 §4) — every other hook outcome
+is 0 (SPEC-M2.7 §1); **75** (`EX_TEMPFAIL`) `kioku serve` replaced its own binary or rolled
+back and wants the service manager to restart it (SPEC-M2.5 §3.1, SPEC-M2.7 §7); **78**
+(`EX_CONFIG`) `kioku serve` refuses a data directory written by a newer kioku (SPEC-M2.7 §5). An unknown
 project on `PUT /pages` or `POST /handoffs` → 404 whose message lists the
 known project ids.
 
@@ -610,6 +555,8 @@ rmcp's `Host`-header allowlist is disabled for `/mcp` (a home server is reached
 by names we cannot know in advance; the bearer token is the guard).
 
 ## 10. MCP tools (rmcp `#[tool_router]`)
+
+> Amended by SPEC-M2.6 §1 (`revision`, `expected_revision`), SPEC-M3.0 §2 (`gotchas`, `verified`), SPEC-M3.1 §1 (`history`) and SPEC-M3.1 §2–§3 (`since`, `kinds`, `path_prefix`); the current table is in README "MCP tools".
 
 All tools are thin wrappers over `kioku-core`; descriptions are what the
 model reads, so write them carefully (Japanese + English one-liner each).
@@ -633,26 +580,11 @@ the agent to query before exploring and to write a handoff before stopping.
 
 ## 11. CLI
 
-```
-kioku init [--client-only <url> <token>]
-kioku serve [--bind] [--port]
-kioku search <query> [--project <id>] [--scope all|project|global] [--limit N]
-kioku hook <session-start|user-prompt-submit|post-tool-use|stop|pre-compact|session-end> [--agent claude-code]
-kioku install claude-code [--project]   /  kioku uninstall claude-code [--project]
-kioku project id [path]
-kioku reindex
-kioku status
-```
-
-`kioku serve` logs with `tracing` (`RUST_LOG`, default `info`), prints the
-bind address and data dir on start, refuses to start without a token
-(regardless of bind address). Default log filter `info,tantivy=warn`.
-
-`search`, `status` and `reindex` are HTTP clients of the server (`[client]`
-config, `COMMAND_TIMEOUT` 600 s); `search` joins its words into one query and
-prints hits like `kioku_query`. `project id` prints only the id. Any command
-error prints `kioku: error: …` and exits 1; `hook` always exits 0 except the
-Stop nudge (2).
+> Replaced by a pointer (SPEC-M3.2 §4): the current commands are listed in CLAUDE.md
+> ("Directory layout") and `kioku --help`; where each is specified: [INDEX.md](INDEX.md).
+> Unchanged since M1: `search`, `status` and `reindex` are HTTP clients of the server
+> (`[client]` config); any command error prints `kioku: error: …` and exits 1; `hook`
+> always exits 0 except the Stop nudge (2).
 
 ## 12. Step plan (one agent run per step)
 

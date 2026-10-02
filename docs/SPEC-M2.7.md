@@ -139,6 +139,8 @@ assert the marker is absent).
 
 ## 12. Small fixes (audit CLI-L2/L3/L5, CORE-8, SEC-10)
 
+> Amended by SPEC-M2.8 §3: `[server] backup_keep` moved to `[retention] backups_keep` (the old key is still read).
+
 - `rotate-token` verifies against the configured bind/own URL, not 127.0.0.1. `cfg.save`
   drops config.toml comments: rewrite only the `auth_token` line in place (string edit,
   no new crate) and keep everything else byte-identical.
