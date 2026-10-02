@@ -390,6 +390,8 @@ try {
             KIOKU_DATA_DIR = $null
             KIOKU_SERVER_URL = 'http://127.0.0.1:9'
             KIOKU_DOWNLOAD_BASE = $Base
+            KIOKU_USER_PATH_FILE = $PathFile
+            LOCALAPPDATA = (Join-Path $Work 'localappdata')
         }
         foreach ($k in $vars.Keys) {
             $saved[$k] = [Environment]::GetEnvironmentVariable($k, 'Process')
@@ -433,6 +435,19 @@ try {
             Check 'real: kioku update renames the running kioku.exe aside' $updated
             Run-Exe @('--version')
             Check 'real: the next run removes kioku.exe.old' ($script:Rc -eq 0 -and -not (Test-Path -LiteralPath "$Exe.old"))
+
+            # SPEC-M3.3 section 3: kioku uninstall removes the user PATH entry install.ps1 added
+            # (it left kioku-path-entry.txt next to kioku.exe) and the running kioku.exe;
+            # the other PATH entries and config.toml stay.
+            $marker = Join-Path $RealDir 'kioku-path-entry.txt'
+            $pathBefore = Get-Content -LiteralPath $PathFile -Raw
+            Check 'real: install.ps1 put the dir on the user PATH and left its marker' ($pathBefore.Contains($RealDir) -and (Test-Path -LiteralPath $marker))
+            Run-Exe @('uninstall', '--dry-run')
+            Check 'real: kioku uninstall --dry-run prints the plan, changes nothing' ($script:Rc -eq 0 -and (Has "PATH: remove $RealDir from the user PATH") -and (Has 'binary: remove') -and (Get-Content -LiteralPath $PathFile -Raw) -eq $pathBefore -and (Test-Path -LiteralPath $Exe))
+            Run-Exe @('uninstall', '--yes')
+            $pathAfter = Get-Content -LiteralPath $PathFile -Raw
+            Check 'real: kioku uninstall removes the installer''s user PATH entry, nothing else' ($script:Rc -eq 0 -and -not $pathAfter.Contains($RealDir) -and $pathAfter.Contains('C:\Tools') -and -not (Test-Path -LiteralPath $marker))
+            Check 'real: kioku uninstall removes the running kioku.exe; config.toml stays' (-not (Test-Path -LiteralPath $Exe) -and (Test-Path -LiteralPath (Join-Path $cfgDir 'config.toml')))
         } finally {
             foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k], 'Process') }
         }

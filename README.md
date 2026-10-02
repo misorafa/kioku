@@ -239,6 +239,38 @@ source build. By hand:
 `cargo install --locked --path crates/kioku-cli` in a checkout. `git` is
 optional at runtime (without it the wiki is not versioned).
 
+### Homebrew
+
+```sh
+brew install misorafa/tap/kioku
+kioku setup            # or paste the line `kioku invite` prints on your server
+```
+
+The formula installs the same release binaries (macOS: Apple silicon and Intel; Linux:
+the static musl builds). Homebrew owns the binary: `kioku update` and the automatic
+updates only print `brew upgrade kioku`, and hooks and the service are registered with
+the stable `$(brew --prefix)/bin/kioku` link, so they keep working across upgrades.
+
+### Uninstall
+
+```sh
+kioku uninstall                 # prints the plan, asks once, then does it
+kioku uninstall --everything    # also config.toml (server URL and token)
+kioku uninstall --everything --purge-data   # also the data directory: run `kioku backup` first
+```
+
+`kioku uninstall` removes kioku's hooks, MCP entries and instruction blocks from every
+agent (other content in those files stays as it was), stops and removes the background
+service, removes the PATH line `install.sh` added (only its exact line ending in
+`# added by the kioku installer`; on Windows, the user PATH entry `install.ps1` added),
+and removes the binary and `kioku.prev`. `config.toml` stays unless `--everything`; the
+data directory (wiki, database, index, backups) is removed only with `--purge-data`,
+after you type `DELETE`. `--yes` skips the questions, `--dry-run` only prints the plan.
+Quit the Claude desktop app first (it rewrites its config while it runs). A Homebrew or
+winget binary is left to the package manager: `brew uninstall kioku` /
+`winget uninstall misorafa.kioku` afterwards. `kioku uninstall <agent>` (or `all`) still
+removes only that agent's entries.
+
 ### Adding another machine: `kioku invite`
 
 Other machines (laptop, desktop, Windows PC) talk to one server. To add one, run
@@ -303,8 +335,9 @@ To turn it off, add this to `config.toml` (or set `KIOKU_AUTO_UPDATE=0`); the
 auto = false
 ```
 
-A winget install is never replaced behind winget's back: it gets the notice
-with `winget upgrade misorafa.kioku`. A service installed before automatic
+A winget or Homebrew install is never replaced behind the package manager's back:
+it gets the notice with `winget upgrade misorafa.kioku` / `brew upgrade kioku`. A
+Docker server never replaces itself either (see [Docker](#docker)). A service installed before automatic
 updates existed needs, once, `kioku update` and then `kioku service install` (the old
 binary that runs the update cannot rewrite the service definition; `kioku doctor` warns).
 
@@ -609,7 +642,8 @@ session (`postToolUse`; file edits and failed tools cannot carry it;
 
 Google retired Gemini CLI for personal accounts on 2026-06-18 (it still serves
 Code Assist Standard/Enterprise and paid API keys); its successor is
-Antigravity CLI, below. Gemini CLI is detected by `~/.gemini/tmp`, not by
+Antigravity CLI, below. The Gemini CLI install path is **legacy**: it keeps working,
+but gets no new features, and its test fixtures live under `fixtures/legacy/`. Gemini CLI is detected by `~/.gemini/tmp`, not by
 `~/.gemini`, which Antigravity creates too.
 
 | what | where |
@@ -714,28 +748,43 @@ of these:
 
 ## Docker
 
+Every release publishes `ghcr.io/misorafa/kioku:<tag>` and `:latest` (linux/amd64 and
+linux/arm64, built from the release's static binaries):
+
 ```sh
-docker build -t kioku .
-docker run -d --name kioku -p 7391:7391 \
+docker run -d --name kioku --restart unless-stopped -p 7391:7391 \
   -e KIOKU_AUTH_TOKEN="$(openssl rand -hex 32)" \
-  -v kioku-data:/data kioku
+  -v kioku-data:/data ghcr.io/misorafa/kioku
 ```
 
 The image runs `kioku serve` as a non-root user (uid 10001) with
-`KIOKU_DATA_DIR=/data` and `KIOKU_BIND=0.0.0.0`. No `config.toml` is needed:
-with `KIOKU_AUTH_TOKEN` set, the data directory is created on first start. Keep
-the token — clients need it for `install.sh … --client-only <url> <token>` (or
-`kioku setup --client-only`). `docker exec kioku kioku invite` also works; it
-prints the container's address, so replace it with the Docker host's in the
-pasted line. On the Docker host itself, `kioku setup` sees the
-running server and does not install a service. A bind-mounted host
-directory must be writable by uid 10001. Extra arguments go to `kioku serve`
-(e.g. `--port 8000`), and `docker exec kioku kioku status` works inside the
-container.
+`KIOKU_DATA_DIR=/data` (a volume) and `KIOKU_BIND=0.0.0.0`, exposes port 7391 and
+reports its health from `/api/v1/health` (`docker ps` shows `healthy`). No
+`config.toml` is needed: with `KIOKU_AUTH_TOKEN` set, the data directory is created on
+first start. Keep the token — clients need it (`kioku setup --client-only <url>`, token
+on stdin). Without `KIOKU_AUTH_TOKEN`, create one once with
+`docker run --rm -v kioku-data:/data ghcr.io/misorafa/kioku init`: in a container,
+`init` prints the generated token (only that once; there is no local config to read it
+from later). `docker exec kioku kioku invite` also works; it prints the container's
+address, so replace it with the Docker host's in the pasted line. On the Docker host
+itself, `kioku setup` sees the running server and does not install a service. A
+bind-mounted host directory must be writable by uid 10001. Arguments replace the
+command: `docker run … ghcr.io/misorafa/kioku serve --port 8000`; `docker exec kioku
+kioku status` works inside the container.
 
-With Compose (see `docker-compose.yml`), put `KIOKU_AUTH_TOKEN=…` in a `.env`
-file next to it and run `docker compose up -d`. The same TLS advice applies:
-the container speaks plain HTTP.
+With Compose, `docker-compose.yml` in this repository is a complete example: put
+`KIOKU_AUTH_TOKEN=…` in a `.env` file next to it and run `docker compose up -d`.
+
+**Updates.** The image is immutable and never updates itself (it only logs that a newer
+release exists). Update by pulling the new image:
+
+```sh
+docker compose pull && docker compose up -d     # or: docker pull ghcr.io/misorafa/kioku && recreate the container
+```
+
+or let [watchtower](https://containrrr.dev/watchtower/) do it (commented example in
+`docker-compose.yml`). The data stays in the volume; clients follow the server's
+version as usual. The same TLS advice applies: the container speaks plain HTTP.
 
 ## MCP tools
 
@@ -1041,13 +1090,12 @@ Shipped (details in [CHANGELOG.md](CHANGELOG.md), specs in [docs/INDEX.md](docs/
   **M2.5** (v0.7.0) automatic updates · **M2.6** (v0.8.0) backup / restore, offline queue ·
   **M2.7** (v0.8.1) hardening · **M2.8** (v0.8.2) per-turn cost, retention · **M3.0**
   (v0.9.0) richer session-start block · **M3.1** (v0.9.1) handoff consumption rules,
-  better search.
+  better search · **M3.2** (v0.9.2) metrics, hook liveness, `doctor --fix`, document index.
 
 Planned:
 
-- **M3.2** (in progress): metrics endpoint and request log, `status --watch` / `--agents`,
-  hook liveness, `doctor --fix`, Local Network diagnosis, one document index.
-- **M3.3**: Homebrew tap, Docker image, `kioku uninstall`, fixture freshness checks.
+- **M3.3** (in progress): Homebrew tap, Docker image on ghcr.io, `kioku uninstall`,
+  fixture freshness checks.
 
 Ideas for M4 and later (not committed): web UI, embeddings and bi-temporal facts, optional
 LLM consolidation, ingest adapters (mail, calendar), an evaluation harness beyond the

@@ -39,6 +39,8 @@ pub enum Status {
     Warn,
     /// Broken.
     Fail,
+    /// Nothing wrong; worth knowing (SPEC-M3.3 §4: an agent newer than kioku's fixtures).
+    Info,
 }
 
 impl Status {
@@ -48,6 +50,7 @@ impl Status {
             Status::Ok => "ok",
             Status::Warn => "warn",
             Status::Fail => "fail",
+            Status::Info => "info",
         }
     }
 
@@ -57,6 +60,7 @@ impl Status {
             Status::Ok => "[ OK ]",
             Status::Warn => "[WARN]",
             Status::Fail => "[FAIL]",
+            Status::Info => "[INFO]",
         }
     }
 }
@@ -200,10 +204,16 @@ pub fn render_text(checks: &[Check]) -> String {
     }
     let fails = checks.iter().filter(|c| c.status == Status::Fail).count();
     let warns = checks.iter().filter(|c| c.status == Status::Warn).count();
+    let infos = checks.iter().filter(|c| c.status == Status::Info).count();
     out.push_str(&format!(
-        "{} checks: {} ok, {warns} warning(s), {fails} failure(s)\n",
+        "{} checks: {} ok, {warns} warning(s), {fails} failure(s){}\n",
         checks.len(),
-        checks.len() - fails - warns
+        checks.len() - fails - warns - infos,
+        if infos > 0 {
+            format!(", {infos} info")
+        } else {
+            String::new()
+        }
     ));
     out
 }
@@ -1550,6 +1560,7 @@ fn agent_checks(agent: Agent, ctx: &InstallCtx, env: &DoctorEnv) -> Vec<Check> {
         _ => {}
     }
     out.extend(instructions_check(agent, ctx));
+    out.extend(fixture_version_check(agent, env));
     // SPEC-M3.2 §3: what `kioku install <agent>` repairs, `--fix` runs.
     for c in &mut out {
         if c.status != Status::Ok
@@ -1561,6 +1572,87 @@ fn agent_checks(agent: Agent, ctx: &InstallCtx, env: &DoctorEnv) -> Vec<Check> {
         }
     }
     out
+}
+
+/// The captured fixture whose `_meta.captured_with` records the agent version kioku's hook
+/// parsing was last checked against (SPEC-M3.3 §4), per agent. Gemini CLI is legacy: none.
+pub fn fixture_meta(agent: Agent) -> Option<&'static str> {
+    match agent {
+        Agent::ClaudeCode => Some(include_str!(
+            "../tests/fixtures/windows/claude-code/stop.captured.json"
+        )),
+        Agent::Codex => Some(include_str!("../tests/fixtures/codex/stop.captured.json")),
+        Agent::Cursor => Some(include_str!(
+            "../tests/fixtures/cursor/session_start.captured.json"
+        )),
+        Agent::Antigravity => Some(include_str!(
+            "../tests/fixtures/antigravity/session_start.captured.json"
+        )),
+        Agent::GeminiCli => None,
+    }
+}
+
+/// `_meta.captured_with` of a fixture (`"cursor-agent 2026.09.26-dd393fe"`, `"unknown"`).
+pub fn captured_with(fixture: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(fixture).ok()?;
+    v.get("_meta")?
+        .get("captured_with")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// The command that prints an agent's version (`None`: not obtainable).
+pub fn agent_version_command(agent: Agent) -> Option<&'static [&'static str]> {
+    match agent {
+        Agent::ClaudeCode => Some(&["claude", "--version"]),
+        Agent::Codex => Some(&["codex", "--version"]),
+        Agent::Cursor => Some(&["cursor-agent", "--version"]),
+        Agent::Antigravity => Some(&["agy", "--version"]),
+        Agent::GeminiCli => None,
+    }
+}
+
+/// The first version-looking word of `text` as numbers: `codex-cli 0.46.0` → [0, 46, 0],
+/// `2.0.14 (Claude Code)` → [2, 0, 14], `2026.09.26-dd393fe` → [2026, 9, 26].
+pub fn version_numbers(text: &str) -> Option<Vec<u64>> {
+    text.split_whitespace().find_map(|word| {
+        let word = word.trim_start_matches('v');
+        if !word.starts_with(|c: char| c.is_ascii_digit()) {
+            return None;
+        }
+        let core = word.split(['-', '+', '(']).next().unwrap_or(word);
+        let nums: Option<Vec<u64>> = core.split('.').map(|p| p.parse().ok()).collect();
+        nums.filter(|n| !n.is_empty())
+    })
+}
+
+/// SPEC-M3.3 §4: an INFO check when the installed agent (`installed`: its `--version`
+/// output) is newer than the version its fixtures were captured with (`recorded`).
+pub fn fixture_version_info(agent: Agent, installed: &str, recorded: &str) -> Option<Check> {
+    let now = version_numbers(installed)?;
+    let then = version_numbers(recorded)?;
+    (now > then).then(|| {
+        check(
+            &format!("agent.{}.fixtures", agent.as_str()),
+            Status::Info,
+            format!(
+                "{} {} is newer than the version kioku's hook fixtures were captured with ({recorded}); kioku keeps working, its payload tests may lag behind (maintainers: sh scripts/probe-agents.sh --check)",
+                agent.as_str(),
+                installed.lines().next().unwrap_or_default().trim()
+            ),
+            None,
+        )
+    })
+}
+
+/// [`fixture_version_info`] for an installed agent (its `--version` through the runner).
+fn fixture_version_check(agent: Agent, env: &DoctorEnv) -> Option<Check> {
+    let recorded = captured_with(fixture_meta(agent)?)?;
+    let out = env.runner.run(agent_version_command(agent)?);
+    if !out.success {
+        return None;
+    }
+    fixture_version_info(agent, &out.stdout, &recorded)
 }
 
 /// True when any of the agent's kioku hooks is registered (user level).
@@ -1613,9 +1705,9 @@ fn log_dir(cfg: &Config, env: &DoctorEnv) -> PathBuf {
 /// mismatch), and the last automatic update from `state/auto-update.json`.
 pub fn update_check(cfg: &Config, env: &DoctorEnv, health: &Health) -> Check {
     use crate::auto_update::{AutoUpdateState, MISMATCH_WARN, unix_now, within};
-    use crate::update::{is_newer, is_winget_install};
+    use crate::update::{is_newer, package_manager};
     let state = AutoUpdateState::load(&log_dir(cfg, env).with_file_name("state"));
-    let winget = is_winget_install(Path::new(&env.bin));
+    let managed = package_manager(Path::new(&env.bin));
     let mut parts = vec![format!(
         "automatic updates {} (channel {})",
         if cfg.update.auto { "on" } else { "off" },
@@ -1623,13 +1715,16 @@ pub fn update_check(cfg: &Config, env: &DoctorEnv, health: &Health) -> Check {
     )];
     let mut status = Status::Ok;
     let mut fix = None;
-    let how = if winget {
-        "winget upgrade misorafa.kioku".to_string()
-    } else {
-        "kioku update".to_string()
+    let how = match managed {
+        Some(pm) => pm.upgrade_command().to_string(),
+        None => "kioku update".to_string(),
     };
-    if winget {
-        parts.push("installed with winget (updates via winget)".into());
+    if let Some(pm) = managed {
+        parts.push(format!(
+            "installed with {0} (updates via {0}: {1})",
+            pm.name(),
+            pm.upgrade_command()
+        ));
     }
     if let Health::Kioku { version } = health
         && !version.is_empty()
@@ -1964,6 +2059,93 @@ const REINDEX_TIMEOUT: Duration = Duration::from_secs(300);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SPEC-M3.3 §4: every captured fixture records `_meta.captured_with`; doctor's INFO line
+    /// appears only for an agent newer than its fixtures.
+    #[test]
+    fn fixture_versions_and_the_doctor_info_line() {
+        for agent in ALL_AGENTS {
+            if let Some(f) = fixture_meta(agent) {
+                assert!(captured_with(f).is_some(), "{}", agent.as_str());
+            }
+        }
+        assert_eq!(
+            captured_with(fixture_meta(Agent::Cursor).unwrap()).as_deref(),
+            Some("cursor-agent 2026.09.26-dd393fe")
+        );
+        assert_eq!(version_numbers("codex-cli 0.46.0"), Some(vec![0, 46, 0]));
+        assert_eq!(
+            version_numbers("2.0.14 (Claude Code)"),
+            Some(vec![2, 0, 14])
+        );
+        assert_eq!(
+            version_numbers("cursor-agent 2026.09.26-dd393fe"),
+            Some(vec![2026, 9, 26])
+        );
+        assert_eq!(version_numbers("unknown"), None);
+
+        let c = fixture_version_info(
+            Agent::Cursor,
+            "2026.10.30-abc\n",
+            "cursor-agent 2026.09.26-dd393fe",
+        )
+        .unwrap();
+        assert_eq!(c.status, Status::Info);
+        assert_eq!(c.id, "agent.cursor.fixtures");
+        assert!(c.message.contains("2026.10.30-abc"), "{}", c.message);
+        assert!(
+            render_text(std::slice::from_ref(&c)).starts_with("[INFO] agent.cursor.fixtures: ")
+        );
+        assert_eq!(
+            render_json(std::slice::from_ref(&c))["checks"][0]["status"],
+            "info"
+        );
+        assert_eq!(exit_code(std::slice::from_ref(&c)), 0);
+        // Same, older or unknown: nothing.
+        assert!(
+            fixture_version_info(
+                Agent::Cursor,
+                "2026.09.26-dd393fe",
+                "cursor-agent 2026.09.26-dd393fe"
+            )
+            .is_none()
+        );
+        assert!(fixture_version_info(Agent::Antigravity, "1.2.7", "agy 1.2.12").is_none());
+        assert!(fixture_version_info(Agent::Codex, "codex-cli 9.0.0", "unknown").is_none());
+
+        // Through the runner, as `kioku doctor` runs it.
+        let home = tempfile::tempdir().unwrap();
+        let env = DoctorEnv {
+            vars: HashMap::new(),
+            home: home.path().to_path_buf(),
+            bin: home.path().join("bin/kioku").display().to_string(),
+            runner: Runner::recording(|argv| {
+                if argv.first().map(String::as_str) == Some("agy") {
+                    crate::service::CmdOutput::ok("agy 1.3.0\n")
+                } else {
+                    crate::service::CmdOutput::ok("")
+                }
+            }),
+            platform: None,
+            hook_platform: crate::install::HookPlatform::current(),
+            timeout: Duration::from_secs(1),
+            app_dirs: Vec::new(),
+            pid: 0,
+        };
+        let c = fixture_version_check(Agent::Antigravity, &env).unwrap();
+        assert!(
+            c.message.starts_with("antigravity agy 1.3.0 is newer"),
+            "{}",
+            c.message
+        );
+        assert!(fixture_version_check(Agent::Cursor, &env).is_none());
+        assert!(fixture_version_check(Agent::GeminiCli, &env).is_none());
+        let text = render_text(&[c, check("x", Status::Ok, "fine", None)]);
+        assert!(
+            text.ends_with("2 checks: 1 ok, 0 warning(s), 0 failure(s), 1 info\n"),
+            "{text}"
+        );
+    }
 
     /// SPEC-M2.7 §5: a data directory written by a newer kioku is a FAIL with the way out.
     #[test]

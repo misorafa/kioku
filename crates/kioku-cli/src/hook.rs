@@ -1853,7 +1853,7 @@ mod tests {
                 .is_none()
         );
         // Gemini error → is_error survives sanitization
-        let text = fixture_text("gemini-cli/after_tool_shell_error.docs.json");
+        let text = fixture_text("legacy/gemini-cli/after_tool_shell_error.docs.json");
         let ev = parse_event(Agent::GeminiCli, HookEventKind::PostToolUse, &text).unwrap();
         let obs = observation_for(&ev).unwrap();
         assert_eq!(obs.payload["tool_response"]["is_error"], true);

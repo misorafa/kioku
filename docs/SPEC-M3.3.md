@@ -1,6 +1,6 @@
 # kioku — SPEC-M3.3: distribution, uninstall, and fixture freshness
 
-Status: spec, 2026-10-02. Amends SPEC-M2 §12–§14 (install, setup, service), SPEC-M2.2
+Status: implemented on branch `m3.3-distribution` (2026-10-02; notes in §6). Amends SPEC-M2 §12–§14 (install, setup, service), SPEC-M2.2
 (Windows), SPEC-M2.5. Read CLAUDE.md, those specs and `packaging/winget/README.md` first.
 Source: the v0.8.0 audit (PROD-9/10, CLI-L10/L13). Depends on M3.2 (docs index).
 
@@ -71,3 +71,105 @@ author's own three machines need nothing new. Fixtures from real agents must not
 Branch `m3.3-distribution`, draft PR against `main`, CI green. The user creates the tap
 repository and the two secrets (`TAP_TOKEN`, and GHCR uses `GITHUB_TOKEN` with
 `packages: write`). Record deviations in §6. Do not merge, tag or change secrets.
+
+## 6. Implementation notes (2026-10-02, branch `m3.3-distribution`)
+
+### Homebrew (§1)
+
+- Template `packaging/homebrew/kioku.rb.tmpl`, renderer `scripts/render-homebrew-formula.sh
+  <tag> <SHA256SUMS>` (POSIX sh; fails without output when a checksum is missing or
+  malformed). The Linux bottles-free formula uses the **musl** tarballs (static: any
+  distro). Golden test: `scripts/test-scripts.sh` against `scripts/fixtures/homebrew/`.
+- `release.yml` job `homebrew` (stable tags only) renders from the release's own
+  `SHA256SUMS` and pushes `Formula/kioku.rb` to `misorafa/homebrew-tap`. Notice-and-skip
+  while `TAP_TOKEN` is unset or the tap cannot be cloned; the job is
+  `continue-on-error`, so it can never fail a release.
+- Detection (`update::package_manager`) matches any path containing `/Cellar/kioku/`
+  (covers `/opt/homebrew`, `/usr/local` and Linuxbrew's `/home/linuxbrew/.linuxbrew`), on
+  the given path and its resolved form (a `<prefix>/bin/kioku` link counts). Wider than
+  the two prefixes the spec names, on purpose.
+- Not in the spec but needed: a keg path (`…/Cellar/kioku/<version>/bin/kioku`) disappears
+  after `brew upgrade` + cleanup, so hooks and the service are registered with the stable
+  `<prefix>/bin/kioku` link (`update::stable_binary_path`), else every upgrade would
+  break them.
+- winget and Homebrew share one rule: `kioku update`, `--rollback`, the client's
+  SessionStart decision and the server's update task never replace a package-managed
+  binary; the notice names the manager's command. A Homebrew *server* under the kioku
+  service only logs the new release (notify only), like a container.
+
+### Docker (§2)
+
+- `Dockerfile` no longer builds from source: the build context holds
+  `linux/<arch>/kioku` and `COPY ${TARGETPLATFORM}/kioku` picks the binary. The release
+  job `docker` downloads the two musl tarballs, verifies them against `SHA256SUMS`, and
+  builds linux/amd64 + linux/arm64 with buildx/QEMU (actions pinned by SHA:
+  setup-qemu-action v4.4.0, setup-buildx-action v4.4.1, login-action v4.6.0,
+  build-push-action v7.4.0). A pre-release tag gets `:<tag>` only, never `:latest`.
+- Base image `debian:trixie-slim` (was bookworm): the CI smoke test uses a glibc binary
+  built on ubuntu-latest (glibc 2.39), which bookworm's glibc 2.36 cannot run; the
+  release image's musl binary runs on either. `curl` is installed for the health check.
+- `ENTRYPOINT ["kioku"]`, `CMD ["serve"]` (was `ENTRYPOINT ["kioku", "serve"]`) so that
+  `docker run … init` works; serve options now need the subcommand
+  (`… serve --port 8000`). Documented in README and CHANGELOG.
+- Container detection: `/.dockerenv`, Podman's `/run/.containerenv`, or
+  `KIOKU_CONTAINER=1`, which the image sets (a `/.dockerenv` is not guaranteed under
+  other runtimes such as containerd/Kubernetes). In a container `kioku serve` runs the
+  release check without the service marker but with `auto` forced off: it only logs
+  "available … pull the new image".
+- `kioku init` prints the token only when it generated it *and* runs in a container
+  (once: a second `init` keeps it and prints "kept existing"); with `KIOKU_AUTH_TOKEN` it
+  says "from KIOKU_AUTH_TOKEN" and never echoes it.
+- CI: `scripts/test-docker.sh target/debug/kioku` in the ubuntu `check` job (image
+  config, uid 10001, `init` token, a `serve` container answering `/api/v1/health` and
+  reported `healthy`, no token in the log). Not run on macOS / Windows runners.
+
+### `kioku uninstall` (§3)
+
+- `kioku uninstall <agent>|all [--project]` already existed (per-agent removal). The
+  spec's machine-wide command is the same subcommand **without** a target:
+  `kioku uninstall [--everything] [--purge-data] [--yes] [--dry-run]`; the new flags
+  conflict with a target. The agent part is exactly `uninstall all` (user level).
+- PATH lines: install.sh already marks its line (`# added by the kioku installer`).
+  Only lines that are byte-for-byte what install.sh writes for the binary's directory
+  (`$HOME/…` or absolute spelling; POSIX and fish forms) are removed, from `~/.zshrc`
+  (and `$ZDOTDIR/.zshrc`), `~/.bashrc`, `~/.bash_profile`, `~/.profile` and
+  `~/.config/fish/conf.d/kioku.fish` (deleted when nothing else is left in it). A PATH
+  entry in the Windows user PATH has no room for a comment: install.ps1 now leaves
+  `kioku-path-entry.txt` next to kioku.exe when it adds the entry, and uninstall removes
+  the entry only when that marker exists or the directory is install.ps1's default
+  `%LOCALAPPDATA%\Programs\kioku` (installs from before the marker).
+- The service is removed only when its definition exists in this home (no
+  `launchctl bootout` for a service kioku did not install here).
+- Confirmation: one "Proceed? [y/N]" for the whole plan (the spec's "asks first" for the
+  binary is this question), and `--purge-data` additionally wants `DELETE` typed; `--yes`
+  skips both. No answer on stdin (EOF) aborts with "re-run with --yes".
+- A cargo build output (`…/target/…`) is never deleted (developer builds, and the test
+  binary itself). On Windows the running kioku.exe is renamed aside and deleted by a
+  detached `cmd` after the process exits.
+- Agent configs come back to their pre-install content (JSON compared structurally,
+  text byte-for-byte); the one-time `*.kioku-bak` backups install wrote are left in
+  place (they are the user's own originals).
+
+### Fixture freshness (§4)
+
+- `probe-agents.sh --check [<dir>]` compares top-level key sets (ignoring `_meta`) of
+  every `*.captured.json` under `crates/kioku-cli/tests/fixtures/` (except `legacy/`)
+  with the same relative file in a fresh capture (default: the newest
+  `~/.kioku/captures/<date>/`, as `kioku hook-dump extract` writes it); a
+  `<event>_<variant>` fixture falls back to the fresh `<event>` file. Nested keys are not
+  compared (tool inputs differ per tool). Needs `python3`. Exit 1 on a changed key set.
+- `_meta.captured_with` was filled from what the fixtures themselves record:
+  `cursor-agent 2026.09.26-dd393fe` (Cursor's `cursor_version` field) and `agy 1.2.12`
+  (recorded with the Antigravity capture, commit 40b0e40); every other fixture (Codex,
+  the Windows Claude Code and Codex captures) says `"unknown"` until it is re-captured.
+- The doctor INFO line (`[INFO] agent.<a>.fixtures`, new `info` status that never changes
+  the exit code) compares `<agent> --version` (`claude`, `codex`, `cursor-agent`, `agy`;
+  run only for detected agents) with the `_meta.captured_with` of one embedded fixture
+  per agent. "Cursor/Claude settings" in the spec turned out not to carry a version, so
+  all four use `--version`. Nothing is printed for `unknown`, an equal or an older
+  version.
+- Gemini CLI fixtures moved to `tests/fixtures/legacy/gemini-cli/` (they are docs-derived;
+  no captured Gemini payload exists). README marks the install path legacy.
+- Not done here (needs the author's machines): captures of Antigravity Stop, Cursor
+  `stop` / `beforeSubmitPrompt`, and Claude Code Stop with `last_assistant_message` on
+  macOS; then set their `_meta.captured_with`.

@@ -1,0 +1,54 @@
+# typed: false
+# frozen_string_literal: true
+
+# kioku @TAG@ — rendered by scripts/render-homebrew-formula.sh from
+# packaging/homebrew/kioku.rb.tmpl in misorafa/kioku (SPEC-M3.3 §1). Do not edit here:
+# every release overwrites this file.
+class Kioku < Formula
+  desc "Self-hosted, Japanese-first shared memory for AI coding agents"
+  homepage "https://github.com/misorafa/kioku"
+  version "@VERSION@"
+  license any_of: ["MIT", "Apache-2.0"]
+
+  on_macos do
+    on_arm do
+      url "https://github.com/misorafa/kioku/releases/download/@TAG@/kioku-@TAG@-aarch64-apple-darwin.tar.gz"
+      sha256 "@SHA256_AARCH64_APPLE_DARWIN@"
+    end
+    on_intel do
+      url "https://github.com/misorafa/kioku/releases/download/@TAG@/kioku-@TAG@-x86_64-apple-darwin.tar.gz"
+      sha256 "@SHA256_X86_64_APPLE_DARWIN@"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "https://github.com/misorafa/kioku/releases/download/@TAG@/kioku-@TAG@-aarch64-unknown-linux-musl.tar.gz"
+      sha256 "@SHA256_AARCH64_UNKNOWN_LINUX_MUSL@"
+    end
+    on_intel do
+      url "https://github.com/misorafa/kioku/releases/download/@TAG@/kioku-@TAG@-x86_64-unknown-linux-musl.tar.gz"
+      sha256 "@SHA256_X86_64_UNKNOWN_LINUX_MUSL@"
+    end
+  end
+
+  def install
+    bin.install "kioku"
+  end
+
+  def caveats
+    <<~EOS
+      Set up this machine (config, background service, hooks + MCP for every agent):
+        kioku setup
+      or join an existing server with the line `kioku invite` prints there.
+
+      Updates come from Homebrew: kioku update only prints `brew upgrade kioku`.
+      To remove kioku's hooks, service and PATH entries before uninstalling:
+        kioku uninstall && brew uninstall kioku
+    EOS
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/kioku --version")
+  end
+end

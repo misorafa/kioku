@@ -160,6 +160,7 @@ fn no_token_in_serve_hook_or_update_logs() {
         auto: true,
         verify: kioku_cli::update::Verify::automatic(),
         state_dir: Some(client_dir.path().join("state")),
+        how: "run `kioku update`".into(),
     };
     match kioku_cli::auto_update::server_check_once(&check, &status) {
         kioku_cli::auto_update::ServerOutcome::Failed(msg) => {

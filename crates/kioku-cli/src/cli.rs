@@ -215,17 +215,29 @@ pub enum Command {
         #[arg(long)]
         mcp_http: bool,
     },
-    /// Remove kioku hooks, the MCP server and the instruction snippet from an agent.
+    /// Without an agent: remove kioku from this machine (every agent's hooks and MCP entries,
+    /// the service, the installer's PATH lines, the binary); prints the plan and asks first.
+    /// With an agent (or `all`): remove only that agent's hooks, MCP server and instructions.
     Uninstall {
-        /// Target agent, or `all` (every agent that has kioku entries).
+        /// Only this agent, or `all` (every agent that has kioku entries).
         #[arg(value_enum)]
-        target: InstallTarget,
+        target: Option<InstallTarget>,
         /// Remove the project's hooks and instructions instead of the user config's.
-        #[arg(long)]
+        #[arg(long, requires = "target")]
         project: bool,
         /// Print what would change; write nothing.
         #[arg(long)]
         dry_run: bool,
+        /// Also remove config.toml (server URL and token).
+        #[arg(long, conflicts_with = "target")]
+        everything: bool,
+        /// Also remove the data directory (wiki, database, index, backups); asks for a typed
+        /// confirmation unless --yes. Run `kioku backup` first.
+        #[arg(long, conflicts_with = "target")]
+        purge_data: bool,
+        /// Do not ask for confirmation.
+        #[arg(long, short = 'y', conflicts_with = "target")]
+        yes: bool,
     },
     /// Project identity helpers.
     Project {
@@ -503,11 +515,28 @@ mod tests {
         assert!(matches!(
             p(&["uninstall", "all", "--project"]).unwrap().command,
             Command::Uninstall {
-                target: InstallTarget::All,
+                target: Some(InstallTarget::All),
                 project: true,
-                dry_run: false
+                dry_run: false,
+                ..
             }
         ));
+        // SPEC-M3.3 §3: without an agent, the whole machine.
+        assert!(matches!(
+            p(&["uninstall", "--everything", "--purge-data", "--yes"])
+                .unwrap()
+                .command,
+            Command::Uninstall {
+                target: None,
+                everything: true,
+                purge_data: true,
+                yes: true,
+                ..
+            }
+        ));
+        assert!(p(&["uninstall"]).is_ok());
+        assert!(p(&["uninstall", "codex", "--purge-data"]).is_err());
+        assert!(p(&["uninstall", "--project"]).is_err());
         assert!(p(&["serve", "--bind", "0.0.0.0", "--port", "9000"]).is_ok());
         assert!(matches!(
             p(&["serve", "--log-file", "/tmp/s.log"]).unwrap().command,

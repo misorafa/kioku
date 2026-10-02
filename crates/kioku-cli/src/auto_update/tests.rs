@@ -11,7 +11,7 @@ fn facts(server: Option<&str>) -> ClientFacts {
         server_version: server.map(str::to_string),
         client_version: "0.6.5".into(),
         auto: true,
-        winget: false,
+        managed: None,
         writable: true,
         lang: Lang::En,
     }
@@ -92,7 +92,7 @@ fn notice_instead_of_update_once_a_day() {
         ClientAction::Notice("kioku v0.7.0 is available (you have v0.6.5): kioku update".into())
     );
     let winget = ClientFacts {
-        winget: true,
+        managed: Some(crate::update::PackageManager::Winget),
         lang: Lang::Ja,
         ..facts(Some("0.7.0"))
     };
@@ -101,6 +101,17 @@ fn notice_instead_of_update_once_a_day() {
         ClientAction::Notice(
             "kioku v0.7.0 が利用できます（この端末は v0.6.5）: winget upgrade misorafa.kioku"
                 .into()
+        )
+    );
+    // SPEC-M3.3 §1: a Homebrew client only gets the notice, even with auto on.
+    let brew = ClientFacts {
+        managed: Some(crate::update::PackageManager::Homebrew),
+        ..facts(Some("0.7.0"))
+    };
+    assert_eq!(
+        client_action(&brew, &st, at),
+        ClientAction::Notice(
+            "kioku v0.7.0 is available (you have v0.6.5): brew upgrade kioku".into()
         )
     );
     let readonly = ClientFacts {
@@ -218,6 +229,7 @@ fn server_check(base: &str, dir: &Path, auto: bool) -> ServerCheck {
         auto,
         verify: Verify::unsigned(),
         state_dir: Some(dir.join("state")),
+        how: "run `kioku update`".into(),
     }
 }
 
@@ -501,4 +513,45 @@ fn three_failed_starts_roll_the_server_back() {
         AutoUpdateState::load(&state).boot_failures.unwrap().count,
         4
     );
+}
+
+/// SPEC-M3.3 §2: a container is recognised by `/.dockerenv`, Podman's
+/// `/run/.containerenv` or the image's `KIOKU_CONTAINER=1`; nothing else counts.
+#[test]
+fn container_detection() {
+    let root = tempfile::tempdir().unwrap();
+    let none = std::collections::HashMap::new();
+    assert!(!in_container_at(root.path(), &none));
+    let image: std::collections::HashMap<String, String> =
+        [("KIOKU_CONTAINER".to_string(), "1".to_string())].into();
+    assert!(in_container_at(root.path(), &image));
+    let other: std::collections::HashMap<String, String> =
+        [("KIOKU_CONTAINER".to_string(), "0".to_string())].into();
+    assert!(!in_container_at(root.path(), &other));
+    std::fs::write(root.path().join(".dockerenv"), "").unwrap();
+    assert!(in_container_at(root.path(), &none));
+    let podman = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(podman.path().join("run")).unwrap();
+    std::fs::write(podman.path().join("run/.containerenv"), "").unwrap();
+    assert!(in_container_at(podman.path(), &none));
+}
+
+/// SPEC-M3.3 §1–2: a container or a package-managed binary never replaces itself; the
+/// server only logs how to update.
+#[test]
+fn containers_and_packages_only_notify() {
+    assert_eq!(
+        server_update_policy(true, ServerInstall::SelfManaged),
+        (true, "run `kioku update`".to_string())
+    );
+    assert!(!server_update_policy(false, ServerInstall::SelfManaged).0);
+    let (auto, how) = server_update_policy(true, ServerInstall::Container);
+    assert!(!auto);
+    assert!(how.contains("docker compose pull"), "{how}");
+    let (auto, how) = server_update_policy(
+        true,
+        ServerInstall::Package(crate::update::PackageManager::Homebrew),
+    );
+    assert!(!auto);
+    assert_eq!(how, "run `brew upgrade kioku`");
 }
