@@ -200,7 +200,19 @@ Where the spec was impossible, silent or had to be made concrete.
     it: a writer's lock file handle can be held for a moment by a `git` child forked
     meanwhile, which made the reopen fail with `LockBusy` in a parallel test run. Opening a
     writer also retries `LockBusy` for up to 2 s.
-18. **Not verified on real machines:** the upgrade of a real v0.9 data directory
+18. **Windows "Access is denied" on commit** (fixed after v0.9.3, branch
+    `fix-windows-index-flake`). Every tantivy commit writes `meta.json` to a temp file and
+    renames it over the old one (`MoveFileExW(MOVEFILE_REPLACE_EXISTING)`), which Windows
+    refuses with os error 5 while any handle has the target open. The reader was opened with
+    `ReloadPolicy::OnCommitWithDelay`, whose watcher thread opens `meta.json` every 500 ms
+    (immediately at reader creation, and for a moment after the index is dropped), and the
+    reload after a commit ran outside the writer lock, so another thread's commit could
+    land on it. The reader is now `Manual` (kioku is the only writer and reloads after
+    each of its commits, under the writer lock), and a writer being retired (index switch,
+    drop) waits for its merge threads, so nothing of the process keeps files of a directory
+    that is removed or reopened. The old index directory is now removed on Windows too
+    once no search maps it; the next-start retry stays for searches in flight.
+19. **Not verified on real machines:** the upgrade of a real v0.9 data directory
     (schema-2 index → `tantivy-v3`, removal of the old directory, especially on Windows
     with searches in flight), the busy-lane rule with two real agents on one branch
     (Claude Code's per-turn finalize makes it apply only mid-turn), `/clear` and
