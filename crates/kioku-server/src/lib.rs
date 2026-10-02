@@ -8,6 +8,7 @@ mod api;
 mod auth;
 pub mod invite;
 pub mod mcp;
+pub mod metrics;
 mod shared;
 mod update;
 
@@ -68,9 +69,10 @@ fn app(
         invites,
         token: Arc::from(auth_token.as_str()),
     };
-    let mut protected = api::protected_routes(store.clone(), update)
+    let metrics = metrics::Metrics::new();
+    let mut protected = api::protected_routes(store.clone(), update, metrics.clone())
         .merge(invite::protected_routes(join.clone()))
-        .nest_service("/mcp", mcp::service(store, mcp_config));
+        .nest_service("/mcp", mcp::service(store, mcp_config, metrics.clone()));
     if auth_token.is_empty() {
         tracing::warn!("no auth_token configured: the API and /mcp are unauthenticated");
     } else {
@@ -80,9 +82,14 @@ fn app(
             auth::require_bearer,
         ));
     }
+    // Outermost: counts (and logs) every request, refused ones included (SPEC-M3.2 §1).
     api::public_routes()
         .merge(invite::public_routes(join))
         .merge(protected)
+        .layer(axum::middleware::from_fn_with_state(
+            metrics,
+            metrics::track,
+        ))
 }
 
 /// Binds `bind:port` and serves the app until Ctrl-C / SIGTERM, using the store's

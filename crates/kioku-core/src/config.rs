@@ -38,6 +38,10 @@ pub struct ServerConfig {
     /// [`Config::backups_keep`]. Not written while it is the default.
     #[serde(skip_serializing_if = "is_default_backup_keep")]
     pub backup_keep: usize,
+    /// One `kioku_http` log line per request (`method route status ms`, SPEC-M3.2 §1); off
+    /// by default (`RUST_LOG=kioku_http=info` turns it on too). Not written while off.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub request_log: bool,
 }
 
 /// Default of `[server] backup_keep`.
@@ -56,6 +60,7 @@ impl Default for ServerConfig {
             data_dir: None,
             summary_lang: Lang::Ja,
             backup_keep: DEFAULT_BACKUP_KEEP,
+            request_log: false,
         }
     }
 }
@@ -643,6 +648,23 @@ mod tests {
         let cfg = Config::load_from_dir(dir.path(), &HashMap::new()).unwrap();
         assert_eq!(cfg.backups_keep(), 7, "[retention] wins");
         assert!(cfg.to_toml().unwrap().contains("backups_keep = 7"));
+    }
+
+    /// SPEC-M3.2 §1: `[server] request_log` is off by default and not written while off.
+    #[test]
+    fn request_log_defaults_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::load_from_dir(dir.path(), &HashMap::new()).unwrap();
+        assert!(!cfg.server.request_log);
+        assert!(!cfg.to_toml().unwrap().contains("request_log"));
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            "[server]\nrequest_log = true\n",
+        )
+        .unwrap();
+        let cfg = Config::load_from_dir(dir.path(), &HashMap::new()).unwrap();
+        assert!(cfg.server.request_log);
+        assert!(cfg.to_toml().unwrap().contains("request_log = true"));
     }
 
     #[test]

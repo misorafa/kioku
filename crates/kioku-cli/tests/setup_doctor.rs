@@ -826,6 +826,8 @@ impl Fixture {
             platform: Some(Platform::Systemd),
             hook_platform: HookPlatform::Unix,
             timeout: Duration::from_secs(3),
+            app_dirs: Vec::new(),
+            pid: 0,
         }
     }
 
@@ -849,6 +851,12 @@ impl Fixture {
 /// A server machine: config + data dir, the server running on that data dir, the service
 /// "installed" through the fake systemd, and every agent installed.
 fn server_machine() -> Fixture {
+    server_machine_with(false)
+}
+
+/// [`server_machine`]; `lenient` also lets the fake systemd's daemon-reload / enable /
+/// restart succeed (`kioku doctor --fix` reinstalls the service).
+fn server_machine_with(lenient: bool) -> Fixture {
     let (home, bin) = home_with_agents(true);
     let data = home.path().join(".kioku");
     let mut cfg = Config::for_data_dir(&data);
@@ -861,11 +869,18 @@ fn server_machine() -> Fixture {
     cfg.client.server_url = base.clone();
     cfg.save().unwrap();
 
-    let runner = Runner::recording(|argv| match argv.join(" ").as_str() {
+    let runner = Runner::recording(move |argv| match argv.join(" ").as_str() {
         "systemctl --user is-active kioku.service" => CmdOutput::ok("active\n"),
         "systemctl --user show -p MainPID --value kioku.service" => CmdOutput::ok("4242\n"),
         "loginctl show-user me -p Linger" => CmdOutput::ok("Linger=yes\n"),
         "git --version" => CmdOutput::ok("git version 2.43.0\n"),
+        "systemctl --user daemon-reload"
+        | "systemctl --user enable --now kioku.service"
+        | "systemctl --user restart kioku.service"
+            if lenient =>
+        {
+            CmdOutput::ok("")
+        }
         _ => CmdOutput::fail("not found"),
     });
     let fx = Fixture {
@@ -937,6 +952,8 @@ fn doctor_all_ok_then_warn_and_fail_scenarios() {
     for a in ["claude-code", "codex", "cursor", "gemini-cli"] {
         expected.insert(format!("agent.{a}.hooks"), Status::Ok);
         expected.insert(format!("agent.{a}.mcp"), Status::Ok);
+        // SPEC-M3.2 §2: no hook ran yet, but no agent binary is on this test PATH.
+        expected.insert(format!("hooks.liveness.{a}"), Status::Ok);
     }
     // Expected warnings: the test binary lives in a temp dir; Codex trust is unverifiable.
     expected.insert("binary".into(), Status::Warn);
@@ -1132,6 +1149,249 @@ fn doctor_all_ok_then_warn_and_fail_scenarios() {
     let _ = &fx.base;
 }
 
+/// SPEC-M3.2 §2: a recorded hook shows up as the last success; an installed agent whose
+/// binary is on PATH and that never succeeded warns.
+#[test]
+fn doctor_liveness_lines_follow_last_hook_json() {
+    let fx = server_machine();
+    let state = fx.home.path().join(".kioku/state");
+    kioku_cli::liveness::record(
+        &state.join(kioku_cli::liveness::LIVENESS_FILE),
+        Agent::ClaudeCode,
+        kioku_cli::HookEventKind::SessionStart,
+        true,
+        &kioku_core::util::now_ts(),
+    );
+    // Codex itself is installed on this machine (on PATH) but never ran a hook.
+    let codex = fx.home.path().join(".local/bin/codex");
+    std::fs::write(&codex, "").unwrap();
+    let checks = doctor::run_doctor(&fx.env(), None);
+    let claude = find(&checks, "hooks.liveness.claude-code");
+    assert_eq!(claude.status, Status::Ok);
+    assert!(
+        claude.message.contains("last successful hook")
+            && claude.message.contains("(session-start)"),
+        "{claude:?}"
+    );
+    let c = find(&checks, "hooks.liveness.codex");
+    assert_eq!(c.status, Status::Warn, "{c:?}");
+    assert!(c.message.contains("no successful hook recorded yet"));
+    assert_eq!(find(&checks, "hooks.liveness.cursor").status, Status::Ok);
+    // Not installed for Antigravity → no line at all.
+    assert!(!checks.iter().any(|c| c.id == "hooks.liveness.antigravity"));
+    assert_eq!(doctor::exit_code(&checks), 0, "liveness never fails doctor");
+}
+
+/// SPEC-M3.2 §3: every fixable check on one fixture, then `--fix` again changes nothing.
+#[test]
+fn doctor_fix_applies_each_safe_fix_and_is_idempotent() {
+    let fx = server_machine_with(true);
+    let data = fx.home.path().join(".kioku");
+    let env = fx.env();
+    // Permissions (unix): config 0644, data dir 0755.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(fx.config_path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // Cursor's hooks are gone.
+    std::fs::write(fx.home.path().join(".cursor/hooks.json"), "{}").unwrap();
+    // The service definition is gone.
+    let manager = setup_env(
+        fx.home.path(),
+        &fx.bin,
+        vars(&[("USER", "me")]),
+        fx.runner.clone(),
+    )
+    .service_manager(&data);
+    let unit = manager.definition_path().unwrap();
+    std::fs::remove_file(&unit).unwrap();
+    // The user dictionary changed after the index was built.
+    let touch = |p: &Path, secs_ago: u64| {
+        std::fs::File::options()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(secs_ago))
+            .unwrap();
+    };
+    touch(&data.join("dict/user.csv"), 10);
+    touch(&data.join("index/schema-version"), 3600);
+    // A hook dump turned on in config.toml whose 24 h window is over.
+    let mut text = std::fs::read_to_string(fx.config_path()).unwrap();
+    assert!(text.contains("\nhook_dump = false\n"), "{text}");
+    text = text.replace(
+        "\nhook_dump = false\n",
+        "\nhook_dump = true # capture for a bug report\n",
+    );
+    std::fs::write(fx.config_path(), &text).unwrap();
+    std::fs::create_dir_all(data.join("state")).unwrap();
+    std::fs::write(
+        data.join("state").join(kioku_cli::dump::HOOK_DUMP_MARKER),
+        "2026-01-01T00:00:00.000Z\n",
+    )
+    .unwrap();
+
+    let before = doctor::run_doctor(&env, None);
+    let mut expected = vec![
+        doctor::FixAction::Install(Agent::Cursor),
+        doctor::FixAction::ServiceInstall,
+        doctor::FixAction::Reindex,
+        doctor::FixAction::ClearHookDump,
+    ];
+    if cfg!(unix) {
+        expected.insert(
+            0,
+            doctor::FixAction::Chmod {
+                path: fx.config_path(),
+                mode: 0o600,
+            },
+        );
+        expected.insert(
+            1,
+            doctor::FixAction::Chmod {
+                path: data.clone(),
+                mode: 0o700,
+            },
+        );
+    }
+    let mut planned = doctor::planned_fixes(&before);
+    planned.sort_by_key(|a| format!("{a:?}"));
+    expected.sort_by_key(|a| format!("{a:?}"));
+    assert_eq!(planned, expected, "{}", doctor::render_text(&before));
+
+    let outcome = doctor::apply_fixes(&env, &before);
+    assert_eq!(outcome.failed, 0, "{:#?}", outcome.lines);
+    assert_eq!(outcome.applied, expected.len(), "{:#?}", outcome.lines);
+    assert_eq!(outcome.exit_code(), 0);
+    let joined = outcome.lines.join("\n");
+    for what in [
+        "fixed: kioku install cursor",
+        "fixed: kioku service install",
+        "fixed: kioku reindex",
+        "fixed: hook dump turned off",
+    ] {
+        assert!(joined.contains(what), "{joined}");
+    }
+    assert!(!joined.contains(TOKEN));
+    // Token, bind and comments stay; only the hook_dump line changed.
+    let after_text = std::fs::read_to_string(fx.config_path()).unwrap();
+    assert_eq!(
+        after_text,
+        text.replace(
+            "hook_dump = true # capture for a bug report",
+            "hook_dump = false"
+        )
+    );
+    assert!(
+        !data
+            .join("state")
+            .join(kioku_cli::dump::HOOK_DUMP_MARKER)
+            .exists()
+    );
+    assert!(unit.is_file());
+
+    let after = doctor::run_doctor(&env, None);
+    for id in [
+        "config",
+        "data_dir",
+        "agent.cursor.hooks",
+        "service",
+        "index",
+        "hook_dump",
+    ] {
+        assert_eq!(
+            find(&after, id).status,
+            Status::Ok,
+            "{id}: {}",
+            doctor::render_text(&after)
+        );
+    }
+    assert_eq!(doctor::planned_fixes(&after), vec![]);
+    // Idempotent: a second run has nothing to do and changes no file.
+    let snap = snapshot(
+        fx.home.path(),
+        &[
+            ".kioku/db",
+            ".kioku/index",
+            ".kioku/logs",
+            ".kioku/wiki/.git",
+        ],
+    );
+    let again = doctor::apply_fixes(&env, &after);
+    assert_eq!(again.lines, ["nothing to fix"]);
+    assert_eq!(again.exit_code(), 0);
+    assert_eq!(
+        snap,
+        snapshot(
+            fx.home.path(),
+            &[
+                ".kioku/db",
+                ".kioku/index",
+                ".kioku/logs",
+                ".kioku/wiki/.git"
+            ]
+        )
+    );
+}
+
+/// SPEC-M3.2 §3: `--fix` never writes a running Claude app's config; it says to quit first.
+#[test]
+fn doctor_fix_leaves_a_running_claude_app_alone() {
+    let fx = server_machine();
+    let desktop_dir = fx.home.path().join("Library/Application Support/Claude");
+    std::fs::create_dir_all(&desktop_dir).unwrap();
+    let desktop = desktop_dir.join("claude_desktop_config.json");
+    std::fs::write(&desktop, "{\"mcpServers\": {}}").unwrap();
+    // `pgrep -x Claude` succeeds: the app runs.
+    let runner = Runner::recording(|argv| match argv.join(" ").as_str() {
+        "pgrep -x Claude" => CmdOutput::ok("123\n"),
+        "git --version" => CmdOutput::ok("git version 2.43.0\n"),
+        _ => CmdOutput::fail("not found"),
+    });
+    let env = DoctorEnv { runner, ..fx.env() };
+    let checks = doctor::run_doctor(&env, Some(Agent::ClaudeCode));
+    let c = find(&checks, "agent.claude-code.desktop");
+    assert_eq!(c.status, Status::Warn);
+    assert_eq!(
+        c.action,
+        Some(doctor::FixAction::Install(Agent::ClaudeCode))
+    );
+    let outcome = doctor::apply_fixes(&env, &checks);
+    assert_eq!(
+        std::fs::read_to_string(&desktop).unwrap(),
+        "{\"mcpServers\": {}}"
+    );
+    assert_eq!(outcome.manual, 1, "{:#?}", outcome.lines);
+    assert!(
+        outcome
+            .lines
+            .iter()
+            .any(|l| l.contains("quit it completely"))
+    );
+    assert_eq!(outcome.exit_code(), 0);
+}
+
+/// An unknown server version (token refused, or a server that only tells it to an
+/// authenticated caller) is never compared: no "runs v, this client is v…".
+#[test]
+fn doctor_server_version_unknown_is_not_compared() {
+    let fx = server_machine();
+    let mut cfg = Config::load_file(&fx.config_path()).unwrap();
+    cfg.client.auth_token = Some("not-the-token".into());
+    cfg.save().unwrap();
+    let checks = doctor::run_doctor(&fx.env(), None);
+    let c = find(&checks, "server");
+    assert_eq!(c.status, Status::Ok, "{c:?}");
+    assert!(
+        c.message.contains("version unknown (older client)"),
+        "{c:?}"
+    );
+    assert!(!c.message.contains("runs v"), "{c:?}");
+    assert_eq!(find(&checks, "auth").status, Status::Fail);
+}
+
 #[test]
 fn doctor_without_config_fails() {
     let (home, bin) = home_with_agents(false);
@@ -1152,6 +1412,8 @@ fn doctor_without_config_fails() {
         }),
         platform: Some(Platform::Systemd),
         timeout: Duration::from_secs(1),
+        app_dirs: Vec::new(),
+        pid: 0,
     };
     let checks = doctor::run_doctor(&env, None);
     let c = find(&checks, "config");
@@ -1216,6 +1478,8 @@ fn doctor_on_a_client_only_machine_skips_data_dir_and_service() {
         }),
         platform: Some(Platform::Systemd),
         timeout: Duration::from_secs(3),
+        app_dirs: Vec::new(),
+        pid: 0,
     };
     let checks = doctor::run_doctor(&denv, None);
     assert!(

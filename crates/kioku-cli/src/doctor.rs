@@ -72,14 +72,50 @@ pub struct Check {
     pub message: String,
     /// How to fix it.
     pub fix: Option<String>,
+    /// What `kioku doctor --fix` does about it (SPEC-M3.2 §3); `None` = nothing safe to do.
+    pub action: Option<FixAction>,
 }
 
-fn check(id: &str, status: Status, message: impl Into<String>, fix: Option<String>) -> Check {
+impl Check {
+    /// The same check with a `--fix` action.
+    pub fn with_action(mut self, action: FixAction) -> Check {
+        self.action = Some(action);
+        self
+    }
+}
+
+/// A safe fix `kioku doctor --fix` applies (SPEC-M3.2 §3). It never rotates tokens, never
+/// changes `[server] bind`, and never writes a running Claude desktop app's config.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FixAction {
+    /// `chmod <mode> <path>` (config 0600, data dir 0700).
+    Chmod {
+        /// File or directory.
+        path: PathBuf,
+        /// New permission bits.
+        mode: u32,
+    },
+    /// `kioku install <agent>` (re-registers hooks, MCP entry and instructions).
+    Install(Agent),
+    /// `kioku service install` (definition missing or without the update marker).
+    ServiceInstall,
+    /// `kioku reindex` (outdated or inconsistent index).
+    Reindex,
+    /// Turn off an expired hook dump (`[client] hook_dump = false`, marker removed).
+    ClearHookDump,
+    /// Nothing kioku may change itself: the instruction is printed (Local Network
+    /// permission, …).
+    Manual(String),
+}
+
+/// Builds a check without a `--fix` action.
+pub fn check(id: &str, status: Status, message: impl Into<String>, fix: Option<String>) -> Check {
     Check {
         id: id.to_string(),
         status,
         message: message.into(),
         fix,
+        action: None,
     }
 }
 
@@ -100,6 +136,11 @@ pub struct DoctorEnv {
     pub hook_platform: crate::install::HookPlatform,
     /// Per-request timeout.
     pub timeout: Duration,
+    /// Where agent apps are looked for (`/Applications`, `~/Applications` on macOS; SPEC-M3.2
+    /// §2 warns only for an agent present on this machine).
+    pub app_dirs: Vec<PathBuf>,
+    /// This process's id: the start of the parent walk to the responsible app (§3.1).
+    pub pid: u32,
 }
 
 impl DoctorEnv {
@@ -113,6 +154,8 @@ impl DoctorEnv {
             platform: None,
             hook_platform: crate::install::HookPlatform::current(),
             timeout: DOCTOR_TIMEOUT,
+            app_dirs: default_app_dirs(&kioku_core::util::home_dir()),
+            pid: std::process::id(),
         }
     }
 
@@ -129,6 +172,15 @@ impl DoctorEnv {
             poll_interval: Duration::from_millis(200),
             poll_timeout: Duration::from_secs(0),
         }
+    }
+}
+
+/// `/Applications` and `~/Applications` on macOS; nothing elsewhere.
+pub fn default_app_dirs(home: &Path) -> Vec<PathBuf> {
+    if cfg!(target_os = "macos") {
+        vec![PathBuf::from("/Applications"), home.join("Applications")]
+    } else {
+        Vec::new()
     }
 }
 
@@ -188,7 +240,7 @@ pub fn run_doctor(env: &DoctorEnv, only: Option<Agent>) -> Vec<Check> {
 
     // Server, auth, index, MCP.
     let health = probe_health(&cfg.client, env.timeout);
-    out.push(server_check(&cfg, &health, server_machine));
+    out.push(server_check(&cfg, &health, server_machine, env));
     if server_machine
         && matches!(health, Health::Kioku { .. })
         && let Some(c) = lan_check(&cfg, env)
@@ -268,6 +320,7 @@ pub fn run_doctor(env: &DoctorEnv, only: Option<Agent>) -> Vec<Check> {
     {
         out.push(c);
     }
+    out.extend(liveness_checks(env, &cfg, &agents));
 
     let queue = crate::outbox::count(&cfg);
     let queue_error = crate::outbox::last_error(&cfg);
@@ -480,15 +533,21 @@ fn config_check(
         "client only"
     };
     match mode(path) {
-        Some(m) if m & 0o077 != 0 => out.push(check(
-            "config",
-            Status::Warn,
-            format!(
-                "{} ({role}) is mode {m:04o}, wider than 0600 (it holds the token)",
-                path.display()
-            ),
-            Some(format!("chmod 600 {}", path.display())),
-        )),
+        Some(m) if m & 0o077 != 0 => out.push(
+            check(
+                "config",
+                Status::Warn,
+                format!(
+                    "{} ({role}) is mode {m:04o}, wider than 0600 (it holds the token)",
+                    path.display()
+                ),
+                Some(format!("chmod 600 {}", path.display())),
+            )
+            .with_action(FixAction::Chmod {
+                path: path.to_path_buf(),
+                mode: 0o600,
+            }),
+        ),
         _ => out.push(check(
             "config",
             Status::Ok,
@@ -523,11 +582,16 @@ fn data_dir_check(cfg: &Config) -> Check {
     }
     let mut warnings = Vec::new();
     let mut fix = None;
+    let mut action = None;
     if let Some(m) = mode(dir)
         && m & 0o077 != 0
     {
         warnings.push(format!("mode {m:04o} is wider than 0700"));
         fix = Some(format!("chmod 700 {}", dir.display()));
+        action = Some(FixAction::Chmod {
+            path: dir.clone(),
+            mode: 0o700,
+        });
     }
     if !dir.join("wiki").join(".git").exists() {
         warnings.push("wiki/ is not a git repository (pages are not versioned)".into());
@@ -541,12 +605,15 @@ fn data_dir_check(cfg: &Config) -> Check {
             None,
         )
     } else {
-        check(
-            "data_dir",
-            Status::Warn,
-            format!("{}: {}", dir.display(), warnings.join("; ")),
-            fix,
-        )
+        Check {
+            action,
+            ..check(
+                "data_dir",
+                Status::Warn,
+                format!("{}: {}", dir.display(), warnings.join("; ")),
+                fix,
+            )
+        }
     }
 }
 
@@ -605,14 +672,18 @@ fn lan_check(cfg: &Config, env: &DoctorEnv) -> Option<Check> {
     )
 }
 
-fn server_check(cfg: &Config, health: &Health, server_machine: bool) -> Check {
+fn server_check(cfg: &Config, health: &Health, server_machine: bool, env: &DoctorEnv) -> Check {
     let url = &cfg.client.server_url;
     match health {
-        // The version is only told with a valid token (SPEC-M2.7 §11); the token check
-        // reports a refused one.
-        Health::Kioku { version } if version.is_empty() => {
-            check("server", Status::Ok, format!("{url} is reachable"), None)
-        }
+        // The version is only told with a valid token (SPEC-M2.7 §11; the token check
+        // reports a refused one) and was dropped from /health in M2.7: never compare an
+        // unknown version (an older client printed "runs v, this client is v0.7.0").
+        Health::Kioku { version } if version.trim().is_empty() => check(
+            "server",
+            Status::Ok,
+            format!("{url} is reachable; version unknown (older client)"),
+            None,
+        ),
         Health::Kioku { version } if version == VERSION => check(
             "server",
             Status::Ok,
@@ -631,17 +702,64 @@ fn server_check(cfg: &Config, health: &Health, server_machine: bool) -> Check {
             format!("{url} does not answer as kioku: {why}"),
             Some("check [client] server_url; another program may own the port".into()),
         ),
-        Health::Down(why) => check(
-            "server",
-            Status::Fail,
-            format!("{url} is unreachable: {why}"),
-            Some(if server_machine {
-                "kioku service start (or kioku service install)".into()
-            } else {
-                format!("check that the server at {url} is running and reachable from here")
-            }),
-        ),
+        Health::Down(why) => {
+            // SPEC-M3.2 §3.1: "no route" to a LAN address that a system binary reaches is
+            // this machine's per-process permission, not the server.
+            if let Some(d) = reach_diagnosis(url, why, env) {
+                let c = check(
+                    "server",
+                    Status::Fail,
+                    format!("{url} is unreachable: {} ({why})", d.message),
+                    Some(d.fix.clone()),
+                );
+                return if d.local_permission {
+                    c.with_action(FixAction::Manual(d.fix))
+                } else {
+                    c
+                };
+            }
+            check(
+                "server",
+                Status::Fail,
+                format!("{url} is unreachable: {why}"),
+                Some(if server_machine {
+                    "kioku service start (or kioku service install)".into()
+                } else {
+                    format!("check that the server at {url} is running and reachable from here")
+                }),
+            )
+        }
     }
+}
+
+/// §3.1 for an unreachable `url`: classifies the error, the address, a `/usr/bin/nc -z`
+/// probe and the responsible app; `None` when the error is not "unreachable" towards a
+/// private address.
+fn reach_diagnosis(url: &str, why: &str, env: &DoctorEnv) -> Option<crate::reach::Diagnosis> {
+    use crate::reach::{self, AddressClass, ConnectError};
+    use std::net::ToSocketAddrs;
+    let error = reach::connect_error(why);
+    if error == ConnectError::Other {
+        return None;
+    }
+    let parsed = reqwest::Url::parse(url.trim()).ok()?;
+    let host = parsed.host_str()?.to_string();
+    let port = parsed.port_or_known_default()?;
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let resolved: Vec<std::net::IpAddr> = (bare, port)
+        .to_socket_addrs()
+        .map(|a| a.map(|s| s.ip()).collect())
+        .unwrap_or_default();
+    let class = reach::address_class(&host, &resolved);
+    if class != AddressClass::Private {
+        return None;
+    }
+    let nc = reach::probe_nc(&env.runner, bare, port);
+    let app = reach::responsible_app(
+        &reach::process_chain(&env.runner, env.pid),
+        std::time::SystemTime::now(),
+    );
+    reach::classify(error, class, nc, url, app.as_ref())
 }
 
 fn index_check(s: &StatusReport) -> Check {
@@ -663,7 +781,8 @@ fn index_check(s: &StatusReport) -> Check {
                 s.index_docs
             ),
             Some("kioku reindex".into()),
-        ),
+        )
+        .with_action(FixAction::Reindex),
         Some(v) if v == s.index_schema_expected => check(
             "index",
             Status::Ok,
@@ -681,7 +800,8 @@ fn index_check(s: &StatusReport) -> Check {
                 s.index_schema_expected
             ),
             Some("if this persists, restart the server (kioku service start on the server machine) and see kioku service logs".into()),
-        ),
+        )
+        .with_action(FixAction::Reindex),
     }
 }
 
@@ -851,7 +971,8 @@ fn service_check(env: &DoctorEnv, cfg: &Config, health: &Health) -> Check {
             Status::Warn,
             msg,
             Some("kioku service install".into()),
-        );
+        )
+        .with_action(FixAction::ServiceInstall);
     }
     if !st.active {
         return if up {
@@ -1429,7 +1550,51 @@ fn agent_checks(agent: Agent, ctx: &InstallCtx, env: &DoctorEnv) -> Vec<Check> {
         _ => {}
     }
     out.extend(instructions_check(agent, ctx));
+    // SPEC-M3.2 §3: what `kioku install <agent>` repairs, `--fix` runs.
+    for c in &mut out {
+        if c.status != Status::Ok
+            && c.fix
+                .as_deref()
+                .is_some_and(|f| f.contains(&format!("kioku install {}", agent.as_str())))
+        {
+            c.action = Some(FixAction::Install(agent));
+        }
+    }
     out
+}
+
+/// True when any of the agent's kioku hooks is registered (user level).
+pub fn hooks_registered(agent: Agent, ctx: &InstallCtx) -> bool {
+    let Ok(Some(settings)) = read_settings(&hooks_path(agent, ctx, false)) else {
+        return false;
+    };
+    hook_specs(agent, &ctx.bin, ctx.platform)
+        .iter()
+        .any(|spec| !our_commands_at(agent, &settings, &spec.key).is_empty())
+}
+
+/// `hooks.liveness.<agent>` for every agent in `agents` whose hooks are registered
+/// (SPEC-M3.2 §2), from `state/last-hook.json`.
+pub fn liveness_checks(env: &DoctorEnv, cfg: &Config, agents: &[Agent]) -> Vec<Check> {
+    let henv = HookEnv {
+        vars: env.vars.clone(),
+        home: Some(env.home.clone()),
+        cwd: None,
+    };
+    let marks = crate::liveness::liveness_path(cfg, &henv)
+        .map(|p| crate::liveness::load(&p))
+        .unwrap_or_default();
+    let ctx = env.setup_env().install_ctx(&cfg.client);
+    let now = kioku_core::util::now().timestamp();
+    agents
+        .iter()
+        .filter(|a| hooks_registered(**a, &ctx))
+        .map(|a| {
+            let present =
+                crate::liveness::agent_present(*a, path_var(&env.vars), &env.home, &env.app_dirs);
+            crate::liveness::liveness_check(*a, marks.get(a.as_str()), present, now)
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1511,12 +1676,17 @@ pub fn update_check(cfg: &Config, env: &DoctorEnv, health: &Health) -> Check {
     // A service installed before SPEC-M2.5 lacks the marker and never updates itself; the
     // `kioku update` that brought this version ran the old binary, which could not rewrite it.
     let manager = env.setup_env().service_manager(&cfg.data_dir);
+    let mut action = None;
     if cfg.update.auto && manager.is_installed() && manager.lacks_service_marker() {
         status = Status::Warn;
         parts.push("the service definition predates automatic updates".into());
         fix = Some("kioku service install".into());
+        action = Some(FixAction::ServiceInstall);
     }
-    check("update", status, parts.join("; "), fix)
+    Check {
+        action,
+        ..check("update", status, parts.join("; "), fix)
+    }
 }
 
 fn hook_log_check(cfg: &Config, env: &DoctorEnv) -> Check {
@@ -1567,7 +1737,8 @@ fn hook_dump_check(cfg: &Config, env: &DoctorEnv) -> Check {
                 "kioku hook-dump enable (another 24 h), or unset KIOKU_HOOK_DUMP / set [client] hook_dump = false"
                     .into(),
             ),
-        );
+        )
+        .with_action(FixAction::ClearHookDump);
     }
     if dump_enabled(cfg, &henv) {
         let path =
@@ -1585,6 +1756,210 @@ fn hook_dump_check(cfg: &Config, env: &DoctorEnv) -> Check {
         check("hook_dump", Status::Ok, "hook payload capture is off", None)
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// --fix (SPEC-M3.2 §3)
+// ---------------------------------------------------------------------------------------
+
+/// What `kioku doctor --fix` did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FixOutcome {
+    /// One line per action (`fixed: …`, `failed: …`, `manual: …`).
+    pub lines: Vec<String>,
+    /// Actions applied.
+    pub applied: usize,
+    /// Actions that failed.
+    pub failed: usize,
+    /// Instructions printed for the user (nothing kioku may change itself).
+    pub manual: usize,
+}
+
+impl FixOutcome {
+    /// 0 when every proposed fix was applied (instructions do not count), else 1.
+    pub fn exit_code(&self) -> i32 {
+        i32::from(self.failed > 0)
+    }
+}
+
+/// The distinct actions of `checks`, in check order.
+pub fn planned_fixes(checks: &[Check]) -> Vec<FixAction> {
+    let mut out: Vec<FixAction> = Vec::new();
+    for a in checks.iter().filter_map(|c| c.action.clone()) {
+        if !out.contains(&a) {
+            out.push(a);
+        }
+    }
+    out
+}
+
+/// True unless the Claude desktop app is known not to run: `pgrep -x Claude` (macOS) /
+/// `tasklist` (Windows); no such app elsewhere. An unanswerable query counts as running,
+/// so its config is left alone.
+pub fn claude_app_running(env: &DoctorEnv) -> bool {
+    match env.hook_platform {
+        crate::install::HookPlatform::Windows => {
+            let out = env
+                .runner
+                .run(&["tasklist", "/FI", "IMAGENAME eq Claude.exe", "/NH"]);
+            !out.success || out.stdout.to_ascii_lowercase().contains("claude.exe")
+        }
+        _ if cfg!(target_os = "macos") || env.runner.is_recording() => {
+            let out = env.runner.run(&["pgrep", "-x", "Claude"]);
+            out.success || !out.stderr.trim().is_empty()
+        }
+        _ => false,
+    }
+}
+
+/// Sets `hook_dump = false` in the `[client]` table of `path`, line by line so comments and
+/// the token line stay as they are; `Ok(false)` when it was not set there.
+pub fn disable_hook_dump_in_config(path: &Path) -> anyhow::Result<bool> {
+    use anyhow::Context;
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Ok(false);
+    };
+    let mut section = String::new();
+    let mut changed = false;
+    let lines: Vec<String> = text
+        .lines()
+        .map(|line| {
+            let t = line.trim();
+            if t.starts_with('[') {
+                section = t.trim_matches(['[', ']']).trim().to_string();
+            } else if section == "client"
+                && let Some((k, v)) = t.split_once('=')
+                && k.trim() == "hook_dump"
+                && v.split('#').next().unwrap_or("").trim() == "true"
+            {
+                changed = true;
+                return "hook_dump = false".to_string();
+            }
+            line.to_string()
+        })
+        .collect();
+    if !changed {
+        return Ok(false);
+    }
+    let mut out = lines.join("\n");
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    let perms = std::fs::metadata(path).map(|m| m.permissions()).ok();
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, out).with_context(|| format!("writing {}", tmp.display()))?;
+    if let Some(p) = perms {
+        let _ = std::fs::set_permissions(&tmp, p);
+    }
+    std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+    Ok(true)
+}
+
+/// Applies the safe fixes of `checks` (SPEC-M3.2 §3) and says what it did. Never rotates a
+/// token, never changes `[server] bind`, never writes a running Claude app's config.
+pub fn apply_fixes(env: &DoctorEnv, checks: &[Check]) -> FixOutcome {
+    let mut o = FixOutcome::default();
+    let senv = env.setup_env();
+    let config_dir = senv.config_dir();
+    let cfg = Config::load_from_dir(&config_dir, &env.vars)
+        .unwrap_or_else(|_| Config::for_data_dir(&config_dir));
+    let done = |o: &mut FixOutcome, what: String, r: anyhow::Result<()>| match r {
+        Ok(()) => {
+            o.applied += 1;
+            o.lines.push(format!("fixed: {what}"));
+        }
+        Err(e) => {
+            o.failed += 1;
+            o.lines.push(format!("failed: {what}: {e:#}"));
+        }
+    };
+    for action in planned_fixes(checks) {
+        match action {
+            FixAction::Chmod { path, mode } => {
+                let what = format!("chmod {mode:o} {}", path.display());
+                #[cfg(unix)]
+                let r = {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                        .map_err(anyhow::Error::from)
+                };
+                #[cfg(not(unix))]
+                let r: anyhow::Result<()> = Ok(());
+                done(&mut o, what, r);
+            }
+            FixAction::Install(agent) => {
+                let ctx = senv.install_ctx(&cfg.client);
+                let desktop = agent == Agent::ClaudeCode
+                    && claude_desktop_configs(&ctx).iter().any(|p| p.exists())
+                    && claude_app_running(env);
+                let opts = InstallOptions {
+                    skip_desktop: desktop,
+                    ..InstallOptions::default()
+                };
+                let r = crate::install::agents::install_agent(agent, &ctx, &opts).map(|_| ());
+                done(&mut o, format!("kioku install {}", agent.as_str()), r);
+                if desktop {
+                    o.manual += 1;
+                    o.lines.push(
+                        "manual: the Claude app is running and rewrites its config: quit it completely (also from the menu bar / tray), then run kioku doctor --fix again / Claude アプリを完全に終了してから、もう一度 kioku doctor --fix を実行してください".into(),
+                    );
+                }
+            }
+            FixAction::ServiceInstall => {
+                let r = senv
+                    .service_manager(&cfg.data_dir)
+                    .install()
+                    .map(|act| o.lines.extend(act.lines.iter().map(|l| format!("  {l}"))));
+                done(&mut o, "kioku service install".into(), r);
+            }
+            FixAction::Reindex => {
+                let r = ApiClient::new(&cfg.client, REINDEX_TIMEOUT)
+                    .and_then(|c| c.post(&["reindex"], &json!({})))
+                    .map(|v| {
+                        let docs = v.get("docs").and_then(Value::as_u64).unwrap_or(0);
+                        o.lines.push(format!("  reindexed {docs} pages"));
+                    });
+                done(&mut o, "kioku reindex".into(), r);
+            }
+            FixAction::ClearHookDump => {
+                let henv = HookEnv {
+                    vars: env.vars.clone(),
+                    home: Some(env.home.clone()),
+                    cwd: None,
+                };
+                if henv.var("KIOKU_HOOK_DUMP").is_some() {
+                    o.manual += 1;
+                    o.lines.push(
+                        "manual: KIOKU_HOOK_DUMP is set in the environment: unset it (kioku cannot change your shell profile)".into(),
+                    );
+                }
+                let r = disable_hook_dump_in_config(&config_dir.join(CONFIG_FILE)).and_then(|_| {
+                    if let Some(marker) = crate::dump::marker_path(&cfg, &henv)
+                        && marker.exists()
+                    {
+                        std::fs::remove_file(&marker)?;
+                    }
+                    Ok(())
+                });
+                done(
+                    &mut o,
+                    "hook dump turned off ([client] hook_dump = false)".into(),
+                    r,
+                );
+            }
+            FixAction::Manual(text) => {
+                o.manual += 1;
+                o.lines.push(format!("manual: {text}"));
+            }
+        }
+    }
+    if o.lines.is_empty() {
+        o.lines.push("nothing to fix".into());
+    }
+    o
+}
+
+/// Deadline of the reindex `--fix` asks the server for.
+const REINDEX_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[cfg(test)]
 mod tests {
@@ -1636,6 +2011,8 @@ mod tests {
             platform: None,
             hook_platform: crate::install::HookPlatform::current(),
             timeout: Duration::from_secs(1),
+            app_dirs: Vec::new(),
+            pid: 0,
         };
         let same = Health::Kioku {
             version: VERSION.to_string(),
@@ -1701,6 +2078,8 @@ mod tests {
             platform: Some(crate::service::Platform::Launchd),
             hook_platform: crate::install::HookPlatform::current(),
             timeout: Duration::from_secs(1),
+            app_dirs: Vec::new(),
+            pid: 0,
         };
         let c = service_check(&env, &cfg, &Health::Down("connection refused".into()));
         assert_eq!(c.status, Status::Fail, "{}", c.message);
@@ -1728,6 +2107,8 @@ mod tests {
             platform: None,
             hook_platform: crate::install::HookPlatform::current(),
             timeout: Duration::from_secs(1),
+            app_dirs: Vec::new(),
+            pid: 0,
         };
         std::fs::write(
             data.join("state").join(crate::dump::HOOK_DUMP_MARKER),
@@ -1765,6 +2146,8 @@ mod tests {
             platform: Some(crate::service::Platform::Launchd),
             hook_platform: crate::install::HookPlatform::current(),
             timeout: Duration::from_secs(1),
+            app_dirs: Vec::new(),
+            pid: 0,
         };
         let same = Health::Kioku {
             version: VERSION.to_string(),
@@ -1993,6 +2376,9 @@ fn reliability_checks(r: &kioku_core::store::ReliabilityReport) -> Vec<Check> {
             drift.then(|| "kioku reindex (on the server machine)".into()),
         ),
     ];
+    if drift && let Some(c) = out.last_mut() {
+        c.action = Some(FixAction::Reindex);
+    }
     if !r.unparseable_pages.is_empty() {
         out.push(check(
             "storage.unparseable",

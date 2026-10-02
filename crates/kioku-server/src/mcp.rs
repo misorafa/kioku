@@ -24,6 +24,7 @@ use rmcp::{
 };
 use serde::Deserialize;
 
+use crate::metrics::Metrics;
 use crate::shared::{DEFAULT_MCP_LIMIT, blocking, clamp_limit, resolve_scope, with_project_hint};
 
 /// `instructions` returned on initialize.
@@ -205,16 +206,29 @@ pub struct HandoffPendingParams {
 #[derive(Clone)]
 pub struct KiokuMcp {
     store: Arc<Store>,
+    metrics: Arc<Metrics>,
     tool_router: ToolRouter<KiokuMcp>,
 }
 
 impl KiokuMcp {
-    /// Creates the handler over a shared store.
+    /// Creates the handler over a shared store (with counters of its own).
     pub fn new(store: Arc<Store>) -> KiokuMcp {
+        KiokuMcp::with_metrics(store, Metrics::new())
+    }
+
+    /// Creates the handler, counting tool calls in `metrics` (SPEC-M3.2 §1).
+    pub fn with_metrics(store: Arc<Store>, metrics: Arc<Metrics>) -> KiokuMcp {
         KiokuMcp {
             store,
+            metrics,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Counts a finished tool call and passes its result through.
+    fn counted(&self, tool: &str, result: Result<String, String>) -> Result<String, String> {
+        self.metrics.record_tool(tool, result.is_ok());
+        result
     }
 }
 
@@ -223,29 +237,37 @@ impl KiokuMcp {
     /// `kioku_query`: full-text search.
     #[tool(description = QUERY_DESC)]
     async fn kioku_query(&self, Parameters(p): Parameters<QueryParams>) -> Result<String, String> {
-        let scope = resolve_scope(p.scope.map(QueryScope::as_str), p.project.as_deref())
+        let result = async {
+            let scope = resolve_scope(p.scope.map(QueryScope::as_str), p.project.as_deref())
+                .map_err(err_text)?;
+            let limit = clamp_limit(p.limit, DEFAULT_MCP_LIMIT);
+            let request = QueryRequest::new(
+                p.query,
+                p.since.as_deref(),
+                &p.kinds.unwrap_or_default(),
+                p.path_prefix,
+            )
             .map_err(err_text)?;
-        let limit = clamp_limit(p.limit, DEFAULT_MCP_LIMIT);
-        let request = QueryRequest::new(
-            p.query,
-            p.since.as_deref(),
-            &p.kinds.unwrap_or_default(),
-            p.path_prefix,
-        )
-        .map_err(err_text)?;
-        let result = blocking(&self.store, move |s| request.run(s, &scope, limit))
-            .await
-            .map_err(err_text)?;
-        Ok(format_query(&result))
+            let result = blocking(&self.store, move |s| request.run(s, &scope, limit))
+                .await
+                .map_err(err_text)?;
+            Ok::<String, String>(format_query(&result))
+        }
+        .await;
+        self.counted("kioku_query", result)
     }
 
     /// `kioku_read`: one page.
     #[tool(description = READ_DESC)]
     async fn kioku_read(&self, Parameters(p): Parameters<ReadParams>) -> Result<String, String> {
-        let page = blocking(&self.store, move |s| s.read_page(&p.path))
-            .await
-            .map_err(err_text)?;
-        Ok(format_page(&page))
+        let result = async {
+            let page = blocking(&self.store, move |s| s.read_page(&p.path))
+                .await
+                .map_err(err_text)?;
+            Ok::<String, String>(format_page(&page))
+        }
+        .await;
+        self.counted("kioku_read", result)
     }
 
     /// `kioku_write_page`: create or replace a page.
@@ -254,25 +276,29 @@ impl KiokuMcp {
         &self,
         Parameters(p): Parameters<WritePageParams>,
     ) -> Result<String, String> {
-        let req = WritePageRequest {
-            expected_revision: p.expected_revision,
-            title: p.title,
-            content: p.content,
-            project: p.project,
-            scope: p.scope.map(|s| match s {
-                WriteScope::Project => PageScope::Project,
-                WriteScope::Global => PageScope::Global,
-            }),
-            tags: p.tags,
-            path: p.path,
-        };
-        let path = blocking(&self.store, move |s| {
-            s.write_page(&req)
-                .map_err(|e| with_project_hint(s, e, req.project.as_deref()))
-        })
-        .await
-        .map_err(err_text)?;
-        Ok(format!("wrote {path}"))
+        let result = async {
+            let req = WritePageRequest {
+                expected_revision: p.expected_revision,
+                title: p.title,
+                content: p.content,
+                project: p.project,
+                scope: p.scope.map(|s| match s {
+                    WriteScope::Project => PageScope::Project,
+                    WriteScope::Global => PageScope::Global,
+                }),
+                tags: p.tags,
+                path: p.path,
+            };
+            let path = blocking(&self.store, move |s| {
+                s.write_page(&req)
+                    .map_err(|e| with_project_hint(s, e, req.project.as_deref()))
+            })
+            .await
+            .map_err(err_text)?;
+            Ok::<String, String>(format!("wrote {path}"))
+        }
+        .await;
+        self.counted("kioku_write_page", result)
     }
 
     /// `kioku_handoff_write`: agent-written handoff.
@@ -281,23 +307,27 @@ impl KiokuMcp {
         &self,
         Parameters(p): Parameters<HandoffWriteParams>,
     ) -> Result<String, String> {
-        let input = HandoffInput {
-            project: p.project,
-            session: p.session.filter(|s| !s.trim().is_empty()),
-            summary: p.summary,
-            next_steps: p.next_steps,
-            open_questions: p.open_questions,
-            decisions: p.decisions,
-            gotchas: p.gotchas,
-            verified: p.verified,
-        };
-        let handoff = blocking(&self.store, move |s| {
-            s.write_handoff(&input)
-                .map_err(|e| with_project_hint(s, e, Some(&input.project)))
-        })
-        .await
-        .map_err(err_text)?;
-        Ok(format!("handoff recorded for {}", handoff.project_id))
+        let result = async {
+            let input = HandoffInput {
+                project: p.project,
+                session: p.session.filter(|s| !s.trim().is_empty()),
+                summary: p.summary,
+                next_steps: p.next_steps,
+                open_questions: p.open_questions,
+                decisions: p.decisions,
+                gotchas: p.gotchas,
+                verified: p.verified,
+            };
+            let handoff = blocking(&self.store, move |s| {
+                s.write_handoff(&input)
+                    .map_err(|e| with_project_hint(s, e, Some(&input.project)))
+            })
+            .await
+            .map_err(err_text)?;
+            Ok::<String, String>(format!("handoff recorded for {}", handoff.project_id))
+        }
+        .await;
+        self.counted("kioku_handoff_write", result)
     }
 
     /// `kioku_handoff_pending`: peek at / accept the pending handoff.
@@ -306,37 +336,49 @@ impl KiokuMcp {
         &self,
         Parameters(p): Parameters<HandoffPendingParams>,
     ) -> Result<String, String> {
-        let session = p.session.filter(|s| !s.trim().is_empty());
-        let history = p.history.unwrap_or(0);
-        let routed = blocking(&self.store, move |s| {
-            let mut routed = s.pending_handoff_routed(
-                &p.project,
-                p.accept,
-                session.as_deref(),
-                p.lane.as_deref(),
-            )?;
-            if history > 0 {
-                routed.history =
-                    s.handoff_history(&p.project, session.as_deref(), p.lane.as_deref(), history)?;
-            }
-            Ok(routed)
-        })
-        .await
-        .map_err(err_text)?;
-        Ok(format_pending(&routed))
+        let result = async {
+            let session = p.session.filter(|s| !s.trim().is_empty());
+            let history = p.history.unwrap_or(0);
+            let routed = blocking(&self.store, move |s| {
+                let mut routed = s.pending_handoff_routed(
+                    &p.project,
+                    p.accept,
+                    session.as_deref(),
+                    p.lane.as_deref(),
+                )?;
+                if history > 0 {
+                    routed.history = s.handoff_history(
+                        &p.project,
+                        session.as_deref(),
+                        p.lane.as_deref(),
+                        history,
+                    )?;
+                }
+                Ok(routed)
+            })
+            .await
+            .map_err(err_text)?;
+            Ok::<String, String>(format_pending(&routed))
+        }
+        .await;
+        self.counted("kioku_handoff_pending", result)
     }
 
     /// `kioku_status`: counts and data dir.
     #[tool(description = STATUS_DESC)]
     async fn kioku_status(&self) -> Result<String, String> {
-        let (status, projects) = blocking(&self.store, |s| {
-            let status = s.status()?;
-            let projects: Vec<String> = s.list_projects()?.into_iter().map(|p| p.id).collect();
-            Ok((status, projects))
-        })
-        .await
-        .map_err(err_text)?;
-        Ok(format_status(&status, &projects))
+        let result = async {
+            let (status, projects) = blocking(&self.store, |s| {
+                let status = s.status()?;
+                let projects: Vec<String> = s.list_projects()?.into_iter().map(|p| p.id).collect();
+                Ok((status, projects))
+            })
+            .await
+            .map_err(err_text)?;
+            Ok::<String, String>(format_status(&status, &projects))
+        }
+        .await;
+        self.counted("kioku_status", result)
     }
 }
 
@@ -359,9 +401,10 @@ pub fn transport_config() -> StreamableHttpServerConfig {
 pub fn service(
     store: Arc<Store>,
     config: StreamableHttpServerConfig,
+    metrics: Arc<Metrics>,
 ) -> StreamableHttpService<KiokuMcp, LocalSessionManager> {
     StreamableHttpService::new(
-        move || Ok(KiokuMcp::new(store.clone())),
+        move || Ok(KiokuMcp::with_metrics(store.clone(), metrics.clone())),
         Arc::new(LocalSessionManager::default()),
         config,
     )

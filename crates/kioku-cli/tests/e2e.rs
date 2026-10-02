@@ -423,6 +423,23 @@ fn stop_without_nudge_finalizes_and_failures_are_logged() {
         lines[0].contains("session-start session=e2e-x status=401"),
         "{log}"
     );
+
+    // SPEC-M3.2 §2: every hook left its mark; the failed one keeps the last success.
+    let marks = kioku_cli::liveness::load(
+        &client_dir
+            .path()
+            .join("state")
+            .join(kioku_cli::liveness::LIVENESS_FILE),
+    );
+    let claude = &marks["claude-code"];
+    assert_eq!(claude.event, "session-start");
+    assert!(!claude.ok, "{claude:?}");
+    let last_ok = claude
+        .last_ok
+        .as_deref()
+        .expect("an earlier hook succeeded");
+    assert!(last_ok <= claude.at.as_str(), "{claude:?}");
+    assert_eq!(marks.len(), 1, "{marks:?}");
 }
 
 // ---------------------------------------------------------------------------------------

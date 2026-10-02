@@ -166,7 +166,7 @@ pub fn run(cli: Cli) -> i32 {
             return with_setup_env(|env| crate::invite::run_join(&url, &code, &opts, env));
         }
         Command::Service { command } => service(command),
-        Command::Doctor { json, agent } => return doctor(json, agent),
+        Command::Doctor { json, agent, fix } => return doctor(json, agent, fix),
         Command::Search {
             query,
             project,
@@ -210,6 +210,7 @@ pub fn run(cli: Cli) -> i32 {
                 enable_hooks_feature,
                 trust_mcp,
                 mcp_http,
+                skip_desktop: false,
             };
             install_cmd(target, &opts, &agents)
         }
@@ -256,7 +257,14 @@ pub fn run(cli: Cli) -> i32 {
             purge_history,
             yes,
         } => forget(session, project, purge_history, yes),
-        Command::Status => status(),
+        Command::Status {
+            watch: None,
+            agents: false,
+        } => status(),
+        Command::Status { agents: true, .. } => status_agents(),
+        Command::Status {
+            watch: Some(secs), ..
+        } => status_watch(secs),
         Command::RotateToken {
             dry_run,
             show_token,
@@ -487,7 +495,7 @@ fn serve(
             cfg.config_file.display()
         );
     }
-    init_tracing(log_file.as_deref())?;
+    init_tracing(log_file.as_deref(), cfg.server.request_log)?;
     let (bind, port) = (cfg.server.bind.clone(), cfg.server.port);
     let data_dir = cfg.data_dir.clone();
     let auto = cfg.update.auto;
@@ -622,10 +630,20 @@ fn serve(
     Ok(0)
 }
 
-fn init_tracing(log_file: Option<&std::path::Path>) -> anyhow::Result<()> {
+/// The log filter of `kioku serve` without `RUST_LOG`: the per-request `kioku_http` lines
+/// (SPEC-M3.2 §1) only with `[server] request_log = true`.
+pub fn default_log_filter(request_log: bool) -> String {
+    let mut filter = "info,tantivy=warn".to_string();
+    if !request_log {
+        filter.push_str(",kioku_http=off");
+    }
+    filter
+}
+
+fn init_tracing(log_file: Option<&std::path::Path>, request_log: bool) -> anyhow::Result<()> {
     use tracing_subscriber::EnvFilter;
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,tantivy=warn"));
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(default_log_filter(request_log)));
     match log_file {
         Some(path) => {
             let writer = crate::logfile::RotatingFile::open(path)
@@ -1068,7 +1086,7 @@ fn rotate_token(dry_run: bool, show_token: bool) -> i32 {
 }
 
 /// `kioku doctor [--json] [--agent <name>]` (M2 §12); returns the exit code.
-fn doctor(json: bool, agent: Option<Agent>) -> i32 {
+fn doctor(json: bool, agent: Option<Agent>, fix: bool) -> i32 {
     let bin = match current_binary() {
         Ok(b) => b,
         Err(err) => {
@@ -1078,13 +1096,180 @@ fn doctor(json: bool, agent: Option<Agent>) -> i32 {
     };
     let env = crate::doctor::DoctorEnv::from_process(bin);
     let checks = crate::doctor::run_doctor(&env, agent);
+    if !fix {
+        if json {
+            let v = crate::doctor::render_json(&checks);
+            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        } else {
+            print!("{}", crate::doctor::render_text(&checks));
+        }
+        return crate::doctor::exit_code(&checks);
+    }
+    // SPEC-M3.2 §3: apply, say what was done, then show the state after the fixes.
+    let outcome = crate::doctor::apply_fixes(&env, &checks);
+    let after = crate::doctor::run_doctor(&env, agent);
     if json {
-        let v = crate::doctor::render_json(&checks);
+        let mut v = crate::doctor::render_json(&after);
+        v["fixes"] = serde_json::json!(outcome.lines);
         println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
     } else {
-        print!("{}", crate::doctor::render_text(&checks));
+        println!("kioku doctor --fix:");
+        for l in &outcome.lines {
+            println!("  {l}");
+        }
+        println!();
+        print!("{}", crate::doctor::render_text(&after));
     }
-    crate::doctor::exit_code(&checks)
+    outcome.exit_code()
+}
+
+/// `kioku status --agents` (SPEC-M3.2 §2): the `hooks.liveness` lines of `kioku doctor`.
+fn status_agents() -> anyhow::Result<()> {
+    let env = crate::doctor::DoctorEnv::from_process(current_binary()?);
+    let config_dir = crate::setup::SetupEnv::from_process(env.bin.clone())?.config_dir();
+    let cfg = Config::load_from_dir(&config_dir, &env.vars)?;
+    let ctx = InstallCtx::from_process(cfg.client.clone(), env.bin.clone())?;
+    let agents: Vec<Agent> = crate::event::ALL_AGENTS
+        .iter()
+        .copied()
+        .filter(|a| crate::install::agents::is_detected(*a, &ctx))
+        .collect();
+    let checks = crate::doctor::liveness_checks(&env, &cfg, &agents);
+    print!("{}", format_agents(&checks));
+    Ok(())
+}
+
+/// The `kioku status --agents` table: one line per installed agent.
+pub fn format_agents(checks: &[crate::doctor::Check]) -> String {
+    if checks.is_empty() {
+        return "no agent has kioku hooks installed (kioku install all)\n".into();
+    }
+    let mut out = String::new();
+    for c in checks {
+        out.push_str(&format!("{} {}\n", c.status.tag(), c.message));
+        if let Some(fix) = &c.fix {
+            out.push_str(&format!("       fix: {fix}\n"));
+        }
+    }
+    out
+}
+
+/// `kioku status --watch N` (SPEC-M3.2 §1): redraws every N seconds until Ctrl-C.
+fn status_watch(secs: u64) -> anyhow::Result<()> {
+    let every = Duration::from_secs(secs.max(1));
+    loop {
+        let frame = (|| -> anyhow::Result<String> {
+            let (cfg, client) = command_client()?;
+            let body = client.get(&["status"], &[])?;
+            let s: StatusReport =
+                serde_json::from_value(body.clone()).context("unexpected status response")?;
+            // An older server has no /metrics: those lines say so.
+            let metrics = client
+                .get(&["metrics"], &[])
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string));
+            let outbox = crate::outbox::count(&cfg).unwrap_or(0);
+            Ok(format_watch(&WatchInput {
+                server_url: cfg.client.server_url.clone(),
+                status: s,
+                update: body.get("update").cloned(),
+                metrics,
+                outbox,
+                now: kioku_core::util::now_ts(),
+                every: secs.max(1),
+            }))
+        })()
+        .unwrap_or_else(|e| format!("kioku status --watch: {e:#}\n"));
+        // Clear the screen and home the cursor, then the frame.
+        print!("\x1b[2J\x1b[H{frame}");
+        let _ = std::io::stdout().flush();
+        std::thread::sleep(every);
+    }
+}
+
+/// Everything one `kioku status --watch` frame shows.
+#[derive(Clone, Debug)]
+pub struct WatchInput {
+    /// `[client] server_url`.
+    pub server_url: String,
+    /// `GET /status`.
+    pub status: StatusReport,
+    /// Its `update` block.
+    pub update: Option<Value>,
+    /// `GET /metrics` text (`None` from a server without it).
+    pub metrics: Option<String>,
+    /// Observations queued on this machine.
+    pub outbox: usize,
+    /// Frame time (RFC 3339).
+    pub now: String,
+    /// Redraw interval in seconds.
+    pub every: u64,
+}
+
+/// The value of an unlabelled sample `name` in Prometheus text.
+pub fn metric_value(text: &str, name: &str) -> Option<f64> {
+    text.lines()
+        .filter(|l| !l.starts_with('#'))
+        .find_map(|l| l.strip_prefix(name)?.strip_prefix(' ')?.trim().parse().ok())
+}
+
+/// `42s` / `5m` / `3h` / `2d` for a seconds age; `never` for a negative one.
+pub fn format_age(secs: f64) -> String {
+    if secs < 0.0 {
+        return "never".into();
+    }
+    let s = secs as u64;
+    match s {
+        0..60 => format!("{s}s ago"),
+        60..3600 => format!("{}m ago", s / 60),
+        3600..86400 => format!("{}h ago", s / 3600),
+        _ => format!("{}d ago", s / 86400),
+    }
+}
+
+/// One `kioku status --watch` frame.
+pub fn format_watch(w: &WatchInput) -> String {
+    let s = &w.status;
+    let version = if s.version.is_empty() {
+        "?"
+    } else {
+        &s.version
+    };
+    let m = w.metrics.as_deref();
+    let get = |name: &str| m.and_then(|t| metric_value(t, name));
+    let no_metrics = "? (server without /api/v1/metrics)";
+    let open = get("kioku_sessions_open")
+        .map(|v| format!("{v}"))
+        .unwrap_or_else(|| no_metrics.into());
+    let last_obs = get("kioku_last_observation_age_seconds")
+        .map(format_age)
+        .unwrap_or_else(|| no_metrics.into());
+    let pending = get("kioku_handoffs_pending")
+        .map(|v| format!("{v}"))
+        .unwrap_or_else(|| "?".into());
+    let mut out = format!(
+        "kioku status --watch {} — {} (Ctrl-C to stop)\n\
+         server        : {} (kioku {version})\n\
+         sessions open : {open} (of {})\n\
+         last obs.     : {last_obs}\n\
+         handoffs      : {pending} pending\n\
+         outbox        : {} queued on this machine\n",
+        w.every, w.now, w.server_url, s.sessions, w.outbox
+    );
+    if let Some(u) = &w.update {
+        out.push_str(&format!("update        : {}\n", format_update_status(u)));
+    }
+    if let Some(st) = &s.storage {
+        out.push_str(&format!(
+            "sizes         : db {}, raw {}, wiki {}, backups {}, index {}\n",
+            human_bytes(st.db_bytes),
+            human_bytes(st.raw_bytes),
+            human_bytes(st.wiki_bytes),
+            human_bytes(st.backups_bytes),
+            human_bytes(st.index_bytes),
+        ));
+    }
+    out
 }
 
 /// `kioku service …` (M2 §10.2). Refuses on a client-only machine.
@@ -1321,6 +1506,84 @@ fn uninstall_cmd(target: InstallTarget, project: bool, dry_run: bool) -> anyhow:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn status_fixture() -> StatusReport {
+        serde_json::from_value(serde_json::json!({
+            "data_dir": "/srv/kioku", "projects": 2, "pages": 10, "sessions": 120,
+            "observations": 5000, "handoffs": 7, "index_docs": 10, "git_enabled": true,
+            "version": "0.9.1",
+            "storage": {"db_bytes": 2097152, "raw_bytes": 1024, "wiki_bytes": 4096,
+                        "backups_bytes": 0, "index_bytes": 8192, "oldest_raw": null,
+                        "last_prune": null}
+        }))
+        .unwrap()
+    }
+
+    /// SPEC-M3.2 §1: one `status --watch` frame, from /metrics when the server has it.
+    #[test]
+    fn watch_frame_shows_liveness_outbox_update_and_sizes() {
+        let metrics = "# TYPE kioku_sessions_open gauge\nkioku_sessions_open 3\n\
+                       kioku_last_observation_age_seconds 42\nkioku_handoffs_pending 1\n\
+                       kioku_http_requests_total{route=\"/api/v1/search\",status=\"200\"} 9\n";
+        assert_eq!(metric_value(metrics, "kioku_sessions_open"), Some(3.0));
+        assert_eq!(metric_value(metrics, "kioku_sessions"), None);
+        let w = WatchInput {
+            server_url: "http://mac-mini.local:7391".into(),
+            status: status_fixture(),
+            update: Some(serde_json::json!({"auto": true, "managed": true})),
+            metrics: Some(metrics.into()),
+            outbox: 2,
+            now: "2026-10-02T12:00:00Z".into(),
+            every: 5,
+        };
+        let f = format_watch(&w);
+        assert!(
+            f.starts_with("kioku status --watch 5 — 2026-10-02T12:00:00Z"),
+            "{f}"
+        );
+        assert!(f.contains("server        : http://mac-mini.local:7391 (kioku 0.9.1)\n"));
+        assert!(f.contains("sessions open : 3 (of 120)\n"), "{f}");
+        assert!(f.contains("last obs.     : 42s ago\n"), "{f}");
+        assert!(f.contains("handoffs      : 1 pending\n"), "{f}");
+        assert!(f.contains("outbox        : 2 queued on this machine\n"));
+        assert!(f.contains("update        : automatic"), "{f}");
+        assert!(
+            f.contains("sizes         : db 2.0 MiB, raw 1 KiB, wiki 4 KiB"),
+            "{f}"
+        );
+        // An older server: no /metrics, the frame still renders.
+        let old = format_watch(&WatchInput { metrics: None, ..w });
+        assert!(
+            old.contains("sessions open : ? (server without /api/v1/metrics)"),
+            "{old}"
+        );
+        assert_eq!(format_age(-1.0), "never");
+        assert_eq!(format_age(7200.0), "2h ago");
+        assert_eq!(format_age(200000.0), "2d ago");
+    }
+
+    /// SPEC-M3.2 §2: `status --agents` prints the doctor liveness lines.
+    #[test]
+    fn agents_table_lists_liveness_lines() {
+        assert!(format_agents(&[]).contains("kioku install all"));
+        let c = crate::liveness::liveness_check(Agent::Codex, None, true, 0);
+        let t = format_agents(&[c]);
+        assert!(t.starts_with("[WARN] codex: no successful hook"), "{t}");
+        assert!(t.contains("       fix: start a session in Codex"), "{t}");
+    }
+
+    /// SPEC-M3.2 §1: request lines are off unless `[server] request_log = true`.
+    #[test]
+    fn request_log_is_filtered_unless_enabled() {
+        assert_eq!(
+            default_log_filter(false),
+            "info,tantivy=warn,kioku_http=off"
+        );
+        assert_eq!(default_log_filter(true), "info,tantivy=warn");
+        for f in [default_log_filter(false), default_log_filter(true)] {
+            assert!(tracing_subscriber::EnvFilter::try_new(&f).is_ok(), "{f}");
+        }
+    }
 
     #[test]
     fn merge_report_text() {

@@ -206,6 +206,10 @@ fn run_hook_unguarded(
             session = ev.session_id.clone();
             handle(&ev, agent, cfg, env)
         });
+    // SPEC-M3.2 §2: the one small state write of a hook (positive liveness).
+    if let Some(path) = crate::liveness::liveness_path(cfg, env) {
+        crate::liveness::record(&path, agent, event, result.is_ok(), &now_ts());
+    }
     match result {
         Ok((r, spawn_update)) => HookOutcome {
             spawn_update,

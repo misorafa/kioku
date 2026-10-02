@@ -924,6 +924,7 @@ fn agents_step(opts: &SetupOptions, env: &SetupEnv, client: &ClientConfig, r: &m
         enable_hooks_feature: false,
         trust_mcp: false,
         mcp_http: opts.mcp_http,
+        skip_desktop: false,
     };
     for (agent, status) in install_all(&ctx, &iopts, &opts.agents) {
         let name = agent.as_str();

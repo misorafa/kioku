@@ -130,6 +130,9 @@ pub struct InstallOptions {
     /// `--mcp-http`: register the v0.3 URL + token MCP entry instead of the `kioku mcp`
     /// stdio bridge (M2 §20.2).
     pub mcp_http: bool,
+    /// Leave the Claude desktop app's config alone (`kioku doctor --fix` while the app runs:
+    /// it rewrites that file and would drop the entry, SPEC-M3.2 §3).
+    pub skip_desktop: bool,
 }
 
 /// What one agent's install / uninstall did.
@@ -874,7 +877,7 @@ pub fn install_agent(
                 "Claude Code",
                 dry,
             ));
-            if !opts.project {
+            if !opts.project && !opts.skip_desktop {
                 let desktop = claude_desktop_mcp_entry(ctx);
                 let mut changed = false;
                 for path in claude_desktop_configs(ctx) {
