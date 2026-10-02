@@ -5,7 +5,7 @@ requests of each tag (`git log <previous tag>..<tag>`). Specifications are in
 [docs/](docs/INDEX.md); the section that is current for each topic is listed in
 [docs/INDEX.md](docs/INDEX.md).
 
-## Unreleased — M3.3: distribution, uninstall, fixture freshness
+## v0.9.3 — 2026-10-02
 
 - Homebrew: `brew install misorafa/tap/kioku`. Each stable release renders
   `Formula/kioku.rb` (`packaging/homebrew/kioku.rb.tmpl`) and pushes it to the tap
