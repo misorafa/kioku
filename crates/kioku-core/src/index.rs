@@ -294,9 +294,13 @@ impl Inner {
         let analyzer = ja_analyzer_with(tokenizer.clone());
         index.tokenizers().register(JA_TOKENIZER, analyzer.clone());
         index.tokenizers().register(WS_TOKENIZER, ws_analyzer());
+        // Manual: kioku is the only writer and reloads right after each commit, under the
+        // writer lock. `OnCommitWithDelay` starts a thread that opens `meta.json` every
+        // 500 ms; on Windows a commit cannot rename the new `meta.json` over one that is
+        // open, so a poll landing on a commit failed it with "Access is denied" (os error 5).
         let reader = index
             .reader_builder()
-            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .reload_policy(ReloadPolicy::Manual)
             .try_into()
             .context("opening index reader")?;
         Ok(Inner {
@@ -357,10 +361,31 @@ impl Inner {
                 w.add_document(tantivy_doc(&f, doc))?;
             }
             w.commit().context("committing index")?;
-            Ok(())
-        })?;
-        self.reader.reload().context("reloading index reader")?;
-        Ok(())
+            self.reload()
+        })
+    }
+
+    /// Reloads the reader. Called with the writer lock held, so no other thread of this
+    /// process commits (renames `meta.json`) while the reload has it open.
+    fn reload(&self) -> anyhow::Result<()> {
+        self.reader.reload().context("reloading index reader")
+    }
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        retire_writer(self.writer.get_mut().take());
+    }
+}
+
+/// Closes a writer and waits for its merge threads: a plain drop leaves a merge running
+/// that keeps files of the directory open (on Windows: undeletable, and it may still
+/// rewrite `.managed.json` while the next writer opens the index).
+fn retire_writer(writer: Option<IndexWriter>) {
+    if let Some(w) = writer
+        && let Err(e) = w.wait_merging_threads()
+    {
+        tracing::warn!(error = %e, "index merge did not finish");
     }
 }
 
@@ -510,10 +535,8 @@ impl SearchIndex {
                 w.delete_term(Term::from_field_text(f.path, p));
             }
             w.commit().context("committing index")?;
-            Ok(())
-        })?;
-        inner.reader.reload().context("reloading index reader")?;
-        Ok(())
+            inner.reload()
+        })
     }
 
     /// Replaces (or adds) the document for `doc.path` and commits.
@@ -558,7 +581,7 @@ impl SearchIndex {
             inner
         };
         new.write(docs, true)?;
-        drop(old.writer.lock().take());
+        retire_writer(old.writer.lock().take());
         *self.inner.write() = Arc::new(new);
         drop(old);
         self.remove_legacy_dirs();

@@ -195,6 +195,102 @@ fn delete_then_rebuild_keeps_the_rebuilt_document() {
     assert_eq!(idx.num_docs(), 2);
 }
 
+/// Regression (Windows CI, "Access is denied", os error 5): a commit renames the new
+/// `meta.json` over the old one, which Windows refuses while anything holds it open. Reopen
+/// → delete → clearing write → rebuild, plus the switch away from an older index, with a
+/// searcher kept alive and other threads searching and writing meanwhile.
+#[test]
+fn reopen_delete_rebuild_with_a_live_searcher() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let tmp = tempfile::tempdir().unwrap();
+    let (legacy, current) = (tmp.path().join("old"), tmp.path().join("new"));
+    let a = doc(
+        "p/a.md",
+        Some("p"),
+        "引き継ぎ",
+        "日本語の本文と自宅サーバー",
+    );
+    let s = doc("p/STATE.md", Some("p"), "状態", "現在の状態");
+    SearchIndex::open(&legacy).unwrap().0.upsert(&a).unwrap();
+    for round in 0..4 {
+        let (idx, _) =
+            SearchIndex::open_with(&current, std::slice::from_ref(&legacy), None).unwrap();
+        let idx = Arc::new(idx);
+        assert_eq!(idx.serving_legacy(), round == 0);
+        // Holds the segments it saw (mmapped) until the end of the round.
+        let searcher = idx.inner().reader.searcher();
+        let seen = searcher.num_docs();
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (idx, stop) = (idx.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    idx.search("日本語", &SearchScope::All, 5).unwrap();
+                }
+            })
+        };
+        if round > 0 {
+            let writer = {
+                let idx = idx.clone();
+                std::thread::spawn(move || {
+                    for i in 0..10 {
+                        let path = format!("p/w{i}.md");
+                        idx.upsert(&doc(&path, Some("p"), "並行", "同時に書く"))
+                            .unwrap();
+                    }
+                })
+            };
+            idx.delete_paths(&["p/a.md".to_string()]).unwrap();
+            idx.upsert_many(std::slice::from_ref(&a), true).unwrap();
+            writer.join().unwrap();
+        }
+        // Round 0 builds the new index and switches to it; later rounds clear and refill.
+        idx.rebuild(&[a.clone(), s.clone()]).unwrap();
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+        assert!(!idx.serving_legacy());
+        assert_eq!(idx.num_docs(), 2);
+        let hits = idx.search("日本語", &SearchScope::All, 5).unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].path, "p/a.md");
+        // The old snapshot still answers from the segments it holds.
+        assert_eq!(searcher.num_docs(), seen);
+        assert_eq!(
+            searcher
+                .search(&AllQuery, &tantivy::collector::Count)
+                .unwrap() as u64,
+            seen
+        );
+        drop(searcher);
+        // Once nothing maps it, the older directory goes (on Windows too).
+        idx.remove_legacy_dirs();
+        assert!(!legacy.exists(), "round {round}");
+    }
+}
+
+/// Nothing in the background opens `meta.json`: the reader reloads only after kioku's own
+/// commits (one made elsewhere stays unseen), so no poll can collide with a commit's rename.
+#[test]
+fn reader_reloads_only_after_its_own_commits() {
+    let tmp = tempfile::tempdir().unwrap();
+    SearchIndex::open(tmp.path())
+        .unwrap()
+        .0
+        .upsert(&doc("p/a.md", Some("p"), "検索", "日本語の本文"))
+        .unwrap();
+    let (idx, _) = SearchIndex::open(tmp.path()).unwrap();
+    assert_eq!(idx.num_docs(), 1);
+    let raw = Index::open_in_dir(tmp.path()).unwrap();
+    let mut w: IndexWriter = raw.writer_with_num_threads(1, WRITER_HEAP).unwrap();
+    w.delete_all_documents().unwrap();
+    w.commit().unwrap();
+    w.wait_merging_threads().unwrap();
+    // Longer than tantivy's 500 ms meta.json poll.
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    assert_eq!(idx.num_docs(), 1, "no background reload");
+    assert_eq!(idx.search("日本語", &SearchScope::All, 3).unwrap().len(), 1);
+}
+
 #[test]
 fn upsert_replaces_and_syntax_fallback() {
     let (_d, idx) = fixture();

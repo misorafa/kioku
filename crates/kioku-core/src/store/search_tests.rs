@@ -302,7 +302,6 @@ fn schema2_index_is_served_until_the_rebuild_switches_over() {
     assert!(!store.index.serving_legacy());
     assert_eq!(store.index_version(), INDEX_SCHEMA_VERSION);
     assert!(dirs.index_dir().join("meta.json").exists());
-    #[cfg(not(windows))]
     assert!(!dirs.index_dir_for(2).exists(), "old index removed");
     // the schema-3 fields work: identifiers by their parts
     for q in ["write_lock", "lock", "Store::open", "index.rs"] {
