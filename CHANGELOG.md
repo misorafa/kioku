@@ -5,7 +5,7 @@ requests of each tag (`git log <previous tag>..<tag>`). Specifications are in
 [docs/](docs/INDEX.md); the section that is current for each topic is listed in
 [docs/INDEX.md](docs/INDEX.md).
 
-## Unreleased — M3.2: observability, `doctor --fix`, one document index
+## v0.9.2 — 2026-10-02
 
 - `GET /api/v1/metrics` (bearer auth): Prometheus text with counts, sizes, ages of the last
   backup / prune / observation / update check, request, MCP tool-call and git-failure
