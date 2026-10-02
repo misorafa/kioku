@@ -48,6 +48,31 @@ config (prints the quit-first instruction), never rotates tokens, never changes
 `[server] bind`. Prints what it did; exit 0 when everything proposed was applied. Tests:
 each fixable check on a fixture; `--fix` is idempotent.
 
+### 3.1 Client reachability diagnosis (field, 2026-10-02)
+
+Seen on a macOS client: every `kioku` request to the LAN server failed with
+`tcp connect error: No route to host (os error 65)` while `curl`, `nc` and `ping` from the
+same shell reached it. Cause class: **per-process network permission** — macOS "Local
+Network" privacy (TCC) denies non-system processes; the permission belongs to the
+*responsible app* (the terminal / IDE / agent app that launched the hook), so hooks fail
+under one app and work under another. Little Snitch rules and silent mode produce the same
+symptom. `doctor`'s `server` check, when the connect error is `EHOSTUNREACH`/`ENETUNREACH`
+to a private address (RFC 1918, link-local, `.local`), must:
+
+1. probe the same address with `/usr/bin/nc -z` (system binary, exempt) — if that
+   succeeds, say so and name the likely cause and fix (ja/en): 「この端末の kioku だけが
+   LAN に出られません。macOS の「プライバシーとセキュリティ › ローカルネットワーク」で、
+   kioku を起動したアプリ（例: Orca / Ghostty / Claude / Codex）を許可してください。Little Snitch
+   を使っている場合は kioku 実行ファイル自体に許可ルールを作ってください」;
+2. print the responsible app (walk `ppid` to the first `.app` bundle) so the user knows
+   which toggle to flip;
+3. never suggest "check the server" in this case.
+
+`doctor --fix` cannot grant TCC; it prints the exact Settings path. Hooks keep failing open;
+with M2.6's queue (server ≥ 0.8.0) the observations are not lost once the permission is
+granted. Test: a unit test on the classifier (error kind + address class + nc result →
+message), and the ppid walk on a fixture.
+
 ## 4. Documents (SPEC-INDEX)
 
 - `docs/INDEX.md`: one table — topic → the section that is currently authoritative
