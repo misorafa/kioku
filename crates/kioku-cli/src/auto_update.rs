@@ -35,7 +35,7 @@ pub const NOTICE_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 /// `kioku doctor` warns when server and client versions differ for longer (§3.4).
 pub const MISMATCH_WARN: Duration = Duration::from_secs(24 * 3600);
 /// The server's first check after start (§3.1 step 1).
-pub const FIRST_CHECK: Duration = Duration::from_secs(10 * 60);
+pub const FIRST_CHECK: Duration = Duration::from_secs(3 * 60);
 /// The server's retention run interval (SPEC-M2.8 §3: daily; ± an eighth of jitter).
 pub const PRUNE_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 /// The server's first retention run: 10 minutes after the first update check (SPEC-M2.8

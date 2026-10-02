@@ -192,7 +192,7 @@ fn check_interval_has_bounded_jitter() {
 #[test]
 fn update_interval_comes_from_config_and_is_clamped() {
     let mut u = kioku_core::config::UpdateConfig::default();
-    assert_eq!(u.interval(), Duration::from_secs(4 * 3600));
+    assert_eq!(u.interval(), Duration::from_secs(3600));
     u.interval_hours = 0;
     assert_eq!(u.interval(), Duration::from_secs(3600));
     u.interval_hours = 1000;

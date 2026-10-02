@@ -47,7 +47,8 @@ channel = "stable"   # "stable" = releases without "-" in the tag (only value in
 
 A task inside `kioku serve` (tokio interval, runs the blocking work in `spawn_blocking`):
 
-1. First check 10 minutes after start, then every `[update] interval_hours` (default 4,
+1. First check 3 minutes after start, then every `[update] interval_hours` (default 1 since
+   v0.9.1; 4 in v0.8.2;
    clamped 1–168; was 24 h until v0.8.1 — too slow in practice) ± an eighth of jitter.
 2. Resolve the latest release tag the same way as `kioku update` (`HEAD …/releases/latest`;
    `KIOKU_REPO` / `KIOKU_DOWNLOAD_BASE` still apply). Tags containing `-` are ignored.
