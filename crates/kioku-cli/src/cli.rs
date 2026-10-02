@@ -141,8 +141,8 @@ pub enum Command {
     },
     /// Search the wiki through the server.
     Search {
-        /// Query words (joined with spaces).
-        #[arg(required = true)]
+        /// Query words (joined with spaces); optional with --path-prefix.
+        #[arg(required_unless_present = "path_prefix")]
         query: Vec<String>,
         /// Restrict to a project (plus global pages).
         #[arg(long)]
@@ -153,6 +153,15 @@ pub enum Command {
         /// Maximum number of hits.
         #[arg(long)]
         limit: Option<usize>,
+        /// Only what was updated on or after this day (YYYY-MM-DD).
+        #[arg(long)]
+        since: Option<String>,
+        /// Only these kinds: page, session, state (repeat or comma-separate).
+        #[arg(long = "kind", value_name = "KIND")]
+        kinds: Vec<String>,
+        /// List the sessions that edited files under this path, newest first.
+        #[arg(long)]
+        path_prefix: Option<String>,
     },
     /// Lifecycle hook handler (reads the agent's JSON payload on stdin).
     Hook {
@@ -451,6 +460,15 @@ mod tests {
             p(&["search", "引き継ぎ", "自動化", "--scope", "global", "--limit", "3"]).unwrap().command,
             Command::Search { query, scope: Some(ScopeArg::Global), limit: Some(3), .. } if query.len() == 2
         ));
+        assert!(matches!(
+            p(&["search", "索引", "--since", "2026-09-01", "--kind", "page", "--kind", "session"]).unwrap().command,
+            Command::Search { since: Some(s), kinds, path_prefix: None, .. } if s == "2026-09-01" && kinds == ["page", "session"]
+        ));
+        assert!(matches!(
+            p(&["search", "--path-prefix", "crates/kioku-core/src/store.rs"]).unwrap().command,
+            Command::Search { query, path_prefix: Some(_), .. } if query.is_empty()
+        ));
+        assert!(p(&["search"]).is_err());
         assert!(matches!(
             p(&["install", "claude-code", "--project"]).unwrap().command,
             Command::Install {

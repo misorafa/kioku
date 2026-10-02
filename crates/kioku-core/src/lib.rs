@@ -29,14 +29,14 @@ pub use db::{NewerSchema, ProjectAlias, ProjectRow, SCHEMA_VERSION, newer_schema
 pub use digest::{FileCount, SessionDigest};
 pub use error::{Error, Result};
 pub use handoff::{Handoff, HandoffInput, HandoffSource, PendingHandoff};
-pub use index::{Hit, SearchScope};
+pub use index::{Hit, SearchOptions, SearchScope};
 pub use layout::{DataDir, InitReport, init};
 pub use page::{Frontmatter, Page, PageKind, PageScope};
 pub use project::{ProjectIdentity, identify};
 pub use session::{
     CONTEXT_VERSION, CarriedItem, FinalizeResult, HANDOFF_STALE_TOOL_USES, NewObservation,
-    Observation, ObservationKind, PinnedPage, RecentSession, Session, SessionCounts, SessionInfo,
-    SessionStartRequest, SessionStartResponse, SessionStatus,
+    Observation, ObservationKind, PathSession, PinnedPage, RecentSession, Session, SessionCounts,
+    SessionInfo, SessionStartRequest, SessionStartResponse, SessionStatus,
 };
 pub use store::{MergeReport, StatusReport, Store, WritePageRequest};
 pub use strings::Lang;

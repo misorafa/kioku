@@ -11,11 +11,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use kioku_core::{ClientConfig, Config, Hit, Page, PendingHandoff, StatusReport};
+use kioku_core::{ClientConfig, Config, Hit, Page, PathSession, PendingHandoff, StatusReport};
 use kioku_server::mcp::{
     HANDOFF_PENDING_DESC, HANDOFF_WRITE_DESC, HandoffPendingParams, HandoffWriteParams,
-    INSTRUCTIONS, QUERY_DESC, QueryParams, READ_DESC, ReadParams, STATUS_DESC, WRITE_PAGE_DESC,
-    WritePageParams, WriteScope, format_hits, format_page, format_pending, format_status,
+    INSTRUCTIONS, QUERY_DESC, QueryParams, QueryRequest, QueryResult, READ_DESC, ReadParams,
+    STATUS_DESC, WRITE_PAGE_DESC, WritePageParams, WriteScope, format_page, format_pending,
+    format_query, format_status,
 };
 use rmcp::{
     ServerHandler, ServiceExt,
@@ -32,6 +33,9 @@ pub const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `kioku_query`'s default number of hits (the server's MCP default).
 const QUERY_DEFAULT_LIMIT: usize = 8;
+
+/// Tool error when the server predates `path_prefix` (SPEC-M3.1 §3).
+pub const PATH_PREFIX_UNSUPPORTED: &str = "this kioku server predates path_prefix and cannot list sessions by path; update the server (`kioku update` on it) / サーバーが古く path_prefix に対応していません（サーバーで kioku update を実行）";
 
 /// The stdio MCP handler: the server's six tools, over REST.
 #[derive(Clone)]
@@ -109,8 +113,12 @@ impl KiokuBridge {
     /// `kioku_query` → `GET /search`.
     #[tool(description = QUERY_DESC)]
     async fn kioku_query(&self, Parameters(p): Parameters<QueryParams>) -> Result<String, String> {
+        let kinds = p.kinds.unwrap_or_default();
+        // Validated here too, so a bad value reads the same as from the server's `/mcp`.
+        let request = QueryRequest::new(p.query, p.since.as_deref(), &kinds, p.path_prefix)
+            .map_err(|e| e.to_string())?;
         let mut query = vec![
-            ("q", p.query),
+            ("q", request.query.clone()),
             ("limit", p.limit.unwrap_or(QUERY_DEFAULT_LIMIT).to_string()),
         ];
         if let Some(project) = p.project {
@@ -119,9 +127,32 @@ impl KiokuBridge {
         if let Some(scope) = p.scope {
             query.push(("scope", scope.as_str().to_string()));
         }
+        if let Some(since) = p.since.filter(|s| !s.trim().is_empty()) {
+            query.push(("since", since));
+        }
+        if !request.options.kinds.is_empty() {
+            query.push(("kinds", request.options.kinds.join(",")));
+        }
+        if let Some(prefix) = &request.path_prefix {
+            query.push(("path_prefix", prefix.clone()));
+        }
         let v = self.call(move |c| c.get(&["search"], &query)).await?;
         let hits: Vec<Hit> = decode(v.get("hits").cloned().unwrap_or(json!([])))?;
-        Ok(format_hits(&hits))
+        let mut result = QueryResult {
+            hits: (!request.query.trim().is_empty()).then_some(hits),
+            sessions: None,
+        };
+        if let Some(prefix) = request.path_prefix {
+            match v.get("sessions") {
+                Some(sessions) => {
+                    let sessions: Vec<PathSession> = decode(sessions.clone())?;
+                    result.sessions = Some((prefix, sessions));
+                }
+                // A server older than SPEC-M3.1 ignores `path_prefix`.
+                None => return Err(PATH_PREFIX_UNSUPPORTED.to_string()),
+            }
+        }
+        Ok(format_query(&result))
     }
 
     /// `kioku_read` → `GET /pages/<path>`.
@@ -201,6 +232,9 @@ impl KiokuBridge {
         }
         if let Some(l) = p.lane {
             query.push(("lane", l));
+        }
+        if let Some(n) = p.history.filter(|n| *n > 0) {
+            query.push(("history", n.to_string()));
         }
         let v = self
             .call(move |c| c.get(&["handoffs", "pending"], &query))

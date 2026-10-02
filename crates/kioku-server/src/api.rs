@@ -20,6 +20,7 @@ use kioku_core::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::mcp::QueryRequest;
 use crate::shared::{DEFAULT_HTTP_LIMIT, blocking, clamp_limit, resolve_scope, with_project_hint};
 use crate::update::SharedUpdateStatus;
 
@@ -186,16 +187,29 @@ async fn add_observation(
 /// Query string of `GET /api/v1/search`.
 #[derive(Debug, Deserialize)]
 struct SearchParams {
-    q: String,
+    /// Required unless `path_prefix` is given.
+    #[serde(default)]
+    q: Option<String>,
     #[serde(default)]
     project: Option<String>,
     #[serde(default)]
     scope: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
+    /// `YYYY-MM-DD` (SPEC-M3.1 §2).
+    #[serde(default)]
+    since: Option<String>,
+    /// Comma-separated kinds: `page,session,state` (SPEC-M3.1 §2).
+    #[serde(default)]
+    kinds: Option<String>,
+    /// List the sessions that edited files under this path (SPEC-M3.1 §3).
+    #[serde(default)]
+    path_prefix: Option<String>,
 }
 
-/// `GET /api/v1/search?q=&project=&scope=&limit=` → `{hits}`.
+/// `GET /api/v1/search?q=&project=&scope=&limit=&since=&kinds=&path_prefix=` → `{hits}`,
+/// plus `sessions` (and `path_prefix`) when a path prefix was given. Older clients send
+/// only `q`; older servers ignore the new parameters.
 async fn search(
     State(store): State<Arc<Store>>,
     params: Result<Query<SearchParams>, QueryRejection>,
@@ -203,8 +217,28 @@ async fn search(
     let Query(p) = params?;
     let scope = resolve_scope(p.scope.as_deref(), p.project.as_deref())?;
     let limit = clamp_limit(p.limit, DEFAULT_HTTP_LIMIT);
-    let hits = blocking(&store, move |s| s.search(&p.q, &scope, limit)).await?;
-    Ok(Json(json!({ "hits": hits })))
+    let has_prefix = p
+        .path_prefix
+        .as_deref()
+        .is_some_and(|x| !x.trim().is_empty());
+    let q = match p.q {
+        Some(q) => q,
+        None if has_prefix => String::new(),
+        None => return Err(ApiError::bad_request("missing query parameter q")),
+    };
+    // An empty query has always answered with no hits; keep that for older clients.
+    if q.trim().is_empty() && !has_prefix {
+        return Ok(Json(json!({ "hits": [] })));
+    }
+    let kinds: Vec<String> = p.kinds.into_iter().collect();
+    let request = QueryRequest::new(q, p.since.as_deref(), &kinds, p.path_prefix)?;
+    let result = blocking(&store, move |s| request.run(s, &scope, limit)).await?;
+    let mut body = json!({ "hits": result.hits.unwrap_or_default() });
+    if let Some((prefix, sessions)) = result.sessions {
+        body["path_prefix"] = json!(prefix);
+        body["sessions"] = json!(sessions);
+    }
+    Ok(Json(body))
 }
 
 /// `GET /api/v1/pages/*path` → `{path, frontmatter, body}`.
@@ -236,23 +270,33 @@ struct PendingParams {
     session: Option<String>,
     #[serde(default)]
     lane: Option<String>,
+    /// Also return the lane's last N handoffs (≤ 20) with their status (SPEC-M3.1 §1).
+    #[serde(default)]
+    history: Option<usize>,
 }
 
-/// `GET /api/v1/handoffs/pending?project=&accept=&session=&lane=` → `{handoff}` (null when
-/// none), plus `reference_handoff` on a branch lane without its own (M2.4 §1.4). The lane is
-/// `lane` (empty = the project lane), else the session's, else the project lane.
+/// `GET /api/v1/handoffs/pending?project=&accept=&session=&lane=&history=` → `{handoff}`
+/// (null when none), plus `reference_handoff` (and `reference_reason`) when only a reference
+/// is shown (M2.4 §1.4, SPEC-M3.1 §1) and `history` when asked for. The lane is `lane`
+/// (empty = the project lane), else the session's, else the project lane.
 async fn pending_handoff(
     State(store): State<Arc<Store>>,
     params: Result<Query<PendingParams>, QueryRejection>,
 ) -> ApiResult {
     let Query(p) = params?;
+    let history = p.history.unwrap_or(0);
     let routed = blocking(&store, move |s| {
-        s.pending_handoff_routed(
+        let mut routed = s.pending_handoff_routed(
             &p.project,
             p.accept,
             p.session.as_deref(),
             p.lane.as_deref(),
-        )
+        )?;
+        if history > 0 {
+            routed.history =
+                s.handoff_history(&p.project, p.session.as_deref(), p.lane.as_deref(), history)?;
+        }
+        Ok(routed)
     })
     .await?;
     to_json(routed)

@@ -522,8 +522,8 @@ async fn status_reports_versions() {
     let (status, body) = srv.get("/api/v1/status").await;
     assert_eq!(status, 200);
     assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(body["index_schema_version"], 2);
-    assert_eq!(body["index_schema_expected"], 2);
+    assert_eq!(body["index_schema_version"], 3);
+    assert_eq!(body["index_schema_expected"], 3);
     // SPEC-M2.5 §3.4: the server's auto-update state (defaults: auto on, nothing checked).
     assert_eq!(body["update"]["auto"], true);
     assert_eq!(body["update"]["managed"], false);
@@ -534,7 +534,7 @@ async fn status_reports_versions() {
     std::fs::remove_file(&file).unwrap();
     let (_, body) = srv.get("/api/v1/status").await;
     assert!(body["index_schema_version"].is_null(), "{body}");
-    assert_eq!(body["index_schema_expected"], 2);
+    assert_eq!(body["index_schema_expected"], 3);
     std::fs::write(&file, "1\n").unwrap();
     let (_, body) = srv.get("/api/v1/status").await;
     assert_eq!(body["index_schema_version"], 1);
@@ -763,6 +763,136 @@ async fn aliases_and_merge_over_http() {
         )
         .await;
     assert_eq!(status, 400);
+}
+
+/// SPEC-M3.1 §2–§3 over HTTP: `since` / `kinds` filters, partial matches, `path_prefix`
+/// sessions, bad filters as 400; §1: `history` on the pending-handoff route.
+#[tokio::test]
+async fn search_filters_path_sessions_and_handoff_history_over_http() {
+    let srv = spawn().await;
+    srv.post("/api/v1/sessions/start", start_body("s-path"))
+        .await;
+    for (kind, payload) in [
+        ("prompt", json!({"prompt": "ストアの書き込みロックを直す"})),
+        (
+            "tool_use",
+            json!({"tool_name": "Edit", "tool_input": {"file_path": "/home/u/kioku/crates/kioku-core/src/store.rs"}, "tool_response": {}}),
+        ),
+    ] {
+        let (status, _) = srv
+            .post(
+                "/api/v1/observations",
+                json!({"session_id": "s-path", "kind": kind, "payload": payload}),
+            )
+            .await;
+        assert_eq!(status, 200);
+    }
+    srv.post(
+        "/api/v1/handoffs",
+        json!({"project": PROJECT, "session": "s-path", "summary": "write_lock の順番を直した"}),
+    )
+    .await;
+    srv.post("/api/v1/sessions/s-path/finalize", json!({}))
+        .await;
+    srv.send(
+        reqwest::Method::PUT,
+        "/api/v1/pages",
+        json!({"title": "書き込みの直列化", "content": "write_lock で直列化する", "project": PROJECT}),
+    )
+    .await;
+
+    // kinds and since
+    let (_, body) = srv
+        .get(&format!(
+            "/api/v1/search?q={}&kinds=page",
+            enc("write_lock")
+        ))
+        .await;
+    let kinds: Vec<&str> = body["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["page"], "{body}");
+    let (_, body) = srv
+        .get(&format!(
+            "/api/v1/search?q={}&kinds=session,page",
+            enc("write_lock")
+        ))
+        .await;
+    assert_eq!(body["hits"].as_array().unwrap().len(), 2, "{body}");
+    let (_, body) = srv
+        .get(&format!(
+            "/api/v1/search?q={}&since=2999-01-01",
+            enc("write_lock")
+        ))
+        .await;
+    assert_eq!(body["hits"], json!([]));
+    let (status, body) = srv
+        .get(&format!(
+            "/api/v1/search?q={}&since=yesterday",
+            enc("ロック")
+        ))
+        .await;
+    assert_eq!(status, 400, "{body}");
+    let (status, _) = srv.get("/api/v1/search?q=x&kinds=memo").await;
+    assert_eq!(status, 400);
+    // an empty query still answers with no hits (older clients)
+    let (status, body) = srv.get("/api/v1/search?q=").await;
+    assert_eq!((status, body), (200, json!({"hits": []})));
+
+    // partial match: no word matches, characters do
+    let (_, body) = srv
+        .get(&format!("/api/v1/search?q={}", enc("直列化す")))
+        .await;
+    assert_eq!(body["hits"][0]["title"], "書き込みの直列化", "{body}");
+
+    // path_prefix, with or without terms
+    let (status, body) = srv
+        .get(&format!(
+            "/api/v1/search?path_prefix={}&project={PROJECT}",
+            enc("crates/kioku-core/src/store.rs")
+        ))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["hits"], json!([]));
+    assert_eq!(body["sessions"][0]["session_id"], "s-path", "{body}");
+    assert_eq!(body["sessions"][0]["summary"], "write_lock の順番を直した");
+    assert!(
+        body["sessions"][0]["title"]
+            .as_str()
+            .unwrap()
+            .contains("書き込みロック"),
+        "{body}"
+    );
+    let (_, body) = srv
+        .get(&format!(
+            "/api/v1/search?q={}&path_prefix=crates",
+            enc("直列化")
+        ))
+        .await;
+    assert_eq!(body["sessions"].as_array().unwrap().len(), 1, "{body}");
+    assert!(!body["hits"].as_array().unwrap().is_empty(), "{body}");
+
+    // history
+    let (_, body) = srv
+        .get(&format!(
+            "/api/v1/handoffs/pending?project={PROJECT}&history=5"
+        ))
+        .await;
+    let history = body["history"].as_array().unwrap();
+    assert!(
+        history.iter().any(|h| h["content_md"]
+            .as_str()
+            .unwrap()
+            .contains("write_lock の順番を直した")),
+        "{body}"
+    );
+    let (_, body) = srv
+        .get(&format!("/api/v1/handoffs/pending?project={PROJECT}"))
+        .await;
+    assert!(body.get("history").is_none(), "only when asked: {body}");
 }
 
 /// Percent-encodes a query-string value.

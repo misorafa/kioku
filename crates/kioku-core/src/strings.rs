@@ -125,6 +125,12 @@ pub struct Strings {
     /// SessionStart context: heading of the main line's handoff shown for reference on a
     /// branch lane without its own (M2.4 §1.4).
     pub start_reference_heading: &'static str,
+    /// SessionStart context: heading of this lane's pending handoff shown for reference
+    /// because another session is active on the lane (SPEC-M3.1 §1 rule 3).
+    pub start_concurrent_heading: &'static str,
+    /// SessionStart context: heading of this lane's pending handoff shown for reference to a
+    /// resumed / compacted session that never accepted one (SPEC-M3.1 §1 rule 1).
+    pub start_resumed_reference_heading: &'static str,
     /// SessionStart context: heading of the STATE.md excerpt.
     pub start_state_heading: &'static str,
     /// SessionStart context: the last reply of the previous session (SPEC-M3.0 §1 section 7).
@@ -186,6 +192,8 @@ pub const JA: Strings = Strings {
     start_lane_line: "lane: {lane}  ← このブランチの引き継ぎだけを受け取る（kioku_handoff_write に session を渡せばこのレーンに残る）",
     start_handoff_heading: "## 前回からの引き継ぎ",
     start_reference_heading: "## メインの引き継ぎ（参考）\n（このブランチ宛ての引き継ぎはまだない。既定ブランチ向けのものを参考として表示しており、受領はしていない）",
+    start_concurrent_heading: "## 未受領の引き継ぎ（参考）\n（同じブランチで別のセッションが作業中のため、引き継ぎは消費していません）",
+    start_resumed_reference_heading: "## 未受領の引き継ぎ（参考）\n（再開したセッションのため、新しい引き継ぎは受領していません）",
     start_state_heading: "## 現在の状態（STATE.md 抜粋）",
     start_last_reply_heading: "## 最後の回答（前回のセッション）",
     start_footer: "セッション終了前に kioku_handoff_write（上の project と session を渡す）で要約・次の一手・未解決点を書くこと。\n関連する過去の記録は kioku_query で検索できる。",
@@ -238,6 +246,8 @@ pub const EN: Strings = Strings {
     start_lane_line: "lane: {lane}  ← only this branch's handoffs are delivered here (pass `session` to kioku_handoff_write to keep yours on this lane)",
     start_handoff_heading: "## Handoff from the previous session",
     start_reference_heading: "## Main line handoff (for reference)\n(No handoff for this branch yet. This one belongs to the default branch; it is shown for reference and was not accepted.)",
+    start_concurrent_heading: "## Pending handoff (for reference)\n(another session is active on this lane; the handoff was left pending)",
+    start_resumed_reference_heading: "## Pending handoff (for reference)\n(this is a resumed session; no new handoff was accepted)",
     start_state_heading: "## Current state (STATE.md excerpt)",
     start_last_reply_heading: "## Last reply (previous session)",
     start_footer: "Before ending the session, record a summary, next steps and open questions with kioku_handoff_write (pass the project and session above).\nSearch past records with kioku_query.",

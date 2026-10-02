@@ -190,7 +190,7 @@ server: http://127.0.0.1:7391
 最後の回答（要約）: 検索のテストを追加しました。 次は README です。
 
 ## 決定事項（これまでの引き継ぎ）
-- ＬＩＮＤＥＲＡ を使う (<md>)
+- lindera を使う (<md>)
 - 検索の再ランキングはどうするか → M3.1 でやる (<md>)
 - SQLite は WAL (<md>)
 - ✓ cargo test は全件通る (<md>)
@@ -222,7 +222,7 @@ session: s5-eeee  ← pass this id as `session` to kioku_handoff_write
 server: http://127.0.0.1:7391
 
 ## Decisions (carried)
-- ＬＩＮＤＥＲＡ を使う (<md>)
+- lindera を使う (<md>)
 - 検索の再ランキングはどうするか → M3.1 でやる (<md>)
 - SQLite は WAL (<md>)
 - ✓ cargo test は全件通る (<md>)

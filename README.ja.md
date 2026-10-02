@@ -79,9 +79,22 @@ SessionEnd        finalize（冪等）
   （「引き継ぎ（自動生成・追記）」）を付けて両方を引き継ぎます。ページの書き込みはすべて git コミットになります。
   finalize は Stop のたびに走りますが、別のセッションがすでに受け取ったルール生成の引き継ぎはその場で
   更新するだけで、新しい指示・ファイル編集・コミット・回答・5 回以上のツール実行があったときだけ新しく発行します。
-- **引き継ぎは一度きり**: 同じプロジェクトの次の SessionStart が最新の未受領の引き継ぎを受け取ります
-  （それより古い未受領のものは置き換え済みとして受領扱いになります）。`kioku_handoff_pending` を
-  `accept=false` で呼ぶと、消費せずに覗くだけです。
+- **引き継ぎを受領するのは誰か**（SPEC-M3.1 §1）: 引き継ぎは、同じプロジェクト・同じレーン（ブランチ）で
+  次に始まる*新しい*セッションが一度だけ受領します。そのレーンの古い未受領のものは `superseded`
+  （置き換え済み）になります。次の 3 つの場合は何も受領しません:
+  - セッションの **compact / resume**（または kioku が既に知っているセッション id）は、以前に
+    受領した引き継ぎをもう一度受け取ります。まだ何も受領していなければ、レーンの未受領の引き継ぎを
+    参考として表示するだけです。
+  - セッションは**自分の書いた引き継ぎを受領しません**（前のターンの Stop が書いた自動生成の引き継ぎは、
+    次のセッションのために未受領のまま残ります）。
+  - **同じレーンで別のセッションが作業中**（30 分以内に観測があり、finalize されていない）の間は、
+    未受領の引き継ぎを参考として表示し、受領はしません（「同じブランチで別のセッションが作業中のため、
+    引き継ぎは消費していません」）。空いたレーンで次に始まるセッションか、
+    `kioku_handoff_pending(accept=true)` の明示的な呼び出しが受領します。
+
+  `kioku_handoff_pending` を `accept=false` で呼ぶと消費せずに覗くだけです。`history: N`（最大 20）で、
+  そのレーンの直近 N 件の引き継ぎを状態（`pending` / `accepted by …` / `superseded`）つきで読めます
+  （ブロックに引き継がれた決定事項だけでは足りないとき）。
 
 ### セッション開始時にエージェントが受け取るもの（SPEC-M3.0）
 
@@ -499,13 +512,16 @@ agy が実際に読み込んだフックは `agy -p "/hooks" --output-format jso
    プロジェクト id は `kioku project id` で確認できます。
 2. （最後の引き継ぎ以降に）ツールを何回か使ったターンが終わると、Stop の催促が `kioku_handoff_write` を
    呼ぶよう求めます。
-3. 同じリポジトリで新しいセッションを始めると（または `/clear`）— 同じエージェントでも別のエージェントでも、
-   このマシンでも別のマシンでも — SessionStart で引き継ぎが注入されます。
+3. 同じリポジトリで新しいセッションを始めると — 同じエージェントでも別のエージェントでも、
+   このマシンでも別のマシンでも — SessionStart で引き継ぎが注入されます（`/clear` や `/compact` の後は、
+   受領せずにもう一度表示されます）。
 4. ターミナルから検索します:
 
 ```sh
 kioku search 引き継ぎ
 kioku search --project <id> --limit 5 設計 判断
+kioku search --since 2026-09-01 --kind page write_lock
+kioku search --path-prefix crates/kioku-core/src/store.rs
 kioku status
 ```
 
@@ -577,14 +593,36 @@ Compose の場合（`docker-compose.yml` 参照）は、同じ場所の `.env` �
 
 | ツール | 入力 | 内容 |
 |--------|------|------|
-| `kioku_query` | `query`、`project?`、`scope?`（`project`/`global`/`all`）、`limit?`（既定 8） | 全文検索（日本語・英語）。`project` を渡すとそのプロジェクトとグローバルのページに絞る。各結果は `1. <path> — <title> (session, 2026-09-28)` の形 |
+| `kioku_query` | `query`、`project?`、`scope?`（`project`/`global`/`all`）、`limit?`（既定 8）、`since?`（`YYYY-MM-DD`）、`kinds?`（`page`/`session`/`state`）、`path_prefix?` | 全文検索（日本語・英語。下の「検索」を参照）。`project` を渡すとそのプロジェクトとグローバルのページに絞る。各結果は `1. <path> — <title> (session, 2026-09-28, @mini)` の形。`path_prefix` を渡すと、そのパス以下のファイルを編集したセッションを返す |
 | `kioku_read` | `path` | wiki 内の相対パス（検索結果に表示されるもの）でページを読む |
 | `kioku_write_page` | `title`、`content`、`project?`、`scope?`（`project`/`global`）、`tags?`、`path?` | 検索可能な Markdown ページを保存する。同じ title/path なら置き換える。`pinned` タグを付けると、そのプロジェクト（グローバルなら全プロジェクト）の SessionStart のブロックに毎回表示される |
 | `kioku_handoff_write` | `project`、`session?`（SessionStart のブロックにある id）、`summary`、`next_steps`、`open_questions`、`decisions`、`verified?`、`gotchas?` | そのプロジェクトの次のセッションが受け取る引き継ぎを記録する。決定事項・確認済みの事実（`verified`）・未解決の質問・落とし穴（`gotchas`）は後のセッションにも引き継がれる |
-| `kioku_handoff_pending` | `project`、`accept?`（既定 false）、`session?`、`lane?` | 未受領の引き継ぎを覗く（または受領する）。既定はメインライン、`session` / `lane` でブランチのレーンを読む |
+| `kioku_handoff_pending` | `project`、`accept?`（既定 false）、`session?`、`lane?`、`history?`（最大 20） | 未受領の引き継ぎを覗く（または受領する）。既定はメインライン、`session` / `lane` でブランチのレーンを読む。`history` でそのレーンの直近の引き継ぎを状態つきで返す |
 | `kioku_status` | — | 件数、データディレクトリ、登録済みプロジェクト id |
 
 サーバーが MCP の `instructions` で、探索の前に検索し、終了の前に引き継ぎを書くようエージェントに伝えます。
+
+### 検索
+
+- **並べ替え**: BM25 の上位 `3 × limit` 件を `スコア × 新しさ × 種類の重み` で並べ直します。新しさは
+  30 日ごとに半分（0.25 未満にはならない）、重みはページ 1.0・STATE.md 0.8・セッションページ 0.6、
+  `pinned` タグ付きのページは ×1.5。よく似た新旧のページがあれば新しい方が先に来ます。
+- **絞り込み**: `since: "2026-09-01"` でその日以降の更新だけ、`kinds: ["page", "session"]` で種類を
+  絞れます。ターミナルからは `kioku search --since 2026-09-01 --kind page 索引`。
+- **識別子**: `kioku_handoff_write`、`Store::open`、`src/index.rs`、`write_lock`、`SearchIndex` は
+  コードの識別子としても索引され、全体でも部分（`handoff`、`open`、`index.rs`、`lock`、`search`）でも
+  見つかります。識別子そのものを書いたページは、その単語を使っているだけのページより上に来ます。
+- **部分一致**: 語として何も一致しないときは文字の 2-gram で探し直し（送り仮名もまたぐので「引継」で
+  「引き継ぎ書」が見つかる）、結果に `（部分一致）/ (partial match)` と付けます。
+- **誰がこのファイルを触ったか**: `path_prefix: "crates/kioku-core/src/store.rs"`（または
+  `kioku search --path-prefix crates/kioku-core/src/store.rs`）で、そのパス以下のファイルを編集した
+  セッションを新しい順に、タイトルと引き継ぎの要約つきで返します。
+- **ユーザー辞書**（`~/.kioku/dict/user.csv`）: 日本語の解析器に覚えさせたい語を 1 行 1 語、
+  `表層形,コスト,品詞,読み[,同義語の代表形]` で書きます（`#` はコメント）。`kioku init` が kioku 自身の
+  用語（引き継ぎ書、レーン、セッション、観測、索引、プロジェクト別名）入りのひな形を書きます。登録した語が
+  その部分を隠すことはありません（引き継ぎ書を登録しても 引き継ぎ で見つかる）。5 列目を書くと同義語に
+  なります（`ハンドオフ,,名詞,ハンドオフ,引き継ぎ` でどちらの語でも両方が見つかる）。編集したら
+  `kioku reindex` を実行してください。索引がこのファイルより古い間は `kioku doctor` が警告します。
 
 ## データの配置
 
@@ -599,7 +637,8 @@ Compose の場合（`docker-compose.yml` 参照）は、同じ場所の `.env` �
       pages/<slug>.md           # kioku_write_page で書いたページ
   raw/<project_id>/<session_id>.jsonl   # 追記のみ・サニタイズ済みの観測（古くなると .jsonl.gz）
   db/kioku.sqlite               # メタデータ、セッション、観測、引き継ぎ
-  index/tantivy/                # 派生データ。`kioku reindex` で wiki/ から再構築
+  dict/user.csv                 # 日本語解析のユーザー辞書（「検索」を参照）
+  index/tantivy-v3/             # 派生データ。`kioku reindex` で wiki/ から再構築
   index/schema-version          # 索引の形式。古ければサーバーが起動時に作り直す
   backups/<id>/                 # `kioku backup` のスナップショット（新しい順に [retention] backups_keep 個）
   logs/hook.log                 # クライアント側フックの失敗ログ
@@ -614,7 +653,8 @@ Compose の場合（`docker-compose.yml` 参照）は、同じ場所の `.env` �
 `C++ tips` と `C tips` など）は、タイトルの 6 桁のハッシュを付けるので、別のタイトルが同じファイルになることは
 ありません。検索は NFKC で正規化するので、全角の `Ｆｌｕｔｔｅｒ` や半角の `ｱﾌﾟﾘ` も `flutter` / `アプリ` で
 見つかります。索引の形式が変わる更新の後は、サーバーが待ち受けを始めた直後に裏で索引を作り直します
-（作り直しが終わるまでは古い索引で検索に答えます）。`kioku reindex` の実行は不要です。起動のたびに、
+（作り直しが終わるまでは古い索引で検索に答えます。索引は形式ごとに別のディレクトリにあり、v3 からは
+`index/tantivy-v3/`。切り替えたあと古い `index/tantivy/` は消します）。`kioku reindex` の実行は不要です。起動のたびに、
 中断した書き込みの一時ファイルを消し、データベースの行とファイルが食い違うページを索引し直します。
 
 ## 設定

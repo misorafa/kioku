@@ -9,6 +9,7 @@
 //! end the block early.
 
 use kioku_core::carry::Carried;
+use kioku_core::handoff::{REFERENCE_CONCURRENT, REFERENCE_RESUMED};
 use kioku_core::render::{carried_lines, pinned_lines, quote_lines, recent_line};
 use kioku_core::strings::{EN, JA, Lang, escape_kioku_tags, fill, memory_note, strings};
 use kioku_core::util::truncate_chars;
@@ -48,6 +49,9 @@ pub struct StartContext {
     /// Markdown of the main line's handoff shown for reference (not accepted) on a branch
     /// lane without a handoff of its own (M2.4 §1.4); ignored when `handoff` is set.
     pub reference: Option<String>,
+    /// Why `reference` was not accepted (SPEC-M3.1 §1): `concurrent`, `resumed`, or the main
+    /// line's (`None` / `main_line`).
+    pub reference_reason: Option<String>,
     /// STATE.md excerpt (first 60 lines), if any; only shown in the legacy layout.
     pub state: Option<String>,
     /// The SPEC-M3.0 sections; `None` from an older server (legacy layout).
@@ -102,6 +106,7 @@ impl StartContext {
             lane: resp.lane,
             handoff: resp.pending_handoff.map(|h| h.content_md),
             reference: resp.reference_handoff.map(|h| h.content_md),
+            reference_reason: resp.reference_reason,
             state: resp.state_excerpt,
             sections,
         }
@@ -187,7 +192,7 @@ fn render_sections(lang: Lang, ctx: &StartContext, sec: &Sections, cap: usize) -
     let reference = clean(&ctx.handoff).is_none() && clean(&ctx.reference).is_some();
     if let Some(h) = clean(&ctx.handoff).or_else(|| clean(&ctx.reference)) {
         let heading = if reference {
-            t.start_reference_heading
+            reference_heading(lang, ctx)
         } else {
             t.start_handoff_heading
         };
@@ -203,6 +208,17 @@ fn render_sections(lang: Lang, ctx: &StartContext, sec: &Sections, cap: usize) -
     // Only the fixed parts are left and they are still too long (absurd project name).
     let body = truncate_chars(&out, cap.saturating_sub(len(CLOSE) + 1));
     format!("{body}\n{CLOSE}")
+}
+
+/// Heading of a handoff shown for reference only: this lane's while another session is
+/// active on it or for a resumed session (SPEC-M3.1 §1), else the main line's (M2.4 §1.4).
+fn reference_heading(lang: Lang, ctx: &StartContext) -> &'static str {
+    let t = strings(lang);
+    match ctx.reference_reason.as_deref() {
+        Some(REFERENCE_CONCURRENT) => t.start_concurrent_heading,
+        Some(REFERENCE_RESUMED) => t.start_resumed_reference_heading,
+        _ => t.start_reference_heading,
+    }
 }
 
 /// `text` shrunk to `budget` chars at line boundaries ([`shrink`]); `None` when too small.
@@ -263,7 +279,7 @@ fn render_legacy(lang: Lang, ctx: &StartContext, cap: usize) -> String {
     let mut state = clean(&ctx.state);
     let t = strings(lang);
     let heading = if reference {
-        t.start_reference_heading
+        reference_heading(lang, ctx)
     } else {
         t.start_handoff_heading
     };
@@ -440,6 +456,51 @@ mod tests {
         // no lane → no lane line
         let out = render_session_start(Lang::Ja, &ctx(None, None));
         assert!(!out.contains("\nlane: "));
+    }
+
+    /// SPEC-M3.1 §1: a lane's handoff left pending because another session is active, or
+    /// shown to a resumed session, says so — in both layouts and languages.
+    #[test]
+    fn reference_reasons_have_their_own_headings() {
+        for sections in [None, Some(Sections::default())] {
+            let mut c = ctx(None, None);
+            c.sections = sections;
+            c.reference = Some("## 引き継ぎ（codex, 2026-10-01）\n### 要約\n並行作業".into());
+            c.reference_reason = Some("concurrent".into());
+            let out = render_session_start(Lang::Ja, &c);
+            assert!(
+                out.contains(
+                    "\n## 未受領の引き継ぎ（参考）\n（同じブランチで別のセッションが作業中のため、引き継ぎは消費していません）\n## 引き継ぎ（codex"
+                ),
+                "{out}"
+            );
+            assert!(!out.contains("メインの引き継ぎ"), "{out}");
+            let out = render_session_start(Lang::En, &c);
+            assert!(
+                out.contains(
+                    "another session is active on this lane; the handoff was left pending"
+                ),
+                "{out}"
+            );
+            c.reference_reason = Some("resumed".into());
+            let out = render_session_start(Lang::Ja, &c);
+            assert!(
+                out.contains("（再開したセッションのため、新しい引き継ぎは受領していません）"),
+                "{out}"
+            );
+            // an unknown (newer) reason falls back to the main-line wording
+            c.reference_reason = Some("something-new".into());
+            let out = render_session_start(Lang::Ja, &c);
+            assert!(out.contains("## メインの引き継ぎ（参考）"), "{out}");
+        }
+        // the reason travels in the response
+        let resp: kioku_core::SessionStartResponse = serde_json::from_value(serde_json::json!({
+            "project_id": "p", "pending_handoff": null, "state_excerpt": null,
+            "recent_sessions": [], "reference_reason": "concurrent"
+        }))
+        .unwrap();
+        let c = StartContext::from_response("p", "s", "http://x", resp);
+        assert_eq!(c.reference_reason.as_deref(), Some("concurrent"));
     }
 
     #[test]

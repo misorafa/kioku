@@ -157,7 +157,9 @@ impl Carried {
 }
 
 /// Collects the carried items of `handoffs` (newest first): each list de-duplicated by
-/// [`normalize`]d text (the newest occurrence kept), items already shown in full in the
+/// [`normalize`]d text — a duplicate keeps the place and date of its newest occurrence but
+/// the wording of its earliest one, so a decision restated with a different width or case
+/// does not change how it reads — items already shown in full in the
 /// block's handoff section (`shown`) left out, and an open question dropped when a handoff
 /// newer than it — or `shown` — has a decision equal to it or starting with its first
 /// [`RESOLVE_PREFIX`] normalised chars.
@@ -165,11 +167,15 @@ pub fn carry(handoffs: &[SourceHandoff], shown: &HandoffItems) -> Carried {
     let norms = |v: &[String]| v.iter().map(|t| normalize(t)).collect::<HashSet<String>>();
     let pick = |list: fn(&HandoffItems) -> &Vec<String>, max: usize| {
         let mut seen = norms(list(shown));
-        let mut out = Vec::new();
+        let mut out: Vec<CarriedItem> = Vec::new();
+        let mut at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for h in handoffs {
             for text in list(&h.items) {
                 let n = normalize(text);
-                if out.len() < max && !n.is_empty() && seen.insert(n) {
+                if let Some(&i) = at.get(&n) {
+                    out[i].text = text.clone();
+                } else if out.len() < max && !n.is_empty() && seen.insert(n.clone()) {
+                    at.insert(n, out.len());
                     out.push(CarriedItem {
                         text: text.clone(),
                         date: h.date.clone(),
@@ -181,11 +187,16 @@ pub fn carry(handoffs: &[SourceHandoff], shown: &HandoffItems) -> Carried {
         out
     };
     let shown_decisions: Vec<String> = shown.decisions.iter().map(|d| normalize(d)).collect();
-    let mut open = Vec::new();
+    let mut open: Vec<CarriedItem> = Vec::new();
+    let mut open_at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut seen = norms(&shown.open_questions);
     for (i, h) in handoffs.iter().enumerate() {
         for q in &h.items.open_questions {
             let n = normalize(q);
+            if let Some(&at) = open_at.get(&n) {
+                open[at].text = q.clone();
+                continue;
+            }
             if open.len() >= MAX_OPEN_QUESTIONS || n.is_empty() || !seen.insert(n.clone()) {
                 continue;
             }
@@ -198,6 +209,7 @@ pub fn carry(handoffs: &[SourceHandoff], shown: &HandoffItems) -> Carried {
                     .map(|d| normalize(d))
                     .any(|d| resolves(&d));
             if !resolved {
+                open_at.insert(n, open.len());
                 open.push(CarriedItem {
                     text: q.clone(),
                     date: h.date.clone(),
@@ -264,6 +276,64 @@ mod tests {
         assert_eq!(normalize("ｱﾌﾟﾘ"), normalize("アプリ"));
     }
 
+    /// Review of M3.0: a restated item keeps the wording it was first written with, while
+    /// its date (and place in the list) is the latest restatement's.
+    #[test]
+    fn duplicates_keep_the_earliest_wording_and_the_latest_date() {
+        let mk = |id: &str, date: &str, decision: &str, question: &str, gotcha: &str| {
+            source(
+                id,
+                date,
+                HandoffInput {
+                    decisions: vec![decision.into(), format!("{id} だけの決定")],
+                    open_questions: vec![question.into()],
+                    gotchas: vec![gotcha.into()],
+                    ..HandoffInput::default()
+                },
+                Lang::Ja,
+            )
+        };
+        let all = [
+            mk(
+                "h3",
+                "2026-10-03",
+                "ＫＩＯＫＵ は 日本語優先",
+                "ＣＩ は遅い？",
+                "ＷＡＬ に注意",
+            ),
+            mk(
+                "h2",
+                "2026-10-02",
+                "Kioku は 日本語優先",
+                "CI は遅い？",
+                "wal に注意",
+            ),
+            mk(
+                "h1",
+                "2026-10-01",
+                "kioku は 日本語優先",
+                "ci は遅い？",
+                "WAL に注意",
+            ),
+        ];
+        let c = carry(&all, &HandoffItems::default());
+        assert_eq!(
+            texts(&c.decisions),
+            [
+                "kioku は 日本語優先",
+                "h3 だけの決定",
+                "h2 だけの決定",
+                "h1 だけの決定"
+            ]
+        );
+        assert_eq!(c.decisions[0].date, "2026-10-03");
+        assert_eq!(c.decisions[0].handoff_id, "h3");
+        assert_eq!(texts(&c.open_questions), ["ci は遅い？"]);
+        assert_eq!(c.open_questions[0].date, "2026-10-03");
+        assert_eq!(texts(&c.gotchas), ["WAL に注意"]);
+        assert_eq!(c.gotchas[0].date, "2026-10-03");
+    }
+
     #[test]
     fn carry_dedupes_excludes_shown_and_resolves_questions() {
         let newest = source(
@@ -306,11 +376,11 @@ mod tests {
         );
         let all = [newest, middle, oldest];
         let c = carry(&all, &HandoffItems::default());
-        // duplicate decision (width / case) kept once, newest date
+        // duplicate decision (width / case) kept once: newest place and date, earliest wording
         assert_eq!(
             texts(&c.decisions),
             [
-                "ＬＩＮＤＥＲＡ を使う",
+                "lindera を使う",
                 "検索の再ランキングはどうするか → M3.1 でやる",
                 "SQLite は WAL",
                 "Use git CLI, not git2"

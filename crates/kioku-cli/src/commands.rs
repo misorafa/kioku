@@ -172,7 +172,20 @@ pub fn run(cli: Cli) -> i32 {
             project,
             scope,
             limit,
-        } => search(&query.join(" "), project, scope, limit),
+            since,
+            kinds,
+            path_prefix,
+        } => search(
+            &query.join(" "),
+            project,
+            scope,
+            limit,
+            SearchFilters {
+                since,
+                kinds,
+                path_prefix,
+            },
+        ),
         Command::Install {
             target,
             project,
@@ -639,13 +652,24 @@ fn command_client() -> anyhow::Result<(Config, ApiClient)> {
     Ok((cfg, client))
 }
 
+/// `kioku search --since / --kind / --path-prefix` (SPEC-M3.1 §2–§3).
+#[derive(Clone, Debug, Default)]
+struct SearchFilters {
+    since: Option<String>,
+    kinds: Vec<String>,
+    path_prefix: Option<String>,
+}
+
 fn search(
     query: &str,
     project: Option<String>,
     scope: Option<ScopeArg>,
     limit: Option<usize>,
+    filters: SearchFilters,
 ) -> anyhow::Result<()> {
     let (_, client) = command_client()?;
+    let options = kioku_core::SearchOptions::parse(filters.since.as_deref(), &filters.kinds)
+        .map_err(|e| anyhow::anyhow!(e))?;
     let mut params = vec![("q", query.to_string())];
     if let Some(p) = project {
         params.push(("project", p));
@@ -656,7 +680,31 @@ fn search(
     if let Some(l) = limit {
         params.push(("limit", l.to_string()));
     }
+    if let Some(since) = options.since {
+        params.push(("since", since.format("%Y-%m-%d").to_string()));
+    }
+    if !options.kinds.is_empty() {
+        params.push(("kinds", options.kinds.join(",")));
+    }
+    if let Some(prefix) = &filters.path_prefix {
+        params.push(("path_prefix", prefix.clone()));
+    }
     let body = client.get(&["search"], &params)?;
+    if let Some(prefix) = &filters.path_prefix {
+        let Some(sessions) = body.get("sessions") else {
+            anyhow::bail!("{}", crate::bridge::PATH_PREFIX_UNSUPPORTED);
+        };
+        let sessions: Vec<kioku_core::PathSession> =
+            serde_json::from_value(sessions.clone()).context("unexpected search response")?;
+        println!(
+            "{}",
+            kioku_server::mcp::path_sessions_body(prefix, &sessions)
+        );
+        if query.trim().is_empty() {
+            return Ok(());
+        }
+        println!();
+    }
     let hits: Vec<Hit> = serde_json::from_value(body.get("hits").cloned().unwrap_or(Value::Null))
         .context("unexpected search response")?;
     print!("{}", format_hits(&hits));
@@ -664,12 +712,17 @@ fn search(
 }
 
 /// Human-readable hit list (same shape as the `kioku_query` MCP tool):
-/// `N. <path> — <title> (<kind>, YYYY-MM-DD) [global]` (SPEC-M3.0 §5).
+/// `N. <path> — <title> (<kind>, YYYY-MM-DD[, @machine]) [global]` (SPEC-M3.0 §5,
+/// SPEC-M3.1 §2), after a partial-match note when the hits only matched by characters.
 pub fn format_hits(hits: &[Hit]) -> String {
     if hits.is_empty() {
         return "no hits\n".to_string();
     }
     let mut out = String::new();
+    if hits.iter().any(|h| h.partial) {
+        out.push_str(kioku_server::mcp::PARTIAL_MATCH_NOTE);
+        out.push('\n');
+    }
     for (i, h) in hits.iter().enumerate() {
         let global = if h.global { " [global]" } else { "" };
         out.push_str(&format!(
@@ -1318,6 +1371,8 @@ mod tests {
             score: 1.234,
             updated: "2026-09-25T00:00:00Z".into(),
             global: true,
+            machine: None,
+            partial: false,
         }];
         assert_eq!(
             format_hits(&hits),
@@ -1328,8 +1383,21 @@ mod tests {
         old.updated = String::new();
         old.kind = "session".into();
         assert!(
-            format_hits(&[old])
+            format_hits(&[old.clone()])
                 .starts_with("1. _global/rust.md — Rust の書き方 (session) [global]\n")
+        );
+        // SPEC-M3.1 §2: the machine of a session, and the partial-match note
+        let session = Hit {
+            machine: Some("mini".into()),
+            partial: true,
+            updated: "2026-10-01T09:00:00Z".into(),
+            path: "p/sessions/2026-10-01-abc.md".into(),
+            global: false,
+            ..old
+        };
+        assert_eq!(
+            format_hits(&[session]),
+            "（部分一致）/ (partial match)\n1. p/sessions/2026-10-01-abc.md — Rust の書き方 (session, 2026-10-01, @mini)\n   【引き継ぎ】を 自動化\n"
         );
     }
 }

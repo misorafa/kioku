@@ -965,9 +965,9 @@ mod tests {
         assert!(done.is_some());
     }
 
-    /// Regression (review of ca8afe5): a SessionStart with a known session id (compact /
-    /// resume) must not get the handoff it accepted earlier again; an offline replay start
-    /// must not consume the pending one.
+    /// Regression (review of ca8afe5, as amended by SPEC-M3.1 §1): a SessionStart with a
+    /// known session id (compact / resume) gets back the handoff it accepted earlier and
+    /// accepts nothing new; an offline replay start must not consume the pending one.
     #[test]
     fn resumed_and_replayed_starts_do_not_reissue_or_consume_handoffs() {
         let tmp = tempfile::tempdir().unwrap();
@@ -998,9 +998,17 @@ mod tests {
             h.id
         );
         req.source = "compact".into();
-        assert!(store.start_session(&req).unwrap().pending_handoff.is_none());
+        let again = store.start_session(&req).unwrap();
+        assert_eq!(again.pending_handoff.unwrap().id, h.id);
+        assert!(again.reference_handoff.is_none());
 
         let newer = handoff(&store, "writer");
+        let resumed = store.start_session(&req).unwrap();
+        assert_eq!(
+            resumed.pending_handoff.unwrap().id,
+            h.id,
+            "not the newer one"
+        );
         let mut replay = req.clone();
         replay.session_id = "offline".into();
         replay.source = OFFLINE_REPLAY_SOURCE.into();
