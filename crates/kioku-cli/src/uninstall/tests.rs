@@ -178,7 +178,7 @@ fn uninstall_restores_agent_configs_and_removes_service_path_line_and_binary() {
         &format!(
             "binary: remove {} and {}",
             bin.display(),
-            h.join(".local/bin/kioku.prev").display()
+            sibling(&bin, PREV_SUFFIX).display()
         ),
         "config.toml is kept (server URL and token); --everything removes it",
         "kioku uninstall: done.",
