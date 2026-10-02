@@ -8,7 +8,78 @@
 # (tokens and secret-looking env values are redacted at write time).
 #
 # Usage:  sh scripts/probe-agents.sh [codex|cursor|gemini|antigravity ...]   (default: all found)
+#         sh scripts/probe-agents.sh --check [<fresh capture dir>]   (monthly; docs/INDEX.md)
+# (gemini = Gemini CLI, legacy: kept working, no new fixtures; SPEC-M3.3 §4)
 set -eu
+
+# --check [<fresh dir>] (SPEC-M3.3 §4): compare the schema (top-level key set, `_meta`
+# ignored) of every `*.captured.json` fixture with the same file in a fresh capture — what
+# `kioku hook-dump extract <agent> <event>` writes to ~/.kioku/captures/<date>/<agent>/ —
+# and print the added / removed keys. A fixture named `<event>_<variant>` (post_tool_use_bash)
+# falls back to the fresh `<event>` file. Default fresh dir: the newest ~/.kioku/captures/*.
+# Exit 0 = no schema change, 1 = a change (or a usage error). Needs python3; writes nothing.
+# KIOKU_FIXTURES_DIR overrides the fixture root (tests).
+if [ "${1:-}" = "--check" ]; then
+  root=$(cd "$(dirname "$0")/.." && pwd)
+  fixtures="${KIOKU_FIXTURES_DIR:-$root/crates/kioku-cli/tests/fixtures}"
+  fresh="${2:-}"
+  if [ -z "$fresh" ]; then
+    # shellcheck disable=SC2012 # capture dirs are dates: plain names
+    fresh=$(ls -1d "$HOME"/.kioku/captures/*/ 2>/dev/null | sort | tail -n 1)
+  fi
+  if [ -z "$fresh" ] || [ ! -d "$fresh" ]; then
+    echo "probe-agents --check: no fresh capture directory (run the probe, then kioku hook-dump extract <agent> <event>; or pass the directory)" >&2
+    exit 1
+  fi
+  command -v python3 >/dev/null 2>&1 || { echo "probe-agents --check: python3 is required" >&2; exit 1; }
+  exec python3 - "$fixtures" "$fresh" <<'PY'
+import json, os, sys
+
+fixtures, fresh = sys.argv[1], sys.argv[2]
+
+def keys(path):
+    with open(path, encoding="utf-8") as f:
+        v = json.load(f)
+    return set(v) - {"_meta"} if isinstance(v, dict) else set()
+
+def counterpart(rel):
+    d, name = os.path.split(rel)
+    stem = name[: -len(".captured.json")]
+    while True:
+        cand = os.path.join(fresh, d, stem + ".captured.json")
+        if os.path.isfile(cand):
+            return cand
+        if "_" not in stem:
+            return None
+        stem = stem.rsplit("_", 1)[0]
+
+changed = compared = 0
+for base, _, files in sorted(os.walk(fixtures)):
+    for name in sorted(files):
+        if not name.endswith(".captured.json"):
+            continue
+        rel = os.path.relpath(os.path.join(base, name), fixtures)
+        if rel.split(os.sep)[0] == "legacy":
+            continue
+        other = counterpart(rel)
+        if other is None:
+            print(f"--   {rel}: not in the fresh capture")
+            continue
+        compared += 1
+        old, new = keys(os.path.join(fixtures, rel)), keys(other)
+        if old == new:
+            print(f"ok   {rel}")
+            continue
+        changed += 1
+        print(f"DIFF {rel} (vs {os.path.relpath(other, fresh)})")
+        for k in sorted(new - old):
+            print(f"     + {k}")
+        for k in sorted(old - new):
+            print(f"     - {k}")
+print(f"{compared} fixture(s) compared, {changed} with a changed key set")
+sys.exit(1 if changed else 0)
+PY
+fi
 
 CFG="$HOME/.kioku/config.toml"
 LOG="$HOME/.kioku/logs/hook-dump.jsonl"

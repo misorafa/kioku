@@ -10,7 +10,7 @@ Files: [SPEC-M1](SPEC-M1.md) · [SPEC-M2](SPEC-M2.md) · [SPEC-M2.1](SPEC-M2.1.m
 [SPEC-M2.2](SPEC-M2.2.md) · [SPEC-M2.3](SPEC-M2.3.md) · [SPEC-M2.4](SPEC-M2.4.md) ·
 [SPEC-M2.5](SPEC-M2.5.md) · [SPEC-M2.6](SPEC-M2.6.md) · [SPEC-M2.7](SPEC-M2.7.md) ·
 [SPEC-M2.8](SPEC-M2.8.md) · [SPEC-M3.0](SPEC-M3.0.md) · [SPEC-M3.1](SPEC-M3.1.md) ·
-[SPEC-M3.2](SPEC-M3.2.md) · [SPEC-M3.3](SPEC-M3.3.md) (planned) · decisions: [adr/](adr/)
+[SPEC-M3.2](SPEC-M3.2.md) · [SPEC-M3.3](SPEC-M3.3.md) · decisions: [adr/](adr/)
 
 | topic | authoritative section(s) | notes |
 |-------|--------------------------|-------|
@@ -61,7 +61,7 @@ Files: [SPEC-M1](SPEC-M1.md) · [SPEC-M2](SPEC-M2.md) · [SPEC-M2.1](SPEC-M2.1.m
 | Claude desktop app (chat, Cowork) config | SPEC-M2.2 §7.3a | quit the app before installing |
 | Codex CLI | SPEC-M2 §4, SPEC-M2.2 §7.2 | |
 | Cursor | SPEC-M2 §5, SPEC-M2.2 §7.3 | late context SPEC-M2 §5.6 |
-| Gemini CLI (legacy) | SPEC-M2 §6 | retired for personal accounts; successor Antigravity |
+| Gemini CLI (legacy) | SPEC-M2 §6, SPEC-M3.3 §4 | retired for personal accounts; successor Antigravity; fixtures in `tests/fixtures/legacy/` |
 | Antigravity CLI | SPEC-M2.1 §3, SPEC-M2.1 §4 | |
 | Installers (common rules, `install all`) | SPEC-M2 §8 | |
 | Instruction snippet | SPEC-M2 §7 | |
@@ -93,6 +93,8 @@ Files: [SPEC-M1](SPEC-M1.md) · [SPEC-M2](SPEC-M2.md) · [SPEC-M2.1](SPEC-M2.1.m
 | `kioku update` (manual) | SPEC-M2 §13.3, SPEC-M2.5 §4 | |
 | Windows client, `install.ps1` | SPEC-M2.2 §4, SPEC-M2.2 §6 | update on Windows SPEC-M2.2 §5 |
 | Orca, WSL, mixed setups | SPEC-M2.2 §9 | |
-| Distribution: Homebrew, Docker, uninstall (planned) | SPEC-M3.3 §1, SPEC-M3.3 §2, SPEC-M3.3 §3 | |
-| Fixture freshness (planned) | SPEC-M3.3 §4 | |
+| Homebrew tap, `brew upgrade` notice | SPEC-M3.3 §1 | notes SPEC-M3.3 §6; template `packaging/homebrew/` |
+| Docker image (ghcr.io), container detection | SPEC-M3.3 §2 | notes SPEC-M3.3 §6; no self-update in a container |
+| `kioku uninstall` (whole machine) | SPEC-M3.3 §3 | per agent: SPEC-M2 §8; notes SPEC-M3.3 §6 |
+| Fixture freshness, `_meta.captured_with` | SPEC-M3.3 §4 | **monthly manual task**: capture with `sh scripts/probe-agents.sh`, `kioku hook-dump extract`, then `sh scripts/probe-agents.sh --check`; doctor `[INFO] agent.<a>.fixtures` |
 | Documents index (this file), ADRs | SPEC-M3.2 §4 | |

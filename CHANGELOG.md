@@ -5,6 +5,31 @@ requests of each tag (`git log <previous tag>..<tag>`). Specifications are in
 [docs/](docs/INDEX.md); the section that is current for each topic is listed in
 [docs/INDEX.md](docs/INDEX.md).
 
+## Unreleased — M3.3: distribution, uninstall, fixture freshness
+
+- Homebrew: `brew install misorafa/tap/kioku`. Each stable release renders
+  `Formula/kioku.rb` (`packaging/homebrew/kioku.rb.tmpl`) and pushes it to the tap
+  (skipped with a notice while `TAP_TOKEN` is not set). A Homebrew binary is never
+  replaced: `kioku update` and the automatic updates print `brew upgrade kioku`; hooks and
+  the service use the stable `<prefix>/bin/kioku` link (SPEC-M3.3 §1).
+- Docker: every release publishes `ghcr.io/misorafa/kioku:<tag>` and `:latest`
+  (linux/amd64 + arm64) built from the release's musl binaries; non-root, `VOLUME /data`,
+  health check on `/api/v1/health`. A container never updates itself (update with
+  `docker compose pull`, or watchtower); `kioku init` in a container prints the token it
+  generates once (SPEC-M3.3 §2). **Changed:** the image's entrypoint is `kioku` with the
+  default command `serve`, so serve options now follow `serve`
+  (`docker run … ghcr.io/misorafa/kioku serve --port 8000`); the Dockerfile packages a
+  release binary instead of building from source.
+- `kioku uninstall` (no agent) removes kioku from the machine: every agent's hooks and MCP
+  entries, the service, the PATH line install.sh / install.ps1 added, the binary and
+  `.prev`; `--everything` also `config.toml`, `--purge-data` also the data directory
+  (typed confirmation). `kioku uninstall <agent>` is unchanged (SPEC-M3.3 §3).
+  install.ps1 now marks the user PATH entry it adds (`kioku-path-entry.txt`).
+- Fixture freshness: `scripts/probe-agents.sh --check` compares captured fixtures' key
+  sets with a fresh capture; fixtures record `_meta.captured_with`; `kioku doctor` prints
+  an `[INFO]` line when an installed agent is newer than its fixtures. Gemini CLI is
+  legacy (fixtures under `tests/fixtures/legacy/`) (SPEC-M3.3 §4).
+
 ## v0.9.2 — 2026-10-02
 
 - `GET /api/v1/metrics` (bearer auth): Prometheus text with counts, sizes, ages of the last

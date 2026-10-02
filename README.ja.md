@@ -221,6 +221,37 @@ curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh
 `cargo install --locked --path crates/kioku-cli` です。実行時の `git` は任意です（無い場合 wiki は
 バージョン管理されません）。
 
+### Homebrew
+
+```sh
+brew install misorafa/tap/kioku
+kioku setup            # またはサーバーで `kioku invite` が表示する行を貼り付ける
+```
+
+formula は同じリリースバイナリ（macOS: Apple シリコンと Intel、Linux: 静的リンクの musl 版）を
+インストールします。バイナリは Homebrew が管理するので、`kioku update` と自動更新は
+`brew upgrade kioku` を案内するだけです。フックとサービスには固定のリンク `$(brew --prefix)/bin/kioku` を
+登録するので、アップグレード後もそのまま動きます。
+
+### アンインストール
+
+```sh
+kioku uninstall                 # 実行内容を表示し、一度確認してから実行
+kioku uninstall --everything    # config.toml（サーバー URL とトークン）も削除
+kioku uninstall --everything --purge-data   # データディレクトリも削除（先に `kioku backup`）
+```
+
+`kioku uninstall` は、すべてのエージェントから kioku のフック・MCP エントリ・指示ブロックを取り除き
+（同じファイルのほかの内容はそのまま）、バックグラウンドサービスを停止・削除し、`install.sh` が追加した
+PATH の行（`# added by the kioku installer` で終わるその行だけ。Windows では `install.ps1` が追加した
+ユーザー PATH のエントリ）を削除し、バイナリと `kioku.prev` を削除します。`config.toml` は
+`--everything` を付けたときだけ、データディレクトリ（wiki、データベース、インデックス、バックアップ）は
+`--purge-data` を付けて `DELETE` と入力したときだけ削除します。`--yes` で確認を省略、`--dry-run` は
+計画を表示するだけです。Claude デスクトップアプリは先に終了してください（起動中は設定を書き戻すため）。
+Homebrew / winget のバイナリはパッケージマネージャーに任せます（このあと `brew uninstall kioku` /
+`winget uninstall misorafa.kioku`）。`kioku uninstall <agent>`（または `all`）は従来どおり、
+そのエージェントのエントリだけを取り除きます。
+
 ### マシンを追加する: `kioku invite`
 
 ほかのマシン（ノート PC、デスクトップ、Windows PC）は 1 台のサーバーに接続します。追加するときは、
@@ -279,8 +310,9 @@ kioku の Developer ID で署名されたバイナリだけを受け入れます
 auto = false
 ```
 
-winget でインストールしたものは winget に黙って置き換えず、`winget upgrade misorafa.kioku` を
-案内するお知らせだけを出します。自動更新より前に入れたサービスは、一度だけ `kioku update` のあと
+winget や Homebrew でインストールしたものはパッケージマネージャーに黙って置き換えず、
+`winget upgrade misorafa.kioku` / `brew upgrade kioku` を案内するお知らせだけを出します。Docker の
+サーバーも自分自身を置き換えません（[Docker](#docker) 参照）。自動更新より前に入れたサービスは、一度だけ `kioku update` のあと
 `kioku service install` を実行すると自動更新が有効になります（更新を実行する古いバイナリはサービス定義を
 書き直せないため。`kioku doctor` が警告します）。
 
@@ -552,7 +584,8 @@ kioku は各セッションの最初のツール使用時（`postToolUse`。フ�
 ### Gemini CLI（レガシー）
 
 Gemini CLI は 2026-06-18 に個人アカウント向けの提供を終了しました（Code Assist Standard/Enterprise と
-有料 API キーでは引き続き使えます）。後継は下の Antigravity CLI です。Gemini CLI の検出には `~/.gemini`
+有料 API キーでは引き続き使えます）。後継は下の Antigravity CLI です。Gemini CLI 向けのインストールは
+**レガシー**扱いです（引き続き動きますが新機能は追加せず、テスト用フィクスチャは `fixtures/legacy/` にあります）。Gemini CLI の検出には `~/.gemini`
 ではなく `~/.gemini/tmp` を使います（`~/.gemini` は Antigravity も作るため）。
 
 | 内容 | 場所 |
@@ -647,25 +680,41 @@ VPN の名前）をプロキシに通したくない場合は `NO_PROXY` に追�
 
 ## Docker
 
+リリースごとに `ghcr.io/misorafa/kioku:<tag>` と `:latest`（linux/amd64 と linux/arm64、リリースの
+静的バイナリから作成）を公開しています:
+
 ```sh
-docker build -t kioku .
-docker run -d --name kioku -p 7391:7391 \
+docker run -d --name kioku --restart unless-stopped -p 7391:7391 \
   -e KIOKU_AUTH_TOKEN="$(openssl rand -hex 32)" \
-  -v kioku-data:/data kioku
+  -v kioku-data:/data ghcr.io/misorafa/kioku
 ```
 
-イメージは非 root ユーザー（uid 10001）で `kioku serve` を実行し、`KIOKU_DATA_DIR=/data`、
-`KIOKU_BIND=0.0.0.0` が設定されています。`config.toml` は不要です。`KIOKU_AUTH_TOKEN` が設定されていれば、
+イメージは非 root ユーザー（uid 10001）で `kioku serve` を実行し、`KIOKU_DATA_DIR=/data`（ボリューム）、
+`KIOKU_BIND=0.0.0.0` が設定され、ポート 7391 を公開し、`/api/v1/health` でヘルスチェックします
+（`docker ps` に `healthy` と出ます）。`config.toml` は不要です。`KIOKU_AUTH_TOKEN` が設定されていれば、
 初回起動時にデータディレクトリが作られます。トークンは控えておいてください（クライアントの
-`install.sh … --client-only <url> <token>`（または `kioku setup --client-only`）に必要です）。
+`kioku setup --client-only <url>` で標準入力から渡します）。`KIOKU_AUTH_TOKEN` を使わない場合は、
+一度だけ `docker run --rm -v kioku-data:/data ghcr.io/misorafa/kioku init` を実行します。コンテナ内の
+`init` は生成したトークンをその一回だけ表示します（あとから読めるローカルの設定がないため）。
 `docker exec kioku kioku invite` も使えますが、表示されるのはコンテナのアドレスなので、貼り付ける行では
-Docker ホストのアドレスに置き換えてください。
-Docker ホスト自身で `kioku setup` を実行すると、動いているサーバーを検出してサービスはインストールしません。ホストのディレクトリをバインドマウントする場合は、
-uid 10001 が書き込めるようにしてください。追加の引数は `kioku serve` に渡されます（例: `--port 8000`）。
-コンテナ内では `docker exec kioku kioku status` が使えます。
+Docker ホストのアドレスに置き換えてください。Docker ホスト自身で `kioku setup` を実行すると、
+動いているサーバーを検出してサービスはインストールしません。ホストのディレクトリをバインドマウントする場合は、
+uid 10001 が書き込めるようにしてください。引数はコマンドを置き換えます
+（`docker run … ghcr.io/misorafa/kioku serve --port 8000`）。コンテナ内では `docker exec kioku kioku status` が使えます。
 
-Compose の場合（`docker-compose.yml` 参照）は、同じ場所の `.env` ファイルに `KIOKU_AUTH_TOKEN=…` を書き、
-`docker compose up -d` を実行します。TLS についての注意は同じです。コンテナは平文の HTTP を話します。
+Compose の場合は、このリポジトリの `docker-compose.yml` がそのまま使える例です。同じ場所の `.env` に
+`KIOKU_AUTH_TOKEN=…` を書き、`docker compose up -d` を実行します。
+
+**更新。** イメージは不変で、自分自身を更新しません（新しいリリースがあることをログに出すだけです）。
+新しいイメージを取得して更新します:
+
+```sh
+docker compose pull && docker compose up -d     # または docker pull ghcr.io/misorafa/kioku してコンテナを作り直す
+```
+
+[watchtower](https://containrrr.dev/watchtower/) に任せることもできます（`docker-compose.yml` にコメントで例があります）。
+データはボリュームに残り、クライアントはいつもどおりサーバーのバージョンに追随します。TLS についての注意は
+同じです。コンテナは平文の HTTP を話します。
 
 ## MCP ツール
 
@@ -931,13 +980,12 @@ memorix など）、一見の価値があります。kioku の違いは、日本
   `kioku invite` / `join` · **M2.4**（v0.6.4）ブランチごとの引き継ぎレーン、プロジェクト別名 · **M2.5**（v0.7.0）
   自動更新 · **M2.6**（v0.8.0）バックアップ / 復元、オフラインキュー · **M2.7**（v0.8.1）堅牢化 · **M2.8**
   （v0.8.2）1 ターンあたりのコスト、保持期間 · **M3.0**（v0.9.0）セッション開始ブロックの充実 · **M3.1**
-  （v0.9.1）引き継ぎの消費ルール、検索の改善。
+  （v0.9.1）引き継ぎの消費ルール、検索の改善 · **M3.2**（v0.9.2）メトリクス、フックの稼働確認、
+  `doctor --fix`、ドキュメントの索引。
 
 予定:
 
-- **M3.2**（作業中）: メトリクスとリクエストログ、`status --watch` / `--agents`、フックの稼働確認、
-  `doctor --fix`、ローカルネットワークの診断、ドキュメントの索引。
-- **M3.3**: Homebrew tap、Docker イメージ、`kioku uninstall`、フィクスチャの鮮度チェック。
+- **M3.3**（作業中）: Homebrew tap、ghcr.io の Docker イメージ、`kioku uninstall`、フィクスチャの鮮度チェック。
 
 M4 以降のアイデア（未確定）: Web UI、埋め込みと bi-temporal な事実管理、任意の LLM による整理、
 取り込みアダプタ（メール、カレンダー）、日本語検索の基準を超える評価ハーネス。

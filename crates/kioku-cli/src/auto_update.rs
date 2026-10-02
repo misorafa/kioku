@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 use crate::event::HookEnv;
 use crate::hook::{append_line, client_state_root};
 use crate::update::{
-    Verify, http_client, install_release, installer_line, is_newer, is_winget_install, latest_tag,
-    release_base,
+    PackageManager, Verify, http_client, install_release, installer_line, is_newer, latest_tag,
+    package_manager, release_base,
 };
 
 /// State file inside `<kioku dir>/state/`.
@@ -301,8 +301,8 @@ pub struct ClientFacts {
     pub client_version: String,
     /// Effective `[update] auto`.
     pub auto: bool,
-    /// The binary is managed by winget.
-    pub winget: bool,
+    /// The package manager that owns the binary (winget, Homebrew), if any.
+    pub managed: Option<PackageManager>,
     /// kioku can write to its binary's directory.
     pub writable: bool,
     /// `[client] lang` (the notice line is bilingual).
@@ -317,11 +317,11 @@ pub fn notice_line(lang: Lang, server: &str, client: &str, how: &str) -> String 
     }
 }
 
-/// How to update by hand: winget, the installer (binary directory not writable), or
-/// `kioku update` (automatic updates turned off).
+/// How to update by hand: the package manager (winget, Homebrew), the installer (binary
+/// directory not writable), or `kioku update` (automatic updates turned off).
 pub fn how_to_update(facts: &ClientFacts, tag: &str) -> String {
-    if facts.winget {
-        "winget upgrade misorafa.kioku".to_string()
+    if let Some(pm) = facts.managed {
+        pm.upgrade_command().to_string()
     } else if !facts.writable {
         installer_line(tag)
     } else {
@@ -341,7 +341,7 @@ pub fn client_action(facts: &ClientFacts, state: &AutoUpdateState, at: i64) -> C
         return ClientAction::Nothing;
     }
     let tag = format!("v{server}");
-    if facts.auto && !facts.winget && facts.writable {
+    if facts.auto && facts.managed.is_none() && facts.writable {
         let throttled = state.target.as_deref() == Some(tag.as_str())
             && within(state.last_attempt.as_deref(), ATTEMPT_THROTTLE, at);
         return if throttled {
@@ -401,7 +401,7 @@ pub fn after_session_start(
             server_version: Some(server.to_string()),
             client_version: VERSION.to_string(),
             auto: cfg.update.auto,
-            winget: exe.as_deref().is_some_and(is_winget_install),
+            managed: exe.as_deref().and_then(package_manager),
             writable: exe
                 .as_deref()
                 .and_then(Path::parent)
@@ -558,8 +558,12 @@ fn background_update(
         return Ok(None);
     }
     let exe = current_binary().context("locating the kioku binary")?;
-    if is_winget_install(&exe) {
-        anyhow::bail!("installed with winget; update with: winget upgrade misorafa.kioku");
+    if let Some(pm) = package_manager(&exe) {
+        anyhow::bail!(
+            "installed with {}; update with: {}",
+            pm.name(),
+            pm.upgrade_command()
+        );
     }
     install_release(&http, &base, &tag, &exe, Verify::automatic())?;
     Ok(Some((tag, crate::update::restart_service(&exe))))
@@ -584,6 +588,47 @@ pub struct ServerCheck {
     pub verify: Verify,
     /// `<data dir>/state` for the result bookkeeping (`kioku doctor`).
     pub state_dir: Option<PathBuf>,
+    /// How to update by hand, logged when a release is available but not installed
+    /// ([`server_update_policy`]).
+    pub how: String,
+}
+
+/// Where a server runs, for its update policy (SPEC-M2.5 §3.1, SPEC-M3.3 §1–2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServerInstall {
+    /// A binary kioku replaces itself (install.sh, `kioku update`).
+    SelfManaged,
+    /// A package manager owns the binary: notify only.
+    Package(PackageManager),
+    /// A container (immutable image): notify only.
+    Container,
+}
+
+/// What a server does about a newer release: install it (`auto` and self-managed) or only
+/// log it. Returns the effective `auto` and the manual update instruction.
+pub fn server_update_policy(auto: bool, install: ServerInstall) -> (bool, String) {
+    match install {
+        ServerInstall::SelfManaged => (auto, "run `kioku update`".to_string()),
+        ServerInstall::Package(pm) => (false, format!("run `{}`", pm.upgrade_command())),
+        ServerInstall::Container => (
+            false,
+            "pull the new image (`docker compose pull && docker compose up -d`, or watchtower)"
+                .to_string(),
+        ),
+    }
+}
+
+/// True when this process runs in a container: `KIOKU_CONTAINER=1` (set by kioku's image),
+/// `/.dockerenv` (Docker) or `/run/.containerenv` (Podman) under `root` (`/` outside tests).
+pub fn in_container_at(root: &Path, vars: &std::collections::HashMap<String, String>) -> bool {
+    vars.get("KIOKU_CONTAINER").is_some_and(|v| v == "1")
+        || root.join(".dockerenv").exists()
+        || root.join("run").join(".containerenv").exists()
+}
+
+/// [`in_container_at`] for the real process.
+pub fn in_container() -> bool {
+    in_container_at(Path::new("/"), &kioku_core::util::env_vars())
 }
 
 /// Result of one server check.
@@ -737,8 +782,9 @@ pub async fn server_update_task(
             ServerOutcome::Available(tag) => {
                 if announced.as_deref() != Some(tag.as_str()) {
                     tracing::info!(
-                        "kioku {tag} is available (running v{}); automatic updates are off: run `kioku update`",
-                        check.current
+                        "kioku {tag} is available (running v{}); not installed automatically: {}",
+                        check.current,
+                        check.how
                     );
                     announced = Some(tag);
                 }

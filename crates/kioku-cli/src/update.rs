@@ -315,6 +315,85 @@ pub fn is_winget_install(exe: &Path) -> bool {
     s.contains("\\winget\\packages\\") || s.contains("\\winget\\links\\")
 }
 
+/// True when `exe` lives in a Homebrew keg (`/opt/homebrew/Cellar/kioku/…`,
+/// `/usr/local/Cellar/kioku/…`, Linuxbrew's `…/.linuxbrew/Cellar/kioku/…`; SPEC-M3.3 §1).
+pub fn is_brew_install(exe: &Path) -> bool {
+    let s = exe.to_string_lossy().replace('\\', "/");
+    s.contains("/Cellar/kioku/")
+}
+
+/// A package manager that owns the kioku binary: `kioku update` and the automatic updates
+/// leave the binary alone and point at the manager's upgrade command instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PackageManager {
+    /// winget (`misorafa.kioku`, packaging/winget).
+    Winget,
+    /// Homebrew (`misorafa/tap/kioku`, packaging/homebrew).
+    Homebrew,
+}
+
+impl PackageManager {
+    /// Human name (`winget`, `Homebrew`).
+    pub fn name(self) -> &'static str {
+        match self {
+            PackageManager::Winget => "winget",
+            PackageManager::Homebrew => "Homebrew",
+        }
+    }
+
+    /// The command that updates kioku.
+    pub fn upgrade_command(self) -> &'static str {
+        match self {
+            PackageManager::Winget => "winget upgrade misorafa.kioku",
+            PackageManager::Homebrew => "brew upgrade kioku",
+        }
+    }
+
+    /// The command that removes kioku.
+    pub fn uninstall_command(self) -> &'static str {
+        match self {
+            PackageManager::Winget => "winget uninstall misorafa.kioku",
+            PackageManager::Homebrew => "brew uninstall kioku",
+        }
+    }
+}
+
+/// Which package manager owns `exe` (a symlink such as `/opt/homebrew/bin/kioku` is
+/// followed), if any.
+pub fn package_manager(exe: &Path) -> Option<PackageManager> {
+    let real = kioku_core::util::canonical_plain(exe).unwrap_or_else(|_| exe.to_path_buf());
+    if is_winget_install(exe) || is_winget_install(&real) {
+        Some(PackageManager::Winget)
+    } else if is_brew_install(exe) || is_brew_install(&real) {
+        Some(PackageManager::Homebrew)
+    } else {
+        None
+    }
+}
+
+/// The path to register in hooks and the service for `exe`: a Homebrew keg path
+/// (`<prefix>/Cellar/kioku/<version>/bin/kioku`, gone after `brew upgrade` + cleanup) becomes
+/// the stable `<prefix>/bin/kioku` link when it exists; anything else is returned unchanged.
+pub fn stable_binary_path(exe: &Path) -> PathBuf {
+    let s = exe.to_string_lossy().replace('\\', "/");
+    if let Some(i) = s.find("/Cellar/kioku/") {
+        let link = Path::new(&s[..i]).join("bin").join(BIN_NAME);
+        if link.exists() {
+            return link;
+        }
+    }
+    exe.to_path_buf()
+}
+
+/// The manager's notice for `kioku update` (nothing is replaced).
+pub fn managed_update_notice(pm: PackageManager, tag: &str) -> String {
+    format!(
+        "kioku was installed with {}; update it with: {} (latest release: {tag})",
+        pm.name(),
+        pm.upgrade_command()
+    )
+}
+
 /// The official releases: `https://github.com/misorafa/kioku/releases`.
 pub fn official_release_base() -> String {
     format!("https://github.com/{KIOKU_REPO}/releases")
@@ -469,14 +548,13 @@ pub fn run_update(args: UpdateArgs) -> anyhow::Result<i32> {
         println!("current: v{VERSION}\nlatest:  {tag} ({TARGET})");
         return Ok(if is_newer(&tag, VERSION) { 10 } else { 0 });
     }
-    // A winget-managed install (packaging/winget): replacing the exe behind winget's back
-    // would leave winget believing the old version is installed.
+    // A winget- or Homebrew-managed install (packaging/winget, packaging/homebrew):
+    // replacing the binary behind the manager's back would leave it believing the old
+    // version is installed (SPEC-M3.3 §1).
     if let Ok(exe) = std::env::current_exe()
-        && is_winget_install(&exe)
+        && let Some(pm) = package_manager(&exe)
     {
-        println!(
-            "kioku was installed with winget; update it with: winget upgrade misorafa.kioku (latest release: {tag})"
-        );
+        println!("{}", managed_update_notice(pm, &tag));
         return Ok(0);
     }
     if !should_install(&tag, VERSION, explicit) {
@@ -658,8 +736,11 @@ pub fn rollback_binary(exe: &Path) -> anyhow::Result<String> {
 pub fn run_rollback() -> anyhow::Result<i32> {
     let exe = std::env::current_exe().context("locating the kioku binary")?;
     let exe = kioku_core::util::canonical_plain(&exe).unwrap_or(exe);
-    if is_winget_install(&exe) {
-        bail!("kioku was installed with winget; use winget to install another version");
+    if let Some(pm) = package_manager(&exe) {
+        bail!(
+            "kioku was installed with {0}; use {0} to install another version",
+            pm.name()
+        );
     }
     let version = rollback_binary(&exe)?;
     println!("kioku: rolled back v{VERSION} -> v{version}");
@@ -855,6 +936,59 @@ mod tests {
         assert!(should_install("v0.1.9", "0.2.0", true));
         assert!(should_install("v0.3.0", "0.2.0", true));
         assert!(!should_install("v0.2.0", "0.2.0", true));
+    }
+
+    /// SPEC-M3.3 §1: a Homebrew keg is recognised; `kioku update` prints `brew upgrade`.
+    #[test]
+    fn brew_installs_are_recognised_and_get_the_brew_notice() {
+        for p in [
+            "/opt/homebrew/Cellar/kioku/0.9.3/bin/kioku",
+            "/usr/local/Cellar/kioku/0.9.3/bin/kioku",
+            "/home/linuxbrew/.linuxbrew/Cellar/kioku/0.9.3/bin/kioku",
+        ] {
+            assert!(is_brew_install(Path::new(p)), "{p}");
+            assert_eq!(
+                package_manager(Path::new(p)),
+                Some(PackageManager::Homebrew)
+            );
+        }
+        for p in [
+            "/Users/me/.local/bin/kioku",
+            "/opt/homebrew/Cellar/kiokuX/1/bin/kioku",
+            "/opt/homebrew/bin/other",
+        ] {
+            assert!(!is_brew_install(Path::new(p)), "{p}");
+            assert_eq!(package_manager(Path::new(p)), None, "{p}");
+        }
+        assert_eq!(
+            managed_update_notice(PackageManager::Homebrew, "v0.9.3"),
+            "kioku was installed with Homebrew; update it with: brew upgrade kioku (latest release: v0.9.3)"
+        );
+        assert_eq!(
+            managed_update_notice(PackageManager::Winget, "v0.9.3"),
+            "kioku was installed with winget; update it with: winget upgrade misorafa.kioku (latest release: v0.9.3)"
+        );
+    }
+
+    /// A symlink into a keg (`<prefix>/bin/kioku`) counts as Homebrew; hooks and the service
+    /// get the stable link instead of the versioned keg path.
+    #[cfg(unix)]
+    #[test]
+    fn brew_links_are_followed_and_kept_stable() {
+        let prefix = tempfile::tempdir().unwrap();
+        let keg = prefix.path().join("Cellar/kioku/0.9.3/bin");
+        std::fs::create_dir_all(&keg).unwrap();
+        std::fs::write(keg.join("kioku"), "#!/bin/sh\n").unwrap();
+        std::fs::create_dir_all(prefix.path().join("bin")).unwrap();
+        let link = prefix.path().join("bin/kioku");
+        std::os::unix::fs::symlink(keg.join("kioku"), &link).unwrap();
+        assert_eq!(package_manager(&link), Some(PackageManager::Homebrew));
+        assert_eq!(stable_binary_path(&keg.join("kioku")), link);
+        // No link (yet): the keg path stays; other paths are untouched.
+        std::fs::remove_file(&link).unwrap();
+        assert_eq!(stable_binary_path(&keg.join("kioku")), keg.join("kioku"));
+        let plain = Path::new("/Users/me/.local/bin/kioku");
+        assert_eq!(stable_binary_path(plain), plain);
     }
 
     #[test]

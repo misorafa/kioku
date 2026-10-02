@@ -36,6 +36,13 @@ jobs:
       - name: cargo test
         if: ${{ !cancelled() }}
         run: cargo test --locked --no-fail-fast
+      # SPEC-M3.3 §2: the Docker image from a locally built linux binary (never a release
+      # asset): --version, non-root, /data, init prints the token once, healthy serve.
+      - name: docker build + run
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: |
+          cargo build --locked -p kioku-cli
+          sh scripts/test-docker.sh target/debug/kioku
 
   install-sh:
     name: install.sh (${{ matrix.os }})
@@ -50,9 +57,13 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-          shellcheck -s sh install.sh scripts/test-install.sh
+          shellcheck -s sh install.sh scripts/test-install.sh scripts/test-scripts.sh \
+            scripts/render-homebrew-formula.sh scripts/probe-agents.sh scripts/test-docker.sh
       - name: install.sh tests (sh)
         run: sh scripts/test-install.sh
+      # SPEC-M3.3 §1, §4: Homebrew formula golden test, probe-agents.sh --check.
+      - name: script tests
+        run: sh scripts/test-scripts.sh
       - name: install.sh tests (dash)
         if: runner.os == 'Linux'
         run: KIOKU_TEST_SH=dash dash scripts/test-install.sh

@@ -1,11 +1,16 @@
-# Example: KIOKU_AUTH_TOKEN=$(openssl rand -hex 32) docker compose up -d
-# Keep the token in a .env file next to this file (not in git) for restarts.
-# Put a TLS-terminating reverse proxy (Caddy, Cloudflare Tunnel, …) or a
-# WireGuard network in front before exposing the port beyond your LAN.
+# kioku server with Docker Compose (SPEC-M3.3 §2).
+#
+#   echo "KIOKU_AUTH_TOKEN=$(openssl rand -hex 32)" > .env    # keep .env out of git
+#   docker compose up -d
+#
+# The image (ghcr.io/misorafa/kioku, linux/amd64 + arm64) never updates itself. Update:
+#   docker compose pull && docker compose up -d
+# or uncomment the watchtower service below to pull new releases automatically.
+# Put a TLS-terminating reverse proxy (Caddy, Cloudflare Tunnel, …) or a WireGuard network
+# in front before exposing the port beyond your LAN.
 services:
   kioku:
-    build: .
-    image: kioku:latest
+    image: ghcr.io/misorafa/kioku:latest
     restart: unless-stopped
     environment:
       KIOKU_AUTH_TOKEN: ${KIOKU_AUTH_TOKEN:?set KIOKU_AUTH_TOKEN}
@@ -15,6 +20,15 @@ services:
       - "7391:7391"          # use "127.0.0.1:7391:7391" when a reverse proxy runs on the same host
     volumes:
       - kioku-data:/data
+    # labels:
+    #   com.centurylinklabs.watchtower.enable: "true"
+
+  # watchtower:
+  #   image: containrrr/watchtower
+  #   restart: unless-stopped
+  #   command: --label-enable --cleanup --interval 86400
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock
 
 volumes:
   kioku-data:

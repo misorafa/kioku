@@ -447,10 +447,14 @@ fn stop_without_nudge_finalizes_and_failures_are_logged() {
 
 /// A docs fixture payload re-pointed at this test's session id and project dir.
 fn fixture_payload(agent: Agent, name: &str, sid: &str, cwd: &Path) -> Value {
+    // Gemini CLI's fixtures are legacy (SPEC-M3.3 §4).
+    let dir = match agent {
+        Agent::GeminiCli => "legacy/gemini-cli",
+        a => a.as_str(),
+    };
     let path = format!(
-        "{}/tests/fixtures/{}/{name}.docs.json",
+        "{}/tests/fixtures/{dir}/{name}.docs.json",
         env!("CARGO_MANIFEST_DIR"),
-        agent.as_str()
     );
     let mut v: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let c = cwd.display().to_string();

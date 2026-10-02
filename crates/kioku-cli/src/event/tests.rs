@@ -110,11 +110,19 @@ struct Variant {
     text: String,
 }
 
+/// Fixture directory of `agent` under `tests/fixtures/` (Gemini CLI is legacy, SPEC-M3.3 §4).
+fn fixture_subdir(agent: Agent) -> String {
+    match agent {
+        Agent::GeminiCli => "legacy/gemini-cli".to_string(),
+        a => a.as_str().to_string(),
+    }
+}
+
 fn variants(agent: Agent, name: &str) -> Vec<Variant> {
     let dir = format!(
         "{}/tests/fixtures/{}",
         env!("CARGO_MANIFEST_DIR"),
-        agent.as_str()
+        fixture_subdir(agent)
     );
     let mut out = Vec::new();
     for (docs, suffix) in [(true, "docs"), (false, "captured")] {
@@ -1011,7 +1019,7 @@ fn stop_payloads_carry_the_last_reply() {
         Some("README を要約しました。")
     );
     assert_eq!(
-        reply(Agent::GeminiCli, "gemini-cli/after_agent.docs.json").as_deref(),
+        reply(Agent::GeminiCli, "legacy/gemini-cli/after_agent.docs.json").as_deref(),
         Some("完了しました。")
     );
     assert_eq!(reply(Agent::Cursor, "cursor/stop.docs.json"), None);
@@ -1024,4 +1032,39 @@ fn stop_payloads_carry_the_last_reply() {
     let blank = r#"{"session_id":"s","cwd":"/x","last_assistant_message":"  \n"}"#;
     let ev = parse_event(Agent::ClaudeCode, HookEventKind::Stop, blank).unwrap();
     assert_eq!(ev.assistant_message, None);
+}
+
+/// SPEC-M3.3 §4: every captured fixture says which agent version produced it
+/// (`_meta.captured_with`, `"unknown"` when nobody recorded it), and Gemini CLI's fixtures
+/// live under `legacy/`.
+#[test]
+fn every_captured_fixture_records_its_agent_version() {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.to_string_lossy().ends_with(".captured.json") {
+                out.push(p);
+            }
+        }
+    }
+    let root = std::path::PathBuf::from(format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR")));
+    let mut files = Vec::new();
+    walk(&root, &mut files);
+    assert!(files.len() >= 20, "{files:?}");
+    for f in files {
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
+        let with = v["_meta"]["captured_with"].as_str();
+        assert!(
+            with.is_some_and(|w| !w.is_empty()),
+            "{}: no _meta.captured_with",
+            f.display()
+        );
+    }
+    assert!(
+        root.join("legacy/gemini-cli/after_agent.docs.json")
+            .is_file()
+    );
+    assert!(!root.join("gemini-cli").exists());
 }

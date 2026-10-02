@@ -294,6 +294,13 @@ function Update-UserPath([string]$Dir, [bool]$NoPath) {
     if (-not $present) {
         $entries += $Dir
         Set-UserPath ($entries -join ';')
+        # The marker `kioku uninstall` looks for before it removes this entry (SPEC-M3.3
+        # section 3): only a PATH entry this installer added is ever removed.
+        try {
+            [System.IO.File]::WriteAllText((Join-Path $Dir 'kioku-path-entry.txt'), "$Dir`r`n")
+        } catch {
+            Warn "could not write $Dir\kioku-path-entry.txt (kioku uninstall will leave the PATH entry)"
+        }
         Say "added $Dir to your user PATH / $(Ja '\u30e6\u30fc\u30b6\u30fc\u306e PATH \u306b\u8ffd\u52a0\u3057\u307e\u3057\u305f') (-NoPath skips this)"
     }
     # This window too: after `irm ... | iex` the kioku command works right away.

@@ -215,10 +215,40 @@ pub fn run(cli: Cli) -> i32 {
             install_cmd(target, &opts, &agents)
         }
         Command::Uninstall {
-            target,
+            target: Some(target),
             project,
             dry_run,
+            ..
         } => uninstall_cmd(target, project, dry_run),
+        Command::Uninstall {
+            target: None,
+            dry_run,
+            everything,
+            purge_data,
+            yes,
+            ..
+        } => {
+            let opts = crate::uninstall::UninstallOptions {
+                everything,
+                purge_data,
+                yes,
+                dry_run,
+            };
+            let env = match current_binary().and_then(crate::setup::SetupEnv::from_process) {
+                Ok(e) => e,
+                Err(err) => {
+                    eprintln!("kioku: error: {err:#}");
+                    return 1;
+                }
+            };
+            let stdin = std::io::stdin();
+            return crate::uninstall::run_uninstall(
+                &opts,
+                &env,
+                &mut stdin.lock(),
+                &mut std::io::stdout(),
+            );
+        }
         Command::Project {
             command: ProjectCommand::Id { path },
         } => project_id(path),
@@ -393,6 +423,23 @@ fn hook_dump_enable() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The `token` line of `kioku init`. Outside a container the token stays in config.toml
+/// (SPEC-M2.7 §10); in a container a generated token is printed once, since nobody reads
+/// the volume's config.toml (SPEC-M3.3 §2). `KIOKU_AUTH_TOKEN` provisions it instead.
+pub fn init_token_line(generated: bool, from_env: bool, container: bool, token: &str) -> String {
+    if generated && container {
+        format!(
+            "{token}\n             (generated; shown only this once: give it to your clients, e.g. kioku setup --client-only <url> with this token on stdin)"
+        )
+    } else if generated {
+        "generated (auth_token in config.toml)".to_string()
+    } else if from_env {
+        "from KIOKU_AUTH_TOKEN".to_string()
+    } else {
+        "kept existing".to_string()
+    }
+}
+
 fn init() -> anyhow::Result<()> {
     let env = env_map();
     let mut cfg = Config::load_with_env(&env)?;
@@ -411,13 +458,15 @@ fn init() -> anyhow::Result<()> {
             "unchanged"
         }
     );
+    let token = cfg.server.auth_token.clone().unwrap_or_default();
     println!(
         "  token    : {}",
-        if report.token_generated {
-            "generated (auth_token in config.toml)"
-        } else {
-            "kept existing"
-        }
+        init_token_line(
+            report.token_generated,
+            env.get("KIOKU_AUTH_TOKEN").is_some_and(|v| !v.is_empty()),
+            crate::auto_update::in_container(),
+            &token
+        )
     );
     println!(
         "  git      : {}",
@@ -505,6 +554,18 @@ fn serve(
     let state_dir = data_dir.join("state");
     let exe = std::env::current_exe().context("locating the kioku binary")?;
     let exe = kioku_core::util::canonical_plain(&exe).unwrap_or(exe);
+    // SPEC-M3.3 §1–2: a container image or a package-managed binary is never replaced; the
+    // server only logs that a release is available (a container checks without the marker).
+    let container = crate::auto_update::in_container();
+    let install = if container {
+        crate::auto_update::ServerInstall::Container
+    } else if let Some(pm) = crate::update::package_manager(&exe) {
+        crate::auto_update::ServerInstall::Package(pm)
+    } else {
+        crate::auto_update::ServerInstall::SelfManaged
+    };
+    let (auto, update_how) = crate::auto_update::server_update_policy(auto, install);
+    let checks_updates = managed || container;
     // SPEC-M2.7 §7: count this start before anything can fail; after repeated failed starts
     // of this version, go back to the previous binary.
     if managed
@@ -592,7 +653,7 @@ fn serve(
                 .await;
             });
         }
-        match (managed, base) {
+        match (checks_updates, base) {
             (true, Some(base)) => {
                 let check = crate::auto_update::ServerCheck {
                     base,
@@ -601,6 +662,7 @@ fn serve(
                     auto,
                     verify: crate::update::Verify::automatic(),
                     state_dir: Some(state_dir),
+                    how: update_how,
                 };
                 tokio::spawn(crate::auto_update::server_update_task(
                     check,
@@ -1031,7 +1093,10 @@ fn current_binary() -> anyhow::Result<String> {
     let exe = std::env::current_exe().context("locating the kioku binary")?;
     // Plain `C:\…` on Windows, not `\\?\C:\…`: this path is written into hook configs.
     let exe = kioku_core::util::canonical_plain(&exe).unwrap_or(exe);
-    Ok(exe.display().to_string())
+    // A Homebrew keg path changes with every `brew upgrade`: register the stable link.
+    Ok(crate::update::stable_binary_path(&exe)
+        .display()
+        .to_string())
 }
 
 /// `kioku setup` (M2 §11); returns the exit code.
@@ -1570,6 +1635,27 @@ mod tests {
         let t = format_agents(&[c]);
         assert!(t.starts_with("[WARN] codex: no successful hook"), "{t}");
         assert!(t.contains("       fix: start a session in Codex"), "{t}");
+    }
+
+    /// SPEC-M3.3 §2: only a token generated inside a container is printed (once).
+    #[test]
+    fn init_prints_the_token_only_in_a_container() {
+        let tok = "c0ffee-token";
+        let shown = init_token_line(true, false, true, tok);
+        assert!(shown.starts_with(tok), "{shown}");
+        assert!(shown.contains("only this once"), "{shown}");
+        for line in [
+            init_token_line(true, false, false, tok),
+            init_token_line(false, true, true, tok),
+            init_token_line(false, false, true, tok),
+            init_token_line(false, false, false, tok),
+        ] {
+            assert!(!line.contains(tok), "{line}");
+        }
+        assert_eq!(
+            init_token_line(false, true, true, tok),
+            "from KIOKU_AUTH_TOKEN"
+        );
     }
 
     /// SPEC-M3.2 §1: request lines are off unless `[server] request_log = true`.

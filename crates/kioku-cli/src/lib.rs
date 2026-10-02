@@ -30,6 +30,7 @@ pub mod render;
 pub mod rotate;
 pub mod service;
 pub mod setup;
+pub mod uninstall;
 pub mod update;
 
 pub use context::{SESSION_START_CAP, StartContext, render_session_start};
