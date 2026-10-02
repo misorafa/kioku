@@ -56,14 +56,22 @@ same shell reached it. Cause class: **per-process network permission** — macOS
 Network" privacy (TCC) denies non-system processes; the permission belongs to the
 *responsible app* (the terminal / IDE / agent app that launched the hook), so hooks fail
 under one app and work under another. Little Snitch rules and silent mode produce the same
-symptom. `doctor`'s `server` check, when the connect error is `EHOSTUNREACH`/`ENETUNREACH`
+symptom. Confirmed on 2026-10-02: in the same second, `/usr/bin/python3` (Apple-signed) connected
+and `/opt/homebrew/bin/python3` (ad-hoc signed) got `errno 65`; the responsible app (Orca)
+showed as *allowed* in System Settings, but had been updated the evening before — a TCC
+grant bound to the previous code signature keeps its toggle on while the new binary's
+children are denied. The fix is to toggle the app off and on again (or remove the entry)
+and relaunch it, so macOS re-prompts.
+`doctor`'s `server` check, when the connect error is `EHOSTUNREACH`/`ENETUNREACH`
 to a private address (RFC 1918, link-local, `.local`), must:
 
 1. probe the same address with `/usr/bin/nc -z` (system binary, exempt) — if that
    succeeds, say so and name the likely cause and fix (ja/en): 「この端末の kioku だけが
    LAN に出られません。macOS の「プライバシーとセキュリティ › ローカルネットワーク」で、
-   kioku を起動したアプリ（例: Orca / Ghostty / Claude / Codex）を許可してください。Little Snitch
-   を使っている場合は kioku 実行ファイル自体に許可ルールを作ってください」;
+   kioku を起動したアプリ（例: Orca / Ghostty / Claude / Codex）を許可してください。既に許可済み
+   に見える場合は、そのアプリを一度オフにしてからオンにし、アプリを再起動してください（アプリの
+   更新後に起きます）。Little Snitch を使っている場合は kioku 実行ファイル自体に許可ルールを
+   作ってください」;
 2. print the responsible app (walk `ppid` to the first `.app` bundle) so the user knows
    which toggle to flip;
 3. never suggest "check the server" in this case.
