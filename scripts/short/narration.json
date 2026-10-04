@@ -6,7 +6,7 @@
    {
     "id": "s1",
     "min": 6.0,
-    "text": "きのう クロード・コード で直した続きを コーデックス に頼むと、「どのログイン画面ですか？」。エージェントを変えると、記憶はゼロから。"
+    "text": "きのう クロードコード で直した続きを コーデックス に頼むと、「どのログイン画面ですか？」。エージェントを変えると、記憶はゼロから。"
    },
    {
     "id": "s2",
@@ -15,8 +15,8 @@
    },
    {
     "id": "s3",
-    "min": 4.0,
-    "text": "そこで、キオク。すべてのエージェントとマシンで共有する、あなたの記憶サーバー。"
+    "min": 5.5,
+    "text": "そこで、キオク。Rustで書かれた、速くて安全なシングルバイナリ。すべてのエージェントとマシンで共有する、あなたの記憶サーバーです。"
    },
    {
     "id": "sj",
@@ -66,8 +66,8 @@
    },
    {
     "id": "s3",
-    "min": 4.0,
-    "text": "Meet kioku: one memory server, shared by every coding agent on every machine you own."
+    "min": 5.5,
+    "text": "Meet kioku: a fast, memory-safe single binary written in Rust. One memory server, shared by every coding agent on every machine you own."
    },
    {
     "id": "sj",

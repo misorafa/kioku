@@ -23,6 +23,7 @@ html,body{width:1080px;height:1920px;overflow:hidden;background:var(--bg);color:
 h1{font-size:104px;line-height:1.12;font-weight:900;letter-spacing:-.01em}
 h1 .hi{color:var(--blue)}h1 .warm{color:var(--orange)}
 h2{font-size:76px;line-height:1.2;font-weight:900}
+p.big .hi{color:var(--blue);font-weight:900}
 p.big{font-size:50px;line-height:1.45;color:#2a3340;font-weight:600}
 .bubble{background:var(--card);border:2px solid var(--line);border-radius:36px;padding:38px 46px;font-size:50px;line-height:1.4;font-weight:700;max-width:900px;box-shadow:var(--shadow)}
 .bubble .who{display:inline-block;font-size:32px;font-weight:800;padding:8px 20px;border-radius:999px;margin-bottom:16px}
@@ -82,7 +83,7 @@ ja: {
  s1k2: 'きょう、Codex に続きを頼むと…', s1b: 'どのログイン画面のことでしょうか？',
  s1h: ['エージェントを<br>変えると、', '<span class="warm">記憶はゼロから。</span>'],
  s2h: ['マシンを変えても、', '<span class="warm">ゼロから。</span>'], s2b: ['MacBook', 'Windows', 'Mac mini'],
- s3sub: 'すべてのエージェント・すべてのマシンで共有する、<br>あなた専用の記憶サーバー。',
+ s3sub: '<span class="hi">Rust</span> 製の、速くて安全なシングルバイナリ。<br>すべてのエージェント・すべてのマシンで共有する、<br>あなた専用の記憶サーバー。',
  sjk: '日本語のために作りました', sjh: ['<span class="hi">日本語</span>のまま、<br>覚える。'],
  sj: ['日本語の指示・要約・引き継ぎをそのまま保存', '日本語の全文検索（形態素解析つき）', '「引継」でも「引き継ぎ書」が見つかる'],
  s4k: 'しくみは 3 つだけ',
@@ -94,14 +95,14 @@ ja: {
  s6: [['sessions/2026-10-04 … @win-pc', 'パスワード再設定画面に同じ検証を入れて', '… <mark>メール検証</mark>を追加。i18n キーの一覧を起こした'], ['pages/auth-design.md', '認証まわりの設計メモ', 'ログインの<mark>検証</mark>順序：<mark>メール</mark> → パスワード → 2FA']],
  s7k: '導入は 1 行', s7h: ['自宅の Mac mini でも、<br>Docker でも。'],
  s7cmd: '<span class="c"># サーバー</span>\ncurl -fsSL …/install.sh | sh\n\n<span class="c"># ほかのマシンは招待コードを 1 行</span>\n<span class="k">KIOKU_JOIN</span>=\'mini:7391/K7Q2M9XD\' sh -c "$(curl -fsSL …/install.sh)"',
- s8tags: ['無料', 'オープンソース', 'LLM を呼ばない', 'データは自分のサーバーに'], s8sub: 'Claude Code / Codex / Cursor / Antigravity',
+ s8tags: ['無料', 'オープンソース', 'Rust 製', 'LLM を呼ばない', 'データは自分のサーバーに'], s8sub: 'Claude Code / Codex / Cursor / Antigravity',
 },
 en: {
  s1k: 'Yesterday, in Claude Code', s1a: 'Fixed the login validation and added tests.',
  s1k2: 'Today, asking Codex to continue…', s1b: 'Which login screen do you mean?',
  s1h: ['Switch agents,', '<span class="warm">memory starts at zero.</span>'],
  s2h: ['Switch machines,', '<span class="warm">zero again.</span>'], s2b: ['MacBook', 'Windows', 'Mac mini'],
- s3sub: 'One memory server, shared by every coding agent<br>on every machine you own.',
+ s3sub: 'A fast, memory-safe single binary written in <span class="hi">Rust</span>.<br>One memory server, shared by every coding agent<br>on every machine you own.',
  sjk: 'Built Japanese-first', sjh: ['Real <span class="hi">Japanese</span> search.<br>English too.'],
  sj: ['Japanese prompts, summaries and handoffs kept as written', 'Full-text search with morphological analysis', 'English works exactly the same way'],
  s4k: 'Three steps, that’s all',
@@ -113,7 +114,7 @@ en: {
  s6: [['sessions/2026-10-04 … @win-pc', 'Apply the same validation to the address step', '… validates the <mark>email</mark> too; listed every i18n key'], ['pages/checkout-design.md', 'Checkout design notes', '<mark>Validation</mark> order: <mark>email</mark>, then card, then address']],
  s7k: 'Install in one line', s7h: ['On a Mac mini at home,<br>or in Docker.'],
  s7cmd: '<span class="c"># server</span>\ncurl -fsSL …/install.sh | sh\n\n<span class="c"># every other machine: paste the invite line</span>\n<span class="k">KIOKU_JOIN</span>=\'mini:7391/K7Q2M9XD\' sh -c "$(curl -fsSL …/install.sh)"',
- s8tags: ['Free', 'Open source', 'No LLM calls', 'Your data on your server'], s8sub: 'Claude Code / Codex / Cursor / Antigravity',
+ s8tags: ['Free', 'Open source', 'Written in Rust', 'No LLM calls', 'Your data on your server'], s8sub: 'Claude Code / Codex / Cursor / Antigravity',
 }}[LANG];
 
 const d = (i, step = .22, base = .1) => `style="--d:${(base + i * step).toFixed(2)}s"`;
