@@ -82,6 +82,9 @@ A task inside `kioku serve` (tokio interval, runs the blocking work in `spawn_bl
 
 ### 3.3 Client
 
+> Amended by SPEC-M3.4 §1: the `kioku mcp` stdio bridge runs the same decision after its
+> first successful tool call, so machines that only use desktop apps (no hooks) update too.
+
 In the SessionStart hook, after the context has been printed:
 
 1. If `server_version` is present, strictly newer than the client's own version, has no `-`,

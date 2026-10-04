@@ -299,7 +299,10 @@ kioku が入っているマシンでは、トークンをコマンドライン�
 kioku の Developer ID で署名されたバイナリだけを受け入れます）。クライアントは GitHub ではなく
 サーバーに追従します。SessionStart フックがサーバーの新しいバージョンに気づくと、クライアントを
 バックグラウンドで更新します（エージェントを待たせず、ダウングレードもしません）。こうしてすべての
-マシンがサーバーと同じバージョンにそろいます。更新の状態は `kioku status` と `kioku doctor` で見られ、
+マシンがサーバーと同じバージョンにそろいます。デスクトップアプリ（Claude.app、Codex.app）だけを
+使うマシンはフックが動かないため、代わりに `kioku mcp` ブリッジが最初に成功したツール呼び出しの
+後にバックグラウンドで同じ確認を行います（お知らせがあれば次の `kioku_query` の結果に 1 行付きます）。
+更新の状態は `kioku status` と `kioku doctor` で見られ、
 バックグラウンドの結果は `~/.kioku/logs/update.log` に残ります。
 
 止めたいときは `config.toml` に次を書きます（または `KIOKU_AUTO_UPDATE=0`）。その場合は `<kioku>`
@@ -722,10 +725,18 @@ docker compose pull && docker compose up -d     # または docker pull ghcr.io/
 |--------|------|------|
 | `kioku_query` | `query`、`project?`、`scope?`（`project`/`global`/`all`）、`limit?`（既定 8）、`since?`（`YYYY-MM-DD`）、`kinds?`（`page`/`session`/`state`）、`path_prefix?` | 全文検索（日本語・英語。下の「検索」を参照）。`project` を渡すとそのプロジェクトとグローバルのページに絞る。各結果は `1. <path> — <title> (session, 2026-09-28, @mini)` の形。`path_prefix` を渡すと、そのパス以下のファイルを編集したセッションを返す |
 | `kioku_read` | `path` | wiki 内の相対パス（検索結果に表示されるもの）でページを読む。`revision` も返す |
-| `kioku_write_page` | `title`、`content`、`project?`、`scope?`（`project`/`global`）、`tags?`、`path?`、`expected_revision?` | 検索可能な Markdown ページを保存する。同じ title/path なら置き換える。`expected_revision`（`kioku_read` の `revision`）を渡すと、その後に誰かが変更していた場合は置き換えずに競合エラーになる。`pinned` タグを付けると、そのプロジェクト（グローバルなら全プロジェクト）の SessionStart のブロックに毎回表示される |
+| `kioku_write_page` | `title`、`content`、`project?`、`scope?`（`project`/`global`）、`tags?`、`path?`、`slug?`、`expected_revision?` | 検索可能な Markdown ページを保存する。同じ title/path/slug なら置き換える。`expected_revision`（`kioku_read` の `revision`）を渡すと、その後に誰かが変更していた場合は置き換えずに競合エラーになる。`pinned` タグを付けると、そのプロジェクト（グローバルなら全プロジェクト）の SessionStart のブロックに毎回表示される |
 | `kioku_handoff_write` | `project`、`session?`（SessionStart のブロックにある id）、`summary`、`next_steps`、`open_questions`、`decisions`、`verified?`、`gotchas?` | そのプロジェクトの次のセッションが受け取る引き継ぎを記録する。決定事項・確認済みの事実（`verified`）・未解決の質問・落とし穴（`gotchas`）は後のセッションにも引き継がれる |
 | `kioku_handoff_pending` | `project`、`accept?`（既定 false）、`session?`、`lane?`、`history?`（最大 20） | 未受領の引き継ぎを覗く（または受領する）。既定はメインライン、`session` / `lane` でブランチのレーンを読む。`history` でそのレーンの直近の引き継ぎを状態つきで返す |
 | `kioku_status` | — | 件数、データディレクトリ、登録済みプロジェクト id |
+
+ページのファイル名は、macOS・Windows・Linux・git・リンクのどこでも同じになるよう ASCII だけにしています。
+ASCII の単語だけのタイトルはそのまま（`Design Notes` → `design-notes.md`）、それ以外は短いハッシュを付けて
+タイトル同士がぶつからないようにし、ASCII がほとんど無いタイトル（日本語だけのタイトル）は日付で
+`2026-10-04-4565ee.md` のように名付けます。読みやすい名前にしたいときは `slug`（`[a-z0-9]` の単語を `-` で
+つないだ 64 文字以内。`path` とは併用不可）を渡します:
+`{"title": "書き込みテスト2", "slug": "write-test-2"}` → `<project>/pages/write-test-2.md`。
+以前に書いたページのパスは変わりません。
 
 サーバーが MCP の `instructions` で、探索の前に検索し、終了の前に引き継ぎを書くようエージェントに伝えます。
 

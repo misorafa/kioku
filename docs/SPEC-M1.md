@@ -95,6 +95,8 @@ KIOKU_AUTH_TOKEN=… kioku serve` is enough — this is how the Docker image run
 
 ## 4. Project identity
 
+> Page file names (as opposed to project ids) are amended by SPEC-M3.4 §2 — see §6.1.
+
 `kioku-core::project::identify(cwd) -> ProjectIdentity { id, name, root, remote }`
 
 Priority:
@@ -189,6 +191,10 @@ agent: claude-code             # session pages only
 
 Frontmatter is parsed with `serde_yaml_ng`; unknown keys are preserved on
 rewrite (keep a `BTreeMap<String, Value>` for extras).
+
+> Amended by SPEC-M3.4 §2: optional `slug` (`<scope dir>/<slug>.md`), and a new page whose
+> title has fewer than 3 ASCII characters (after NFKC) is named `<YYYY-MM-DD>-<6 hex>.md`;
+> pages written before keep their paths.
 
 `kioku_write_page` path rules: `scope=global` → `_global/<slug(title)>.md`;
 else `<project_id>/pages/<slug(title)>.md`. For page file names, a title

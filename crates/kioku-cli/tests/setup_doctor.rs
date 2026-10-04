@@ -1179,7 +1179,22 @@ fn doctor_liveness_lines_follow_last_hook_json() {
     assert_eq!(find(&checks, "hooks.liveness.cursor").status, Status::Ok);
     // Not installed for Antigravity → no line at all.
     assert!(!checks.iter().any(|c| c.id == "hooks.liveness.antigravity"));
+    // No bridge call recorded yet → no mcp line.
+    assert!(!checks.iter().any(|c| c.id == "hooks.liveness.mcp"));
     assert_eq!(doctor::exit_code(&checks), 0, "liveness never fails doctor");
+
+    // SPEC-M3.4 §1: a desktop app's tool call through `kioku mcp` shows as its own line.
+    kioku_cli::liveness::record_named(
+        &state.join(kioku_cli::liveness::LIVENESS_FILE),
+        kioku_cli::liveness::MCP_ENTRY,
+        kioku_cli::liveness::MCP_EVENT,
+        true,
+        &kioku_core::util::now_ts(),
+    );
+    let checks = doctor::run_doctor(&fx.env(), None);
+    let mcp = find(&checks, "hooks.liveness.mcp");
+    assert_eq!(mcp.status, Status::Ok);
+    assert!(mcp.message.contains("last successful tool call"), "{mcp:?}");
 }
 
 /// SPEC-M3.2 §3: every fixable check on one fixture, then `--fix` again changes nothing.

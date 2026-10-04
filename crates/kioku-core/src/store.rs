@@ -48,7 +48,8 @@ use crate::handoff::{
 use crate::index::{Hit, INDEX_SCHEMA_VERSION, IndexDoc, SearchIndex, SearchOptions, SearchScope};
 use crate::layout::DataDir;
 use crate::page::{
-    Frontmatter, GLOBAL_DIR, Page, PageKind, PageScope, resolve_write_path, validate_rel_path,
+    Frontmatter, GLOBAL_DIR, Page, PageKind, PageScope, is_dated_name_for, page_slug,
+    resolve_write_path, scope_root, title_hash, validate_rel_path,
 };
 use crate::project::{
     ProjectIdentity, comparable_root, is_derived_id, is_remote_derived, is_valid_id, normalize_lane,
@@ -83,6 +84,11 @@ pub const PATH_FILES_MAX: usize = 5;
 pub const PATH_SUMMARY_MAX: usize = 300;
 
 /// `\` → `/`, a leading `./` and surrounding spaces removed.
+/// Today (UTC) as `YYYY-MM-DD`, the prefix of a date-named page (SPEC-M3.4 §2).
+fn today() -> String {
+    util::now().format("%Y-%m-%d").to_string()
+}
+
 fn normalize_path_prefix(prefix: &str) -> String {
     let p = prefix.trim().replace('\\', "/");
     p.strip_prefix("./").unwrap_or(&p).to_string()
@@ -162,6 +168,9 @@ pub struct WritePageRequest {
     /// Explicit path inside the scope.
     #[serde(default)]
     pub path: Option<String>,
+    /// ASCII file name inside the scope (SPEC-M3.4 §2; not together with `path`).
+    #[serde(default)]
+    pub slug: Option<String>,
 }
 
 /// Output of `Store::status`.
@@ -1272,11 +1281,19 @@ impl Store {
                 Some(self.project(id)?.id)
             }
         };
-        let path =
-            match self.redirected_write_path(req.path.as_deref(), scope, project.as_deref())? {
-                Some(moved) => moved,
-                None => resolve_write_path(title, scope, project.as_deref(), req.path.as_deref())?,
-            };
+        // Some MCP clients send "" for every optional string: an empty slug is none.
+        let slug = req.slug.as_deref().filter(|s| !s.trim().is_empty());
+        let explicit = req
+            .path
+            .as_deref()
+            .filter(|p| slug.is_none() || !p.trim().is_empty());
+        let path = match self.redirected_write_path(explicit, scope, project.as_deref())? {
+            Some(moved) if slug.is_none() => moved,
+            _ if slug.is_none() && explicit.is_none() => {
+                self.title_write_path(title, scope, project.as_deref())?
+            }
+            _ => resolve_write_path(title, scope, project.as_deref(), explicit, slug, &today())?,
+        };
         let fm = Frontmatter {
             title: title.to_string(),
             project,
@@ -1337,6 +1354,38 @@ impl Store {
             _ => format!("{GLOBAL_DIR}/"),
         };
         Ok(moved.starts_with(&root).then_some(moved))
+    }
+
+    /// Where a page written by title alone goes (SPEC-M3.4 §2): the file an earlier write of
+    /// the same title created — its pre-M3.4 name ([`page_slug`]) or a date-prefixed name
+    /// from another day — else the name [`crate::page::title_slug`] derives today. Existing
+    /// pages keep their paths, and writing a title again replaces its page.
+    fn title_write_path(
+        &self,
+        title: &str,
+        scope: PageScope,
+        project: Option<&str>,
+    ) -> Result<String> {
+        let root = scope_root(scope, project)?;
+        let legacy = validate_rel_path(&format!("{root}/{}.md", page_slug(title)))?;
+        if self.dirs.wiki().join(&legacy).is_file() {
+            return Ok(legacy);
+        }
+        let hash = title_hash(title);
+        let mut dated: Vec<String> = std::fs::read_dir(self.dirs.wiki().join(&root))
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|name| is_dated_name_for(name, &hash))
+                    .collect()
+            })
+            .unwrap_or_default();
+        dated.sort();
+        match dated.into_iter().next() {
+            Some(name) => validate_rel_path(&format!("{root}/{name}")),
+            None => resolve_write_path(title, scope, project, None, None, &today()),
+        }
     }
 
     /// `rel`, or where a moved page now lives (`page_redirects`); a real file at `rel` wins.
@@ -3501,7 +3550,11 @@ mod tests {
                 ..WritePageRequest::default()
             })
             .unwrap();
-        assert!(global.starts_with("_global/page-"));
+        // SPEC-M3.4 §2: a Japanese-only title is date-prefixed
+        assert!(
+            global.starts_with(&format!("_global/{}-", today())),
+            "{global}"
+        );
         let proj = store
             .write_page(&WritePageRequest {
                 title: "Design Notes".into(),
@@ -3719,4 +3772,108 @@ mod tests {
     }
 
     const REDACTED_MARK: &str = crate::sanitize::REDACTED;
+
+    fn write_named(
+        store: &Store,
+        title: &str,
+        content: &str,
+        slug: Option<&str>,
+        path: Option<&str>,
+    ) -> Result<String> {
+        store.write_page(&WritePageRequest {
+            title: title.into(),
+            content: content.into(),
+            project: Some(project().id),
+            slug: slug.map(str::to_string),
+            path: path.map(str::to_string),
+            ..WritePageRequest::default()
+        })
+    }
+
+    fn page_files(store: &Store) -> Vec<String> {
+        let mut names: Vec<String> =
+            std::fs::read_dir(store.dirs.wiki().join(project().id).join("pages"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+        names.sort();
+        names
+    }
+
+    /// SPEC-M3.4 §2: `slug` names the file, a Japanese-only title gets a date-prefixed name,
+    /// an ASCII title keeps its slug, and pages written before keep their paths.
+    #[test]
+    fn page_names_from_slug_and_title() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path());
+        start(&store, "names-1");
+        let pid = project().id;
+
+        // slug: readable path, found by a Japanese query, rewritten in place
+        let p = write_named(
+            &store,
+            "書き込みテスト2",
+            "スラッグ付きのページも日本語で検索できる",
+            Some("Write-Test-2"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(p, format!("{pid}/pages/write-test-2.md"));
+        let hits = store
+            .search("日本語で検索", &SearchScope::Project(pid.clone()), 10)
+            .unwrap();
+        assert!(hits.iter().any(|h| h.path == p), "{hits:?}");
+        let again = write_named(
+            &store,
+            "書き込みテスト2",
+            "差し替え",
+            Some("write-test-2"),
+            None,
+        );
+        assert_eq!(again.unwrap(), p);
+        assert_eq!(store.read_page(&p).unwrap().body.trim(), "差し替え");
+
+        // slug with path, invalid slug → invalid input; an empty slug is none
+        for (slug, path) in [(Some("a"), Some("a.md")), (Some("a_b"), None)] {
+            let err = write_named(&store, "メモ", "x", slug, path).unwrap_err();
+            assert!(matches!(err, Error::InvalidInput(_)), "{err}");
+        }
+        let p = write_named(&store, "Empty Slug", "x", Some(""), None).unwrap();
+        assert_eq!(p, format!("{pid}/pages/empty-slug.md"));
+
+        // a Japanese-only title: date first; written again (any day) → the same page
+        let title = "日本語だけのタイトル";
+        let dated = write_named(&store, title, "一回目", None, None).unwrap();
+        assert_eq!(
+            dated,
+            format!("{pid}/pages/{}-{}.md", today(), title_hash(title))
+        );
+        assert_eq!(
+            write_named(&store, title, "二回目", None, None).unwrap(),
+            dated
+        );
+        let old = format!("{pid}/pages/2025-01-31-{}.md", title_hash("古いメモ"));
+        write_named(&store, "古いメモ", "前の日", None, Some(&old)).unwrap();
+        assert_eq!(
+            write_named(&store, "古いメモ", "今日", None, None).unwrap(),
+            old
+        );
+
+        // an ASCII title keeps the old slug
+        let p = write_named(&store, "Design Notes", "x", None, None).unwrap();
+        assert_eq!(p, format!("{pid}/pages/design-notes.md"));
+
+        // regression: a page named `page-<hash>.md` before M3.4 keeps its path
+        let legacy = format!("{pid}/pages/{}.md", page_slug("運用メモ"));
+        assert!(legacy.contains("/pages/page-"), "{legacy}");
+        write_named(&store, "運用メモ", "旧形式", None, Some(&legacy)).unwrap();
+        assert_eq!(
+            write_named(&store, "運用メモ", "更新", None, None).unwrap(),
+            legacy
+        );
+        assert_eq!(store.read_page(&legacy).unwrap().body.trim(), "更新");
+
+        let files = page_files(&store);
+        assert_eq!(files.len(), 6, "no duplicates: {files:?}");
+    }
 }

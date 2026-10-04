@@ -79,3 +79,58 @@ Branch `m3.4-bridge-update-slug`, draft PR against `main`, CI green on every job
 docs/INDEX.md (client update trigger → M3.4 §1; page paths → M3.4 §2), SPEC-M2.5 §3.3 and
 SPEC-M1 §4 get a "see M3.4" line, CHANGELOG Unreleased. Record deviations in §4. Do not
 merge, tag or change secrets.
+
+## 4. Implementation notes
+
+Recorded with the implementation (branch `m3.4-bridge-update-slug`).
+
+§1, the bridge:
+
+- The decision is `auto_update::after_session_start` itself, called by the bridge with a
+  `HookEnv` built from its environment; no logic is duplicated and the hook path is
+  unchanged. The detached updater is started with `auto_update::spawn_background`
+  (`spawn_detached`).
+- "After the first tool result has been written to stdout": rmcp writes a tool's response
+  after the handler returns and offers no hook after the write. The check is a
+  `tokio::spawn` (then `spawn_blocking`) issued when the first successful result is handed
+  back, so it can never delay that result, but it may start a few milliseconds before the
+  bytes are flushed.
+- `kioku_status` hands its own `version` to the check; any other first call makes the
+  one-off `GET /status` in the background (`version` there, since `/health` has none —
+  SPEC-M2.7 §11).
+- At most once per process: an atomic flag is set by the first successful call. When the
+  background `GET /status` itself fails (the server went away between the call and the
+  check) the decision has not run, and the flag is re-armed for the next successful call.
+- Only a bridge started as `kioku mcp` (config re-read from the environment) checks and
+  records liveness; a bridge with a fixed config (in-process tests, embedding) does neither,
+  so a test never starts an updater that would replace the test binary.
+- The notice is taken from `after_session_start`, which records `last_notice` when it
+  decides (as for the hook). If the app makes no further `kioku_query` /
+  `kioku_handoff_pending` call in that bridge process, that day's notice is not shown.
+  The appended text is `\n\nkioku: <notice line>`.
+- Liveness: `liveness::record_named(path, "mcp", "tool_call", true, now)` after each
+  successful call, on the same background task (serialized within the process). `kioku
+  doctor` / `kioku status --agents` show `hooks.liveness.mcp` once an entry exists; it is
+  always OK (an app may simply not have been used), with "(more than 7 days ago)" when old.
+
+§2, page names:
+
+- The page path rules are in SPEC-M1 §6.1, not §4 (§4 is project identity; its `slug()`
+  for project ids is unchanged). The "Amended by SPEC-M3.4 §2" note is in §6.1, with a
+  pointer in §4.
+- A date-prefixed name changes every day, so "writing the same title again replaces the
+  page" needed a lookup: a write by title alone (no `slug`, no `path`) first reuses the
+  page that title already has in the scope directory — its pre-M3.4 name (`page_slug`:
+  `page-<hash>.md`, `<base>-<hash>.md`) or any `YYYY-MM-DD-<hash>.md` — and only otherwise
+  derives today's name. The date is UTC.
+- "ASCII title keeps the old slug" takes precedence over "fewer than 3 ASCII characters":
+  titles made only of ASCII words (`Go`, `x`, `Design Notes`) keep `page_slug`. The rule
+  applies to titles that `page_slug` would hash.
+- Titles with at least 3 ASCII characters after NFKC are `<NFKC ASCII slug>-<hash>`;
+  without full-width characters this equals the old name. The hash is still over the
+  (redacted, trimmed) original title, so it matches pre-M3.4 names.
+- An empty `slug` (`""`, sent by MCP clients that fill every optional string) is absent;
+  with a `slug`, an empty `path` is absent too. `slug` + non-empty `path` → 400 /
+  tool error.
+- The stdio bridge adds a line to the result when the written path does not end in
+  `/<slug>.md` — a server older than M3.4 ignores the unknown field.

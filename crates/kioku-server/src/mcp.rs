@@ -37,7 +37,7 @@ pub const QUERY_DESC: &str = "kioku の記憶（過去のセッション要約�
 pub const READ_DESC: &str = "kioku のページを path（kioku_query の結果に出る wiki 内の相対パス。例: <project_id>/STATE.md, <project_id>/sessions/2026-09-25-0c2f1a2b-3f9a1c2e4b5d.md, _global/<slug>.md）で読み、frontmatter の要約、本文、更新競合の検出に使う revision を返す。\nRead one kioku page by its wiki-relative path.";
 
 /// Tool description of `write_page` (shared with the `kioku mcp` bridge).
-pub const WRITE_PAGE_DESC: &str = "後で役に立つ知見・設計判断・手順・調査結果を Markdown ページとして kioku に保存する（検索対象になり、git に履歴が残る）。同じ title（または path）で書くと本文を置き換える。tags に pinned を付けたページは、そのプロジェクト（scope=global なら全プロジェクト）の SessionStart の <kioku> ブロックに毎回表示される（新しい順に 3 件まで、本文の先頭 400 字）— 常に守ってほしいルールや前提に使う。既存ページの更新前には kioku_read で読み、返された revision を expected_revision に渡す。競合（エラー）したら再読込して変更を統合してから書き直す。省略または空文字なら無条件に上書きする。scope=project（project を渡した場合の既定）はそのプロジェクト専用、scope=global はプロジェクトを横断する個人的なメモ。セッションの引き継ぎには使わず kioku_handoff_write を使うこと。\nSave durable knowledge as a searchable page; writing the same title/path replaces it. Tag it `pinned` to show it at every session start.";
+pub const WRITE_PAGE_DESC: &str = "後で役に立つ知見・設計判断・手順・調査結果を Markdown ページとして kioku に保存する（検索対象になり、git に履歴が残る）。同じ title（または path）で書くと本文を置き換える。tags に pinned を付けたページは、そのプロジェクト（scope=global なら全プロジェクト）の SessionStart の <kioku> ブロックに毎回表示される（新しい順に 3 件まで、本文の先頭 400 字）— 常に守ってほしいルールや前提に使う。既存ページの更新前には kioku_read で読み、返された revision を expected_revision に渡す。競合（エラー）したら再読込して変更を統合してから書き直す。省略または空文字なら無条件に上書きする。scope=project（project を渡した場合の既定）はそのプロジェクト専用、scope=global はプロジェクトを横断する個人的なメモ。セッションの引き継ぎには使わず kioku_handoff_write を使うこと。タイトルが日本語だけのときは slug に英数字の短い名前（例: write-test-2）を付けると、wiki 上で見つけやすいパスになる（同じ slug で書くと置き換える）。\nSave durable knowledge as a searchable page; writing the same title/path/slug replaces it. Tag it `pinned` to show it at every session start. For a non-ASCII title, give `slug` a short ASCII name so the file is findable in the wiki.";
 
 /// Tool description of `handoff_write` (shared with the `kioku mcp` bridge).
 pub const HANDOFF_WRITE_DESC: &str = "このセッションの引き継ぎを記録する。このプロジェクトで次に始まるセッション（別のエージェントや別マシンでも）の冒頭に自動で渡される。作業を終える前、区切りがついたとき、コンテキストが尽きそうなときに必ず呼ぶこと。project と session には SessionStart の <kioku> ブロックに書かれた project の id と session の id を渡すこと（session を省略すると、そのプロジェクトで最後に観測のあった開いているセッションに紐づく）。summary=何をしたか・今どういう状態か、next_steps=次の一手（ファイル名やコマンドまで具体的に）、open_questions=未解決の点、decisions=決めたこととその理由、verified=確認済みの事実（実際に試して確かめたこと）、gotchas=落とし穴・注意点（次のセッションが踏みそうな罠）。decisions / verified / open_questions / gotchas は次回以降のセッション開始時にも引き継がれて表示されるので、1 項目 1 行で簡潔に書くこと。\nRecord a handoff for the next session of this project; always call it before you stop. Pass `project` and `session` from the SessionStart <kioku> block. decisions, verified facts, open questions and gotchas are carried into later sessions too: one short line each.";
@@ -147,6 +147,9 @@ pub struct WritePageParams {
     /// path inside the scope.
     #[serde(default)]
     pub path: Option<String>,
+    /// ファイル名にする英数字の短い名前（任意。例: write-test-2。小文字・数字を - でつなぐ 1〜64 文字。path とは併用不可）/ optional short ASCII file name (`[a-z0-9]` words joined by `-`, 1–64 chars; not with `path`).
+    #[serde(default)]
+    pub slug: Option<String>,
 }
 
 /// Input of `kioku_handoff_write` (spec §7.5).
@@ -288,6 +291,7 @@ impl KiokuMcp {
                 }),
                 tags: p.tags,
                 path: p.path,
+                slug: p.slug,
             };
             let path = blocking(&self.store, move |s| {
                 s.write_page(&req)

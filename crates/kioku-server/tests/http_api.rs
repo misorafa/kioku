@@ -367,7 +367,12 @@ async fn pages_put_get_and_search() {
         .await;
     assert_eq!(status, 200, "{body}");
     let global_path = body["path"].as_str().unwrap().to_string();
-    assert!(global_path.starts_with("_global/page-"));
+    // SPEC-M3.4 §2: a Japanese-only title gets a date-prefixed name
+    let today = kioku_core::util::display_date(&kioku_core::util::now_ts());
+    assert!(
+        global_path.starts_with(&format!("_global/{today}-")),
+        "{global_path}"
+    );
 
     let (status, body) = srv
         .send(
@@ -469,6 +474,26 @@ async fn pages_put_get_and_search() {
         )
         .await;
     assert_eq!(status, 400);
+    // SPEC-M3.4 §2: slug — a readable name; with path or malformed → 400
+    let (status, body) = srv
+        .send(
+            Method::PUT,
+            "/api/v1/pages",
+            json!({"title": "書き込みテスト2", "content": "スラッグ", "project": PROJECT,
+                   "slug": "Write-Test-2"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["path"], format!("{PROJECT}/pages/write-test-2.md"));
+    for bad in [
+        json!({"title": "x", "content": "y", "slug": "a", "path": "a.md"}),
+        json!({"title": "x", "content": "y", "slug": "日本語"}),
+        json!({"title": "x", "content": "y", "slug": "a".repeat(65)}),
+    ] {
+        let (status, body) = srv.send(Method::PUT, "/api/v1/pages", bad.clone()).await;
+        assert_eq!(status, 400, "{bad} → {body}");
+        assert!(body["error"].as_str().unwrap().contains("slug"), "{body}");
+    }
     let (status, body) = srv.get("/api/v1/pages/_global/missing.md").await;
     assert_eq!(status, 404);
     assert!(body["error"].as_str().unwrap().contains("not found"));

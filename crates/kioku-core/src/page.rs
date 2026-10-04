@@ -327,7 +327,8 @@ fn tags_from_value(v: &Value) -> Vec<String> {
 ///
 /// Titles would otherwise collapse to the same (or an empty) slug and overwrite each other:
 /// `設計メモ` → `page-1a2b3c`, `Rust の設計` → `rust-9f8e7d`, `C++ tips` → `c-tips-4d5e6f`
-/// (while `C tips` stays `c-tips`).
+/// (while `C tips` stays `c-tips`). Since SPEC-M3.4 §2 this is the name of ASCII titles and
+/// the name pages written before M3.4 keep; new non-ASCII titles use [`title_slug`].
 pub fn page_slug(title: &str) -> String {
     let base = slug_raw(title);
     let hash = &sha256_hex(title.trim())[..6];
@@ -377,7 +378,80 @@ pub fn validate_rel_path(path: &str) -> Result<String> {
     Ok(parts.join("/"))
 }
 
-/// Resolves where `kioku_write_page` writes (spec §6.1 path rules).
+/// Longest `slug` accepted by `kioku_write_page` (SPEC-M3.4 §2).
+pub const SLUG_MAX: usize = 64;
+
+/// A title whose ASCII part is shorter than this gets a date-prefixed name (SPEC-M3.4 §2).
+const READABLE_MIN: usize = 3;
+
+/// The 6-hex hash of a title that keeps two titles apart in their file names.
+pub fn title_hash(title: &str) -> String {
+    sha256_hex(title.trim())[..6].to_string()
+}
+
+/// Validates an agent-given `slug` (SPEC-M3.4 §2): ASCII letters/digits words joined by
+/// single `-`, 1–[`SLUG_MAX`] characters; uppercase is folded. Returns the lowercased slug.
+pub fn validate_slug(raw: &str) -> Result<String> {
+    let slug = raw.trim().to_ascii_lowercase();
+    let well_formed = !slug.is_empty()
+        && slug.len() <= SLUG_MAX
+        && slug
+            .split('-')
+            .all(|w| !w.is_empty() && w.chars().all(|c| c.is_ascii_alphanumeric()));
+    if !well_formed {
+        return Err(Error::invalid(format!(
+            "slug must be ASCII letters/digits words joined by single '-', 1-{SLUG_MAX} characters (e.g. write-test-2) / slug は英数字の単語を 1 つの - でつないだ 1〜{SLUG_MAX} 文字: {raw:?}"
+        )));
+    }
+    Ok(slug)
+}
+
+/// File name (without `.md`) of a new page written by title alone (SPEC-M3.4 §2): a title
+/// [`page_slug`] keeps whole (ASCII words) keeps that slug; a title whose ASCII part after
+/// NFKC is shorter than 3 characters becomes `<date>-<hash>` (`date` = `YYYY-MM-DD`, so a
+/// listing is at least chronological); anything else is the NFKC-folded ASCII part plus the
+/// hash.
+pub fn title_slug(title: &str, date: &str) -> String {
+    let trimmed = title.trim();
+    if slug_is_lossless(trimmed) {
+        return page_slug(title);
+    }
+    let base = slug_raw(&crate::index::nfkc(trimmed));
+    let hash = title_hash(title);
+    if base.len() < READABLE_MIN {
+        format!("{date}-{hash}")
+    } else {
+        format!("{base}-{hash}")
+    }
+}
+
+/// True when `name` is a file name [`title_slug`] gives a title with this `hash` on some
+/// day: `YYYY-MM-DD-<hash>.md`.
+pub fn is_dated_name_for(name: &str, hash: &str) -> bool {
+    let Some(date) = name
+        .strip_suffix(".md")
+        .and_then(|s| s.strip_suffix(hash))
+        .and_then(|s| s.strip_suffix('-'))
+    else {
+        return false;
+    };
+    date.len() == 10 && chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok()
+}
+
+/// Directory (wiki-relative) of a scope's pages: `_global` or `<project>/pages`.
+pub fn scope_root(scope: PageScope, project: Option<&str>) -> Result<String> {
+    Ok(match scope {
+        PageScope::Global => GLOBAL_DIR.to_string(),
+        PageScope::Project => {
+            let p = project.ok_or_else(|| Error::invalid("scope=project requires a project"))?;
+            format!("{p}/pages")
+        }
+    })
+}
+
+/// Resolves where `kioku_write_page` writes (spec §6.1 path rules, SPEC-M3.4 §2): the
+/// explicit `path`, else `<scope dir>/<slug>.md`, else the name [`title_slug`] derives
+/// (`date` = today, `YYYY-MM-DD`). `slug` and `path` together are an error.
 ///
 /// Explicit project-scope paths are confined to `<project>/pages/` so callers cannot
 /// overwrite STATE.md or session pages.
@@ -386,16 +460,20 @@ pub fn resolve_write_path(
     scope: PageScope,
     project: Option<&str>,
     explicit: Option<&str>,
+    slug: Option<&str>,
+    date: &str,
 ) -> Result<String> {
-    let root = match scope {
-        PageScope::Global => GLOBAL_DIR.to_string(),
-        PageScope::Project => {
-            let p = project.ok_or_else(|| Error::invalid("scope=project requires a project"))?;
-            format!("{p}/pages")
+    let root = scope_root(scope, project)?;
+    if let Some(raw) = slug {
+        if explicit.is_some() {
+            return Err(Error::invalid(
+                "give either slug or path, not both / slug と path は同時に指定できません",
+            ));
         }
-    };
+        return validate_rel_path(&format!("{root}/{}.md", validate_slug(raw)?));
+    }
     let path = match explicit {
-        None => format!("{root}/{}.md", page_slug(title)),
+        None => format!("{root}/{}.md", title_slug(title, date)),
         Some(raw) => {
             let rel = validate_rel_path(raw)?;
             let scope_prefix = match scope {
@@ -516,25 +594,162 @@ mod tests {
 
     #[test]
     fn write_path_rules() {
-        let p = resolve_write_path("Design Notes", PageScope::Global, None, None).unwrap();
+        let p = resolve_write_path("Design Notes", PageScope::Global, None, None, None, D).unwrap();
         assert_eq!(p, "_global/design-notes.md");
-        let p = resolve_write_path("Design", PageScope::Project, Some("k-1"), None).unwrap();
+        let p =
+            resolve_write_path("Design", PageScope::Project, Some("k-1"), None, None, D).unwrap();
         assert_eq!(p, "k-1/pages/design.md");
-        let p = resolve_write_path("x", PageScope::Project, Some("k-1"), Some("arch/db")).unwrap();
+        let p = resolve_write_path(
+            "x",
+            PageScope::Project,
+            Some("k-1"),
+            Some("arch/db"),
+            None,
+            D,
+        )
+        .unwrap();
         assert_eq!(p, "k-1/pages/arch/db.md");
-        let p = resolve_write_path("x", PageScope::Project, Some("k-1"), Some("k-1/pages/a.md"))
-            .unwrap();
+        let p = resolve_write_path(
+            "x",
+            PageScope::Project,
+            Some("k-1"),
+            Some("k-1/pages/a.md"),
+            None,
+            D,
+        )
+        .unwrap();
         assert_eq!(p, "k-1/pages/a.md");
         assert!(
-            resolve_write_path("x", PageScope::Project, Some("k-1"), Some("k-1/STATE.md")).is_err()
+            resolve_write_path(
+                "x",
+                PageScope::Project,
+                Some("k-1"),
+                Some("k-1/STATE.md"),
+                None,
+                D
+            )
+            .is_err()
         );
-        assert!(resolve_write_path("x", PageScope::Project, Some("k-1"), Some("../a.md")).is_err());
         assert!(
-            resolve_write_path("x", PageScope::Project, Some("k-1"), Some("/etc/x.md")).is_err()
+            resolve_write_path(
+                "x",
+                PageScope::Project,
+                Some("k-1"),
+                Some("../a.md"),
+                None,
+                D
+            )
+            .is_err()
         );
-        assert!(resolve_write_path("x", PageScope::Global, None, Some("a/../../b")).is_err());
-        assert!(resolve_write_path("x", PageScope::Project, None, None).is_err());
-        let p = resolve_write_path("x", PageScope::Global, None, Some("tips/rust.md")).unwrap();
+        assert!(
+            resolve_write_path(
+                "x",
+                PageScope::Project,
+                Some("k-1"),
+                Some("/etc/x.md"),
+                None,
+                D
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_write_path("x", PageScope::Global, None, Some("a/../../b"), None, D).is_err()
+        );
+        assert!(resolve_write_path("x", PageScope::Project, None, None, None, D).is_err());
+        let p = resolve_write_path("x", PageScope::Global, None, Some("tips/rust.md"), None, D)
+            .unwrap();
         assert_eq!(p, "_global/tips/rust.md");
+    }
+
+    const D: &str = "2026-10-04";
+
+    /// SPEC-M3.4 §2: valid, uppercase folded, invalid characters, too long, with `path`.
+    #[test]
+    fn slug_validation() {
+        assert_eq!(validate_slug("write-test-2").unwrap(), "write-test-2");
+        assert_eq!(validate_slug("Write-Test-2").unwrap(), "write-test-2");
+        assert_eq!(validate_slug(" x ").unwrap(), "x");
+        let max = "a".repeat(SLUG_MAX);
+        assert_eq!(validate_slug(&max).unwrap(), max);
+        for bad in [
+            "",
+            "-a",
+            "a-",
+            "a--b",
+            "a_b",
+            "a b",
+            "a/b",
+            "../a",
+            "a.md",
+            "書き込み",
+            "ｗｒｉｔｅ",
+            &"a".repeat(SLUG_MAX + 1),
+        ] {
+            let err = validate_slug(bad).unwrap_err();
+            assert!(err.to_string().contains("slug must be"), "{bad}: {err}");
+        }
+        let p = resolve_write_path(
+            "書き込みテスト",
+            PageScope::Project,
+            Some("k-1"),
+            None,
+            Some("Write-Test-2"),
+            D,
+        )
+        .unwrap();
+        assert_eq!(p, "k-1/pages/write-test-2.md");
+        let p = resolve_write_path("メモ", PageScope::Global, None, None, Some("memo"), D).unwrap();
+        assert_eq!(p, "_global/memo.md");
+        let both = resolve_write_path(
+            "メモ",
+            PageScope::Project,
+            Some("k-1"),
+            Some("a.md"),
+            Some("a"),
+            D,
+        )
+        .unwrap_err();
+        assert!(both.to_string().contains("not both"), "{both}");
+        assert!(resolve_write_path("メモ", PageScope::Global, None, None, Some("a_b"), D).is_err());
+    }
+
+    /// SPEC-M3.4 §2: a Japanese-only title is date-prefixed, an ASCII title keeps its slug,
+    /// a readable ASCII part (also after NFKC) is kept with the hash.
+    #[test]
+    fn title_slugs_for_new_pages() {
+        let hash = title_hash("書き込みテスト");
+        assert_eq!(
+            title_slug("書き込みテスト", D),
+            format!("2026-10-04-{hash}")
+        );
+        assert_ne!(title_slug("設計メモ", D), title_slug("運用メモ", D));
+        // 1–2 ASCII characters are not readable either
+        let t = "書き込みテスト2（メモ）";
+        assert_eq!(title_slug(t, D), format!("2026-10-04-{}", title_hash(t)));
+        // ASCII titles keep the old slug, even short ones
+        for ascii in [
+            "Design Notes",
+            "Go",
+            "x",
+            "C tips",
+            "C++ tips",
+            "v1.2 notes",
+        ] {
+            assert_eq!(title_slug(ascii, D), page_slug(ascii), "{ascii}");
+        }
+        // a readable ASCII part stays readable
+        let t = "書き込みテスト2(claude.ai から)";
+        assert_eq!(title_slug(t, D), format!("2-claude-ai-{}", title_hash(t)));
+        // full-width ASCII is folded by NFKC
+        let t = "ＡＰＩの設計";
+        assert_eq!(title_slug(t, D), format!("api-{}", title_hash(t)));
+        // dated names are recognised for the same title only
+        let name = format!("{}.md", title_slug("書き込みテスト", D));
+        assert!(is_dated_name_for(&name, &hash));
+        assert!(is_dated_name_for(&format!("2025-01-31-{hash}.md"), &hash));
+        assert!(!is_dated_name_for(&name, &title_hash("設計メモ")));
+        assert!(!is_dated_name_for(&format!("page-{hash}.md"), &hash));
+        assert!(!is_dated_name_for(&format!("2025-13-31-{hash}.md"), &hash));
+        assert!(!is_dated_name_for(&format!("2025-01-31-{hash}"), &hash));
     }
 }

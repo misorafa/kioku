@@ -45,25 +45,30 @@ pub fn load(path: &Path) -> BTreeMap<String, HookMark> {
         .unwrap_or_default()
 }
 
+/// Entry of the `kioku mcp` bridge in `last-hook.json` (SPEC-M3.4 §1): desktop apps run no
+/// hooks, so their successful tool calls are the machine's sign of life.
+pub const MCP_ENTRY: &str = "mcp";
+/// Event recorded for the bridge's entry.
+pub const MCP_EVENT: &str = "tool_call";
+
 /// Records one hook of `agent`. Best effort and never blocking on failure: a temp file in
 /// the same directory renamed over the old one (readers never see a torn file).
 pub fn record(path: &Path, agent: Agent, event: HookEventKind, ok: bool, now: &str) {
-    let _ = try_record(path, agent, event, ok, now);
+    record_named(path, agent.as_str(), event.cli_name(), ok, now);
 }
 
-fn try_record(
-    path: &Path,
-    agent: Agent,
-    event: HookEventKind,
-    ok: bool,
-    now: &str,
-) -> std::io::Result<()> {
+/// [`record`] under any entry name (`mcp` for the stdio bridge) and event name.
+pub fn record_named(path: &Path, entry: &str, event: &str, ok: bool, now: &str) {
+    let _ = try_record(path, entry, event, ok, now);
+}
+
+fn try_record(path: &Path, entry: &str, event: &str, ok: bool, now: &str) -> std::io::Result<()> {
     let mut marks = load(path);
-    let previous_ok = marks.get(agent.as_str()).and_then(|m| m.last_ok.clone());
+    let previous_ok = marks.get(entry).and_then(|m| m.last_ok.clone());
     marks.insert(
-        agent.as_str().to_string(),
+        entry.to_string(),
         HookMark {
-            event: event.cli_name().to_string(),
+            event: event.to_string(),
             at: now.to_string(),
             ok,
             last_ok: if ok {
@@ -194,6 +199,24 @@ pub fn liveness_check(
     }
 }
 
+/// The `hooks.liveness.mcp` line (SPEC-M3.4 §1): when the `kioku mcp` bridge recorded a
+/// successful tool call, say when — always OK (an app may simply not have been used).
+pub fn mcp_liveness_check(mark: &HookMark, now: i64) -> crate::doctor::Check {
+    let at = mark.last_ok.clone().unwrap_or_else(|| mark.at.clone());
+    let stale = kioku_core::util::parse_ts(&at)
+        .is_none_or(|t| now - t.timestamp() > LIVENESS_WINDOW.as_secs() as i64);
+    crate::doctor::Check {
+        id: format!("hooks.liveness.{MCP_ENTRY}"),
+        status: crate::doctor::Status::Ok,
+        message: format!(
+            "{MCP_ENTRY} (kioku mcp bridge, desktop apps): last successful tool call {at}{}",
+            if stale { " (more than 7 days ago)" } else { "" }
+        ),
+        fix: None,
+        action: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +264,43 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, [LIVENESS_FILE]);
+    }
+
+    /// SPEC-M3.4 §1: the bridge's entry sits next to the hooks' and shows as one OK line.
+    #[test]
+    fn the_mcp_bridge_has_its_own_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state").join(LIVENESS_FILE);
+        record(
+            &path,
+            Agent::Codex,
+            HookEventKind::Stop,
+            true,
+            "2026-10-01T00:00:00.000Z",
+        );
+        record_named(
+            &path,
+            MCP_ENTRY,
+            MCP_EVENT,
+            true,
+            "2026-10-02T00:00:00.000Z",
+        );
+        let marks = load(&path);
+        assert_eq!(marks["codex"].event, "stop");
+        let mcp = &marks[MCP_ENTRY];
+        assert_eq!(mcp.event, "tool_call");
+        assert_eq!(mcp.last_ok.as_deref(), Some("2026-10-02T00:00:00.000Z"));
+        let c = mcp_liveness_check(mcp, at("2026-10-02T12:00:00.000Z"));
+        assert_eq!(c.id, "hooks.liveness.mcp");
+        assert_eq!(c.status, Status::Ok);
+        assert!(
+            c.message
+                .ends_with("last successful tool call 2026-10-02T00:00:00.000Z"),
+            "{c:?}"
+        );
+        let old = mcp_liveness_check(mcp, at("2026-10-20T00:00:00.000Z"));
+        assert_eq!(old.status, Status::Ok);
+        assert!(old.message.contains("more than 7 days ago"), "{old:?}");
     }
 
     #[test]

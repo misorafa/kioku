@@ -200,7 +200,7 @@ server: http://127.0.0.1:7391
 - ⚠ Windows ではパス区切りが \\ になる (<md>)
 
 ## ピン留め
-- 作業ルール (_global/page-1935be.md)
+- 作業ルール (_global/<date>-1935be.md)
   > main に直接 push しない。
   > 詳細は docs/ を見る。
 
@@ -232,7 +232,7 @@ server: http://127.0.0.1:7391
 - ⚠ Windows ではパス区切りが \\ になる (<md>)
 
 ## Pinned pages
-- 作業ルール (_global/page-1935be.md)
+- 作業ルール (_global/<date>-1935be.md)
   > main に直接 push しない。
   > 詳細は docs/ を見る。
 
