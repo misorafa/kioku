@@ -41,7 +41,7 @@
    {
     "id": "s7",
     "min": 4.5,
-    "text": "導入は1行。自宅のマックミニでも、ドッカーでも。"
+    "text": "導入は1行。サーバーはマックでも、リナックスでも、ドッカーでも。クライアントはウィンドウズも。"
    },
    {
     "id": "s8",
@@ -92,7 +92,7 @@
    {
     "id": "s7",
     "min": 4.5,
-    "text": "Install in one line, on a Mac mini at home or in Docker."
+    "text": "Install in one line: the server runs on a Mac, Linux or Docker, and Windows joins as a client."
    },
    {
     "id": "s8",
