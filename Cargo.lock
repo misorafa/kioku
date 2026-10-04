@@ -1213,7 +1213,7 @@ dependencies = [
 
 [[package]]
 name = "kioku-cli"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -1236,7 +1236,7 @@ dependencies = [
 
 [[package]]
 name = "kioku-core"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1260,7 +1260,7 @@ dependencies = [
 
 [[package]]
 name = "kioku-server"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "anyhow",
  "axum",

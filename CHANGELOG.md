@@ -5,7 +5,7 @@ requests of each tag (`git log <previous tag>..<tag>`). Specifications are in
 [docs/](docs/INDEX.md); the section that is current for each topic is listed in
 [docs/INDEX.md](docs/INDEX.md).
 
-## Unreleased
+## v0.9.4 — 2026-10-04
 
 - The `kioku mcp` bridge follows the server's version (SPEC-M3.4 §1): machines that only
   use desktop apps (Claude.app, Codex.app) run no SessionStart hook and never updated.
