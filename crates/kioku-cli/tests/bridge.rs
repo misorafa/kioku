@@ -187,6 +187,44 @@ async fn bridge_serves_the_server_tools_over_rest() {
         .unwrap();
     assert_eq!(stale.is_error, Some(true));
     assert!(text(&stale).contains("conflict"));
+    // SPEC-M3.4 §2: slug goes through the bridge; a Japanese query finds the page
+    let slugged = bridge
+        .call_tool(call(
+            "kioku_write_page",
+            json!({"title": "書き込みテスト2", "content": "ブリッジ経由でスラッグを付けた",
+                   "project": PROJECT, "slug": "write-test-2"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        text(&slugged),
+        format!("wrote {PROJECT}/pages/write-test-2.md")
+    );
+    let found = bridge
+        .call_tool(call(
+            "kioku_query",
+            json!({"query": "ブリッジ経由 スラッグ", "project": PROJECT}),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        text(&found).contains(&format!(
+            "{PROJECT}/pages/write-test-2.md — 書き込みテスト2 ("
+        )),
+        "{}",
+        text(&found)
+    );
+    let both = bridge
+        .call_tool(call(
+            "kioku_write_page",
+            json!({"title": "書き込みテスト2", "content": "x", "project": PROJECT,
+                   "slug": "write-test-2", "path": "a.md"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(both.is_error, Some(true));
+    assert!(text(&both).contains("slug"), "{}", text(&both));
+
     let missing = bridge
         .call_tool(call("kioku_read", json!({"path": "nope/none.md"})))
         .await

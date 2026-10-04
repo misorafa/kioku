@@ -324,7 +324,10 @@ verified, and on macOS only a binary signed by kioku's Developer ID — then
 restarts. Clients follow the server, not GitHub: when a SessionStart hook sees
 that the server runs a newer version, it updates the client in the background
 (never blocking the agent, never downgrading), so every machine ends up on the
-server's version. `kioku status` and `kioku doctor` show the update state;
+server's version. A machine that only uses desktop apps (Claude.app, Codex.app — no
+hooks) updates through the `kioku mcp` bridge instead: its first successful tool call
+runs the same check in the background, and a notice line, when there is one, is added to
+the next `kioku_query` result. `kioku status` and `kioku doctor` show the update state;
 background results go to `~/.kioku/logs/update.log`.
 
 To turn it off, add this to `config.toml` (or set `KIOKU_AUTO_UPDATE=0`); the
@@ -792,10 +795,18 @@ version as usual. The same TLS advice applies: the container speaks plain HTTP.
 |------|-------|--------------|
 | `kioku_query` | `query`, `project?`, `scope?` (`project`/`global`/`all`), `limit?` (default 8), `since?` (`YYYY-MM-DD`), `kinds?` (`page`/`session`/`state`), `path_prefix?` | full-text search (Japanese and English; see [Search](#search)); `project` narrows to that project plus global pages; each hit reads `1. <path> — <title> (session, 2026-09-28, @mini)`; with `path_prefix` it lists the sessions that edited files under that path |
 | `kioku_read` | `path` | reads a page by its wiki-relative path (as shown in query results), with its `revision` |
-| `kioku_write_page` | `title`, `content`, `project?`, `scope?` (`project`/`global`), `tags?`, `path?`, `expected_revision?` | saves a searchable Markdown page; the same title/path replaces it — with `expected_revision` (the `revision` from `kioku_read`) only if nobody changed it since (else a conflict error); tag it `pinned` to show it in every SessionStart block of the project (or of every project, for a global page) |
+| `kioku_write_page` | `title`, `content`, `project?`, `scope?` (`project`/`global`), `tags?`, `path?`, `slug?`, `expected_revision?` | saves a searchable Markdown page; the same title/path/slug replaces it — with `expected_revision` (the `revision` from `kioku_read`) only if nobody changed it since (else a conflict error); tag it `pinned` to show it in every SessionStart block of the project (or of every project, for a global page) |
 | `kioku_handoff_write` | `project`, `session?` (from the SessionStart block), `summary`, `next_steps`, `open_questions`, `decisions`, `verified?`, `gotchas?` | records the handoff the next session of the project receives; decisions, verified facts (確認済みの事実), open questions and gotchas (落とし穴・注意点) are also carried into later sessions |
 | `kioku_handoff_pending` | `project`, `accept?` (default false), `session?`, `lane?`, `history?` (≤ 20) | peeks at (or consumes) the pending handoff of the main line, or of a session's / named branch lane; `history` adds the lane's last handoffs with their status |
 | `kioku_status` | — | counts, data dir and known project ids |
+
+Page file names stay ASCII so they are identical on macOS, Windows, Linux, in git and in
+links. A title that is ASCII words keeps its slug (`Design Notes` → `design-notes.md`);
+otherwise a short hash keeps two titles apart, and a title with almost no ASCII (a
+Japanese-only title) is named by date, `2026-10-04-4565ee.md`. For a readable name, pass
+`slug` (`[a-z0-9]` words joined by `-`, up to 64 characters, not together with `path`):
+`{"title": "書き込みテスト2", "slug": "write-test-2"}` → `<project>/pages/write-test-2.md`.
+Pages written earlier keep their paths.
 
 The server's MCP `instructions` tell the agent to query before exploring and to
 write a handoff before stopping.

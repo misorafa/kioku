@@ -182,6 +182,48 @@ async fn mcp_tools_over_streamable_http() {
         .unwrap();
     assert_ne!(fresh.is_error, Some(true), "{}", text(&fresh));
 
+    // SPEC-M3.4 §2: slug with a Japanese title → readable path, found by a Japanese query
+    let slugged = client
+        .call_tool(
+            CallToolRequestParams::new("kioku_write_page").with_arguments(args(json!({
+                "title": "書き込みテスト",
+                "content": "スラッグで名前を付けたページ",
+                "project": PROJECT,
+                "slug": "write-test-2"
+            }))),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        text(&slugged),
+        format!("wrote {PROJECT}/pages/write-test-2.md")
+    );
+    let found = client
+        .call_tool(
+            CallToolRequestParams::new("kioku_query").with_arguments(args(json!({
+                "query": "スラッグ 名前",
+                "project": PROJECT
+            }))),
+        )
+        .await
+        .unwrap();
+    assert!(
+        text(&found).contains(&format!("{PROJECT}/pages/write-test-2.md — 書き込みテスト")),
+        "{}",
+        text(&found)
+    );
+    let both = client
+        .call_tool(
+            CallToolRequestParams::new("kioku_write_page").with_arguments(args(json!({
+                "title": "書き込みテスト", "content": "x", "project": PROJECT,
+                "slug": "a", "path": "a.md"
+            }))),
+        )
+        .await
+        .unwrap();
+    assert_eq!(both.is_error, Some(true));
+    assert!(text(&both).contains("slug"), "{}", text(&both));
+
     // handoff write → pending (peek) → accept
     let wrote = client
         .call_tool(

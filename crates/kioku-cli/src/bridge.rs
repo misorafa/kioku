@@ -5,9 +5,16 @@
 //! re-reads config.toml before every call: a token rotated (or a server re-pointed) by
 //! `kioku rotate-token`, `setup` or `invite` mid-session must not leave it sending a stale
 //! token and failing every call with 401 until the agent restarts.
+//!
+//! Desktop apps (Claude.app, Codex.app) run no hooks, so the bridge also does the hooks'
+//! two machine-level chores (SPEC-M3.4 §1): it follows the server's version — once per
+//! process, after the first successful tool call, off the call's path, through
+//! [`crate::auto_update::after_session_start`] — and records each successful call in
+//! `state/last-hook.json` under `mcp`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -27,6 +34,7 @@ use rmcp::{
 use serde_json::{Value, json};
 
 use crate::client::{ApiClient, HttpError};
+use crate::event::HookEnv;
 
 /// Deadline of one tool call's REST request.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -37,6 +45,20 @@ const QUERY_DEFAULT_LIMIT: usize = 8;
 /// Tool error when the server predates `path_prefix` (SPEC-M3.1 §3).
 pub const PATH_PREFIX_UNSUPPORTED: &str = "this kioku server predates path_prefix and cannot list sessions by path; update the server (`kioku update` on it) / サーバーが古く path_prefix に対応していません（サーバーで kioku update を実行）";
 
+/// What a bridge started by an app (`kioku mcp`) keeps for following the server's version
+/// and for its liveness entry (SPEC-M3.4 §1).
+struct Follow {
+    /// Environment, home directory and data directory of this machine's kioku state.
+    env: HookEnv,
+    /// Set once the version check has started: it runs at most once per process.
+    started: AtomicBool,
+    /// The update notice (auto off / winget / brew / not writable) not yet shown; it is
+    /// appended to the next `kioku_query` / `kioku_handoff_pending` result.
+    notice: parking_lot::Mutex<Option<String>>,
+    /// Serializes this process's writes of `last-hook.json` (they share one temp name).
+    liveness: parking_lot::Mutex<()>,
+}
+
 /// The stdio MCP handler: the server's six tools, over REST.
 #[derive(Clone)]
 pub struct KiokuBridge {
@@ -45,6 +67,9 @@ pub struct KiokuBridge {
     /// Environment to re-read config.toml with before each call (`KIOKU_*` overrides still
     /// apply); `None` = always use `client`.
     env: Option<Arc<HashMap<String, String>>>,
+    /// Version following and liveness; `None` for a bridge with a fixed config (tests,
+    /// embedding), which never touches the machine's state or starts an updater.
+    follow: Option<Arc<Follow>>,
     tool_router: ToolRouter<KiokuBridge>,
 }
 
@@ -54,6 +79,7 @@ impl KiokuBridge {
         KiokuBridge {
             client,
             env: None,
+            follow: None,
             tool_router: Self::tool_router(),
         }
     }
@@ -61,8 +87,19 @@ impl KiokuBridge {
     /// A bridge that loads config with `env` now and re-reads it before every call.
     pub fn from_env(env: HashMap<String, String>) -> anyhow::Result<KiokuBridge> {
         let client = Config::load_with_env(&env)?.client;
+        let follow = Follow {
+            env: HookEnv {
+                vars: env.clone(),
+                home: kioku_core::util::home_dir_opt(),
+                cwd: None,
+            },
+            started: AtomicBool::new(false),
+            notice: parking_lot::Mutex::new(None),
+            liveness: parking_lot::Mutex::new(()),
+        };
         Ok(KiokuBridge {
             env: Some(Arc::new(env)),
+            follow: Some(Arc::new(follow)),
             ..KiokuBridge::new(client)
         })
     }
@@ -88,6 +125,116 @@ impl KiokuBridge {
         &self,
         f: impl FnOnce(&ApiClient) -> anyhow::Result<Value> + Send + 'static,
     ) -> Result<Value, String> {
+        self.call_hinted(f, false).await
+    }
+
+    /// [`KiokuBridge::call`]; `is_status` = the response is `GET /status`, whose `version`
+    /// spares the version check its own request.
+    async fn call_hinted(
+        &self,
+        f: impl FnOnce(&ApiClient) -> anyhow::Result<Value> + Send + 'static,
+        is_status: bool,
+    ) -> Result<Value, String> {
+        let result = self.request(f).await;
+        if let Ok(v) = &result {
+            let version = is_status
+                .then(|| v.get("version").and_then(Value::as_str))
+                .flatten()
+                .map(str::to_string);
+            self.after_success(version);
+        }
+        result
+    }
+
+    /// After a successful call (SPEC-M3.4 §1), both on a spawned task so the call's result
+    /// is never held up: the liveness entry, and — the first time in this process — the
+    /// version check.
+    fn after_success(&self, status_version: Option<String>) {
+        let Some(follow) = self.follow.clone() else {
+            return;
+        };
+        let bridge = self.clone();
+        let first = !follow.started.swap(true, Ordering::SeqCst);
+        tokio::spawn(async move {
+            let _ = tokio::task::spawn_blocking(move || {
+                bridge.record_liveness();
+                if first {
+                    bridge.follow_server(status_version);
+                }
+            })
+            .await;
+        });
+    }
+
+    /// The machine's config as it is now (`None` for a fixed bridge or a broken file).
+    fn current_config(&self) -> Option<Config> {
+        Config::load_with_env(self.env.as_deref()?).ok()
+    }
+
+    /// `state/last-hook.json` ← `mcp` / `tool_call` (SPEC-M3.2 §2, SPEC-M3.4 §1).
+    fn record_liveness(&self) {
+        let (Some(follow), Some(cfg)) = (&self.follow, self.current_config()) else {
+            return;
+        };
+        if let Some(path) = crate::liveness::liveness_path(&cfg, &follow.env) {
+            let _one_writer = follow.liveness.lock();
+            crate::liveness::record_named(
+                &path,
+                crate::liveness::MCP_ENTRY,
+                crate::liveness::MCP_EVENT,
+                true,
+                &kioku_core::util::now_ts(),
+            );
+        }
+    }
+
+    /// The SessionStart hook's client update decision, for a bridge (blocking): the server
+    /// version from `status_version` or a one-off `GET /status`, then
+    /// [`crate::auto_update::after_session_start`], and a detached `kioku update
+    /// --background` when one is due or a notice for the next query result. When the server
+    /// cannot be asked, the check is left for the next successful call.
+    fn follow_server(&self, status_version: Option<String>) {
+        let Some(follow) = &self.follow else {
+            return;
+        };
+        let version = status_version.filter(|v| !v.is_empty()).or_else(|| {
+            let client = self.current_client();
+            ApiClient::new(&client, CALL_TIMEOUT)
+                .and_then(|api| api.get(&["status"], &[]))
+                .ok()
+                .and_then(|v| v.get("version").and_then(Value::as_str).map(str::to_string))
+                .filter(|v| !v.is_empty())
+        });
+        let (Some(version), Some(cfg)) = (version, self.current_config()) else {
+            follow.started.store(false, Ordering::SeqCst);
+            return;
+        };
+        let (notice, spawn) =
+            crate::auto_update::after_session_start(&cfg, &follow.env, Some(&version));
+        if let Some(line) = notice {
+            *follow.notice.lock() = Some(line);
+        }
+        if let Some(tag) = spawn
+            && let Err(err) = crate::auto_update::spawn_background(&tag)
+        {
+            let root = crate::hook::client_state_root(&cfg, &follow.env);
+            crate::auto_update::log_update(root.as_deref(), &format!("kioku: {err:#}"));
+        }
+    }
+
+    /// `out` with the pending update notice appended, once (SPEC-M3.4 §1).
+    fn with_notice(&self, mut out: String) -> String {
+        if let Some(line) = self.follow.as_ref().and_then(|f| f.notice.lock().take()) {
+            out.push_str(&format!("\n\nkioku: {line}"));
+        }
+        out
+    }
+
+    /// One REST call on the blocking pool with the config as it is now.
+    async fn request(
+        &self,
+        f: impl FnOnce(&ApiClient) -> anyhow::Result<Value> + Send + 'static,
+    ) -> Result<Value, String> {
         let bridge = self.clone();
         tokio::task::spawn_blocking(move || {
             let client = bridge.current_client();
@@ -102,6 +249,16 @@ impl KiokuBridge {
         .await
         .map_err(|e| format!("kioku mcp: {e}"))?
     }
+}
+
+/// A server older than SPEC-M3.4 ignores `slug`: say so when the written path is not
+/// `…/<slug>.md`.
+pub fn slug_ignored_note(path: &str, slug: Option<&str>) -> Option<String> {
+    let slug = slug?;
+    let expected = format!("/{slug}.md");
+    (!path.ends_with(&expected)).then(|| {
+        "kioku: this kioku server predates slug and named the page from its title; update the server (`kioku update` on it) / サーバーが古く slug に未対応のため、タイトルから名前を付けました".to_string()
+    })
 }
 
 fn decode<T: serde::de::DeserializeOwned>(v: Value) -> Result<T, String> {
@@ -152,7 +309,7 @@ impl KiokuBridge {
                 None => return Err(PATH_PREFIX_UNSUPPORTED.to_string()),
             }
         }
-        Ok(format_query(&result))
+        Ok(self.with_notice(format_query(&result)))
     }
 
     /// `kioku_read` → `GET /pages/<path>`.
@@ -186,11 +343,17 @@ impl KiokuBridge {
             }),
             "tags": p.tags,
             "path": p.path,
+            "slug": p.slug,
         });
+        let slug = p
+            .slug
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty());
         let v = self.call(move |c| c.put(&["pages"], &body)).await?;
-        Ok(format!(
-            "wrote {}",
-            v.get("path").and_then(Value::as_str).unwrap_or_default()
+        let path = v.get("path").and_then(Value::as_str).unwrap_or_default();
+        Ok(slug_ignored_note(path, slug.as_deref()).map_or_else(
+            || format!("wrote {path}"),
+            |note| format!("wrote {path}\n{note}"),
         ))
     }
 
@@ -241,13 +404,13 @@ impl KiokuBridge {
             .await?;
         // `reference_handoff` is additive (M2.4 §1.4); an older server sends `handoff` only.
         let routed: PendingHandoff = decode(v)?;
-        Ok(format_pending(&routed))
+        Ok(self.with_notice(format_pending(&routed)))
     }
 
     /// `kioku_status` → `GET /status`.
     #[tool(description = STATUS_DESC)]
     async fn kioku_status(&self) -> Result<String, String> {
-        let v = self.call(|c| c.get(&["status"], &[])).await?;
+        let v = self.call_hinted(|c| c.get(&["status"], &[]), true).await?;
         // `project_ids` is additive (M2 §20.1).
         let projects: Vec<String> = v
             .get("project_ids")
@@ -335,5 +498,17 @@ mod tests {
 
         std::fs::write(dir.path().join("config.toml"), "[client\n").unwrap();
         assert_eq!(bridge.current_client().auth_token.as_deref(), Some("old"));
+    }
+
+    /// SPEC-M3.4 §2: a server that ignored `slug` (it predates it) is called out.
+    #[test]
+    fn a_server_that_ignores_slug_is_called_out() {
+        assert_eq!(
+            slug_ignored_note("p/pages/write-test-2.md", Some("write-test-2")),
+            None
+        );
+        assert_eq!(slug_ignored_note("p/pages/page-4565ee.md", None), None);
+        let note = slug_ignored_note("p/pages/page-4565ee.md", Some("write-test-2")).unwrap();
+        assert!(note.contains("predates slug") && note.contains("slug に未対応"));
     }
 }

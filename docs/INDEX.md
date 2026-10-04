@@ -10,7 +10,8 @@ Files: [SPEC-M1](SPEC-M1.md) · [SPEC-M2](SPEC-M2.md) · [SPEC-M2.1](SPEC-M2.1.m
 [SPEC-M2.2](SPEC-M2.2.md) · [SPEC-M2.3](SPEC-M2.3.md) · [SPEC-M2.4](SPEC-M2.4.md) ·
 [SPEC-M2.5](SPEC-M2.5.md) · [SPEC-M2.6](SPEC-M2.6.md) · [SPEC-M2.7](SPEC-M2.7.md) ·
 [SPEC-M2.8](SPEC-M2.8.md) · [SPEC-M3.0](SPEC-M3.0.md) · [SPEC-M3.1](SPEC-M3.1.md) ·
-[SPEC-M3.2](SPEC-M3.2.md) · [SPEC-M3.3](SPEC-M3.3.md) · decisions: [adr/](adr/)
+[SPEC-M3.2](SPEC-M3.2.md) · [SPEC-M3.3](SPEC-M3.3.md) · [SPEC-M3.4](SPEC-M3.4.md) ·
+decisions: [adr/](adr/)
 
 | topic | authoritative section(s) | notes |
 |-------|--------------------------|-------|
@@ -28,6 +29,7 @@ Files: [SPEC-M1](SPEC-M1.md) · [SPEC-M2](SPEC-M2.md) · [SPEC-M2.1](SPEC-M2.1.m
 | Schema version, downgrade refusal | SPEC-M2.7 §5 | `PRAGMA user_version`; `kioku serve` exits 78 |
 | One process per data directory | SPEC-M2.7 §6 | `kioku.lock`, `needs_reindex` self-heal |
 | Page format | SPEC-M1 §6.1 | |
+| Page paths (`slug`, date-prefixed names) | SPEC-M3.4 §2 | amends the path rules of SPEC-M1 §6.1; existing pages keep their paths |
 | Session page name | SPEC-M2.6 §1 | `YYYY-MM-DD-<8>-<12 hex>.md`, redirects |
 | Page revisions, `expected_revision` (409) | SPEC-M2.6 §1 | |
 | tantivy schema, analyzers | SPEC-M1 §6.2, SPEC-M3.1 §2 | index schema v3 (`code`, `ja_bigram`) |
@@ -65,13 +67,13 @@ Files: [SPEC-M1](SPEC-M1.md) · [SPEC-M2](SPEC-M2.md) · [SPEC-M2.1](SPEC-M2.1.m
 | Antigravity CLI | SPEC-M2.1 §3, SPEC-M2.1 §4 | |
 | Installers (common rules, `install all`) | SPEC-M2 §8 | |
 | Instruction snippet | SPEC-M2 §7 | |
-| `kioku mcp` stdio bridge | SPEC-M2 §20 | default MCP registration |
+| `kioku mcp` stdio bridge | SPEC-M2 §20 | default MCP registration; version following and liveness SPEC-M3.4 §1 |
 | HTTP API | SPEC-M1 §9, SPEC-M2 §9 | additions in SPEC-M2.3 §3.2, SPEC-M2.6 §3, SPEC-M2.8 §3, SPEC-M3.1 §2, SPEC-M3.2 §1 |
 | Error responses and exit codes | SPEC-M1 §9 | 409; exit 78 (newer schema), 75 (restart after update), 2 (Stop nudge) |
-| MCP tools | SPEC-M1 §10 | parameters added by SPEC-M2.6 §1, SPEC-M3.0 §2, SPEC-M3.1 §1, SPEC-M3.1 §2, SPEC-M3.1 §3 |
+| MCP tools | SPEC-M1 §10 | parameters added by SPEC-M2.6 §1, SPEC-M3.0 §2, SPEC-M3.1 §1, SPEC-M3.1 §2, SPEC-M3.1 §3, SPEC-M3.4 §2 (`slug`) |
 | CLI commands | SPEC-M1 §11, SPEC-M2 §14 | full list: CLAUDE.md "Directory layout" and `kioku --help` |
 | Metrics endpoint, request log, `status --watch` | SPEC-M3.2 §1 | |
-| Positive liveness (`state/last-hook.json`, `status --agents`) | SPEC-M3.2 §2 | |
+| Positive liveness (`state/last-hook.json`, `status --agents`) | SPEC-M3.2 §2 | `mcp` entry of the stdio bridge: SPEC-M3.4 §1 |
 | `kioku doctor` | SPEC-M2 §12, SPEC-M2.6 §4, SPEC-M2.5 §3.4 | `--fix`: SPEC-M3.2 §3 |
 | `kioku doctor --fix` | SPEC-M3.2 §3 | |
 | Client reachability (Local Network permission) | SPEC-M3.2 §3.1 | |
@@ -85,7 +87,7 @@ Files: [SPEC-M1](SPEC-M1.md) · [SPEC-M2](SPEC-M2.md) · [SPEC-M2.1](SPEC-M2.1.m
 | Security model | SPEC-M2 §15, SPEC-M2.7 §3 | see also SECURITY.md |
 | Automatic updates (principle) | SPEC-M2.5 §1 | [ADR-0002](adr/ADR-0002-clients-follow-server-version.md) |
 | Server update interval | SPEC-M2.5 §3.1 | as amended v0.8.2 / v0.9.1: default 1 h, first check 3 min after start |
-| Client follows the server | SPEC-M2.5 §3.3 | |
+| Client follows the server | SPEC-M2.5 §3.3, SPEC-M3.4 §1 | trigger: SessionStart hook, or the `kioku mcp` bridge's first successful tool call (app-only machines) |
 | Update verification order | SPEC-M2.7 §2, SPEC-M2.5 §4 | |
 | Update source hardening (mirrors) | SPEC-M2.7 §11 | |
 | Server rollback, `kioku update --rollback` | SPEC-M2.7 §7 | |

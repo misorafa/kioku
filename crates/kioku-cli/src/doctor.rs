@@ -1666,7 +1666,8 @@ pub fn hooks_registered(agent: Agent, ctx: &InstallCtx) -> bool {
 }
 
 /// `hooks.liveness.<agent>` for every agent in `agents` whose hooks are registered
-/// (SPEC-M3.2 §2), from `state/last-hook.json`.
+/// (SPEC-M3.2 §2), plus `hooks.liveness.mcp` once the stdio bridge recorded a tool call
+/// (SPEC-M3.4 §1), from `state/last-hook.json`.
 pub fn liveness_checks(env: &DoctorEnv, cfg: &Config, agents: &[Agent]) -> Vec<Check> {
     let henv = HookEnv {
         vars: env.vars.clone(),
@@ -1678,7 +1679,7 @@ pub fn liveness_checks(env: &DoctorEnv, cfg: &Config, agents: &[Agent]) -> Vec<C
         .unwrap_or_default();
     let ctx = env.setup_env().install_ctx(&cfg.client);
     let now = kioku_core::util::now().timestamp();
-    agents
+    let mut checks: Vec<Check> = agents
         .iter()
         .filter(|a| hooks_registered(**a, &ctx))
         .map(|a| {
@@ -1686,7 +1687,12 @@ pub fn liveness_checks(env: &DoctorEnv, cfg: &Config, agents: &[Agent]) -> Vec<C
                 crate::liveness::agent_present(*a, path_var(&env.vars), &env.home, &env.app_dirs);
             crate::liveness::liveness_check(*a, marks.get(a.as_str()), present, now)
         })
-        .collect()
+        .collect();
+    // SPEC-M3.4 §1: the stdio bridge (desktop apps, no hooks) leaves its own entry.
+    if let Some(mark) = marks.get(crate::liveness::MCP_ENTRY) {
+        checks.push(crate::liveness::mcp_liveness_check(mark, now));
+    }
+    checks
 }
 
 // ---------------------------------------------------------------------------------------

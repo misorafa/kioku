@@ -5,6 +5,23 @@ requests of each tag (`git log <previous tag>..<tag>`). Specifications are in
 [docs/](docs/INDEX.md); the section that is current for each topic is listed in
 [docs/INDEX.md](docs/INDEX.md).
 
+## Unreleased
+
+- The `kioku mcp` bridge follows the server's version (SPEC-M3.4 §1): machines that only
+  use desktop apps (Claude.app, Codex.app) run no SessionStart hook and never updated.
+  The bridge now runs the hook's update decision once per process, in the background
+  after its first successful tool call (same `state/auto-update.json`, 6 h throttle, lock,
+  winget / Homebrew / not-writable rules) and starts the detached `kioku update
+  --background`; a notice goes into the next `kioku_query` / `kioku_handoff_pending`
+  result. Each successful call records `mcp` / `tool_call` in `state/last-hook.json`, so
+  `kioku doctor` and `kioku status --agents` show app-only machines as alive.
+- Readable page names (SPEC-M3.4 §2): `kioku_write_page` (MCP, bridge, `PUT
+  /api/v1/pages`) takes an optional `slug` (`[a-z0-9]` words joined by `-`, 1–64 chars;
+  uppercase folded; with `path` → 400) that names the file `<scope dir>/<slug>.md`. A new
+  page whose title has fewer than 3 ASCII characters after NFKC (a Japanese-only title) is
+  named `<YYYY-MM-DD>-<hash>.md` instead of `page-<hash>.md`. Existing pages keep their
+  paths, and writing the same title again still replaces its page.
+
 ## v0.9.3 — 2026-10-02
 
 - Homebrew: `brew install misorafa/tap/kioku`. Each stable release renders

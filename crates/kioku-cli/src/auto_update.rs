@@ -372,9 +372,10 @@ fn current_binary() -> Option<PathBuf> {
     Some(kioku_core::util::canonical_plain(&exe).unwrap_or(exe))
 }
 
-/// SessionStart side effects of the server's version: records the version mismatch, then
-/// decides per [`client_action`] and records the attempt / notice. Returns the notice line
-/// and the tag to update to. Never fails (the hook must not).
+/// Side effects of the server's version, for the SessionStart hook and the `kioku mcp`
+/// bridge (SPEC-M3.4 §1): records the version mismatch, then decides per [`client_action`]
+/// and records the attempt / notice. Returns the notice line and the tag to update to.
+/// Never fails (neither caller may).
 pub fn after_session_start(
     cfg: &Config,
     env: &HookEnv,
