@@ -2,9 +2,9 @@
 
 [日本語](README.ja.md) | English
 
-**Status: v0.9 — in daily use on the author's machines; M2.1–M3.1 shipped, M3.2 in
-progress (see [Roadmap](#roadmap) and [CHANGELOG.md](CHANGELOG.md)).** Expect rough
-edges; config formats and APIs may still change between minor versions.
+**Status: v0.9.4 — in daily use on the author's three machines (Mac mini server, Mac and
+Windows clients); M2.1–M3.4 shipped, v1.0.0 in preparation (see [Roadmap](#roadmap) and
+[CHANGELOG.md](CHANGELOG.md)).** Config formats and APIs may still change before 1.0.
 
 kioku is a self-hosted memory server shared by all your AI coding agents on all
 your machines. It is a single Rust binary. Everything it remembers is plain
