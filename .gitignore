@@ -1,3 +1,7 @@
 /target
 **/*.rs.bk
 .DS_Store
+scripts/short/node_modules/
+scripts/short/out/
+scripts/short/package*.json
+docs/media/kioku-short-*.mp4

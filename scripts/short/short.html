@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="ja">
+<meta charset="utf-8">
+<title>kioku short</title>
+<style>
+:root{--bg:#0e1016;--fg:#f4f5f7;--mute:#9aa3b2;--cyan:#4fd1ff;--orange:#ff9f43;--green:#5be49b;--card:#171a23;--line:#2a2f3d}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{width:1080px;height:1920px;overflow:hidden;background:var(--bg);color:var(--fg);
+  font-family:"Hiragino Sans","Hiragino Kaku Gothic ProN","Helvetica Neue",Arial,sans-serif;font-feature-settings:"palt"}
+.mono{font-family:Menlo,"SF Mono",Consolas,monospace}
+#bg{position:absolute;inset:0;background:
+  radial-gradient(900px 900px at 20% 10%,rgba(79,209,255,.16),transparent 60%),
+  radial-gradient(900px 900px at 85% 90%,rgba(255,159,67,.14),transparent 60%);animation:drift 24s ease-in-out infinite alternate}
+@keyframes drift{from{transform:translate(0,0) scale(1)}to{transform:translate(-40px,-60px) scale(1.08)}}
+.scene{position:absolute;inset:0;padding:110px 80px 160px;display:flex;flex-direction:column;justify-content:center;gap:40px;
+  opacity:0;transform:translateY(60px);transition:opacity .45s ease,transform .6s cubic-bezier(.2,.8,.2,1);pointer-events:none}
+.scene.show{opacity:1;transform:none}
+.scene.out{opacity:0;transform:translateY(-60px)}
+.item{opacity:0;transform:translateY(36px);transition:opacity .5s ease var(--d,0s),transform .6s cubic-bezier(.2,.8,.2,1) var(--d,0s)}
+.show .item{opacity:1;transform:none}
+.kicker{font-size:44px;color:var(--mute);font-weight:600;letter-spacing:.04em}
+h1{font-size:104px;line-height:1.12;font-weight:800;letter-spacing:-.01em}
+h1 .hi{color:var(--cyan)}h1 .warm{color:var(--orange)}
+h2{font-size:76px;line-height:1.2;font-weight:800}
+p.big{font-size:52px;line-height:1.45;color:#dfe3ea;font-weight:500}
+.bubble{background:var(--card);border:2px solid var(--line);border-radius:36px;padding:40px 48px;font-size:50px;line-height:1.4;font-weight:600;position:relative;max-width:900px}
+.bubble .who{display:inline-block;font-size:34px;font-weight:700;padding:8px 20px;border-radius:999px;margin-bottom:18px}
+.bubble.a .who{background:rgba(79,209,255,.18);color:var(--cyan)}
+.bubble.b{align-self:flex-end;border-color:rgba(255,159,67,.5)}
+.bubble.b .who{background:rgba(255,159,67,.18);color:var(--orange)}
+.badges{display:flex;gap:28px;flex-wrap:wrap}
+.badge{font-size:44px;font-weight:700;padding:22px 34px;border-radius:24px;background:var(--card);border:2px solid var(--line)}
+.badge.q::after{content:" ??";color:var(--orange)}
+.logo{font-size:220px;font-weight:900;letter-spacing:-.03em;line-height:1;color:var(--fg)}
+.logo small{display:block;font-size:84px;color:var(--cyan);font-weight:800;letter-spacing:.3em;margin-top:8px}
+.steps{display:flex;flex-direction:column;gap:30px}
+.step{display:flex;align-items:flex-start;gap:30px;background:var(--card);border:2px solid var(--line);border-radius:32px;padding:34px 40px}
+.step .n{font-size:64px;font-weight:900;color:var(--cyan);line-height:1;min-width:70px}
+.step .t{font-size:58px;font-weight:800;line-height:1.15}
+.step .s{font-size:38px;color:var(--mute);margin-top:12px;line-height:1.35;font-weight:500}
+.arrow{align-self:center;font-size:60px;color:var(--mute);line-height:1;margin:-10px 0}
+.term{background:#0b0d13;border:2px solid var(--line);border-radius:28px;padding:38px 42px;font-size:36px;line-height:1.5;white-space:pre-wrap;word-break:break-all}
+.term .c{color:var(--mute)}.term .k{color:var(--cyan);font-weight:700}.term .w{color:var(--orange)}.term .g{color:var(--green)}
+.term.big{font-size:42px}
+.block{background:var(--card);border:2px solid var(--line);border-radius:32px;padding:36px 42px;display:flex;flex-direction:column;gap:14px}
+.block .h{font-size:44px;font-weight:800;color:var(--cyan);margin-top:14px}
+.block .h:first-child{margin-top:0}
+.block .l{font-size:40px;line-height:1.35;font-weight:500;color:#e7eaf0}
+.block .l.warn{color:var(--orange)}
+.block .l.ok{color:var(--green)}
+.hit{background:var(--card);border:2px solid var(--line);border-radius:28px;padding:30px 36px}
+.hit .p{font-size:30px;color:var(--mute)}
+.hit .t{font-size:44px;font-weight:800;margin:8px 0}
+.hit .x{font-size:36px;color:#dfe3ea;line-height:1.4}
+.hit mark{background:rgba(255,159,67,.35);color:var(--fg);border-radius:8px;padding:0 6px}
+.foot{position:absolute;left:80px;right:80px;bottom:70px;display:flex;justify-content:space-between;align-items:center;font-size:34px;color:var(--mute);font-weight:600}
+.foot b{color:var(--fg)}
+#bar{position:absolute;left:0;bottom:0;height:10px;background:var(--cyan);width:0}
+.end .logo{font-size:170px}
+.tags{display:flex;gap:22px;flex-wrap:wrap}
+.tag{font-size:40px;font-weight:700;padding:16px 28px;border-radius:999px;background:rgba(91,228,155,.14);color:var(--green);border:2px solid rgba(91,228,155,.4)}
+.url{font-size:60px;font-weight:800;color:var(--fg)}
+</style>
+<body>
+<div id="bg"></div>
+<div id="root"></div>
+<div class="foot"><span><b>kioku</b> — 記憶</span><span id="lang-tag"></span></div>
+<div id="bar"></div>
+<script>
+const Q = new URLSearchParams(location.search);
+const LANG = Q.get('lang') === 'en' ? 'en' : 'ja';
+document.documentElement.lang = LANG;
+document.getElementById('lang-tag').textContent = LANG === 'ja' ? 'github.com/misorafa/kioku' : 'github.com/misorafa/kioku';
+document.querySelector('.foot span b').nextSibling.textContent = LANG === 'ja' ? ' — 記憶' : ' — shared memory for coding agents';
+
+const T = {
+ja: {
+ s1k: 'きのう、Claude Code で', s1a: 'ログイン画面の検証、直しておいたよ。テストも追加した。',
+ s1k2: 'きょう、Codex に続きを頼むと…', s1b: 'どのログイン画面のことでしょうか？',
+ s1h: ['エージェントを<br>変えると、', '<span class="warm">記憶はゼロから。</span>'],
+ s2h: ['マシンを変えても、', '<span class="warm">ゼロから。</span>'], s2b: ['MacBook', 'Windows', 'Mac mini'],
+ s3sub: 'すべてのエージェント・すべてのマシンで共有する、<br>あなた専用の記憶サーバー。',
+ s4k: 'しくみは 3 つだけ',
+ s4: [['記録', 'フックが指示・編集・最後の回答を自動で送る'], ['要約', 'サーバーが引き継ぎと決定事項にまとめる（LLM は使わない）'], ['注入', '次のセッションが、どのエージェントでも続きから始まる']],
+ s5k: '次のセッションは、こう始まる',
+ s5: [['h', '前回からの引き継ぎ'], ['l', 'パスワード再設定画面にもメール検証を追加'], ['h', '次にやること'], ['l', '・エラーメッセージの日本語訳を埋める'], ['h', '決定事項（これまでの引き継ぎ）'], ['l', '・エラーは i18n キーで返す'], ['h', '落とし穴'], ['l warn', '⚠ cargo test は DB のマイグレーションを先に'], ['h', '最近のセッション'], ['l', '・codex @win-pc　・claude-code @macbook']],
+ s6k: '日本語のまま検索できる',
+ s6cmd: '<span class="k">kioku_query</span> "<span class="w">メール検証</span>"',
+ s6: [['sessions/2026-10-04 … @win-pc', 'パスワード再設定画面に同じ検証を入れて', '… <mark>メール検証</mark>を追加。i18n キーの一覧を起こした'], ['pages/auth-design.md', '認証まわりの設計メモ', 'ログインの<mark>検証</mark>順序：<mark>メール</mark> → パスワード → 2FA']],
+ s7k: '導入は 1 行', s7h: ['自宅の Mac mini でも、<br>Docker でも。'],
+ s7cmd: '<span class="c"># サーバー</span>\ncurl -fsSL …/install.sh | sh\n\n<span class="c"># ほかのマシンは招待コードを 1 行</span>\n<span class="k">KIOKU_JOIN</span>=\'mini:7391/K7Q2M9XD\' sh -c "$(curl -fsSL …/install.sh)"',
+ s8tags: ['無料', 'オープンソース', 'LLM を呼ばない', 'データは自分のサーバーに'], s8sub: 'Claude Code / Codex / Cursor / Antigravity',
+},
+en: {
+ s1k: 'Yesterday, in Claude Code', s1a: 'Fixed the login validation and added tests.',
+ s1k2: 'Today, asking Codex to continue…', s1b: 'Which login screen do you mean?',
+ s1h: ['Switch agents,', '<span class="warm">memory starts at zero.</span>'],
+ s2h: ['Switch machines,', '<span class="warm">zero again.</span>'], s2b: ['MacBook', 'Windows', 'Mac mini'],
+ s3sub: 'One memory server, shared by every coding agent<br>on every machine you own.',
+ s4k: 'Three steps, that’s all',
+ s4: [['Capture', 'Hooks send prompts, edits and the final reply automatically'], ['Summarize', 'The server writes handoffs and decisions (no LLM calls)'], ['Inject', 'The next session — any agent — starts where you left off']],
+ s5k: 'How the next session starts',
+ s5: [['h', 'Handoff from the previous session'], ['l', 'Address step validates the email too'], ['h', 'Next steps'], ['l', '• Fill in the Japanese translations'], ['h', 'Decisions (carried)'], ['l', '• Errors are returned as i18n keys'], ['h', 'Gotchas'], ['l warn', '⚠ npm test needs the mock payment server'], ['h', 'Recent sessions'], ['l', '• codex @win-pc • claude-code @macbook']],
+ s6k: 'Search in Japanese or English',
+ s6cmd: '<span class="k">kioku_query</span> "<span class="w">email validation</span>"',
+ s6: [['sessions/2026-10-04 … @win-pc', 'Apply the same validation to the address step', '… validates the <mark>email</mark> too; listed every i18n key'], ['pages/checkout-design.md', 'Checkout design notes', '<mark>Validation</mark> order: <mark>email</mark>, then card, then address']],
+ s7k: 'Install in one line', s7h: ['On a Mac mini at home,<br>or in Docker.'],
+ s7cmd: '<span class="c"># server</span>\ncurl -fsSL …/install.sh | sh\n\n<span class="c"># every other machine: paste the invite line</span>\n<span class="k">KIOKU_JOIN</span>=\'mini:7391/K7Q2M9XD\' sh -c "$(curl -fsSL …/install.sh)"',
+ s8tags: ['Free', 'Open source', 'No LLM calls', 'Your data on your server'], s8sub: 'Claude Code / Codex / Cursor / Antigravity',
+}}[LANG];
+
+const d = (i, step = .25, base = .15) => `style="--d:${(base + i * step).toFixed(2)}s"`;
+const scenes = [
+`<div class="scene" id="s1">
+  <div class="kicker item" ${d(0)}>${T.s1k}</div>
+  <div class="bubble a item" ${d(1)}><span class="who">Claude Code</span><br>${T.s1a}</div>
+  <div class="kicker item" ${d(3)}>${T.s1k2}</div>
+  <div class="bubble b item" ${d(4)}><span class="who">Codex</span><br><span id="tw"></span></div>
+  <h1 class="item" ${d(8)}>${T.s1h[0]}<br>${T.s1h[1]}</h1>
+</div>`,
+`<div class="scene" id="s2">
+  <h1 class="item" ${d(0)}>${T.s2h[0]}<br>${T.s2h[1]}</h1>
+  <div class="badges">${T.s2b.map((b,i)=>`<div class="badge q item" ${d(i+2,.35)}>${b}</div>`).join('')}</div>
+</div>`,
+`<div class="scene" id="s3" style="align-items:center;text-align:center">
+  <div class="logo item" ${d(0)}>kioku<small>記憶</small></div>
+  <p class="big item" ${d(2,.3)}>${T.s3sub}</p>
+</div>`,
+`<div class="scene" id="s4">
+  <div class="kicker item" ${d(0)}>${T.s4k}</div>
+  <div class="steps">${T.s4.map((s,i)=>`${i?`<div class="arrow item" ${d(i*2,.45)}>↓</div>`:''}<div class="step item" ${d(i*2+1,.45)}><div class="n">${i+1}</div><div><div class="t">${s[0]}</div><div class="s">${s[1]}</div></div></div>`).join('')}</div>
+</div>`,
+`<div class="scene" id="s5">
+  <div class="kicker item" ${d(0)}>${T.s5k}</div>
+  <div class="block item" ${d(1)}>${T.s5.map((l,i)=>`<div class="${l[0]} item" ${d(i+2,.32)}>${l[1]}</div>`).join('')}</div>
+</div>`,
+`<div class="scene" id="s6">
+  <div class="kicker item" ${d(0)}>${T.s6k}</div>
+  <div class="term big mono item" ${d(1)}>${T.s6cmd}</div>
+  ${T.s6.map((h,i)=>`<div class="hit item" ${d(i*2+3,.4)}><div class="p mono">${h[0]}</div><div class="t">${h[1]}</div><div class="x">${h[2]}</div></div>`).join('')}
+</div>`,
+`<div class="scene" id="s7">
+  <div class="kicker item" ${d(0)}>${T.s7k}</div>
+  <h2 class="item" ${d(1)}>${T.s7h[0]}</h2>
+  <div class="term mono item" ${d(3,.3)}>${T.s7cmd}</div>
+</div>`,
+`<div class="scene end" id="s8" style="align-items:center;text-align:center">
+  <div class="logo item" ${d(0)}>kioku<small>記憶</small></div>
+  <div class="tags" style="justify-content:center">${T.s8tags.map((t,i)=>`<div class="tag item" ${d(i+2,.25)}>${t}</div>`).join('')}</div>
+  <p class="big item" ${d(7)}>${T.s8sub}</p>
+  <div class="url mono item" ${d(8)}>github.com/misorafa/kioku</div>
+</div>`];
+document.getElementById('root').innerHTML = scenes.join('');
+
+// Timeline (seconds): when each scene starts. Total length = last + hold.
+const starts = [0, 8.5, 13.5, 19.5, 29.5, 38.5, 45.5, 52];
+const TOTAL = 58;
+const els = starts.map((_, i) => document.getElementById('s' + (i + 1)));
+let twTimer = null;
+function typewrite(text) {
+  const el = document.getElementById('tw'); el.textContent = ''; let i = 0; clearInterval(twTimer);
+  twTimer = setInterval(() => { el.textContent = text.slice(0, ++i); if (i >= text.length) clearInterval(twTimer); }, 55);
+}
+function show(k) {
+  els.forEach((e, i) => { e.classList.toggle('show', i === k); e.classList.toggle('out', i < k); });
+  if (k === 0) setTimeout(() => typewrite(T.s1b), 1300);
+}
+window.seek = (t) => { let k = 0; starts.forEach((s, i) => { if (t >= s) k = i; }); show(k);
+  document.getElementById('bar').style.width = (Math.min(t, TOTAL) / TOTAL * 1080) + 'px'; };
+if (!Q.has('still')) {
+  const t0 = performance.now();
+  starts.forEach((s, i) => setTimeout(() => show(i), s * 1000));
+  (function tick(){ const t = (performance.now() - t0) / 1000; document.getElementById('bar').style.width = (Math.min(t, TOTAL) / TOTAL * 1080) + 'px'; if (t < TOTAL) requestAnimationFrame(tick); })();
+}
+</script>
+</body>
+</html>
