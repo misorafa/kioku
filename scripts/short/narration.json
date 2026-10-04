@@ -1,0 +1,104 @@
+{
+ "ja": {
+  "voice": "ja-JP-NanamiNeural",
+  "rate": "+20%",
+  "scenes": [
+   {
+    "id": "s1",
+    "min": 6.0,
+    "text": "きのう Claude Code で直した続きを Codex に頼むと、「どのログイン画面ですか？」。エージェントを変えると、記憶はゼロから。"
+   },
+   {
+    "id": "s2",
+    "min": 3.0,
+    "text": "マシンを変えても、ゼロから。"
+   },
+   {
+    "id": "s3",
+    "min": 4.0,
+    "text": "そこで、kioku。すべてのエージェントとマシンで共有する、あなたの記憶サーバー。"
+   },
+   {
+    "id": "sj",
+    "min": 4.5,
+    "text": "日本語のために作りました。指示も要約も引き継ぎも、日本語のまま。検索もちゃんと日本語で。"
+   },
+   {
+    "id": "s4",
+    "min": 6.0,
+    "text": "しくみは3つ。記録して、要約して、次のセッションに注入する。LLMは使いません。"
+   },
+   {
+    "id": "s5",
+    "min": 6.5,
+    "text": "次のセッションは、こう始まります。引き継ぎ、次にやること、決定事項、落とし穴まで。"
+   },
+   {
+    "id": "s6",
+    "min": 3.5,
+    "text": "過去の作業は、日本語のまま検索。"
+   },
+   {
+    "id": "s7",
+    "min": 4.5,
+    "text": "導入は1行。自宅のMac miniでも、Dockerでも。"
+   },
+   {
+    "id": "s8",
+    "min": 5.0,
+    "text": "無料、オープンソース、データは自分のサーバーに。kioku、きょうから。"
+   }
+  ]
+ },
+ "en": {
+  "voice": "en-US-EmmaNeural",
+  "rate": "+14%",
+  "scenes": [
+   {
+    "id": "s1",
+    "min": 6.0,
+    "text": "Ask Codex to continue what Claude Code fixed yesterday, and it says: which login screen? Switch agents, and memory starts at zero."
+   },
+   {
+    "id": "s2",
+    "min": 3.0,
+    "text": "Switch machines, zero again."
+   },
+   {
+    "id": "s3",
+    "min": 4.0,
+    "text": "Meet kioku: one memory server, shared by every coding agent on every machine you own."
+   },
+   {
+    "id": "sj",
+    "min": 4.5,
+    "text": "Built Japanese-first, with real Japanese search and summaries, and it works just as well in English."
+   },
+   {
+    "id": "s4",
+    "min": 6.0,
+    "text": "Three steps: capture, summarize, inject into the next session. No LLM calls."
+   },
+   {
+    "id": "s5",
+    "min": 6.5,
+    "text": "The next session starts with the handoff, next steps, decisions, even the gotchas. Any agent, any machine."
+   },
+   {
+    "id": "s6",
+    "min": 3.5,
+    "text": "Search your past work in Japanese or English."
+   },
+   {
+    "id": "s7",
+    "min": 4.5,
+    "text": "Install in one line, on a Mac mini at home or in Docker."
+   },
+   {
+    "id": "s8",
+    "min": 5.0,
+    "text": "Free, open source, your data on your server. Try kioku today."
+   }
+  ]
+ }
+}
