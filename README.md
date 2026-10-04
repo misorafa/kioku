@@ -29,6 +29,8 @@ and handoffs are built by rules.
               agents search and write memory through MCP tools (kioku_query, …)
 ```
 
+![kioku demo: search past sessions, then the next session starts with the handoff, carried decisions, pinned pages and recent sessions](docs/media/kioku-demo-en.gif)
+
 Install on the machine that will be the server (macOS / Linux, no sudo):
 
 ```sh
