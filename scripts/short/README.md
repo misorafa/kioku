@@ -17,3 +17,6 @@ or the `rate`), derives each scene's length from its clip, records the page with
 timings, adds synthesized sound effects (whoosh on scene changes, chime on the logo and end
 card, pops on the three steps) and mixes everything into an X-friendly MP4. Edit the `T`
 table in `short.html` for on-screen copy. The MP4s are not committed (~9 MB each).
+
+`diagram.html` + `node shoot.mjs` render the one-page flow diagram `docs/media/kioku-flow-{ja,en}.png` (1600×900 @2x).
+Post drafts live in `docs/marketing/x-posts.md`.

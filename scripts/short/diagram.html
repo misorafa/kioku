@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="ja">
+<meta charset="utf-8">
+<title>kioku — how it works</title>
+<style>
+:root{--bg:#f6f7fb;--fg:#141922;--mute:#5f6b7a;--blue:#1b6ef3;--orange:#f0732a;--green:#15a36b;--card:#fff;--line:#e3e7ee;--shadow:0 14px 40px rgba(20,25,34,.10)}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{width:1600px;height:900px;overflow:hidden;background:var(--bg);color:var(--fg);font-family:"Hiragino Sans","Hiragino Kaku Gothic ProN","Helvetica Neue",Arial,sans-serif;font-feature-settings:"palt"}
+.mono{font-family:Menlo,"SF Mono",Consolas,monospace}
+#bg{position:absolute;inset:-10%;background:radial-gradient(700px 700px at 10% 10%,rgba(27,110,243,.14),transparent 60%),radial-gradient(800px 800px at 92% 90%,rgba(240,115,42,.14),transparent 60%),radial-gradient(600px 600px at 60% 20%,rgba(21,163,107,.10),transparent 60%)}
+.wrap{position:absolute;inset:0;padding:56px 64px 48px;display:flex;flex-direction:column;gap:28px}
+.head{display:flex;align-items:baseline;gap:26px}
+.head .logo{font-size:64px;font-weight:900;letter-spacing:-.03em}
+.head .logo small{font-size:30px;color:var(--blue);font-weight:900;letter-spacing:.3em;margin-left:14px}
+.head .tag{font-size:30px;color:var(--mute);font-weight:700}
+.cols{display:grid;grid-template-columns:1fr 70px 1.15fr 70px 1fr;align-items:stretch;gap:0;flex:1}
+.col{background:var(--card);border:2px solid var(--line);border-radius:28px;box-shadow:var(--shadow);padding:28px 30px;display:flex;flex-direction:column;gap:16px}
+.col .n{display:flex;align-items:center;gap:14px}
+.col .n b{font-size:40px;color:var(--blue);font-weight:900}
+.col .n span{font-size:40px;font-weight:900}
+.col p{font-size:23px;color:var(--mute);font-weight:600;line-height:1.4}
+.chips{display:flex;flex-wrap:wrap;gap:10px}
+.chip{font-size:22px;font-weight:800;padding:9px 16px;border-radius:999px;background:#eef3ff;color:#1a3d8f;border:1.5px solid #d7e2ff}
+.chip.os{background:#f1f3f6;color:#2b3440;border-color:#e0e5ec}
+.arrow{display:flex;align-items:center;justify-content:center;font-size:46px;color:var(--mute);font-weight:900}
+.server{background:#1b2130;color:#eef2f8;border-color:#1b2130}
+.server .n span,.server .n b{color:#fff}.server .n b{color:#7cc4ff}
+.server p{color:#b7c1d0}
+.server .chip{background:rgba(124,196,255,.14);color:#cfe6ff;border-color:rgba(124,196,255,.35)}
+.server .rust{background:rgba(240,115,42,.18);color:#ffc89e;border-color:rgba(240,115,42,.45)}
+.block{background:#f6f8fc;border:1.5px solid var(--line);border-radius:18px;padding:16px 18px;display:flex;flex-direction:column;gap:6px;margin-top:auto}
+.block .h{font-size:20px;font-weight:900;color:var(--blue)}
+.block .l{font-size:20px;font-weight:600;color:#1f2733}
+.block .l.warn{color:var(--orange)}
+.foot{display:flex;justify-content:space-between;align-items:center;font-size:24px;color:var(--mute);font-weight:700}
+.foot .pts{display:flex;gap:10px}
+.foot .pt{font-size:21px;font-weight:800;padding:7px 14px;border-radius:999px;background:rgba(21,163,107,.12);color:var(--green);border:1.5px solid rgba(21,163,107,.35)}
+</style>
+<body>
+<div id="bg"></div>
+<div class="wrap" id="root"></div>
+<script>
+const LANG = new URLSearchParams(location.search).get('lang') === 'en' ? 'en' : 'ja';
+document.documentElement.lang = LANG;
+const T = {
+ja: { tag: 'AI コーディングエージェントの、共有される記憶',
+  c1: ['記録', 'フックが指示・編集・最後の回答を自動で送る。手作業なし。'],
+  c2: ['要約', 'ルールで引き継ぎ・決定事項・STATE.md にまとめる。LLM は呼ばない。'],
+  c3: ['注入', '次のセッションが、どのエージェント・どのマシンでも続きから始まる。'],
+  agents: ['Claude Code', 'Codex', 'Cursor', 'Antigravity'], os: ['macOS', 'Windows', 'Linux'],
+  store: ['Markdown in git', 'SQLite', 'tantivy + lindera（日本語検索）', 'MCP + hooks'], rust: 'Rust 製シングルバイナリ',
+  block: [['h', '前回からの引き継ぎ'], ['l', 'パスワード再設定画面にもメール検証を追加'], ['h', '決定事項（これまで）'], ['l', '・エラーは i18n キーで返す'], ['h', '落とし穴'], ['l warn', '⚠ テスト前に DB マイグレーション']],
+  pts: ['無料', 'オープンソース', '自宅サーバー / Docker', '日本語ファースト'], url: 'github.com/misorafa/kioku' },
+en: { tag: 'Shared memory for AI coding agents',
+  c1: ['Capture', 'Hooks send prompts, edits and the final reply automatically. Nothing to do by hand.'],
+  c2: ['Summarize', 'Rules turn it into handoffs, decisions and STATE.md. No LLM calls.'],
+  c3: ['Inject', 'The next session — any agent, any machine — starts where you left off.'],
+  agents: ['Claude Code', 'Codex', 'Cursor', 'Antigravity'], os: ['macOS', 'Windows', 'Linux'],
+  store: ['Markdown in git', 'SQLite', 'tantivy + lindera (Japanese search)', 'MCP + hooks'], rust: 'Single Rust binary',
+  block: [['h', 'Handoff from the previous session'], ['l', 'Address step validates the email too'], ['h', 'Decisions (carried)'], ['l', '• Errors are returned as i18n keys'], ['h', 'Gotchas'], ['l warn', '⚠ run DB migrations before tests']],
+  pts: ['Free', 'Open source', 'Home server / Docker', 'Japanese-first'], url: 'github.com/misorafa/kioku' } }[LANG];
+document.getElementById('root').innerHTML = `
+<div class="head"><div class="logo">kioku<small>記憶</small></div><div class="tag">${T.tag}</div></div>
+<div class="cols">
+  <div class="col"><div class="n"><b>1</b><span>${T.c1[0]}</span></div><p>${T.c1[1]}</p>
+    <div class="chips">${T.agents.map(a=>`<span class="chip">${a}</span>`).join('')}</div>
+    <div class="chips">${T.os.map(a=>`<span class="chip os">${a}</span>`).join('')}</div></div>
+  <div class="arrow">→</div>
+  <div class="col server"><div class="n"><b>2</b><span>${T.c2[0]}</span></div><p>${T.c2[1]}</p>
+    <div class="chips">${T.store.map(a=>`<span class="chip">${a}</span>`).join('')}<span class="chip rust">${T.rust}</span></div></div>
+  <div class="arrow">→</div>
+  <div class="col"><div class="n"><b>3</b><span>${T.c3[0]}</span></div><p>${T.c3[1]}</p>
+    <div class="block">${T.block.map(l=>`<div class="${l[0]}">${l[1]}</div>`).join('')}</div></div>
+</div>
+<div class="foot"><div class="pts">${T.pts.map(p=>`<span class="pt">${p}</span>`).join('')}</div><div class="mono">${T.url}</div></div>`;
+</script>
+</body>
+</html>
