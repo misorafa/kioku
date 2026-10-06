@@ -56,7 +56,10 @@ if ($env:KIOKU_RELEASE_TAG) {
     $Tag = $env:KIOKU_RELEASE_TAG
     if (-not $Tag.StartsWith('v')) { $Tag = "v$Tag" }
 } else {
-    $Tag = (Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers @{ 'User-Agent' = 'kioku-e2e' }).tag_name
+    # The releases/latest redirect, as install.ps1 resolves it (the REST API is rate-limited per
+    # runner IP without a token).
+    $r = Invoke-WebRequest -UseBasicParsing -Method Head -Uri "https://github.com/$Repo/releases/latest"
+    $Tag = ($r.BaseResponse.RequestMessage.RequestUri.AbsoluteUri -split '/tag/')[-1]
 }
 $Version = $Tag.TrimStart('v')
 $env:KIOKU_VERSION = $Tag
