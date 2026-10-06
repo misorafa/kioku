@@ -1,4 +1,5 @@
-# Virtual clean install on Windows (PowerShell 7) of the PUBLIC release path: the Windows
+﻿# Virtual clean install on Windows (PowerShell 5.1 or 7; saved with a UTF-8 BOM so 5.1 reads
+# the Japanese fixtures correctly on a Japanese code page) of the PUBLIC release path: the Windows
 # counterpart of scripts/e2e/clean-install.sh, run by .github/workflows/clean-install.yml on a
 # pristine windows-latest runner. Never run it on a machine you use: install.ps1 adds each
 # throwaway install directory to the user PATH in the registry.
