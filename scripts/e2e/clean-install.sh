@@ -33,6 +33,7 @@
 # Prints PASS / FAIL / KNOWN / SKIP per step and exits 1 on any FAIL. KNOWN = a failure that
 # matches a bug already fixed on main but not yet in the release under test (see known()).
 # Never prints a token or a full invite code. Needs curl, awk, sed (+ docker without --host).
+# shellcheck disable=SC2016 # single-quoted commands are expanded by the machine's own shell
 set -eu
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
