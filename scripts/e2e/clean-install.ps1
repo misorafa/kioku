@@ -22,7 +22,8 @@
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-Set-StrictMode -Version 3
+# No Set-StrictMode: it would leak into install.ps1 (run in this scope like `irm | iex`),
+# which reads variables a user may not have set ($KiokuJoinUrl), as it always has.
 
 $Repo = 'misorafa/kioku'
 $InstallPs1Url = "https://raw.githubusercontent.com/$Repo/main/install.ps1"
@@ -195,6 +196,14 @@ try {
     $ok = $false
 }
 Check "server: install.ps1 -NoSetup installed kioku $Version" ($ok -and (Test-Path (Exe 'server')))
+function Stop-Early {
+    if ($script:serve -and -not $script:serve.HasExited) { Stop-Process -Id $script:serve.Id -Force }
+    Write-Host ''
+    Write-Host "release ${Tag}: $script:Passed passed, $script:Failed failed (stopped early)"
+    exit 1
+}
+$serve = $null
+if (-not (Test-Path (Exe 'server'))) { Stop-Early }
 Invoke-Kioku (Exe 'server') @('--version') $srvDir
 Check "server: kioku.exe --version = kioku $Version" ($script:Out.Trim() -eq "kioku $Version")
 Invoke-Kioku (Exe 'server') @('init') $srvDir
@@ -217,6 +226,7 @@ $line = ''
 if ($script:Out -match '(?m)^  Windows \(PowerShell\):  (.+)$') { $line = $Matches[1].Trim() }
 $shape = "^\`$env:KIOKU_JOIN='127\.0\.0\.1:$Port/[A-Za-z0-9]+'; irm $([regex]::Escape($InstallPs1Url)) \| iex$"
 Check "server: kioku invite printed the Windows line: $(Mask $line)" ($script:Code -eq 0 -and $line -match $shape)
+if (-not $up -or -not ($line -match $shape)) { Stop-Early }
 
 # --------------------------------------------------------------------------- clients
 
