@@ -469,6 +469,38 @@ fn mode(_p: &Path) -> Option<u32> {
     None
 }
 
+/// `config` check (and "server machine") for a machine without config.toml that is
+/// configured by `KIOKU_AUTH_TOKEN`: kioku's Docker image, or a server without a file; with
+/// `KIOKU_SERVER_URL` outside the image, a client. `None` without a token.
+pub fn env_only_config(vars: &HashMap<String, String>, path: &Path) -> Option<(Check, bool)> {
+    let set = |k: &str| vars.get(k).is_some_and(|v| !v.trim().is_empty());
+    if !set("KIOKU_AUTH_TOKEN") {
+        return None;
+    }
+    let server_machine = in_kioku_image(vars) || !set("KIOKU_SERVER_URL");
+    let from = if set("KIOKU_SERVER_URL") {
+        "KIOKU_AUTH_TOKEN, KIOKU_SERVER_URL"
+    } else {
+        "KIOKU_AUTH_TOKEN"
+    };
+    let c = check(
+        "config",
+        Status::Ok,
+        format!(
+            "no {}; configured from the environment ({from})",
+            path.display()
+        ),
+        None,
+    );
+    Some((c, server_machine))
+}
+
+/// True inside kioku's own Docker image (`KIOKU_CONTAINER=1`), whose container runtime
+/// runs `kioku serve` and which never updates itself.
+fn in_kioku_image(vars: &HashMap<String, String>) -> bool {
+    vars.get("KIOKU_CONTAINER").is_some_and(|v| v == "1")
+}
+
 /// Returns the effective config, whether it is usable, and whether this is a server machine.
 fn config_check(
     env: &DoctorEnv,
@@ -486,6 +518,12 @@ fn config_check(
             .to_string(),
     );
     if !path.exists() {
+        // The Docker image needs no config.toml (README "Docker"): KIOKU_AUTH_TOKEN alone
+        // configures the server, so doctor inside it must not fail on the missing file.
+        if let Some((c, server_machine)) = env_only_config(&env.vars, path) {
+            out.push(c);
+            return (fallback(), true, server_machine);
+        }
         out.push(check(
             "config",
             Status::Fail,
@@ -933,6 +971,14 @@ fn mcp_check(client: &ClientConfig, timeout: Duration) -> Check {
 fn service_check(env: &DoctorEnv, cfg: &Config, health: &Health) -> Check {
     let manager = env.setup_env().service_manager(&cfg.data_dir);
     let up = matches!(health, Health::Kioku { .. });
+    if up && in_kioku_image(&env.vars) {
+        return check(
+            "service",
+            Status::Ok,
+            "kioku's Docker image: the container runtime runs `kioku serve` (no launchd / systemd needed)",
+            None,
+        );
+    }
     if let Platform::Unsupported(_) = manager.platform {
         return check(
             "service",
@@ -1714,11 +1760,15 @@ pub fn update_check(cfg: &Config, env: &DoctorEnv, health: &Health) -> Check {
     use crate::update::{is_newer, package_manager};
     let state = AutoUpdateState::load(&log_dir(cfg, env).with_file_name("state"));
     let managed = package_manager(Path::new(&env.bin));
-    let mut parts = vec![format!(
-        "automatic updates {} (channel {})",
-        if cfg.update.auto { "on" } else { "off" },
-        cfg.update.channel
-    )];
+    let mut parts = vec![if in_kioku_image(&env.vars) {
+        "automatic updates off in kioku's Docker image (pull the new image to update)".to_string()
+    } else {
+        format!(
+            "automatic updates {} (channel {})",
+            if cfg.update.auto { "on" } else { "off" },
+            cfg.update.channel
+        )
+    }];
     let mut status = Status::Ok;
     let mut fix = None;
     let how = match managed {

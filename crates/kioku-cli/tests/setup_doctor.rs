@@ -247,6 +247,56 @@ fn setup_without_service_installs_agents_and_is_idempotent() {
     assert_eq!(snapshot(home.path(), &[]), before);
 }
 
+/// Found by scripts/e2e/clean-install.sh: `install.sh … --no-service` on a server without
+/// launchd / systemd (a container) exited 1 because nobody had started `kioku serve` yet.
+/// No answer at all is a skipped auth check now; an HTTP answer (401) still fails.
+#[test]
+fn setup_no_service_without_a_running_server_succeeds() {
+    let (home, bin) = home_with_agents(false);
+    let base = format!("http://127.0.0.1:{}", free_port());
+    let env = setup_env(
+        home.path(),
+        &bin,
+        vars(&[("KIOKU_SERVER_URL", &base), ("KIOKU_AUTH_TOKEN", TOKEN)]),
+        Runner::recording(|_| CmdOutput::ok("")),
+    );
+    let opts = SetupOptions {
+        no_service: true,
+        no_agents: true,
+        ..SetupOptions::default()
+    };
+    let rep = run_setup(&opts, &env);
+    let lines = rep.summary_lines();
+    assert_eq!(
+        lines[3],
+        format!(
+            "  --  auth        no server answers at {base} yet (--no-service): start it with `kioku serve`, then check with `kioku doctor`"
+        ),
+        "{}",
+        rep.render()
+    );
+    assert_eq!(rep.exit_code(), 0, "{}", rep.render());
+
+    // With --no-service, a server that answers 401 still fails.
+    let (served, _server) = test_server();
+    let env = setup_env(
+        home.path(),
+        &bin,
+        vars(&[
+            ("KIOKU_SERVER_URL", &served),
+            ("KIOKU_AUTH_TOKEN", "not-the-server-token"),
+        ]),
+        Runner::recording(|_| CmdOutput::ok("")),
+    );
+    let rep = run_setup(&opts, &env);
+    assert!(
+        rep.summary_lines()[3].starts_with("  xx  auth"),
+        "{}",
+        rep.render()
+    );
+    assert_eq!(rep.exit_code(), 1);
+}
+
 #[test]
 fn setup_on_windows_requires_client_only() {
     let (home, bin) = home_with_agents(true);
@@ -1405,6 +1455,70 @@ fn doctor_server_version_unknown_is_not_compared() {
     );
     assert!(!c.message.contains("runs v"), "{c:?}");
     assert_eq!(find(&checks, "auth").status, Status::Fail);
+}
+
+/// Found by scripts/e2e/clean-install.sh: `docker exec kioku kioku doctor` in the documented
+/// image setup (KIOKU_AUTH_TOKEN, no config.toml) failed on the missing file and warned
+/// about launchd / systemd. The environment is a valid config there, and the container
+/// runtime is the service.
+#[test]
+fn doctor_in_the_docker_image_needs_no_config_file() {
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let mut cfg = Config::for_data_dir(data.path());
+    cfg.server.auth_token = Some(TOKEN.into());
+    kioku_core::init(&mut cfg).unwrap();
+    // `kioku serve` with KIOKU_AUTH_TOKEN creates the data dir but no config.toml.
+    let _ = std::fs::remove_file(data.path().join("config.toml"));
+    let store = Arc::new(Store::open(cfg).unwrap());
+    let base = format!(
+        "http://{}",
+        spawn_server(store, TOKEN.into(), "127.0.0.1:0".into())
+    );
+    let env = DoctorEnv {
+        vars: vars(&[
+            ("KIOKU_DATA_DIR", data.path().to_str().unwrap()),
+            ("KIOKU_AUTH_TOKEN", TOKEN),
+            ("KIOKU_CONTAINER", "1"),
+            ("KIOKU_SERVER_URL", &base),
+        ]),
+        hook_platform: HookPlatform::Unix,
+        home: home.path().to_path_buf(),
+        bin: "/usr/local/bin/kioku".into(),
+        runner: Runner::recording(|argv| {
+            if argv[0] == "git" {
+                CmdOutput::ok("git version 2.47.3\n")
+            } else {
+                CmdOutput::fail("")
+            }
+        }),
+        platform: Some(Platform::Systemd),
+        timeout: Duration::from_secs(3),
+        app_dirs: Vec::new(),
+        pid: 0,
+    };
+    let checks = doctor::run_doctor(&env, None);
+    let c = find(&checks, "config");
+    assert_eq!(c.status, Status::Ok, "{c:?}");
+    assert!(
+        c.message.contains("configured from the environment"),
+        "{c:?}"
+    );
+    assert!(!c.message.contains(TOKEN), "{c:?}");
+    assert_eq!(find(&checks, "auth").status, Status::Ok);
+    assert_eq!(find(&checks, "data_dir").status, Status::Ok, "{checks:#?}");
+    let s = find(&checks, "service");
+    assert_eq!(s.status, Status::Ok, "{s:?}");
+    assert!(s.message.contains("Docker image"), "{s:?}");
+    let u = find(&checks, "update");
+    assert!(u.message.contains("off in kioku's Docker image"), "{u:?}");
+    assert_eq!(doctor::exit_code(&checks), 0, "{checks:#?}");
+
+    // Without the token the missing file is still a failure.
+    let mut bare = env;
+    bare.vars.remove("KIOKU_AUTH_TOKEN");
+    let checks = doctor::run_doctor(&bare, None);
+    assert_eq!(find(&checks, "config").status, Status::Fail);
 }
 
 #[test]
