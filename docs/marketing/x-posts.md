@@ -18,7 +18,12 @@ kioku（記憶）
 ・Rust 製シングルバイナリ、LLM は呼ばない、データは自宅サーバーに
 ・無料・オープンソース
 
-導入は 1 行。
+導入は 1 行。Windows 版は現在無署名です（SmartScreen の警告が出ます。署名は申請中。SHA256SUMS で検証できます）。
+https://github.com/misorafa/kioku
+
+### A'. 140 字版（X Premium でない場合：日本語は 1 文字 2 カウント、URL は 23 カウント）
+
+「エージェントを変えると記憶がゼロ」を直すために、Claude Code / Codex / Cursor / Antigravity で共有する記憶サーバー kioku を作りました。日本語ファースト、Rust 製、無料・OSS。Windows 版は現在無署名です。
 https://github.com/misorafa/kioku
 
 ### B. 3 連投（1 本目に動画、2 本目に 1 枚図、3 本目にコマンド）
@@ -44,7 +49,7 @@ https://github.com/misorafa/kioku
 
 curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh
 
-無料・オープンソース。感想や要望、歓迎です。
+無料・オープンソース。Windows 版は現在無署名です（SmartScreen の警告が出ます。署名は申請中、SHA256SUMS で検証可）。感想や要望、歓迎です。
 https://github.com/misorafa/kioku
 
 ### 返信欄に添える補足（任意）
@@ -67,7 +72,12 @@ kioku (記憶)
 • Single Rust binary, no LLM calls, your data on your own server
 • Free and open source
 
-One-line install.
+One-line install. The Windows binary is currently unsigned (SmartScreen will warn; signing is in progress; verify with SHA256SUMS).
+https://github.com/misorafa/kioku
+
+### A'. Short version (280 chars)
+
+Built a memory server shared by Claude Code / Codex / Cursor / Antigravity, so switching agents or machines no longer resets to zero. Japanese-first, single Rust binary, free & open source. Windows binary currently unsigned.
 https://github.com/misorafa/kioku
 
 ### B. Thread (video on 1, diagram on 2, command on 3)
@@ -92,7 +102,7 @@ Install in one line. The server runs on a Mac, Linux or Docker; Windows joins as
 
 curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh
 
-Free, open source. Feedback welcome.
+Free, open source. The Windows binary is currently unsigned (SmartScreen warns; signing in progress; verify with SHA256SUMS). Feedback welcome.
 https://github.com/misorafa/kioku
 
 ### Optional follow-up replies
