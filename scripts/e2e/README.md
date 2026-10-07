@@ -79,3 +79,20 @@ refuses 7391), bound to 127.0.0.1.
   `scripts/probe-agents.sh --check` (docs/INDEX.md "Fixture freshness").
 - **Automatic updates across versions** (the server pins auto-update off during a run) and
   a Windows *server* (unsupported; `clean-install.ps1` uses one only as a stand-in).
+
+## Real Windows machine (manual)
+
+The CI job runs on a pristine `windows-latest` runner with PowerShell 7. A real Japanese
+Windows 11 box (Windows PowerShell 5.1, Defender on) found two things the runner did not —
+the script must be saved with a UTF-8 BOM and must not use `ProcessStartInfo.ArgumentList` —
+so run it on real hardware now and then, from a machine that can `ssh` into it:
+
+```sh
+ssh <windows-host> "powershell -NoProfile -ExecutionPolicy Bypass -Command \"git clone -q --depth 1 https://github.com/misorafa/kioku.git \$env:TEMP\kioku-e2e-src; Set-Location \$env:TEMP\kioku-e2e-src; \$env:KIOKU_RELEASE_TAG='v0.9.4'; powershell -NoProfile -ExecutionPolicy Bypass -File scripts\e2e\clean-install.ps1\""
+```
+
+It needs git on the Windows side and nothing else. Afterwards remove what the installer left:
+the `kioku-e2e-*` directories under `%TEMP%` and the matching entries in the user `Path`
+(`[Environment]::SetEnvironmentVariable('Path', ((… -split ';') -notmatch 'kioku-e2e-') -join ';', 'User')`).
+Expected on a real machine: `binary` is the only doctor warning (profiles live under `%TEMP%`).
+Last run: 2026-10-07 on a Japanese Windows 11 Pro — 25 passed, 0 failed (v0.9.4).
