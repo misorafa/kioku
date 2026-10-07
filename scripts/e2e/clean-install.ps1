@@ -137,7 +137,8 @@ function Mcp-Handoff([string]$Name, [string]$ProjectId, [string]$Session) {
     $cfg = Get-Content -Raw -Encoding UTF8 (Join-Path $Work "$Name\.claude.json") | ConvertFrom-Json
     $entry = $cfg.mcpServers.kioku
     $psi = [Diagnostics.ProcessStartInfo]::new($entry.command)
-    foreach ($a in $entry.args) { $psi.ArgumentList.Add([string]$a) }
+    # Windows PowerShell 5.1 (.NET Framework) has no ProcessStartInfo.ArgumentList: quote by hand.
+    $psi.Arguments = (@($entry.args) | ForEach-Object { '"' + ([string]$_ -replace '(\\*)"', '$1$1\"') + '"' }) -join ' '
     $psi.WorkingDirectory = Join-Path $Work "$Name\src\demo"
     $psi.UseShellExecute = $false
     $psi.RedirectStandardInput = $true
