@@ -10,6 +10,14 @@ and `doctor --fix`, Homebrew/Docker/winget distribution, and a virtual clean-ins
 across Linux containers, macOS and Windows (also run on a real Japanese Windows 11 machine).
 The Windows binary is still unsigned (SmartScreen warns); code signing is in progress.
 
+- Virtual clean-install test of the public release path: Linux containers (Ubuntu server,
+  Debian and Alpine clients, Docker image), macOS (separate HOMEs, signature and
+  notarization) and Windows (install.ps1, invite line, kioku.exe hooks); `scripts/e2e/`,
+  weekly `clean-install.yml`; also run on a real Japanese Windows 11 (25/25).
+- `install.sh --no-service` no longer fails when no server has been started yet; Docker
+  installs with env-only config pass `kioku doctor`.
+- `install.ps1` works under `Set-StrictMode` profiles.
+
 
 Every release of kioku, newest first. Built from the release commits and the merged pull
 requests of each tag (`git log <previous tag>..<tag>`). Specifications are in
