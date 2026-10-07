@@ -33,7 +33,10 @@ $Fix = Join-Path $Root 'crates\kioku-cli\tests\fixtures\windows\claude-code'
 $Port = 7391
 
 # Doctor warnings expected on the Windows clients (no Claude Code binary, only ~/.claude).
-$AllowedWarnClient = @()
+# `binary`: the throwaway profiles live under the temp directory, which doctor rightly flags
+# ("hooks break when it moves") on a real machine; on a CI runner RUNNER_TEMP is not under
+# %TEMP%, so the warning only appears locally.
+$AllowedWarnClient = @('binary')
 
 $script:Passed = 0
 $script:Failed = 0
