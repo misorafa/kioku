@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.0.0 — 2026-10-07
+
+First stable release. Everything from the M2.1–M3.4 milestones is in: multi-agent and
+multi-machine handoffs with lanes and aliases, invites, automatic updates that follow the
+server, offline queue with delivery receipts, backup/restore, carried decisions and pinned
+pages in the session-start block, re-ranked Japanese search with a user dictionary, metrics
+and `doctor --fix`, Homebrew/Docker/winget distribution, and a virtual clean-install test
+across Linux containers, macOS and Windows (also run on a real Japanese Windows 11 machine).
+The Windows binary is still unsigned (SmartScreen warns); code signing is in progress.
+
+
 Every release of kioku, newest first. Built from the release commits and the merged pull
 requests of each tag (`git log <previous tag>..<tag>`). Specifications are in
 [docs/](docs/INDEX.md); the section that is current for each topic is listed in
