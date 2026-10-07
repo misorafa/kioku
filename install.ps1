@@ -325,8 +325,11 @@ function Invoke-KiokuInstall([object[]]$Arguments) {
     # set them; SPEC-M2.7 section 4 removed that route), or KIOKU_JOIN below.
     $joinUrl = ''
     $joinCode = ''
-    if ($KiokuJoinUrl) { $joinUrl = [string]$KiokuJoinUrl }
-    if ($KiokuJoinCode) { $joinCode = [string]$KiokuJoinCode }
+    # Read these as "maybe unset" so a profile with Set-StrictMode does not break `irm | iex`.
+    $legacyUrl = Get-Variable -Name KiokuJoinUrl -ValueOnly -ErrorAction SilentlyContinue
+    $legacyCode = Get-Variable -Name KiokuJoinCode -ValueOnly -ErrorAction SilentlyContinue
+    if ($legacyUrl) { $joinUrl = [string]$legacyUrl }
+    if ($legacyCode) { $joinCode = [string]$legacyCode }
     # SPEC-M2.3 section 9: `$env:KIOKU_JOIN='<server>:<port>/<code>'; irm <github>/install.ps1 | iex`
     # -- the script comes from GitHub over https, not from a bare LAN IP, and no execution-policy
     # bypass is involved (Defender flagged `powershell -ExecutionPolicy Bypass -c irm http://<ip>/... | iex`).
