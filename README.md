@@ -443,7 +443,9 @@ any time):
    answers with another version than this binary (you just replaced the
    binary), it is restarted: `restarted (v<old> -> v<new>)`. `--no-service`
    skips it.
-3. **auth** — checks the token with an authenticated request.
+3. **auth** — checks the token with an authenticated request. With
+   `--no-service` and no server running yet (a container, a host without
+   launchd / systemd), this line is `--` and says to start `kioku serve`.
 4. **agents** — installs hooks + MCP for every agent it detects (`~/.claude`,
    `~/.codex` or `$CODEX_HOME`, `~/.cursor`, `~/.gemini`); `--agents` limits
    the set, `--no-agents` skips it, `--no-instructions` skips the instruction
@@ -710,6 +712,19 @@ Run one server for all your machines. On a fresh server,
 there, then `kioku service stop && kioku service start`). Then run
 `kioku invite` for every other machine (see Install).
 
+On a host without launchd / systemd (a container, WSL without systemd) or one where
+another supervisor runs kioku, install without the service and without agent hooks,
+then start the server yourself:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh -s -- --bind 0.0.0.0 --no-service --no-agents
+~/.local/bin/kioku serve --log-file ~/.kioku/logs/serve.log &   # or under your supervisor
+~/.local/bin/kioku invite
+```
+
+`scripts/e2e/clean-install.sh` runs exactly this server in a pristine container and
+joins clients to it with the printed line.
+
 **Which URL to use.** `kioku invite` (like `--print-client-command`) prints the
 server's LAN IP and lists the machine's other addresses; `kioku invite --host
 <address>` uses another one. The new machine keeps exactly the address in the
@@ -775,7 +790,7 @@ address, so replace it with the Docker host's in the pasted line. On the Docker 
 itself, `kioku setup` sees the running server and does not install a service. A
 bind-mounted host directory must be writable by uid 10001. Arguments replace the
 command: `docker run … ghcr.io/misorafa/kioku serve --port 8000`; `docker exec kioku
-kioku status` works inside the container.
+kioku status` and `docker exec kioku kioku doctor` work inside the container.
 
 With Compose, `docker-compose.yml` in this repository is a complete example: put
 `KIOKU_AUTH_TOKEN=…` in a `.env` file next to it and run `docker compose up -d`.

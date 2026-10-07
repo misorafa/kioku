@@ -361,6 +361,17 @@ pub fn run_setup(opts: &SetupOptions, env: &SetupEnv) -> SetupReport {
                     "auth",
                     format!("token accepted by {}", state.cfg.client.server_url),
                 ),
+                // --no-service on a server machine (a container, a host without launchd /
+                // systemd): nobody has started `kioku serve` yet, which is not a failure.
+                // An HTTP answer (401, 5xx) still is.
+                Err(e) if opts.no_service && http_status(&e).is_none() => r.push(
+                    Mark::Skip,
+                    "auth",
+                    format!(
+                        "no server answers at {} yet (--no-service): start it with `kioku serve`, then check with `kioku doctor`",
+                        state.cfg.client.server_url
+                    ),
+                ),
                 Err(e) => r.push(Mark::Fail, "auth", auth_failure(&e, &config_path)),
             }
         }

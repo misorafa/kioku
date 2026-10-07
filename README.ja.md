@@ -407,7 +407,9 @@ kioku setup [--client-only <url> <token>] [--no-service] [--no-agents] [--agents
    サービスをインストールしません。インストール済みのサービスがこのバイナリと違うバージョンで応答した
    場合（バイナリを置き換えた直後など）は再起動します: `restarted (v<old> -> v<new>)`。
    `--no-service` で省略します。
-3. **auth** — 認証付きのリクエストでトークンを確認します。
+3. **auth** — 認証付きのリクエストでトークンを確認します。`--no-service` でまだサーバーが
+   動いていない場合（コンテナや launchd / systemd のないホスト）は `--` になり、`kioku serve`
+   を起動するよう表示します。
 4. **agents** — 検出したすべてのエージェント（`~/.claude`、`~/.codex` または `$CODEX_HOME`、
    `~/.cursor`、`~/.gemini`）にフック + MCP をインストールします。`--agents` で対象を絞り、
    `--no-agents` で省略し、`--no-instructions` で指示スニペットを省略します。
@@ -649,6 +651,18 @@ kioku status
 `kioku service stop && kioku service start`）。続いて、ほかのマシンごとに `kioku invite` を実行します
 （「インストール」を参照）。
 
+launchd / systemd のないホスト（コンテナ、systemd なしの WSL）や、別のスーパーバイザーで kioku を
+動かすホストでは、サービスとエージェントのフックなしでインストールし、サーバーは自分で起動します:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh -s -- --bind 0.0.0.0 --no-service --no-agents
+~/.local/bin/kioku serve --log-file ~/.kioku/logs/serve.log &   # またはスーパーバイザーの下で
+~/.local/bin/kioku invite
+```
+
+`scripts/e2e/clean-install.sh` は、まさにこのサーバーをまっさらなコンテナで動かし、表示された行で
+クライアントを参加させます。
+
 **接続先の選び方。** `kioku invite`（と `--print-client-command`）はサーバーの LAN の IP を表示し、
 この機械のほかのアドレスも並べます。別のアドレスを使うなら `kioku invite --host <アドレス>`。
 新しいマシンは、貼り付けた行に書かれたアドレスをそのまま使います。
@@ -705,7 +719,7 @@ docker run -d --name kioku --restart unless-stopped -p 7391:7391 \
 Docker ホストのアドレスに置き換えてください。Docker ホスト自身で `kioku setup` を実行すると、
 動いているサーバーを検出してサービスはインストールしません。ホストのディレクトリをバインドマウントする場合は、
 uid 10001 が書き込めるようにしてください。引数はコマンドを置き換えます
-（`docker run … ghcr.io/misorafa/kioku serve --port 8000`）。コンテナ内では `docker exec kioku kioku status` が使えます。
+（`docker run … ghcr.io/misorafa/kioku serve --port 8000`）。コンテナ内では `docker exec kioku kioku status` と `docker exec kioku kioku doctor` が使えます。
 
 Compose の場合は、このリポジトリの `docker-compose.yml` がそのまま使える例です。同じ場所の `.env` に
 `KIOKU_AUTH_TOKEN=…` を書き、`docker compose up -d` を実行します。

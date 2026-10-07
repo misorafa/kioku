@@ -1,0 +1,61 @@
+name: clean install (e2e)
+
+# Virtual "clean install on several machines" of the PUBLIC release path (scripts/e2e/README.md):
+# pristine machines install the published release with the README one-liners, join with the
+# line `kioku invite` prints, simulate a Claude Code session with the real hook binary and
+# check that the other machine's next session starts with the handoff. Uses no secrets and
+# talks only to GitHub, ghcr.io and its own throwaway server.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to test (e.g. v0.9.4); empty = latest release
+        required: false
+        type: string
+  schedule:
+    - cron: "17 3 * * 1" # weekly, Monday 03:17 UTC
+  pull_request:
+    paths:
+      - install.sh
+      - install.ps1
+      - scripts/e2e/**
+      - .github/workflows/clean-install.yml
+
+permissions:
+  contents: read
+
+env:
+  KIOKU_RELEASE_TAG: ${{ inputs.tag }}
+
+jobs:
+  linux-docker:
+    name: Linux containers (ubuntu server, debian + alpine clients, Docker image)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: clean-install.sh
+        run: sh scripts/e2e/clean-install.sh
+
+  windows:
+    name: Windows (install.ps1, invite line, kioku.exe hooks)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: clean-install.ps1
+        shell: pwsh
+        run: ./scripts/e2e/clean-install.ps1
+
+  macos:
+    name: macOS (install.sh, separate HOMEs, signature + notarization)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: clean-install.sh --host
+        run: sh scripts/e2e/clean-install.sh --host
+      - name: signature and notarization of the installed binary
+        if: ${{ !cancelled() }}
+        run: sh scripts/e2e/macos-signature.sh

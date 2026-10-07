@@ -1135,7 +1135,13 @@ Non-interactive (safe under `curl … | sh`); every step idempotent. Order:
    is polled again until it reports this version; the line then reads
    `… running at <url>, restarted (v<old> -> v<new>)` (still another version
    after the restart → `!!`). Fallback platform (§10.5) → warning, continue.
-4. **Auth check** — `GET /api/v1/status` with the token (401 → fail).
+4. **Auth check** — `GET /api/v1/status` with the token (401 → fail). With
+   `--no-service` on a server machine, no answer at all (connection refused / timeout)
+   is `--` "no server answers at <url> yet (--no-service): start it with `kioku serve`"
+   and does not fail the run: nothing has started the server yet (a container, a host
+   without launchd / systemd). Any HTTP answer is still checked. (Amended after the
+   clean-install e2e test, `scripts/e2e/clean-install.sh`, showed
+   `install.sh … --no-service` exiting 1 on such a host.)
 5. **Agents** (unless `--no-agents`) — `install all` semantics (§8.3).
 6. **Summary** and exit code: 0 when steps 2–5 succeeded (warnings allowed),
    1 otherwise (agents are still installed when only the service failed —
@@ -1222,6 +1228,13 @@ skips the others.
 | `hook_dump` | dump enabled (env or config) | off | on ("raw payloads with possible secrets are being written") | — |
 
 Doctor on a client-only machine skips `data_dir` and `service`.
+
+Without config.toml but with `KIOKU_AUTH_TOKEN` in the environment (kioku's Docker image,
+SPEC-M3.3 §2), `config` is OK ("configured from the environment"); it is a server machine
+unless `KIOKU_SERVER_URL` is set outside the image. Inside the image (`KIOKU_CONTAINER=1`)
+`service` is OK while the server answers (the container runtime runs `kioku serve`), and
+`update` says automatic updates are off there. (Amended: `docker exec kioku kioku doctor`
+failed on the missing file before.)
 
 ## 13. `install.sh` and releases
 

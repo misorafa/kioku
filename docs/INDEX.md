@@ -99,4 +99,5 @@ decisions: [adr/](adr/)
 | Docker image (ghcr.io), container detection | SPEC-M3.3 §2 | notes SPEC-M3.3 §6; no self-update in a container |
 | `kioku uninstall` (whole machine) | SPEC-M3.3 §3 | per agent: SPEC-M2 §8; notes SPEC-M3.3 §6 |
 | Fixture freshness, `_meta.captured_with` | SPEC-M3.3 §4 | **monthly manual task**: capture with `sh scripts/probe-agents.sh`, `kioku hook-dump extract`, then `sh scripts/probe-agents.sh --check`; doctor `[INFO] agent.<a>.fixtures` |
+| Clean-install e2e of the public release path | SPEC-M2 §13, SPEC-M2.3 §4 | `sh scripts/e2e/clean-install.sh` (Docker; `--host` without Docker), `pwsh scripts/e2e/clean-install.ps1` (Windows runner only); workflow `clean-install.yml` (weekly + dispatch); see `scripts/e2e/README.md` |
 | Documents index (this file), ADRs | SPEC-M3.2 §4 | |
