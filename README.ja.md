@@ -235,6 +235,18 @@ formula は同じリリースバイナリ（macOS: Apple シリコンと Intel�
 `brew upgrade kioku` を案内するだけです。フックとサービスには固定のリンク `$(brew --prefix)/bin/kioku` を
 登録するので、アップグレード後もそのまま動きます。
 
+### winget（Windows）
+
+```powershell
+winget install misorafa.kioku
+kioku join <url> <code>        # サーバーで `kioku invite` が表示する行
+```
+
+パッケージの中身は同じリリース zip（`kioku.exe` をポータブルコマンドとして登録）です。バイナリは
+winget が管理するので、`kioku update` と自動更新は `winget upgrade misorafa.kioku` を案内するだけです。
+各リリースは [winget-pkgs](https://github.com/microsoft/winget-pkgs) に自動で提出され、Microsoft の
+審査を経て数日後に反映されます。バイナリは現在無署名です（[Windows](#windowsクライアント専用) を参照）。
+
 ### アンインストール
 
 ```sh
@@ -353,7 +365,7 @@ Claude Code（CLI と Claude デスクトップアプリの Code タブ）と Co
 $env:KIOKU_JOIN='192.168.1.240:7391/K7Q2M9XD'; irm https://raw.githubusercontent.com/misorafa/kioku/main/install.ps1 | iex
 ```
 
-**PowerShell** に貼り付けてください。Git Bash では `curl … | sh` の行を貼ると、自動で PowerShell に引き継ぎます。どちらの行も `powershell -ExecutionPolicy Bypass -c …` で包まないでください（Windows Defender が `Trojan:Win32/Commando.A!ml` として止めます）。
+**PowerShell** に貼り付けてください。Git Bash では `curl … | sh` の行を貼ると、自動で PowerShell に引き継ぎます。パッケージマネージャーで入れたい場合は `winget install misorafa.kioku` のあとに `kioku join …` の行を実行しても同じです（[winget](#wingetwindows) を参照）。どちらの行も `powershell -ExecutionPolicy Bypass -c …` で包まないでください（Windows Defender が `Trojan:Win32/Commando.A!ml` として止めます）。
 
 `install.ps1` は `kioku-<tag>-x86_64-pc-windows-msvc.tar.gz` をダウンロードして `SHA256SUMS` で
 検証し（`Get-FileHash`）、`kioku.exe` を `%LOCALAPPDATA%\Programs\kioku` にインストールし、そのフォルダを

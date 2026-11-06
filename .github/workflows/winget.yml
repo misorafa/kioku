@@ -5,8 +5,8 @@ name: winget
 # updates the zip URL and its SHA-256, and opens a PR from the ShinichiroGoto/winget-pkgs
 # fork. Called by release.yml after each GitHub Release; run it by hand to submit an
 # existing tag. Skipped while the WINGET_TOKEN secret (a classic PAT with `public_repo`,
-# owned by ShinichiroGoto) is not set, and while misorafa.kioku is not yet in winget-pkgs
-# (the first version is submitted by hand and waits for a moderator).
+# owned by ShinichiroGoto) is not set, and while misorafa.kioku is not in winget-pkgs
+# (the first version, 1.0.0, was submitted by hand and merged on 2026-11-04).
 
 on:
   workflow_call:

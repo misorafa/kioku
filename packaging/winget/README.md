@@ -6,6 +6,9 @@ Source of the manifests submitted to https://github.com/microsoft/winget-pkgs un
 portable command `kioku`. Update PackageVersion, InstallerUrl, InstallerSha256 (uppercase
 hex from the release's `.zip.sha256`), ReleaseDate and ReleaseNotesUrl for each version.
 
+The first submission (1.0.0, manifest schema 1.28.0) was merged on 2026-11-04
+(microsoft/winget-pkgs#442720); `winget install misorafa.kioku` works since then.
+
 ## Automation
 
 From the second version on, `.github/workflows/winget.yml` submits each release: release.yml

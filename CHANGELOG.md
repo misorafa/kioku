@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- kioku is in winget: `winget install misorafa.kioku` (first submission merged
+  2026-11-04). Later releases are submitted automatically by `winget.yml`.
+
 ## v1.0.0 — 2026-10-07
 
 First stable release. Everything from the M2.1–M3.4 milestones is in: multi-agent and

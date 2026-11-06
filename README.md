@@ -253,6 +253,19 @@ the static musl builds). Homebrew owns the binary: `kioku update` and the automa
 updates only print `brew upgrade kioku`, and hooks and the service are registered with
 the stable `$(brew --prefix)/bin/kioku` link, so they keep working across upgrades.
 
+### winget (Windows)
+
+```powershell
+winget install misorafa.kioku
+kioku join <url> <code>        # the line `kioku invite` prints on your server
+```
+
+The package is the same release zip (`kioku.exe` as a portable command). winget owns the
+binary: `kioku update` and the automatic updates only print `winget upgrade misorafa.kioku`.
+Each release is submitted to [winget-pkgs](https://github.com/microsoft/winget-pkgs)
+automatically and appears a few days later, after Microsoft's review. The binary is
+unsigned for now (see [Windows](#windows-client-only)).
+
 ### Uninstall
 
 ```sh
@@ -382,7 +395,7 @@ normal or administrator — it always installs for your own user):
 $env:KIOKU_JOIN='192.168.1.240:7391/K7Q2M9XD'; irm https://raw.githubusercontent.com/misorafa/kioku/main/install.ps1 | iex
 ```
 
-Paste it into **PowerShell**. From Git Bash, paste the `curl … | sh` line instead: it hands over to PowerShell by itself. Do not wrap either line in `powershell -ExecutionPolicy Bypass -c …`: Windows Defender flags that shape as `Trojan:Win32/Commando.A!ml`.
+Paste it into **PowerShell**. From Git Bash, paste the `curl … | sh` line instead: it hands over to PowerShell by itself. If you prefer a package manager, `winget install misorafa.kioku` followed by the `kioku join …` line does the same (see [winget](#winget-windows)). Do not wrap either line in `powershell -ExecutionPolicy Bypass -c …`: Windows Defender flags that shape as `Trojan:Win32/Commando.A!ml`.
 
 `install.ps1` downloads `kioku-<tag>-x86_64-pc-windows-msvc.tar.gz`, verifies it
 against `SHA256SUMS` (`Get-FileHash`), installs `kioku.exe` to
