@@ -10,7 +10,7 @@ Files: [SPEC-M1](SPEC-M1.md) · [SPEC-M2](SPEC-M2.md) · [SPEC-M2.1](SPEC-M2.1.m
 [SPEC-M2.2](SPEC-M2.2.md) · [SPEC-M2.3](SPEC-M2.3.md) · [SPEC-M2.4](SPEC-M2.4.md) ·
 [SPEC-M2.5](SPEC-M2.5.md) · [SPEC-M2.6](SPEC-M2.6.md) · [SPEC-M2.7](SPEC-M2.7.md) ·
 [SPEC-M2.8](SPEC-M2.8.md) · [SPEC-M3.0](SPEC-M3.0.md) · [SPEC-M3.1](SPEC-M3.1.md) ·
-[SPEC-M3.2](SPEC-M3.2.md) · [SPEC-M3.3](SPEC-M3.3.md) · [SPEC-M3.4](SPEC-M3.4.md) ·
+[SPEC-M3.2](SPEC-M3.2.md) · [SPEC-M3.3](SPEC-M3.3.md) · [SPEC-M3.4](SPEC-M3.4.md) · [SPEC-M3.5](SPEC-M3.5.md) ·
 decisions: [adr/](adr/)
 
 | topic | authoritative section(s) | notes |
@@ -19,11 +19,11 @@ decisions: [adr/](adr/)
 | Data directory layout | SPEC-M1 §2, SPEC-M2.6 §2, SPEC-M2.8 §3 | `outbox/`, `backups/`, `state/`, `dict/`, `captures/`, `logs/` — README "Data layout" lists them all |
 | `config.toml` `[server]` / `[client]` | SPEC-M1 §3, SPEC-M3.0 §4 | `nudge`, `nudge_min_minutes`; `[server] request_log` → SPEC-M3.2 §1 |
 | `config.toml` `[update]` | SPEC-M2.5 §2, SPEC-M2.7 §11 | `allow_mirror` |
-| `config.toml` `[retention]` | SPEC-M2.8 §3 | supersedes `[server] backup_keep` (SPEC-M2.7 §12) |
+| `config.toml` `[retention]` | SPEC-M2.8 §3, SPEC-M3.5 §2 | supersedes `[server] backup_keep` (SPEC-M2.7 §12) |
 | Project identity | SPEC-M1 §4, SPEC-M2.7 §8 | identity cache `state/projects.json` |
 | Project aliases, `kioku project merge` | SPEC-M2.4 §2 | |
 | Handoff lanes per branch | SPEC-M2.4 §1 | default branch: SPEC-M2.4 §1.2 |
-| Handoff routing and consumption | SPEC-M3.1 §1 | supersedes SPEC-M2.4 §1.4 and the acceptance rule of SPEC-M1 §7.1 |
+| Handoff routing and consumption | SPEC-M3.1 §1, SPEC-M3.5 §1 | supersedes SPEC-M2.4 §1.4 and the acceptance rule of SPEC-M1 §7.1; a session superseding its own older pending handoffs: SPEC-M3.5 §1 |
 | Handoff contents (`gotchas`, `verified`) | SPEC-M1 §7.5, SPEC-M3.0 §2 | |
 | SQLite schema | SPEC-M1 §5 | updated listing with the SPEC that added each column |
 | Schema version, downgrade refusal | SPEC-M2.7 §5 | `PRAGMA user_version`; `kioku serve` exits 78 |
@@ -56,7 +56,7 @@ decisions: [adr/](adr/)
 | Memory is untrusted data | SPEC-M2.7 §3 | |
 | Offline queue, delivery receipts | SPEC-M2.6 §3 | `kioku sync` |
 | Backup and restore | SPEC-M2.6 §2, SPEC-M2.8 §4 | bundle format 2; keep count SPEC-M2.8 §3 |
-| Retention, `kioku prune`, `kioku forget` | SPEC-M2.8 §3 | |
+| Retention, `kioku prune`, `kioku forget` | SPEC-M2.8 §3, SPEC-M3.5 §2 | |
 | Self-maintaining server (startup sweep, deferred reindex) | SPEC-M2.8 §5 | |
 | Storage diagnostics (`/diagnostics`) | SPEC-M2.6 §4 | |
 | Claude Code hooks and MCP | SPEC-M2 §8, SPEC-M2.2 §7.1 | M1 §8.5 replaced by the installer rules |
@@ -72,7 +72,7 @@ decisions: [adr/](adr/)
 | Error responses and exit codes | SPEC-M1 §9 | 409; exit 78 (newer schema), 75 (restart after update), 2 (Stop nudge) |
 | MCP tools | SPEC-M1 §10 | parameters added by SPEC-M2.6 §1, SPEC-M3.0 §2, SPEC-M3.1 §1, SPEC-M3.1 §2, SPEC-M3.1 §3, SPEC-M3.4 §2 (`slug`) |
 | CLI commands | SPEC-M1 §11, SPEC-M2 §14 | full list: CLAUDE.md "Directory layout" and `kioku --help` |
-| Metrics endpoint, request log, `status --watch` | SPEC-M3.2 §1 | |
+| Metrics endpoint, request log, `status --watch` | SPEC-M3.2 §1, SPEC-M3.5 §3 | |
 | Positive liveness (`state/last-hook.json`, `status --agents`) | SPEC-M3.2 §2 | `mcp` entry of the stdio bridge: SPEC-M3.4 §1 |
 | `kioku doctor` | SPEC-M2 §12, SPEC-M2.6 §4, SPEC-M2.5 §3.4 | `--fix`: SPEC-M3.2 §3 |
 | `kioku doctor --fix` | SPEC-M3.2 §3 | |

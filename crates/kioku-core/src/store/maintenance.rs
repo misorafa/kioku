@@ -47,6 +47,16 @@ pub struct PruneReport {
     pub backups_removed: PruneCount,
     /// Hook dump files removed.
     pub hook_dumps_removed: PruneCount,
+    /// Pending handoffs superseded: older than `handoffs_pending_days` and not the newest
+    /// pending of their lane (SPEC-M3.5 §2).
+    #[serde(default)]
+    pub handoffs_superseded: u64,
+    /// Idle open sessions finalized (`sessions_idle_days`, SPEC-M3.5 §2).
+    #[serde(default)]
+    pub sessions_finalized: u64,
+    /// Idle open sessions without any observation deleted (SPEC-M3.5 §2).
+    #[serde(default)]
+    pub sessions_deleted: u64,
     /// When the run happened (RFC 3339).
     pub at: String,
 }
@@ -298,8 +308,11 @@ impl Store {
     /// Applies `[retention]` (SPEC-M2.8 §3): gzips raw logs older than `raw_days` (deletes
     /// them at twice that), reduces the observations of finalized sessions older than
     /// `observations_days` to stubs (their digest is cached first), keeps `backups_keep`
-    /// backups and deletes hook dumps older than `hook_dump_days`. `dry_run` changes
-    /// nothing and reports what would be done.
+    /// backups and deletes hook dumps older than `hook_dump_days`; finalizes (or, without
+    /// any observation, deletes) open sessions idle for `sessions_idle_days` and supersedes
+    /// pending handoffs older than `handoffs_pending_days` that are not the newest pending
+    /// of their lane (SPEC-M3.5 §2). `dry_run` changes nothing and reports what would be
+    /// done.
     pub fn prune(&self, dry_run: bool) -> Result<PruneReport> {
         let r = self.config.retention.clone();
         let now = SystemTime::now();
@@ -418,6 +431,23 @@ impl Store {
             }
         }
 
+        // SPEC-M3.5 §2: idle sessions first, so a rules handoff issued for one takes part in
+        // the handoffs step like any other.
+        if r.sessions_idle_days > 0 {
+            self.prune_idle_sessions(r.sessions_idle_days, dry_run, &mut report)?;
+        }
+        if r.handoffs_pending_days > 0 {
+            let cutoff = util::fmt_ts(
+                util::now() - chrono::Duration::days(i64::from(r.handoffs_pending_days)),
+            );
+            let conn = self.db.lock();
+            for id in db::stale_pending_handoffs(&conn, &cutoff)? {
+                if dry_run || db::supersede_handoff(&conn, &id, &report.at)? {
+                    report.handoffs_superseded += 1;
+                }
+            }
+        }
+
         if !dry_run {
             self.db
                 .lock()
@@ -432,10 +462,68 @@ impl Store {
                 sessions_reduced = report.sessions_reduced.count,
                 backups_removed = report.backups_removed.count,
                 hook_dumps_removed = report.hook_dumps_removed.count,
+                handoffs_superseded = report.handoffs_superseded,
+                sessions_finalized = report.sessions_finalized,
+                sessions_deleted = report.sessions_deleted,
                 "retention applied"
             );
         }
         Ok(report)
+    }
+
+    /// The sessions step of retention (SPEC-M3.5 §2): an open session whose newest
+    /// observation (or start, without one) is older than `days` is finalized as of that last
+    /// activity; one that has no observation and authored no handoff is deleted instead.
+    fn prune_idle_sessions(
+        &self,
+        days: u32,
+        dry_run: bool,
+        report: &mut PruneReport,
+    ) -> Result<()> {
+        let cutoff = util::fmt_ts(util::now() - chrono::Duration::days(i64::from(days)));
+        let idle = db::idle_open_sessions(&self.db.lock(), &cutoff)?;
+        for (session, last) in idle {
+            if last.is_none() {
+                let conn = self.db.lock();
+                let deleted = if dry_run {
+                    !conn
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM handoffs WHERE session_id = ?1)",
+                            [&session.id],
+                            |r| r.get::<_, bool>(0),
+                        )
+                        .context("querying the database")?
+                } else {
+                    db::delete_empty_session(&conn, &session.id)?
+                };
+                if deleted {
+                    report.sessions_deleted += 1;
+                    continue;
+                }
+            }
+            if dry_run {
+                report.sessions_finalized += 1;
+                continue;
+            }
+            // Listed a moment ago; an observation may have arrived since.
+            let still_idle = db::idle_open_sessions(&self.db.lock(), &cutoff)?
+                .iter()
+                .any(|(s, _)| s.id == session.id);
+            if !still_idle {
+                continue;
+            }
+            let as_of = last.unwrap_or_else(|| session.started_at.clone());
+            match self.finalize_as_of(&session.id, Some(&as_of), &|_| {}) {
+                Ok(_) => {
+                    tracing::info!(session = %session.id, reason = "idle", "session finalized");
+                    report.sessions_finalized += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(session = %session.id, error = %e, "finalizing an idle session failed");
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Reduces every observation of `session` to its stub ([`crate::digest::stub_payload`])

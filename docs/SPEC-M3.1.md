@@ -7,6 +7,8 @@ SPEC-M2.4.md, SPEC-M3.0.md first. Source: the v0.8.0 audit. Depends on M3.0 (sec
 
 ## 1. Who consumes a handoff (SPEC-M2.4 §1.4 extended)
 
+> Amended by SPEC-M3.5 §1: a session's newer handoff supersedes its own older pending handoffs of the same source on the lane.
+
 Today every SessionStart except `offline-replay` routes and accepts the newest pending
 handoff of its lane. Three cases are wrong:
 

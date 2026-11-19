@@ -4,6 +4,15 @@
 
 - kioku is in winget: `winget install misorafa.kioku` (first submission merged
   2026-11-04). Later releases are submitted automatically by `winget.yml`.
+- Handoff and session hygiene (SPEC-M3.5): a session's newer handoff supersedes its own
+  older pending ones on the lane, and a session's rules handoff is refreshed in place
+  instead of piling up one row per agent handoff on a long-lived branch session. New
+  `[retention] handoffs_pending_days = 30` (old pending handoffs that are not the newest
+  of their lane become `superseded`) and `sessions_idle_days = 7` (idle open sessions are
+  finalized; ones with no observation are deleted); `kioku prune` reports
+  `handoffs superseded`, `sessions finalized`, `sessions deleted`. New gauges
+  `kioku_handoffs_pending_lanes` and `kioku_sessions_idle`; `kioku status` and `--watch`
+  show pending handoffs per lane and idle sessions.
 
 ## v1.0.0 — 2026-10-07
 

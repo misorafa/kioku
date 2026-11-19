@@ -834,9 +834,16 @@ fn status() -> anyhow::Result<()> {
     println!("data dir     : {}", s.data_dir);
     println!("projects     : {}", s.projects);
     println!("pages        : {}", s.pages);
-    println!("sessions     : {}", s.sessions);
+    // SPEC-M3.5 §3: open / idle sessions and pending handoffs come from /metrics (`?`
+    // against a server without it).
+    let metrics = client
+        .get(&["metrics"], &[])
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string));
+    let hygiene = Hygiene::from_metrics(metrics.as_deref());
+    println!("{}", hygiene.sessions_line(s.sessions));
     println!("observations : {}", s.observations);
-    println!("handoffs     : {}", s.handoffs);
+    println!("{}", hygiene.handoffs_line(s.handoffs));
     println!("index docs   : {}", s.index_docs);
     println!(
         "git          : {}",
@@ -952,6 +959,14 @@ pub fn format_prune(r: &kioku_core::store::PruneReport) -> String {
     ));
     out.push_str(&line("backups removed", &r.backups_removed, "freed"));
     out.push_str(&line("hook dumps removed", &r.hook_dumps_removed, "freed"));
+    // SPEC-M3.5 §2: plain counts
+    for (label, n) in [
+        ("handoffs superseded", r.handoffs_superseded),
+        ("sessions finalized", r.sessions_finalized),
+        ("sessions deleted", r.sessions_deleted),
+    ] {
+        out.push_str(&format!("  {label:<19}: {n}\n"));
+    }
     out
 }
 
@@ -1292,6 +1307,54 @@ pub fn format_age(secs: f64) -> String {
     }
 }
 
+/// The handoff and session hygiene numbers of `kioku status` (SPEC-M3.5 §3), each `?` when
+/// the server does not report it (no `/metrics`, or a server older than the gauge).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hygiene {
+    /// `kioku_sessions_open`.
+    pub open: String,
+    /// `kioku_sessions_idle`.
+    pub idle: String,
+    /// `kioku_handoffs_pending`.
+    pub pending: String,
+    /// `kioku_handoffs_pending_lanes`.
+    pub lanes: String,
+}
+
+impl Hygiene {
+    /// Reads the four gauges from `GET /metrics` text.
+    pub fn from_metrics(metrics: Option<&str>) -> Hygiene {
+        let get = |name: &str| {
+            metrics
+                .and_then(|t| metric_value(t, name))
+                .map(|v| format!("{v}"))
+                .unwrap_or_else(|| "?".into())
+        };
+        Hygiene {
+            open: get("kioku_sessions_open"),
+            idle: get("kioku_sessions_idle"),
+            pending: get("kioku_handoffs_pending"),
+            lanes: get("kioku_handoffs_pending_lanes"),
+        }
+    }
+
+    /// The `sessions` line of plain `kioku status`.
+    pub fn sessions_line(&self, sessions: u64) -> String {
+        format!(
+            "sessions     : {sessions} (open: {}, idle: {})",
+            self.open, self.idle
+        )
+    }
+
+    /// The `handoffs` line of plain `kioku status`.
+    pub fn handoffs_line(&self, handoffs: u64) -> String {
+        format!(
+            "handoffs     : {handoffs} (pending: {} on {} lanes)",
+            self.pending, self.lanes
+        )
+    }
+}
+
 /// One `kioku status --watch` frame.
 pub fn format_watch(w: &WatchInput) -> String {
     let s = &w.status;
@@ -1303,23 +1366,22 @@ pub fn format_watch(w: &WatchInput) -> String {
     let m = w.metrics.as_deref();
     let get = |name: &str| m.and_then(|t| metric_value(t, name));
     let no_metrics = "? (server without /api/v1/metrics)";
-    let open = get("kioku_sessions_open")
-        .map(|v| format!("{v}"))
-        .unwrap_or_else(|| no_metrics.into());
+    let h = Hygiene::from_metrics(m);
+    let open = match m {
+        Some(_) => format!("{} (idle: {}) of {}", h.open, h.idle, s.sessions),
+        None => no_metrics.into(),
+    };
     let last_obs = get("kioku_last_observation_age_seconds")
         .map(format_age)
         .unwrap_or_else(|| no_metrics.into());
-    let pending = get("kioku_handoffs_pending")
-        .map(|v| format!("{v}"))
-        .unwrap_or_else(|| "?".into());
     let mut out = format!(
         "kioku status --watch {} — {} (Ctrl-C to stop)\n\
          server        : {} (kioku {version})\n\
-         sessions open : {open} (of {})\n\
+         sessions open : {open}\n\
          last obs.     : {last_obs}\n\
-         handoffs      : {pending} pending\n\
+         handoffs      : {} pending on {} lanes\n\
          outbox        : {} queued on this machine\n",
-        w.every, w.now, w.server_url, s.sessions, w.outbox
+        w.every, w.now, w.server_url, h.pending, h.lanes, w.outbox
     );
     if let Some(u) = &w.update {
         out.push_str(&format!("update        : {}\n", format_update_status(u)));
@@ -1607,9 +1669,10 @@ mod tests {
             "{f}"
         );
         assert!(f.contains("server        : http://mac-mini.local:7391 (kioku 0.9.1)\n"));
-        assert!(f.contains("sessions open : 3 (of 120)\n"), "{f}");
+        // a 1.0 server: no hygiene gauges yet (SPEC-M3.5 §3), so those numbers are `?`
+        assert!(f.contains("sessions open : 3 (idle: ?) of 120\n"), "{f}");
         assert!(f.contains("last obs.     : 42s ago\n"), "{f}");
-        assert!(f.contains("handoffs      : 1 pending\n"), "{f}");
+        assert!(f.contains("handoffs      : 1 pending on ? lanes\n"), "{f}");
         assert!(f.contains("outbox        : 2 queued on this machine\n"));
         assert!(f.contains("update        : automatic"), "{f}");
         assert!(
@@ -1625,6 +1688,74 @@ mod tests {
         assert_eq!(format_age(-1.0), "never");
         assert_eq!(format_age(7200.0), "2h ago");
         assert_eq!(format_age(200000.0), "2d ago");
+    }
+
+    /// SPEC-M3.5 §3: `kioku status` and `--watch` show pending handoffs per lane and idle
+    /// sessions; `?` against a server without the gauges.
+    #[test]
+    fn status_shows_pending_lanes_and_idle_sessions() {
+        let metrics = "kioku_sessions_open 16\nkioku_sessions_idle 10\n\
+                       kioku_handoffs_pending 214\nkioku_handoffs_pending_lanes 40\n\
+                       kioku_last_observation_age_seconds 5\n";
+        let h = Hygiene::from_metrics(Some(metrics));
+        assert_eq!(
+            h.sessions_line(120),
+            "sessions     : 120 (open: 16, idle: 10)"
+        );
+        assert_eq!(
+            h.handoffs_line(300),
+            "handoffs     : 300 (pending: 214 on 40 lanes)"
+        );
+        let w = WatchInput {
+            server_url: "http://mac-mini.local:7391".into(),
+            status: status_fixture(),
+            update: None,
+            metrics: Some(metrics.into()),
+            outbox: 0,
+            now: "2026-11-20T12:00:00Z".into(),
+            every: 5,
+        };
+        let f = format_watch(&w);
+        assert!(f.contains("sessions open : 16 (idle: 10) of 120\n"), "{f}");
+        assert!(
+            f.contains("handoffs      : 214 pending on 40 lanes\n"),
+            "{f}"
+        );
+        // an older server without /metrics
+        let old = Hygiene::from_metrics(None);
+        assert_eq!(
+            old.sessions_line(120),
+            "sessions     : 120 (open: ?, idle: ?)"
+        );
+        assert_eq!(
+            old.handoffs_line(7),
+            "handoffs     : 7 (pending: ? on ? lanes)"
+        );
+    }
+
+    /// SPEC-M3.5 §2: `kioku prune` prints the hygiene counts.
+    #[test]
+    fn prune_report_lists_hygiene_counts() {
+        let r = kioku_core::store::PruneReport {
+            dry_run: true,
+            handoffs_superseded: 174,
+            sessions_finalized: 6,
+            sessions_deleted: 4,
+            ..Default::default()
+        };
+        let text = format_prune(&r);
+        assert!(text.contains("  handoffs superseded: 174\n"), "{text}");
+        assert!(text.contains("  sessions finalized : 6\n"), "{text}");
+        assert!(text.contains("  sessions deleted   : 4\n"), "{text}");
+        // an older server's report (no such fields) still parses, as 0
+        let old: kioku_core::store::PruneReport = serde_json::from_value(serde_json::json!({
+            "dry_run": false, "raw_gzipped": {"count": 0, "bytes": 0},
+            "raw_deleted": {"count": 0, "bytes": 0}, "sessions_reduced": {"count": 0, "bytes": 0},
+            "observations_reduced": 0, "backups_removed": {"count": 0, "bytes": 0},
+            "hook_dumps_removed": {"count": 0, "bytes": 0}, "at": "2026-11-20T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(old.handoffs_superseded, 0);
     }
 
     /// SPEC-M3.2 §2: `status --agents` prints the doctor liveness lines.

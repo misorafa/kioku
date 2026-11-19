@@ -15,6 +15,13 @@ pub struct MetricsSnapshot {
     pub observations_total: u64,
     /// Handoffs nobody has accepted yet.
     pub handoffs_pending: u64,
+    /// Distinct (project, lane) pairs with at least one pending handoff (SPEC-M3.5 §3).
+    #[serde(default)]
+    pub handoffs_pending_lanes: u64,
+    /// Open sessions without an observation for `[retention] sessions_idle_days` (0 when
+    /// that step is off; SPEC-M3.5 §3).
+    #[serde(default)]
+    pub sessions_idle: u64,
     /// Documents in the search index.
     pub index_docs: u64,
     /// Disk usage (`db/`, `raw/`, `wiki/`, `backups/`, `index/`) and the last prune.
@@ -32,6 +39,13 @@ impl Store {
     pub fn metrics_snapshot(&self) -> Result<MetricsSnapshot> {
         let storage = self.storage()?;
         let conn = self.db.lock();
+        let idle_days = self.config.retention.sessions_idle_days;
+        let sessions_idle = if idle_days == 0 {
+            0
+        } else {
+            let cutoff = util::fmt_ts(util::now() - chrono::Duration::days(i64::from(idle_days)));
+            db::idle_open_sessions(&conn, &cutoff)?.len() as u64
+        };
         let scalar = |sql: &str| -> Result<u64> {
             let n: i64 = conn
                 .query_row(sql, [], |r| r.get(0))
@@ -53,6 +67,11 @@ impl Store {
             sessions_total: db::count(&conn, "sessions")?,
             observations_total: db::count(&conn, "observations")?,
             handoffs_pending: scalar("SELECT COUNT(*) FROM handoffs WHERE accepted_at IS NULL")?,
+            handoffs_pending_lanes: scalar(
+                "SELECT COUNT(*) FROM (SELECT DISTINCT project_id, lane FROM handoffs
+                 WHERE accepted_at IS NULL)",
+            )?,
+            sessions_idle,
             index_docs: self.index.num_docs(),
             last_backup: meta("last_backup")?,
             last_observation: meta("last_received")?,

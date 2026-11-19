@@ -548,14 +548,16 @@ start|stop` manage the LaunchAgent only.
 ## Monitoring
 
 ```sh
-kioku status                # counts, sizes, update state
-kioku status --watch 5      # redraw every 5 s: sessions open, last observation, outbox, update, sizes
+kioku status                # counts (open / idle sessions, pending handoffs on how many lanes), sizes, update state
+kioku status --watch 5      # redraw every 5 s: sessions open (idle), last observation, handoffs pending per lane, outbox, update, sizes
 kioku status --agents       # each installed agent's last successful hook (no server needed)
 ```
 
 `GET /api/v1/metrics` (bearer token, like every API route) serves Prometheus text:
-gauges `kioku_sessions_open`, `kioku_sessions_total`, `kioku_observations_total`,
-`kioku_handoffs_pending`, `kioku_index_docs`, `kioku_outbox_queued` (always 0 on the
+gauges `kioku_sessions_open`, `kioku_sessions_idle` (open past `[retention]
+sessions_idle_days`), `kioku_sessions_total`, `kioku_observations_total`,
+`kioku_handoffs_pending`, `kioku_handoffs_pending_lanes` (lanes with at least one pending
+handoff), `kioku_index_docs`, `kioku_outbox_queued` (always 0 on the
 server), `kioku_{db,raw,wiki,backups}_bytes`, `kioku_last_backup_age_seconds`,
 `kioku_last_prune_age_seconds`, `kioku_last_observation_age_seconds`,
 `kioku_update_last_check_age_seconds` (`-1` = never) and `kioku_version_info{version}`;
@@ -953,6 +955,8 @@ raw_days = 90           # raw/*.jsonl older than this are gzipped, deleted at tw
 observations_days = 180 # observations of finalized sessions older than this become stubs
 backups_keep = 10       # backups kept (was [server] backup_keep, which is still read)
 hook_dump_days = 7      # logs/hook-dump.jsonl* older than this are deleted
+handoffs_pending_days = 30 # pending handoffs older than this that are not the newest pending of their lane are superseded
+sessions_idle_days = 7  # open sessions without an observation for this long are finalized; ones with none at all are deleted
 auto = true             # run the policy daily inside `kioku serve`
 ```
 
@@ -1192,8 +1196,15 @@ and `kioku reindex` cannot bring back sessions and handoffs — they live in SQL
 it prints how many files / sessions and how many bytes: raw logs gzipped and deleted,
 sessions whose observations were reduced to stubs (tool name, path or first command line,
 commit message, error flag — exactly what the session summary uses, so pages, STATE.md
-and handoffs are unchanged; the full text is dropped), old backups and hook dumps.
-`kioku status` shows the sizes of the database, raw logs, wiki, backups and index, the
+and handoffs are unchanged; the full text is dropped), old backups and hook dumps. It
+also keeps handoffs and sessions honest: pending handoffs older than
+`handoffs_pending_days` that are not the newest pending one of their lane become
+`superseded` (the newest stays, whatever its age — it is the lane's current state), and
+open sessions without an observation for `sessions_idle_days` are finalized like a Stop
+(digest, session page, STATE.md; a later prompt reopens them) or, when they have no
+observation at all, deleted; it prints `handoffs superseded`, `sessions finalized` and
+`sessions deleted`. A session's newer handoff already supersedes its own older pending
+ones on the lane when it is written. `kioku status` shows the sizes of the database, raw logs, wiki, backups and index, the
 oldest raw log and the last prune.
 
 **Removing something: `kioku forget`.**

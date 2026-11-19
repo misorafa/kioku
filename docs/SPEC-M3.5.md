@@ -101,6 +101,94 @@ use the lane name `ShinichiroGoto/DBの完全暗号化`):
 
 Record deviations and causes found in §5.
 
-## 5. Implementation notes
+## 5. Implementation notes (2026-11-20, branch `m3.5-hygiene`)
 
-(filled in by the implementation)
+### Why one session had 9 pending rules handoffs on one lane (§1)
+
+The refresh condition of the finalize path was too narrow, and not in the ways guessed in
+§1. It looked for the session's newest *pending* rules handoff (any lane), but then dropped
+it when it was **older than the session's newest agent handoff**: an addendum (SPEC-M1
+§7.1 step 4, "work continued after the agent's handoff") had to rank above the agent
+handoff it extends, and refreshing the old row in place keeps its `created_at`, so the code
+inserted a new row instead. On a long-lived branch session the cycle is: Stop → rules
+handoff R1; the agent writes A1; ≥ `HANDOFF_STALE_TOOL_USES` (3) tool uses; Stop → R1 is
+older than A1, so R2 is inserted; the agent writes A2; … — one new pending rules row per
+agent handoff followed by real work, none ever superseded (nobody else starts on the lane,
+and the session never accepts its own). 29 agent handoffs and 9 rules rows on
+`ShinichiroGoto/DBの完全暗号化` is that cycle.
+
+Fix (`store.rs`, step 4 of finalize): the row to refresh is now **the session's own
+pending rules handoff on the session's current lane** (`db::own_pending_handoff`). When it
+predates the session's newest agent handoff it is *reissued* above it (`db::reissue_handoff`:
+content, `created_at`, `seq_at` replaced) instead of a second row being inserted; otherwise
+it is refreshed in place with `created_at` kept, as before. An already accepted rules
+handoff is still refreshed in place only when nothing meaningful changed (SPEC-M3.0 §4);
+that lookup is now also restricted to the session's lane (a session whose branch changed
+used to have its old lane's row rewritten). A rules row is inserted only when the session
+has no pending one on the lane, and the insert then supersedes the session's other pending
+rules handoffs on the lane (§1) — in practice rows left by an older server.
+
+### Superseding own handoffs (§1)
+
+- `db::supersede_own_pending` (same session, source, project and lane; `accepted_by =
+  "superseded"`, `accepted_at = now`). `write_handoff` runs insert + supersede in one
+  transaction under the DB lock; finalize runs them under the same DB lock.
+- A handoff written without a session (`session` omitted and no open session) supersedes
+  nothing. When `session` is omitted but an open session is found, the handoff goes to the
+  project lane (SPEC-M2.4 §1.3), so it supersedes that session's older pending handoffs on
+  the project lane only.
+- A session's pending rules handoff is *not* superseded by its newer agent handoff (other
+  source, as specified): a session has at most one pending rules row per lane, and it ranks
+  below the agent handoff until it becomes the addendum. §2 cleans it up if it gets old.
+
+### Retention (§2)
+
+- **Order:** the sessions step runs before the handoffs step, so a rules handoff issued
+  for an idle session takes part in the handoffs step like any other.
+- **Deviation — idle finalize is dated by the last activity.** A finalize issued by
+  retention uses the session's newest observation `ts` (its `started_at` without one) as
+  `ended_at` and as the `created_at` of a new rules handoff, not "now". With "now", a
+  session that went quiet ten days ago would issue a rules handoff that outranks every
+  handoff written on the lane since (peeks and SessionStart take the newest), which is
+  wrong. Everything else is a Stop finalize (`Store::finalize_as_of`, called by
+  `finalize_session` with `None`). Re-finalizing on a later Stop uses "now" as before.
+- **"No observation" sessions are deleted only when they also authored no handoff**
+  (`write_handoff` can name a session that has no observation). Such a session is
+  finalized instead (a non-substantive finalize: status only, no page), so the handoff
+  keeps its author. Deletion is one `DELETE … WHERE status = 'open' AND NOT EXISTS
+  (observations) AND NOT EXISTS (handoffs)`, so an observation that arrives meanwhile
+  wins. The idle list is re-read right before each finalize for the same reason.
+- A failing finalize of one idle session is logged (`finalizing an idle session failed`)
+  and the run continues, so one broken session cannot stop the daily prune.
+- A dry run counts the idle sessions it would finalize / delete and the handoffs it would
+  supersede on the current state (it does not simulate the rules handoffs the sessions
+  step would issue).
+- The finalize log line is `session finalized` with `reason = "idle"`; the daily `retention
+  applied` line carries `handoffs_superseded`, `sessions_finalized`, `sessions_deleted`.
+- New `PruneReport` fields are `#[serde(default)]`, so a newer client reads an older
+  server's report (as 0).
+
+### Metrics and status (§3)
+
+- `kioku_handoffs_pending_lanes` counts distinct `(project_id, lane)` pairs with a pending
+  handoff; `kioku_sessions_idle` uses the same query as the sessions step (0 when
+  `sessions_idle_days = 0`).
+- Wording: plain `kioku status` changes its `sessions` and `handoffs` lines to
+  `sessions     : 120 (open: 16, idle: 10)` and `handoffs     : 300 (pending: 214 on 40
+  lanes)` (the column layout of that command); `--watch` shows `sessions open : 16 (idle:
+  10) of 120` and `handoffs      : 214 pending on 40 lanes`. Plain `status` now also reads
+  `/metrics`; any number the server does not report prints `?`.
+
+### Tests
+
+`store::handoff_tests::{a_sessions_newer_handoff_supersedes_its_own_older_pending_ones,
+rules_handoff_is_refreshed_not_duplicated_on_a_long_lived_lane,
+inserted_rules_handoff_supersedes_the_sessions_older_pending_ones}`,
+`store::maintenance::tests::{prune_supersedes_stale_handoffs_and_settles_idle_sessions,
+zero_days_disable_the_hygiene_steps}` (also the §3 gauges on the same fixture),
+`config::tests::retention_table_and_backup_keep_fallback` (new defaults),
+`kioku-server` `metrics::tests::renders_every_family_and_escapes_labels` and
+`tests/metrics.rs` (gauges present), `kioku-cli`
+`commands::tests::{status_shows_pending_lanes_and_idle_sessions,
+prune_report_lists_hygiene_counts}`. The store tests use the lane
+`ShinichiroGoto/DBの完全暗号化` and Japanese prompts, summaries and decisions.

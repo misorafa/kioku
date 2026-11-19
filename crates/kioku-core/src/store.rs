@@ -849,6 +849,19 @@ impl Store {
         session_id: &str,
         before_mark: &dyn Fn(&Store),
     ) -> Result<FinalizeResult> {
+        self.finalize_as_of(session_id, None, before_mark)
+    }
+
+    /// The finalize behind [`Store::finalize_session`]. `as_of` (an idle session finalized
+    /// by retention, SPEC-M3.5 §2) is the session's last activity: it becomes `ended_at` and
+    /// the creation time of a new rules handoff, so a session that went quiet days ago does
+    /// not outrank handoffs written since.
+    fn finalize_as_of(
+        &self,
+        session_id: &str,
+        as_of: Option<&str>,
+        before_mark: &dyn Fn(&Store),
+    ) -> Result<FinalizeResult> {
         let _write = self.write_lock.lock();
         let (mut session, project, digest, max_seq, delta) = {
             let conn = self.db.lock();
@@ -880,12 +893,13 @@ impl Store {
         }
 
         let now = now_ts();
+        let ended = as_of.map(str::to_string).unwrap_or_else(|| now.clone());
         if !digest.is_substantive() {
             before_mark(self);
-            db::finalize_if_unchanged(&self.db.lock(), session_id, max_seq, &now)?;
+            db::finalize_if_unchanged(&self.db.lock(), session_id, max_seq, &ended)?;
             return Ok(FinalizeResult::default());
         }
-        session.ended_at = Some(now.clone());
+        session.ended_at = Some(ended.clone());
         let lang = self.config.lang();
 
         // 3. session page
@@ -920,31 +934,33 @@ impl Store {
             true,
         )?;
 
-        // 4. rules handoff: one pending rules handoff per session (or per agent handoff, for
-        // the addendum), refreshed in place on re-finalize with its created_at kept. One that
+        // 4. rules handoff: one pending rules handoff per session and lane, refreshed in
+        // place on re-finalize with its created_at kept. When it predates the session's
+        // newest agent handoff (the addendum case) it is reissued above that handoff instead
+        // of a second row being inserted (SPEC-M3.5 §1, the cause recorded in §5). One that
         // was already accepted is refreshed in place too, unless the digest changed in a way
-        // that matters since it was issued (SPEC-M3.0 §4); only then is a new row issued.
+        // that matters since it was issued (SPEC-M3.0 §4); only then is a new row issued,
+        // and it supersedes the session's older pending rules handoffs on the lane.
         let handoff_id = match (&digest.agent_handoff, &delta) {
             (Some(h), None) => h.id.clone(),
             (agent, _) => {
                 let conn = self.db.lock();
-                let existing = db::newest_session_handoff(
+                let pending = db::own_pending_handoff(
                     &conn,
                     session_id,
-                    Some(HandoffSource::Rules),
-                    true,
-                )?
-                // An addendum must be newer than the agent handoff it extends; an older
-                // rules handoff predates it and is left alone (it ranks below the agent's).
-                .filter(|r| agent.as_ref().is_none_or(|a| r.created_at >= a.created_at));
-                let existing = match existing {
-                    Some(pending) => Some(pending),
+                    HandoffSource::Rules,
+                    session.lane.as_deref(),
+                )?;
+                let accepted = match &pending {
+                    Some(_) => None,
                     None => db::newest_session_handoff(
                         &conn,
                         session_id,
                         Some(HandoffSource::Rules),
                         false,
                     )?
+                    .filter(|r| r.lane == session.lane)
+                    // An addendum must be newer than the agent handoff it extends.
                     .filter(|r| agent.as_ref().is_none_or(|a| r.created_at >= a.created_at))
                     .map(|r| -> Result<Option<Handoff>> {
                         let Some(at) = db::handoff_seq_at(&conn, &r.id)? else {
@@ -958,19 +974,25 @@ impl Store {
                     .transpose()?
                     .flatten(),
                 };
-                match existing {
-                    Some(existing) => {
+                match (pending, accepted) {
+                    (Some(p), _)
+                        if agent.as_ref().is_some_and(|a| p.created_at <= a.created_at) =>
+                    {
+                        db::reissue_handoff(&conn, &p.id, &handoff_md, &ended, max_seq, &now)?;
+                        p.id
+                    }
+                    (Some(existing), _) | (None, Some(existing)) => {
                         db::update_handoff_content(&conn, &existing.id, &handoff_md, &now)?;
                         existing.id
                     }
-                    None => {
+                    (None, None) => {
                         let h = Handoff {
                             id: util::new_id(),
                             project_id: project.id.clone(),
                             session_id: Some(session.id.clone()),
                             source: HandoffSource::Rules,
                             content_md: handoff_md.clone(),
-                            created_at: now.clone(),
+                            created_at: ended.clone(),
                             accepted_at: None,
                             accepted_by: None,
                             agent: Some(session.agent.clone()),
@@ -978,6 +1000,7 @@ impl Store {
                             lane: session.lane.clone(),
                         };
                         db::insert_handoff(&conn, &h, Some(max_seq))?;
+                        db::supersede_own_pending(&conn, &h, &now)?;
                         h.id
                     }
                 }
@@ -997,7 +1020,7 @@ impl Store {
         // 6. mark finalized — unless an observation arrived meanwhile (then it stays open
         // and the next Stop / SessionEnd finalizes it with that observation included).
         before_mark(self);
-        db::finalize_if_unchanged(&self.db.lock(), session_id, max_seq, &now)?;
+        db::finalize_if_unchanged(&self.db.lock(), session_id, max_seq, &ended)?;
         Ok(FinalizeResult {
             substantive: true,
             session_page: Some(page_path),
@@ -1074,7 +1097,14 @@ impl Store {
             Some(s) => Some(db::max_seq(&conn, &s.id)?),
             None => None,
         };
-        db::insert_handoff(&conn, &h, seq_at)?;
+        // SPEC-M3.5 §1: the writer session's older pending agent handoffs on this lane are
+        // superseded by this one, in the same transaction.
+        let tx = conn
+            .unchecked_transaction()
+            .context("starting transaction")?;
+        db::insert_handoff(&tx, &h, seq_at)?;
+        db::supersede_own_pending(&tx, &h, &h.created_at)?;
+        tx.commit().context("committing handoff")?;
         Ok(h)
     }
 

@@ -259,3 +259,262 @@ fn clear_with_a_new_id_is_a_new_session() {
     let again = start_with(&store, &cleared, lane, "clear");
     assert_eq!(again.pending_handoff.unwrap().id, h.id);
 }
+
+// ------------------------------------------------------------------ SPEC-M3.5 §1
+
+/// The lane of the audit finding (SPEC-M3.5): one long-lived session, nobody else.
+const CRYPT_LANE: &str = "ShinichiroGoto/DBの完全暗号化";
+
+fn write_decision(store: &Store, session: &str, summary: &str, decision: &str) -> Handoff {
+    store
+        .write_handoff(&HandoffInput {
+            project: project().id,
+            session: Some(session.into()),
+            summary: summary.into(),
+            next_steps: vec!["鍵の保管場所を決める".into()],
+            decisions: vec![decision.into()],
+            ..HandoffInput::default()
+        })
+        .unwrap()
+}
+
+fn edit(store: &Store, session: &str, path: &str) {
+    store
+        .add_observation(&NewObservation {
+            event_id: None,
+            session_id: session.into(),
+            kind: ObservationKind::ToolUse,
+            ts: None,
+            payload: json!({"tool_name": "Edit", "tool_input": {"file_path": path}, "tool_response": {}}),
+        })
+        .unwrap();
+}
+
+fn pending_of(store: &Store, session: &str, source: HandoffSource) -> Vec<Handoff> {
+    db::lane_handoffs(&store.db.lock(), &project().id, Some(CRYPT_LANE), 50)
+        .unwrap()
+        .into_iter()
+        .filter(|h| h.session_id.as_deref() == Some(session) && h.source == source)
+        .filter(|h| h.accepted_at.is_none())
+        .collect()
+}
+
+/// SPEC-M3.5 §1: a session writing three agent handoffs on a lane leaves one pending and
+/// two superseded; another session's pending handoff on the lane is untouched; `carry`
+/// still carries a decision from a superseded handoff; `history` shows the statuses.
+#[test]
+fn a_sessions_newer_handoff_supersedes_its_own_older_pending_ones() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(Config::for_data_dir(tmp.path())).unwrap();
+    let lane = Some(CRYPT_LANE);
+    // two sessions on the lane; the other one leaves a pending handoff while "long" works
+    start(&store, "other", lane);
+    start(&store, "long", lane);
+    work(&store, "long", 1);
+    work(&store, "other", 120);
+    let others = write_decision(
+        &store,
+        "other",
+        "別セッションの引き継ぎ",
+        "鍵は OS のキーチェーンに置く",
+    );
+    store.finalize_session("other").unwrap();
+    let first = write_decision(
+        &store,
+        "long",
+        "暗号化の方針を決めた",
+        "SQLCipher で DB を暗号化する",
+    );
+    let second = write_decision(
+        &store,
+        "long",
+        "移行手順を書いた",
+        "移行は起動時に一度だけ行う",
+    );
+    let third = write_decision(&store, "long", "テストを通した", "平文の DB は移行後に消す");
+
+    assert_eq!(
+        row(&store, &first.id).accepted_by.as_deref(),
+        Some(SUPERSEDED)
+    );
+    assert_eq!(
+        row(&store, &second.id).accepted_by.as_deref(),
+        Some(SUPERSEDED)
+    );
+    assert!(row(&store, &third.id).accepted_at.is_none());
+    assert!(
+        row(&store, &others.id).accepted_at.is_none(),
+        "another session's pending handoff is not superseded by this one"
+    );
+    assert_eq!(pending_of(&store, "long", HandoffSource::Agent).len(), 1);
+    // the project lane is another lane: what happens there does not touch this one
+    start(&store, "main-writer", None);
+    let main = write_decision(&store, "main-writer", "メインの引き継ぎ", "main は安定版");
+    write_decision(&store, "main-writer", "メインの続き", "main は安定版のまま");
+    assert_eq!(
+        row(&store, &main.id).accepted_by.as_deref(),
+        Some(SUPERSEDED)
+    );
+    assert!(row(&store, &third.id).accepted_at.is_none());
+
+    // history shows what they are
+    let history = store
+        .handoff_history(&project().id, None, lane, 10)
+        .unwrap();
+    let status: Vec<(String, String)> =
+        history.iter().map(|h| (h.id.clone(), h.status())).collect();
+    for (id, want) in [
+        (&third.id, "pending"),
+        (&second.id, SUPERSEDED),
+        (&first.id, SUPERSEDED),
+        (&others.id, "pending"),
+    ] {
+        assert!(
+            status.contains(&(id.clone(), want.to_string())),
+            "{want}: {status:?}"
+        );
+    }
+
+    // carried decisions (SPEC-M3.0) still read the superseded handoffs: a new session on
+    // another lane sees every decision, the first one's included
+    let resp = start(&store, "reader", Some("feature/鍵の保管"));
+    let decisions: Vec<&str> = resp.decisions.iter().map(|d| d.text.as_str()).collect();
+    for d in [
+        "SQLCipher で DB を暗号化する",
+        "移行は起動時に一度だけ行う",
+        "平文の DB は移行後に消す",
+    ] {
+        assert!(decisions.contains(&d), "{d} missing from {decisions:?}");
+    }
+    assert!(
+        resp.decisions.iter().any(|d| d.handoff_id == first.id),
+        "the carried item names the superseded handoff"
+    );
+}
+
+/// SPEC-M3.5 §1 (cause in §5): a session's rules handoff is refreshed in place even when
+/// it predates the session's newer agent handoff (the addendum case used to insert a new
+/// row each time); a new row is issued only after the old one was accepted and the work
+/// changed, and the session never has two pending rules handoffs on the lane.
+#[test]
+fn rules_handoff_is_refreshed_not_duplicated_on_a_long_lived_lane() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(Config::for_data_dir(tmp.path())).unwrap();
+    let lane = Some(CRYPT_LANE);
+    let pause = || std::thread::sleep(std::time::Duration::from_millis(5));
+    start(&store, "long", lane);
+    work(&store, "long", 1);
+    let rules = store.finalize_session("long").unwrap().handoff_id.unwrap();
+    assert_eq!(row(&store, &rules).source, HandoffSource::Rules);
+
+    for round in 0..3 {
+        pause();
+        let agent = write_decision(
+            &store,
+            "long",
+            &format!("{round} 回目の作業"),
+            "暗号鍵は 32 バイト",
+        );
+        // enough work after the agent handoff for an addendum
+        for f in ["暗号.rs", "移行.rs", "鍵.rs"] {
+            edit(&store, "long", &format!("/home/u/記憶/src/{f}"));
+        }
+        pause();
+        let id = store.finalize_session("long").unwrap().handoff_id.unwrap();
+        assert_eq!(
+            id, rules,
+            "round {round}: refreshed in place, not a new row"
+        );
+        let r = row(&store, &id);
+        assert!(
+            r.created_at > agent.created_at,
+            "the addendum ranks above its agent handoff"
+        );
+        assert!(r.content_md.contains("暗号.rs"), "{}", r.content_md);
+        let peek = store
+            .pending_handoff_routed(&project().id, false, None, lane)
+            .unwrap()
+            .handoff
+            .unwrap();
+        assert_eq!(peek.id, rules, "round {round}");
+        assert_eq!(pending_of(&store, "long", HandoffSource::Rules).len(), 1);
+        assert_eq!(pending_of(&store, "long", HandoffSource::Agent).len(), 1);
+    }
+
+    // a plain re-finalize keeps created_at
+    let before = row(&store, &rules);
+    work(&store, "long", 0);
+    store.finalize_session("long").unwrap();
+    assert_eq!(row(&store, &rules).created_at, before.created_at);
+
+    // accepted by the next session, then the long session keeps working: a new row
+    let next = start(&store, "next", lane).pending_handoff.unwrap();
+    assert_eq!(next.id, rules);
+    store.finalize_session("next").unwrap();
+    work(&store, "long", 0);
+    for f in ["監査.rs", "ログ.rs", "設定.rs"] {
+        edit(&store, "long", &format!("/home/u/記憶/src/{f}"));
+    }
+    pause();
+    let fresh = store.finalize_session("long").unwrap().handoff_id.unwrap();
+    assert_ne!(
+        fresh, rules,
+        "the accepted one is not rewritten under its reader"
+    );
+    assert_eq!(row(&store, &rules).accepted_by.as_deref(), Some("next"));
+    let pending = pending_of(&store, "long", HandoffSource::Rules);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, fresh);
+}
+
+/// SPEC-M3.5 §1: an inserted handoff supersedes the writer session's older pending ones of
+/// the same source on the lane — here rules rows left by an older server, which inserted
+/// one per addendum — and a re-finalize then refreshes the one pending row.
+#[test]
+fn inserted_rules_handoff_supersedes_the_sessions_older_pending_ones() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(Config::for_data_dir(tmp.path())).unwrap();
+    start(&store, "long", Some(CRYPT_LANE));
+    work(&store, "long", 1);
+    let h = Handoff {
+        id: util::new_id(),
+        project_id: project().id,
+        session_id: Some("long".into()),
+        source: HandoffSource::Rules,
+        content_md: "## 引き継ぎ（自動生成）\n古い行".into(),
+        created_at: util::fmt_ts(util::now() - chrono::Duration::days(3)),
+        accepted_at: None,
+        accepted_by: None,
+        agent: Some("claude-code".into()),
+        updated_at: None,
+        lane: Some(CRYPT_LANE.into()),
+    };
+    let legacy = [
+        h.clone(),
+        Handoff {
+            id: util::new_id(),
+            ..h.clone()
+        },
+    ];
+    let now = util::now_ts();
+    let fresh = Handoff {
+        id: util::new_id(),
+        created_at: now.clone(),
+        ..h
+    };
+    {
+        let conn = store.db.lock();
+        for l in &legacy {
+            db::insert_handoff(&conn, l, Some(0)).unwrap();
+        }
+        db::insert_handoff(&conn, &fresh, Some(1)).unwrap();
+        assert_eq!(db::supersede_own_pending(&conn, &fresh, &now).unwrap(), 2);
+    }
+    for l in &legacy {
+        assert_eq!(row(&store, &l.id).accepted_by.as_deref(), Some(SUPERSEDED));
+    }
+    assert!(row(&store, &fresh.id).accepted_at.is_none());
+    let id = store.finalize_session("long").unwrap().handoff_id.unwrap();
+    assert_eq!(id, fresh.id);
+    assert_eq!(pending_of(&store, "long", HandoffSource::Rules).len(), 1);
+}
