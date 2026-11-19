@@ -130,6 +130,18 @@ pub fn render(
     );
     gauge(
         &mut out,
+        "kioku_handoffs_pending_lanes",
+        "Lanes (project and branch) with at least one pending handoff.",
+        snap.handoffs_pending_lanes,
+    );
+    gauge(
+        &mut out,
+        "kioku_sessions_idle",
+        "Open sessions without an observation for [retention] sessions_idle_days.",
+        snap.sessions_idle,
+    );
+    gauge(
+        &mut out,
         "kioku_index_docs",
         "Documents in the search index.",
         snap.index_docs,
@@ -302,6 +314,9 @@ mod tests {
         m.record_tool("kioku_query", false);
         let snap = MetricsSnapshot {
             sessions_open: 2,
+            sessions_idle: 1,
+            handoffs_pending: 7,
+            handoffs_pending_lanes: 3,
             last_backup: Some("2026-10-01T00:00:00.000Z".into()),
             ..MetricsSnapshot::default()
         };
@@ -312,6 +327,11 @@ mod tests {
         };
         let text = render(&snap, &m, &input, at("2026-10-02T00:00:00.000Z"));
         assert!(text.contains("kioku_sessions_open 2\n"));
+        // SPEC-M3.5 §3
+        assert!(text.contains("kioku_sessions_idle 1\n"));
+        assert!(text.contains("kioku_handoffs_pending 7\n"));
+        assert!(text.contains("kioku_handoffs_pending_lanes 3\n"));
+        assert!(text.contains("# TYPE kioku_handoffs_pending_lanes gauge\n"));
         assert!(text.contains("kioku_last_backup_age_seconds 86400\n"));
         assert!(text.contains("kioku_update_last_check_age_seconds -1\n"));
         assert!(text.contains("kioku_version_info{version=\"0.9.\\\"1\"} 1\n"));

@@ -161,8 +161,9 @@ impl UpdateConfig {
     }
 }
 
-/// `[retention]` section (SPEC-M2.8 §3): how long the server keeps raw logs, observation
-/// payloads, backups and hook dumps. `0` days turns that category off.
+/// `[retention]` section (SPEC-M2.8 §3, SPEC-M3.5 §2): how long the server keeps raw logs,
+/// observation payloads, backups and hook dumps, stale pending handoffs and idle open
+/// sessions. `0` days turns that category off.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RetentionConfig {
@@ -176,6 +177,12 @@ pub struct RetentionConfig {
     pub backups_keep: Option<usize>,
     /// `logs/hook-dump.jsonl*` older than this are deleted.
     pub hook_dump_days: u32,
+    /// Pending handoffs older than this that are not the newest pending of their lane are
+    /// superseded (SPEC-M3.5 §2).
+    pub handoffs_pending_days: u32,
+    /// Open sessions without an observation for this long are finalized; ones with no
+    /// observation at all are deleted (SPEC-M3.5 §2).
+    pub sessions_idle_days: u32,
     /// Run the policy daily inside `kioku serve`.
     pub auto: bool,
 }
@@ -186,6 +193,10 @@ pub const DEFAULT_RAW_DAYS: u32 = 90;
 pub const DEFAULT_OBSERVATIONS_DAYS: u32 = 180;
 /// Default of `[retention] hook_dump_days`.
 pub const DEFAULT_HOOK_DUMP_DAYS: u32 = 7;
+/// Default of `[retention] handoffs_pending_days`.
+pub const DEFAULT_HANDOFFS_PENDING_DAYS: u32 = 30;
+/// Default of `[retention] sessions_idle_days`.
+pub const DEFAULT_SESSIONS_IDLE_DAYS: u32 = 7;
 
 impl Default for RetentionConfig {
     fn default() -> RetentionConfig {
@@ -194,6 +205,8 @@ impl Default for RetentionConfig {
             observations_days: DEFAULT_OBSERVATIONS_DAYS,
             backups_keep: None,
             hook_dump_days: DEFAULT_HOOK_DUMP_DAYS,
+            handoffs_pending_days: DEFAULT_HANDOFFS_PENDING_DAYS,
+            sessions_idle_days: DEFAULT_SESSIONS_IDLE_DAYS,
             auto: true,
         }
     }
@@ -638,6 +651,9 @@ mod tests {
         let cfg = Config::load_from_dir(dir.path(), &HashMap::new()).unwrap();
         assert_eq!(cfg.retention.raw_days, 30);
         assert_eq!(cfg.retention.observations_days, DEFAULT_OBSERVATIONS_DAYS);
+        // SPEC-M3.5 §2: the new keys default when an older config lacks them
+        assert_eq!(cfg.retention.handoffs_pending_days, 30);
+        assert_eq!(cfg.retention.sessions_idle_days, 7);
         assert!(!cfg.retention.auto);
         assert_eq!(cfg.backups_keep(), 4, "the old setting is still read");
         std::fs::write(

@@ -968,6 +968,128 @@ pub fn accept_handoff(conn: &Connection, id: &str, by: &str, now: &str) -> anyho
     Ok(())
 }
 
+/// Marks the pending handoffs of `h`'s writer session with the same source, project and lane
+/// — other than `h` itself — as [`crate::handoff::SUPERSEDED`] (SPEC-M3.5 §1); returns how
+/// many. A handoff without a session supersedes nothing.
+pub fn supersede_own_pending(conn: &Connection, h: &Handoff, now: &str) -> anyhow::Result<u64> {
+    let Some(session) = &h.session_id else {
+        return Ok(0);
+    };
+    let n = conn.execute(
+        "UPDATE handoffs SET accepted_at = ?1, accepted_by = ?2
+         WHERE session_id = ?3 AND source = ?4 AND project_id = ?5 AND lane IS ?6
+           AND accepted_at IS NULL AND id != ?7",
+        params![
+            now,
+            crate::handoff::SUPERSEDED,
+            session,
+            h.source.as_str(),
+            h.project_id,
+            h.lane,
+            h.id
+        ],
+    )?;
+    Ok(n as u64)
+}
+
+/// The session's own newest pending handoff of one source on one lane (SPEC-M3.5 §1: the
+/// rules handoff a re-finalize refreshes in place).
+pub fn own_pending_handoff(
+    conn: &Connection,
+    session: &str,
+    source: HandoffSource,
+    lane: Option<&str>,
+) -> anyhow::Result<Option<Handoff>> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "{HANDOFF_SELECT} WHERE h.session_id = ?1 AND h.source = ?2 AND h.lane IS ?3
+                 AND h.accepted_at IS NULL {HANDOFF_ORDER}"
+            ),
+            params![session, source.as_str(), lane],
+            handoff_from_row,
+        )
+        .optional()?)
+}
+
+/// Refreshes a pending handoff as if it had been issued at `created_at` (content, creation
+/// time and `seq_at` replaced, `updated_at` = `now`): the session's rules handoff turned
+/// into the addendum of a newer agent handoff (SPEC-M3.5 §1).
+pub fn reissue_handoff(
+    conn: &Connection,
+    id: &str,
+    content: &str,
+    created_at: &str,
+    seq_at: i64,
+    now: &str,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "UPDATE handoffs SET content_md = ?2, created_at = ?3, seq_at = ?4, updated_at = ?5
+         WHERE id = ?1",
+        params![id, content, created_at, seq_at, now],
+    )?;
+    Ok(())
+}
+
+/// Ids of pending handoffs created before `cutoff` that are not the newest pending handoff
+/// of their project and lane (ranked like [`newest_pending_handoff`]; SPEC-M3.5 §2).
+pub fn stale_pending_handoffs(conn: &Connection, cutoff: &str) -> anyhow::Result<Vec<String>> {
+    // The subquery ranks exactly like HANDOFF_ORDER.
+    let mut stmt = conn.prepare(
+        "SELECT h.id FROM handoffs h
+         WHERE h.accepted_at IS NULL AND h.created_at < ?1
+           AND h.id != (SELECT n.id FROM handoffs n
+                        WHERE n.project_id = h.project_id AND n.lane IS h.lane
+                          AND n.accepted_at IS NULL
+                        ORDER BY n.created_at DESC, (n.source = 'agent') DESC, n.rowid DESC
+                        LIMIT 1)
+         ORDER BY h.created_at",
+    )?;
+    let rows = stmt.query_map(params![cutoff], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Marks pending handoff `id` as [`crate::handoff::SUPERSEDED`]; false when it was no longer
+/// pending.
+pub fn supersede_handoff(conn: &Connection, id: &str, now: &str) -> anyhow::Result<bool> {
+    let n = conn.execute(
+        "UPDATE handoffs SET accepted_at = ?2, accepted_by = ?3 WHERE id = ?1 AND accepted_at IS NULL",
+        params![id, now, crate::handoff::SUPERSEDED],
+    )?;
+    Ok(n > 0)
+}
+
+/// Open sessions whose newest observation (`started_at` without one) is older than
+/// `cutoff`, each with its newest observation time (SPEC-M3.5 §2).
+pub fn idle_open_sessions(
+    conn: &Connection,
+    cutoff: &str,
+) -> anyhow::Result<Vec<(Session, Option<String>)>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SESSION_COLS}, (SELECT MAX(o.ts) FROM observations o WHERE o.session_id = s.id)
+         FROM sessions s WHERE s.status = 'open'
+           AND COALESCE((SELECT MAX(o.ts) FROM observations o WHERE o.session_id = s.id),
+                        s.started_at) < ?1
+         ORDER BY s.started_at"
+    ))?;
+    let rows = stmt.query_map(params![cutoff], |r| {
+        Ok((session_from_row(r)?, r.get::<_, Option<String>>(11)?))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Deletes session `id` when it is still open, has no observation and authored no handoff;
+/// false when it no longer qualifies (SPEC-M3.5 §2).
+pub fn delete_empty_session(conn: &Connection, id: &str) -> anyhow::Result<bool> {
+    let n = conn.execute(
+        "DELETE FROM sessions WHERE id = ?1 AND status = 'open'
+           AND NOT EXISTS (SELECT 1 FROM observations WHERE session_id = ?1)
+           AND NOT EXISTS (SELECT 1 FROM handoffs WHERE session_id = ?1)",
+        params![id],
+    )?;
+    Ok(n > 0)
+}
+
 /// The last `limit` handoffs of a project on one lane, newest first, whatever their status.
 pub fn lane_handoffs(
     conn: &Connection,

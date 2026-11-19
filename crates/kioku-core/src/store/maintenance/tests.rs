@@ -452,3 +452,249 @@ fn outdated_index_is_rebuilt_on_request() {
             .is_empty()
     );
 }
+
+// ------------------------------------------------------------------ SPEC-M3.5 §2, §3
+
+/// The branch lane of the audit finding.
+const CRYPT_LANE: &str = "ShinichiroGoto/DBの完全暗号化";
+
+/// Handoff ids of the hygiene fixture.
+struct Hygiene {
+    /// Lane A (`CRYPT_LANE`): 40 and 35 days old (superseded by prune), 1 day old (kept).
+    a_old: Vec<String>,
+    a_new: String,
+    /// Project lane: 50 days old (superseded), 45 days old but the newest pending (kept).
+    b_older: String,
+    b_newest: String,
+    /// Project lane, 60 days old but already accepted (untouched).
+    b_accepted: String,
+}
+
+fn old_handoff(store: &Store, lane: Option<&str>, days: i64, text: &str) -> String {
+    let h = Handoff {
+        id: util::new_id(),
+        project_id: project().id,
+        session_id: None,
+        source: HandoffSource::Agent,
+        content_md: format!("## 引き継ぎ\n### 要約\n{text}"),
+        created_at: days_ago(days),
+        accepted_at: None,
+        accepted_by: None,
+        agent: Some("claude-code".into()),
+        updated_at: None,
+        lane: lane.map(str::to_string),
+    };
+    db::insert_handoff(&store.db.lock(), &h, None).unwrap();
+    h.id
+}
+
+fn start_on(store: &Store, session: &str, lane: Option<&str>) {
+    store
+        .start_session(&SessionStartRequest {
+            machine: None,
+            session_id: session.into(),
+            agent: "claude-code".into(),
+            cwd: "/home/u/記憶".into(),
+            source: "startup".into(),
+            project: project(),
+            lane: lane.map(str::to_string),
+        })
+        .unwrap();
+}
+
+fn prompt_at(store: &Store, session: &str, ts: Option<String>, prompt: &str) {
+    store
+        .add_observation(&NewObservation {
+            event_id: None,
+            session_id: session.into(),
+            kind: ObservationKind::Prompt,
+            ts,
+            payload: json!({ "prompt": prompt }),
+        })
+        .unwrap();
+}
+
+/// Old and new pending handoffs on two lanes; an active, an idle and an empty open session.
+fn hygiene_fixture(store: &Store) -> Hygiene {
+    let lane = Some(CRYPT_LANE);
+    // sessions first: a SessionStart would accept a pending handoff of its lane
+    start_on(store, "active", lane);
+    prompt_at(store, "active", None, "暗号化のテストを書いて");
+    start_on(store, "idle", lane);
+    prompt_at(store, "idle", Some(days_ago(10)), "鍵の保管場所を調べて");
+    start_on(store, "empty", None);
+    store
+        .db
+        .lock()
+        .execute(
+            "UPDATE sessions SET started_at = ?1 WHERE id = 'empty'",
+            [days_ago(9)],
+        )
+        .unwrap();
+    let a_old = vec![
+        old_handoff(store, lane, 40, "暗号化の調査を始めた"),
+        old_handoff(store, lane, 35, "SQLCipher を試した"),
+    ];
+    let a_new = old_handoff(store, lane, 1, "暗号化を実装した");
+    let b_accepted = old_handoff(store, None, 60, "とても古い引き継ぎ");
+    db::accept_handoff(&store.db.lock(), &b_accepted, "someone", &days_ago(59)).unwrap();
+    let b_older = old_handoff(store, None, 50, "古い引き継ぎ");
+    let b_newest = old_handoff(store, None, 45, "放置された引き継ぎ");
+    Hygiene {
+        a_old,
+        a_new,
+        b_older,
+        b_newest,
+        b_accepted,
+    }
+}
+
+fn pending(store: &Store, id: &str) -> bool {
+    db::get_handoff(&store.db.lock(), id)
+        .unwrap()
+        .unwrap()
+        .accepted_at
+        .is_none()
+}
+
+/// SPEC-M3.5 §2: a dry run counts and changes nothing; the real run supersedes only the
+/// old non-newest pending handoffs, finalizes the idle session (its page exists), deletes
+/// the empty one and leaves the active one; a later observation reopens the finalized
+/// session. §3: the gauges follow on the same fixture.
+#[test]
+fn prune_supersedes_stale_handoffs_and_settles_idle_sessions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(Config::for_data_dir(tmp.path())).unwrap();
+    let f = hygiene_fixture(&store);
+
+    let m = store.metrics_snapshot().unwrap();
+    assert_eq!(m.handoffs_pending, 5);
+    assert_eq!(m.handoffs_pending_lanes, 2);
+    assert_eq!((m.sessions_open, m.sessions_idle), (3, 2));
+
+    let dry = store.prune(true).unwrap();
+    assert!(dry.dry_run);
+    assert_eq!(dry.handoffs_superseded, 3);
+    assert_eq!(dry.sessions_finalized, 1);
+    assert_eq!(dry.sessions_deleted, 1);
+    assert_eq!(
+        store.metrics_snapshot().unwrap(),
+        m,
+        "a dry run changes nothing"
+    );
+    assert!(
+        db::get_session(&store.db.lock(), "empty")
+            .unwrap()
+            .is_some()
+    );
+
+    let real = store.prune(false).unwrap();
+    assert_eq!(
+        (
+            real.handoffs_superseded,
+            real.sessions_finalized,
+            real.sessions_deleted
+        ),
+        (3, 1, 1)
+    );
+    // handoffs: only the old non-newest pending ones
+    for id in f.a_old.iter().chain([&f.b_older]) {
+        let h = db::get_handoff(&store.db.lock(), id).unwrap().unwrap();
+        assert_eq!(h.accepted_by.as_deref(), Some(crate::handoff::SUPERSEDED));
+    }
+    assert!(pending(&store, &f.a_new));
+    assert!(
+        pending(&store, &f.b_newest),
+        "the newest pending of a lane stays, whatever its age"
+    );
+    let accepted = db::get_handoff(&store.db.lock(), &f.b_accepted)
+        .unwrap()
+        .unwrap();
+    assert_eq!(accepted.accepted_by.as_deref(), Some("someone"));
+
+    // sessions: idle finalized as of its last activity, with a page; empty deleted;
+    // active untouched
+    let idle = db::get_session(&store.db.lock(), "idle").unwrap().unwrap();
+    assert_eq!(idle.status, SessionStatus::Finalized);
+    let last = days_ago(10);
+    assert_eq!(
+        idle.ended_at.as_deref().map(|t| &t[..10]),
+        Some(&last[..10])
+    );
+    let page = store.read_page(&session_page_path(&idle)).unwrap();
+    assert!(page.body.contains("鍵の保管場所を調べて"), "{}", page.body);
+    // its rules handoff carries the idle time, so it does not outrank the newer handoff
+    let peek = store
+        .pending_handoff_routed(&project().id, false, None, Some(CRYPT_LANE))
+        .unwrap()
+        .handoff
+        .unwrap();
+    assert_eq!(peek.id, f.a_new);
+    assert!(
+        db::get_session(&store.db.lock(), "empty")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        db::get_session(&store.db.lock(), "active")
+            .unwrap()
+            .unwrap()
+            .status,
+        SessionStatus::Open
+    );
+
+    let m = store.metrics_snapshot().unwrap();
+    assert_eq!(
+        m.handoffs_pending, 3,
+        "a_new, b_newest, idle's rules handoff"
+    );
+    assert_eq!(m.handoffs_pending_lanes, 2);
+    assert_eq!((m.sessions_open, m.sessions_idle), (1, 0));
+
+    // a later observation reopens the finalized session; nothing is left to do
+    prompt_at(&store, "idle", None, "続きをお願い");
+    assert_eq!(
+        store.session_info("idle").unwrap().status,
+        SessionStatus::Open
+    );
+    let again = store.prune(false).unwrap();
+    assert_eq!(
+        (
+            again.handoffs_superseded,
+            again.sessions_finalized,
+            again.sessions_deleted
+        ),
+        (0, 0, 0)
+    );
+}
+
+/// SPEC-M3.5 §2: `0` turns each step off (and the idle gauge reads 0).
+#[test]
+fn zero_days_disable_the_hygiene_steps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = Config::for_data_dir(tmp.path());
+    cfg.retention.handoffs_pending_days = 0;
+    let store = Store::open(cfg.clone()).unwrap();
+    let f = hygiene_fixture(&store);
+    let r = store.prune(false).unwrap();
+    assert_eq!(r.handoffs_superseded, 0);
+    assert_eq!((r.sessions_finalized, r.sessions_deleted), (1, 1));
+    assert!(f.a_old.iter().all(|id| pending(&store, id)));
+    drop(store);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = Config::for_data_dir(tmp.path());
+    cfg.retention.sessions_idle_days = 0;
+    let store = Store::open(cfg).unwrap();
+    hygiene_fixture(&store);
+    assert_eq!(store.metrics_snapshot().unwrap().sessions_idle, 0);
+    let r = store.prune(false).unwrap();
+    assert_eq!(r.handoffs_superseded, 3);
+    assert_eq!((r.sessions_finalized, r.sessions_deleted), (0, 0));
+    assert!(
+        db::get_session(&store.db.lock(), "empty")
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(store.metrics_snapshot().unwrap().sessions_open, 3);
+}

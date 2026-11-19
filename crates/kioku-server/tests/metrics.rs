@@ -14,11 +14,13 @@ use rmcp::{
 };
 use serde_json::json;
 
-const GAUGES: [&str; 15] = [
+const GAUGES: [&str; 17] = [
     "kioku_sessions_open",
     "kioku_sessions_total",
     "kioku_observations_total",
     "kioku_handoffs_pending",
+    "kioku_handoffs_pending_lanes",
+    "kioku_sessions_idle",
     "kioku_index_docs",
     "kioku_outbox_queued",
     "kioku_db_bytes",
@@ -199,6 +201,11 @@ async fn counters_increment_after_requests_and_tool_calls() {
         "{after}"
     );
     assert_eq!(sample(&after, "kioku_sessions_open"), Some(1.0));
+    // SPEC-M3.5 §3: the session is active, not idle; lanes never exceed handoffs
+    assert_eq!(sample(&after, "kioku_sessions_idle"), Some(0.0));
+    assert!(
+        sample(&after, "kioku_handoffs_pending_lanes") <= sample(&after, "kioku_handoffs_pending")
+    );
     assert_eq!(sample(&after, "kioku_observations_total"), Some(1.0));
     let age = sample(&after, "kioku_last_observation_age_seconds").unwrap();
     assert!((0.0..60.0).contains(&age), "{age}");
