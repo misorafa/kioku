@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.28.0.schema.json
 PackageIdentifier: misorafa.kioku
-PackageVersion: 1.0.0
+PackageVersion: 1.0.1
 PackageLocale: en-US
 Publisher: misorafa
 PublisherUrl: https://github.com/misorafa
@@ -25,6 +25,6 @@ Tags:
 - mcp
 - memory
 - japanese
-ReleaseNotesUrl: https://github.com/misorafa/kioku/releases/tag/v1.0.0
+ReleaseNotesUrl: https://github.com/misorafa/kioku/releases/tag/v1.0.1
 ManifestType: defaultLocale
 ManifestVersion: 1.28.0
