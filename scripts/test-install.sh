@@ -487,7 +487,8 @@ if command -v wget >/dev/null 2>&1; then
         [ -d "$d" ] || continue
         for f in "$d"/*; do
             b=$(basename "$f")
-            [ "$b" = curl ] || [ -e "$NOCURL/$b" ] || ln -s "$f" "$NOCURL/$b"
+            # -L too: a dangling link (grub-ntldr-img on ubuntu-latest) fails -e
+            [ "$b" = curl ] || [ -e "$NOCURL/$b" ] || [ -L "$NOCURL/$b" ] || ln -s "$f" "$NOCURL/$b"
         done
     done
     # wget may live outside those dirs (Homebrew on Apple silicon: /opt/homebrew/bin).
