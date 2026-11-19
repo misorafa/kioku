@@ -2,7 +2,7 @@
 
 日本語 | [English](README.md)
 
-**ステータス: v1.0.0 — 安定版。作者の 3 台（Mac mini サーバー、Mac と Windows のクライアント）で日常的に
+**ステータス: v1.0.1 — 安定版。作者の 3 台（Mac mini サーバー、Mac と Windows のクライアント）で日常的に
 使用中（[ロードマップ](#ロードマップ)と [CHANGELOG.md](CHANGELOG.md)）。** 1.x の間は設定の形式と HTTP / MCP の
 API の互換性を保ちます。
 

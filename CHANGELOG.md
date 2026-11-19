@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.0.1 — 2026-11-20
 
 - kioku is in winget: `winget install misorafa.kioku` (first submission merged
   2026-11-04). Later releases are submitted automatically by `winget.yml`.

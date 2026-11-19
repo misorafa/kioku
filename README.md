@@ -2,7 +2,7 @@
 
 [日本語](README.ja.md) | English
 
-**Status: v1.0.0 — stable. In daily use on the author's three machines (Mac mini server, Mac
+**Status: v1.0.1 — stable. In daily use on the author's three machines (Mac mini server, Mac
 and Windows clients); see [Roadmap](#roadmap) and [CHANGELOG.md](CHANGELOG.md).** Config
 formats and the HTTP/MCP API are kept compatible within 1.x.
 
