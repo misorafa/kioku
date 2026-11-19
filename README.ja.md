@@ -504,13 +504,15 @@ LaunchAgent が入っている場合は先に `kioku service uninstall` で外�
 ## 監視
 
 ```sh
-kioku status                # 件数、サイズ、更新の状態
-kioku status --watch 5      # 5 秒ごとに再表示: 進行中のセッション、最後の観測、未送信、更新、サイズ
+kioku status                # 件数（進行中 / 放置中のセッション、未受領の引き継ぎとそのレーン数）、サイズ、更新の状態
+kioku status --watch 5      # 5 秒ごとに再表示: 進行中（放置中）のセッション、最後の観測、レーンごとの未受領の引き継ぎ、未送信、更新、サイズ
 kioku status --agents       # 各エージェントの最後に成功したフック（サーバー不要）
 ```
 
 `GET /api/v1/metrics`（ほかの API と同じくベアラートークンが必要）は Prometheus のテキスト形式を返します:
-ゲージ `kioku_sessions_open`、`kioku_sessions_total`、`kioku_observations_total`、`kioku_handoffs_pending`、
+ゲージ `kioku_sessions_open`、`kioku_sessions_idle`（`[retention] sessions_idle_days` を過ぎた進行中のセッション）、
+`kioku_sessions_total`、`kioku_observations_total`、`kioku_handoffs_pending`、
+`kioku_handoffs_pending_lanes`（未受領の引き継ぎが一つ以上あるレーンの数）、
 `kioku_index_docs`、`kioku_outbox_queued`（サーバーでは常に 0）、`kioku_{db,raw,wiki,backups}_bytes`、
 `kioku_last_backup_age_seconds`、`kioku_last_prune_age_seconds`、`kioku_last_observation_age_seconds`、
 `kioku_update_last_check_age_seconds`（`-1` = まだ無い）、`kioku_version_info{version}`。起動以降のカウンタ
@@ -869,6 +871,8 @@ raw_days = 90           # これより古い raw/*.jsonl は gzip、2 倍の日�
 observations_days = 180 # これより古い終了済みセッションの観測は要約だけの形に縮める
 backups_keep = 10       # 残すバックアップの数（旧 [server] backup_keep も引き続き読む）
 hook_dump_days = 7      # これより古い logs/hook-dump.jsonl* を削除
+handoffs_pending_days = 30 # これより古い未受領の引き継ぎは、そのレーンの最新でなければ superseded にする
+sessions_idle_days = 7  # この日数観測の無い進行中セッションは終了処理する。観測が一つも無いものは削除
 auto = true             # `kioku serve` が毎日この方針を適用する
 ```
 
@@ -1073,7 +1077,13 @@ bundle を clone し、その上にコピーしたページを重ね（違いが
 今すぐ適用します（`--dry-run` は報告のみ）。種類ごとに件数とバイト数を表示します: gzip / 削除した
 raw ログ、観測を要約だけの形（ツール名、パスまたはコマンドの 1 行目、コミットメッセージ、エラーかどうか —
 セッションの要約が使うものだけなので、ページ・STATE.md・引き継ぎは変わりません。本文は消えます）に
-縮めたセッション、古いバックアップとフックのダンプ。`kioku status` はデータベース、raw ログ、wiki、
+縮めたセッション、古いバックアップとフックのダンプ。引き継ぎとセッションの後片付けもします:
+`handoffs_pending_days` より古い未受領の引き継ぎは、そのレーンで最新の未受領でなければ `superseded`
+にします（最新のものは古くても残します — それがレーンの現在の状態です）。`sessions_idle_days` の間
+観測の無い進行中のセッションは Stop と同じように終了処理し（要約、セッションページ、STATE.md。あとで
+指示が来れば再開します）、観測が一つも無いものは削除します。表示は `handoffs superseded`、
+`sessions finalized`、`sessions deleted`。なお、同じセッションが新しい引き継ぎを書いた時点で、その
+レーンにある自分の古い未受領の引き継ぎは superseded になります。`kioku status` はデータベース、raw ログ、wiki、
 バックアップ、索引の大きさ、最も古い raw ログ、最後の prune を表示します。
 
 **記録を消す: `kioku forget`。**

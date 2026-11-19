@@ -9,6 +9,8 @@ author in six months) can find the current rule for anything in one place.
 
 ## 1. Metrics and request log
 
+> Amended by SPEC-M3.5 §3: `kioku_handoffs_pending_lanes`, `kioku_sessions_idle` and the matching `kioku status` lines.
+
 - `GET /api/v1/metrics` (bearer auth): Prometheus text format, no new crate (hand-written
   lines). Gauges: `kioku_sessions_open`, `kioku_sessions_total`,
   `kioku_observations_total`, `kioku_handoffs_pending`, `kioku_index_docs`,

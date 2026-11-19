@@ -40,6 +40,8 @@ the write lock.
 
 ## 3. Retention: `[retention]`, `kioku prune`, `kioku forget` (audit CORE-中-6, PROD-6)
 
+> Amended by SPEC-M3.5 §2: `handoffs_pending_days`, `sessions_idle_days` and their `PruneReport` counts.
+
 ```toml
 [retention]
 raw_days = 90            # raw/<project>/<session>.jsonl older than this are gzipped, then deleted at 2×
