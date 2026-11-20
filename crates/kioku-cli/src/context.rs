@@ -46,6 +46,9 @@ pub struct StartContext {
     pub lane: Option<String>,
     /// Markdown of the handoff consumed by this session, if any.
     pub handoff: Option<String>,
+    /// `handoff` is the resumed session's own latest agent handoff (SPEC-M3.6 §1): shown
+    /// under its own heading.
+    pub own_handoff: bool,
     /// Markdown of the main line's handoff shown for reference (not accepted) on a branch
     /// lane without a handoff of its own (M2.4 §1.4); ignored when `handoff` is set.
     pub reference: Option<String>,
@@ -104,6 +107,7 @@ impl StartContext {
             session_id: session_id.to_string(),
             server_url: server_url.to_string(),
             lane: resp.lane,
+            own_handoff: resp.own_handoff && resp.pending_handoff.is_some(),
             handoff: resp.pending_handoff.map(|h| h.content_md),
             reference: resp.reference_handoff.map(|h| h.content_md),
             reference_reason: resp.reference_reason,
@@ -179,7 +183,15 @@ fn render_sections(lang: Lang, ctx: &StartContext, sec: &Sections, cap: usize) -
         (t.start_last_reply_heading, reply, LAST_REPLY_CAP),
     ]
     .into_iter()
-    .filter_map(|(heading, items, cap)| section(lang, heading, items, cap))
+    .filter_map(|(heading, items, cap)| {
+        // SPEC-M3.6 §2 rule 3: section 4 ends with a hint, within its cap.
+        if heading == t.carried_open_questions {
+            let hint = format!("{}\n", t.carried_resolve_hint);
+            let s = section(lang, heading, items, cap.saturating_sub(len(&hint)))?;
+            return Some(format!("{s}{hint}"));
+        }
+        section(lang, heading, items, cap)
+    })
     .collect();
 
     // Section 2: the handoff (or the main line's, for reference) in the remaining budget.
@@ -194,7 +206,7 @@ fn render_sections(lang: Lang, ctx: &StartContext, sec: &Sections, cap: usize) -
         let heading = if reference {
             reference_heading(lang, ctx)
         } else {
-            t.start_handoff_heading
+            handoff_heading(lang, ctx)
         };
         let fixed = len(&head) + len(&footer) + len(&tail) + len(heading) + 3;
         if let Some(h) = fit(&h, cap.saturating_sub(fixed)) {
@@ -208,6 +220,17 @@ fn render_sections(lang: Lang, ctx: &StartContext, sec: &Sections, cap: usize) -
     // Only the fixed parts are left and they are still too long (absurd project name).
     let body = truncate_chars(&out, cap.saturating_sub(len(CLOSE) + 1));
     format!("{body}\n{CLOSE}")
+}
+
+/// Heading of the session's own handoff: the resumed session's own latest one (SPEC-M3.6
+/// §1) or the usual "from the previous session".
+fn handoff_heading(lang: Lang, ctx: &StartContext) -> &'static str {
+    let t = strings(lang);
+    if ctx.own_handoff {
+        t.start_own_handoff_heading
+    } else {
+        t.start_handoff_heading
+    }
 }
 
 /// Heading of a handoff shown for reference only: this lane's while another session is
@@ -277,11 +300,10 @@ fn render_legacy(lang: Lang, ctx: &StartContext, cap: usize) -> String {
     let reference = clean(&ctx.handoff).is_none() && clean(&ctx.reference).is_some();
     let mut handoff = clean(&ctx.handoff).or_else(|| clean(&ctx.reference));
     let mut state = clean(&ctx.state);
-    let t = strings(lang);
     let heading = if reference {
         reference_heading(lang, ctx)
     } else {
-        t.start_handoff_heading
+        handoff_heading(lang, ctx)
     };
     if handoff.is_some() {
         // STATE.md's first section repeats the pending handoff verbatim; print it once.
@@ -411,6 +433,9 @@ fn len(s: &str) -> usize {
 
 #[cfg(test)]
 mod m30_tests;
+
+#[cfg(test)]
+mod m36_tests;
 
 #[cfg(test)]
 mod tests {

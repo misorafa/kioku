@@ -114,6 +114,7 @@ fn incremental_digest_equals_from_scratch_at_every_step() {
                 .write_handoff(&HandoffInput {
                     gotchas: Vec::new(),
                     verified: Vec::new(),
+                    resolved: Vec::new(),
                     project: project().id,
                     session: Some("step".into()),
                     summary: format!("途中経過 {i}"),
@@ -252,6 +253,7 @@ fn one_commit_per_turn_and_none_without_changes() {
         .write_handoff(&HandoffInput {
             gotchas: Vec::new(),
             verified: Vec::new(),
+            resolved: Vec::new(),
             project: project().id,
             session: Some("turns".into()),
             summary: "検索の索引を直した".into(),

@@ -198,6 +198,7 @@ server: http://127.0.0.1:7391
 ## 未解決（これまでの引き継ぎ）
 - Windows の CI が遅い (<md>)
 - ⚠ Windows ではパス区切りが \\ になる (<md>)
+（解決したものは kioku_handoff_write の resolved に書くと消える）
 
 ## ピン留め
 - 作業ルール (_global/<date>-1935be.md)
@@ -230,6 +231,7 @@ server: http://127.0.0.1:7391
 ## Open questions (carried)
 - Windows の CI が遅い (<md>)
 - ⚠ Windows ではパス区切りが \\ になる (<md>)
+(list what is settled in `resolved` of kioku_handoff_write to clear it)
 
 ## Pinned pages
 - 作業ルール (_global/<date>-1935be.md)

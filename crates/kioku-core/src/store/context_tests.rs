@@ -78,6 +78,7 @@ struct Items<'a> {
     open: &'a [&'a str],
     verified: &'a [&'a str],
     gotchas: &'a [&'a str],
+    resolved: &'a [&'a str],
 }
 
 fn handoff(store: &Store, session: &str, summary: &str, items: Items<'_>) -> Handoff {
@@ -92,6 +93,7 @@ fn handoff(store: &Store, session: &str, summary: &str, items: Items<'_>) -> Han
             decisions: v(items.decisions),
             verified: v(items.verified),
             gotchas: v(items.gotchas),
+            resolved: v(items.resolved),
         })
         .unwrap()
 }
@@ -488,5 +490,67 @@ fn session_info_reports_seconds_since_the_last_handoff() {
             .unwrap()
             .secs_since_handoff
             .is_some_and(|s| s < 60)
+    );
+}
+
+/// SPEC-M3.6 §2: `resolved` in a later handoff closes a carried open question and gotcha
+/// at the next session start and in STATE.md; the resolved text itself is not carried.
+#[test]
+fn resolved_items_stop_being_carried() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(Config::for_data_dir(tmp.path())).unwrap();
+    start(&store, "r1", "claude-code", None, None);
+    work(&store, "r1", "リリースの準備");
+    handoff(
+        &store,
+        "r1",
+        "準備した",
+        Items {
+            open: &["v1.0.0 のタグはいつ打つか", "リリース日はいつにするか"],
+            gotchas: &["Windows の CI は 40 分かかる", "WAL に注意"],
+            ..Items::default()
+        },
+    );
+    store.finalize_session("r1").unwrap();
+    start(&store, "r2", "codex", None, None);
+    work(&store, "r2", "タグを打った");
+    handoff(
+        &store,
+        "r2",
+        "タグを打った",
+        Items {
+            decisions: &["タグは CI が通ってから打つ"],
+            resolved: &["v1.0.0 のタグはいつ打つか", "Windows の CI は 40 分かかる"],
+            ..Items::default()
+        },
+    );
+    store.finalize_session("r2").unwrap();
+
+    let r = start(&store, "r3", "claude-code", None, None);
+    assert!(
+        r.pending_handoff
+            .as_ref()
+            .unwrap()
+            .content_md
+            .contains("### 解決済み\n- v1.0.0 のタグはいつ打つか\n"),
+        "{:?}",
+        r.pending_handoff
+    );
+    assert_eq!(texts(&r.open_questions), ["リリース日はいつにするか"]);
+    assert_eq!(texts(&r.gotchas), ["WAL に注意"]);
+    let state =
+        std::fs::read_to_string(tmp.path().join("wiki").join(project().id).join("STATE.md"))
+            .unwrap();
+    assert!(state.contains("リリース日はいつにするか"), "{state}");
+    // STATE.md shows r2's handoff in full (with its 解決済み list) but carries neither item
+    let carried = state
+        .split("## 未解決（これまでの引き継ぎ）")
+        .nth(1)
+        .unwrap_or("");
+    assert!(!carried.contains("40 分かかる"), "{state}");
+    assert!(!carried.contains("タグはいつ打つか"), "{state}");
+    assert!(
+        !state.contains("kioku_handoff_write の resolved"),
+        "no hint in STATE.md"
     );
 }

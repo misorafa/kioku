@@ -40,7 +40,7 @@ pub const READ_DESC: &str = "kioku のページを path（kioku_query の結果�
 pub const WRITE_PAGE_DESC: &str = "後で役に立つ知見・設計判断・手順・調査結果を Markdown ページとして kioku に保存する（検索対象になり、git に履歴が残る）。同じ title（または path）で書くと本文を置き換える。tags に pinned を付けたページは、そのプロジェクト（scope=global なら全プロジェクト）の SessionStart の <kioku> ブロックに毎回表示される（新しい順に 3 件まで、本文の先頭 400 字）— 常に守ってほしいルールや前提に使う。既存ページの更新前には kioku_read で読み、返された revision を expected_revision に渡す。競合（エラー）したら再読込して変更を統合してから書き直す。省略または空文字なら無条件に上書きする。scope=project（project を渡した場合の既定）はそのプロジェクト専用、scope=global はプロジェクトを横断する個人的なメモ。セッションの引き継ぎには使わず kioku_handoff_write を使うこと。タイトルが日本語だけのときは slug に英数字の短い名前（例: write-test-2）を付けると、wiki 上で見つけやすいパスになる（同じ slug で書くと置き換える）。\nSave durable knowledge as a searchable page; writing the same title/path/slug replaces it. Tag it `pinned` to show it at every session start. For a non-ASCII title, give `slug` a short ASCII name so the file is findable in the wiki.";
 
 /// Tool description of `handoff_write` (shared with the `kioku mcp` bridge).
-pub const HANDOFF_WRITE_DESC: &str = "このセッションの引き継ぎを記録する。このプロジェクトで次に始まるセッション（別のエージェントや別マシンでも）の冒頭に自動で渡される。作業を終える前、区切りがついたとき、コンテキストが尽きそうなときに必ず呼ぶこと。project と session には SessionStart の <kioku> ブロックに書かれた project の id と session の id を渡すこと（session を省略すると、そのプロジェクトで最後に観測のあった開いているセッションに紐づく）。summary=何をしたか・今どういう状態か、next_steps=次の一手（ファイル名やコマンドまで具体的に）、open_questions=未解決の点、decisions=決めたこととその理由、verified=確認済みの事実（実際に試して確かめたこと）、gotchas=落とし穴・注意点（次のセッションが踏みそうな罠）。decisions / verified / open_questions / gotchas は次回以降のセッション開始時にも引き継がれて表示されるので、1 項目 1 行で簡潔に書くこと。\nRecord a handoff for the next session of this project; always call it before you stop. Pass `project` and `session` from the SessionStart <kioku> block. decisions, verified facts, open questions and gotchas are carried into later sessions too: one short line each.";
+pub const HANDOFF_WRITE_DESC: &str = "このセッションの引き継ぎを記録する。このプロジェクトで次に始まるセッション（別のエージェントや別マシンでも）の冒頭に自動で渡される。作業を終える前、区切りがついたとき、コンテキストが尽きそうなときに必ず呼ぶこと。project と session には SessionStart の <kioku> ブロックに書かれた project の id と session の id を渡すこと（session を省略すると、そのプロジェクトで最後に観測のあった開いているセッションに紐づく）。summary=何をしたか・今どういう状態か、next_steps=次の一手（ファイル名やコマンドまで具体的に）、open_questions=未解決の点、decisions=決めたこととその理由、verified=確認済みの事実（実際に試して確かめたこと）、gotchas=落とし穴・注意点（次のセッションが踏みそうな罠）、resolved=前回までの『未解決』『落とし穴』のうち、もう当てはまらないものを書くと次回から表示されなくなる。decisions / verified / open_questions / gotchas は次回以降のセッション開始時にも引き継がれて表示されるので、1 項目 1 行で簡潔に書くこと。\nRecord a handoff for the next session of this project; always call it before you stop. Pass `project` and `session` from the SessionStart <kioku> block. decisions, verified facts, open questions and gotchas are carried into later sessions too: one short line each; list settled ones in `resolved` to stop carrying them.";
 
 /// Tool description of `handoff_pending` (shared with the `kioku mcp` bridge).
 pub const HANDOFF_PENDING_DESC: &str = "プロジェクトの未受領の引き継ぎ（最新のもの）を取得する。既定の accept=false では覗くだけで消費しない。accept=true にすると受領済みにして、同じレーンの古い未受領の引き継ぎを superseded（置き換え済み）にする。通常は SessionStart フックが自動で受領するが、同じブランチで別のセッションが作業中だった場合は参考表示だけで受領されないので、引き継ぐと決めたらここで accept=true を呼ぶ。自分のセッションが書いた引き継ぎは受領されない。引き継ぎはブランチごとのレーンに分かれる: session を渡すとそのセッションのレーン、lane（ブランチ名）を渡すとそのレーン、どちらも無ければ既定ブランチ（メインライン）のレーンを読む。自分のレーンに引き継ぎが無いときは、メインラインの引き継ぎが参考として返る（受領はされない）。<kioku> ブロックに引き継がれた決定事項だけでは足りないときは history=N（最大 20）で、そのレーンの直近 N 件の引き継ぎを状態（pending / accepted by … / superseded）つきで読める。\nPeek at (or accept) the pending handoff of a project; handoffs are routed per branch lane (session or lane; default = main line). `history: N` (≤ 20) returns the lane's last N handoffs with their status when the carried decisions are not enough.";
@@ -180,6 +180,9 @@ pub struct HandoffWriteParams {
     /// 落とし穴・注意点 / pitfalls the next session should know about.
     #[serde(default)]
     pub gotchas: Vec<String>,
+    /// 解決済み: 前回までの『未解決』『落とし穴』のうち、もう当てはまらないものを書くと次回から表示されなくなる（文の全体か先頭部分）/ resolved: carried open questions or gotchas that no longer hold (their text or its leading part); they stop being shown from the next session on.
+    #[serde(default)]
+    pub resolved: Vec<String>,
 }
 
 /// Input of `kioku_handoff_pending`.
@@ -321,6 +324,7 @@ impl KiokuMcp {
                 decisions: p.decisions,
                 gotchas: p.gotchas,
                 verified: p.verified,
+                resolved: p.resolved,
             };
             let handoff = blocking(&self.store, move |s| {
                 s.write_handoff(&input)
