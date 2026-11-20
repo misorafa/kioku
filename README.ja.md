@@ -229,10 +229,6 @@ curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh
 
 ### Homebrew
 
-> **まだ使えません。** tap（`misorafa/homebrew-tap`）が未公開のため、下のコマンドは現時点では
-> 失敗します。formula とリリース時の更新ジョブは用意済みです。公開までは上の `install.sh` を
-> 使ってください。
-
 ```sh
 brew install misorafa/tap/kioku
 kioku setup            # またはサーバーで `kioku invite` が表示する行を貼り付ける
@@ -1058,7 +1054,7 @@ kioku が代わりに選んだこと:
   （v0.9.1）引き継ぎの消費ルール、検索の改善 · **M3.2**（v0.9.2）メトリクス、フックの稼働確認、
   `doctor --fix`、ドキュメントの索引。
 - **M3.3**（v0.9.3）ghcr.io の Docker イメージ、`kioku uninstall`、フィクスチャの鮮度チェック、Homebrew の
-  formula（tap 自体は未公開）· **M3.4**（v0.9.4）アプリだけのマシンもサーバーの版に追従、読みやすい
+  formula（tap は 2026-11-20 に公開）· **M3.4**（v0.9.4）アプリだけのマシンもサーバーの版に追従、読みやすい
   ページ名 · **v1.0.0** 最初の安定版、winget（`misorafa.kioku`）· **M3.5**（v1.0.1）引き継ぎと
   セッションの整理。
 

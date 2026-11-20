@@ -249,10 +249,6 @@ optional at runtime (without it the wiki is not versioned).
 
 ### Homebrew
 
-> **Not available yet.** The tap `misorafa/homebrew-tap` has not been published, so the
-> command below fails today. The formula and the release job are ready; until the tap
-> exists, use `install.sh` above.
-
 ```sh
 brew install misorafa/tap/kioku
 kioku setup            # or paste the line `kioku invite` prints on your server
@@ -1172,7 +1168,7 @@ Shipped (details in [CHANGELOG.md](CHANGELOG.md), specs in [docs/INDEX.md](docs/
   (v0.9.0) richer session-start block · **M3.1** (v0.9.1) handoff consumption rules,
   better search · **M3.2** (v0.9.2) metrics, hook liveness, `doctor --fix`, document index.
 - **M3.3** (v0.9.3) Docker image on ghcr.io, `kioku uninstall`, fixture freshness checks,
-  Homebrew formula (the tap itself is not published yet) · **M3.4** (v0.9.4) app-only
+  Homebrew formula (tap published 2026-11-20) · **M3.4** (v0.9.4) app-only
   machines follow the server's version, readable page names · **v1.0.0** first stable
   release; winget (`misorafa.kioku`) · **M3.5** (v1.0.1) handoff and session hygiene.
 

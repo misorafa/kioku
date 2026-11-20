@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Homebrew: the tap `misorafa/homebrew-tap` is published (2026-11-20, starting with
+  v1.0.1), so `brew install misorafa/tap/kioku` works; releases update it through
+  `TAP_TOKEN`. The formula no longer states a `version` that Homebrew reads from the URL
+  (`brew audit --strict`).
 - Fresh memory at session start (SPEC-M3.6 §1): after a compact or resume, a session gets
   back the newer of the handoff it accepted and the last handoff it wrote itself, under
   「このセッションの直近の引き継ぎ（再開）」 / "This session's latest handoff (resumed)"
