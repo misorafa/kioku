@@ -580,7 +580,7 @@ fn project_instructions_embed_the_project_id_and_cursor_rule_is_exact() {
     let proj = tempfile::tempdir().unwrap();
     write(
         &proj.path().join(".kioku.toml"),
-        "project = \"chord-life-ace9dc4a\"\n",
+        "project = \"sample-app-ace9dc4a\"\n",
     );
     let c = ctx(home.path(), proj.path(), BIN);
     install_agent(Agent::Cursor, &c, &opts(true)).unwrap();
@@ -589,10 +589,10 @@ fn project_instructions_embed_the_project_id_and_cursor_rule_is_exact() {
         mdc,
         block::mdc_content(&block::instructions_body(
             kioku_core::Lang::Ja,
-            Some("chord-life-ace9dc4a")
+            Some("sample-app-ace9dc4a")
         ))
     );
-    assert!(mdc.contains("`chord-life-ace9dc4a`"));
+    assert!(mdc.contains("`sample-app-ace9dc4a`"));
     assert!(
         !proj.path().join("AGENTS.md").exists(),
         "Cursor never writes AGENTS.md"
@@ -609,7 +609,7 @@ fn project_instructions_embed_the_project_id_and_cursor_rule_is_exact() {
 
     install_agent(Agent::Codex, &c, &opts(true)).unwrap();
     let agents = std::fs::read_to_string(proj.path().join("AGENTS.md")).unwrap();
-    assert!(agents.contains("`chord-life-ace9dc4a`"));
+    assert!(agents.contains("`sample-app-ace9dc4a`"));
     assert!(proj.path().join(".codex/hooks.json").exists());
     // MCP stays user-level.
     assert!(home.path().join(".codex/config.toml").exists());

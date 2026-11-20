@@ -258,3 +258,7 @@ and the evaluation.
   production), but its tests and the auto-update tests probe scripts written a moment
   before, so the helper lives in `kioku-core` next to `output_with_deadline` rather than in
   `update.rs`. Test: `util::tests::retry_text_busy_retries_only_etxtbsy_up_to_the_limit`.
+- `docs`: the example project name in README / README.ja, SPEC-M1 §4, SPEC-M2 and the
+  tests of `project.rs`, `install/block.rs` and `install/agents/tests.rs` is now the
+  neutral `sample-app` (`sample-app-ace9dc4a`, `Sample_App` for the case variant); example
+  strings only, no behaviour change.

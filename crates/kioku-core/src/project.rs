@@ -692,12 +692,12 @@ mod tests {
     #[test]
     fn name_from_remote_rules() {
         assert_eq!(
-            name_from_remote("proj", "github.com/me/chord-life"),
-            "chord-life"
+            name_from_remote("proj", "github.com/me/sample-app"),
+            "sample-app"
         );
         assert_eq!(
-            name_from_remote("proj", "github.com/me/Chord_Life"),
-            "Chord_Life"
+            name_from_remote("proj", "github.com/me/Sample_App"),
+            "Sample_App"
         );
         // No ASCII in the repo name → the id falls back to the directory slug, so does the name.
         assert_eq!(
@@ -720,12 +720,12 @@ mod tests {
                 "remote",
                 "add",
                 "origin",
-                "git@github.com:me/chord-life.git"
+                "git@github.com:me/sample-app.git"
             ]
         ));
         let id = identify(&dir).unwrap();
-        assert!(id.id.starts_with("chord-life-"), "{}", id.id);
-        assert_eq!(id.name, "chord-life");
+        assert!(id.id.starts_with("sample-app-"), "{}", id.id);
+        assert_eq!(id.name, "sample-app");
 
         // `.kioku.toml` `name` still wins.
         std::fs::write(

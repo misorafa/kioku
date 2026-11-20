@@ -916,8 +916,8 @@ auto = true             # `kioku serve` が毎日この方針を適用する
    ```
 
 2. `origin` リモートのある git リポジトリ: `<repo>-<sha256(正規化したリモート) の先頭 8 桁>`。
-   例: フォルダ `proj`、リモート `git@github.com:me/chord-life.git` → id `chord-life-…`、
-   名前 `chord-life`。リモートは正規化される（スキーム、認証情報、ポート、`.git` を除去し、
+   例: フォルダ `proj`、リモート `git@github.com:me/sample-app.git` → id `sample-app-…`、
+   名前 `sample-app`。リモートは正規化される（スキーム、認証情報、ポート、`.git` を除去し、
    ホスト名を小文字化）ので、あるマシンの SSH クローンと、別のマシンの別名フォルダにある
    HTTPS クローンが同じ記憶を共有します。
 3. それ以外（リモートの無い git、または git 以外）: `<フォルダ名>-<sha256(正規化パス) の先頭 8 桁>` —

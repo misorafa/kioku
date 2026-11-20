@@ -1005,7 +1005,7 @@ prints it):
 
 2. In a git repository with an `origin` remote: `<repo>-<8 hex of
    sha256(normalized remote)>`, e.g. folder `proj` with remote
-   `git@github.com:me/chord-life.git` → id `chord-life-…`, name `chord-life`.
+   `git@github.com:me/sample-app.git` → id `sample-app-…`, name `sample-app`.
    The remote is normalized (scheme, credentials, port and `.git` stripped,
    host lowercased), so an SSH clone on one machine and an HTTPS clone in a
    differently named folder on another share the same memory.
