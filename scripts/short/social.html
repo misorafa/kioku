@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="ja">
+<meta charset="utf-8">
+<title>kioku — social preview</title>
+<!-- GitHub social preview (1280x640). Render:
+     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless --hide-scrollbars \
+       --window-size=1280,640 --screenshot=docs/media/social-preview.png scripts/short/social.html -->
+<style>
+:root{--bg:#f6f7fb;--fg:#141922;--mute:#5f6b7a;--blue:#1b6ef3;--orange:#f0732a;--green:#15a36b;--line:#e3e7ee}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{width:1280px;height:640px;overflow:hidden;background:var(--bg);color:var(--fg);font-family:"Hiragino Sans","Hiragino Kaku Gothic ProN","Helvetica Neue",Arial,sans-serif;font-feature-settings:"palt"}
+#bg{position:absolute;inset:0;background:radial-gradient(620px 620px at 6% 4%,rgba(27,110,243,.16),transparent 60%),radial-gradient(700px 700px at 96% 100%,rgba(240,115,42,.16),transparent 60%)}
+.wrap{position:absolute;inset:0;padding:64px 80px 60px;display:flex;flex-direction:column}
+.logo{font-size:112px;font-weight:900;letter-spacing:-.03em;line-height:1}
+.logo small{font-size:46px;color:var(--blue);font-weight:900;letter-spacing:.3em;margin-left:22px}
+.tag{margin-top:26px;font-size:33px;font-weight:800;line-height:1.3;white-space:nowrap;letter-spacing:-.01em}
+.sub{margin-top:10px;font-size:27px;white-space:nowrap;font-weight:700;color:var(--mute)}
+.chips{margin-top:34px;display:flex;flex-wrap:wrap;gap:12px}
+.chip{font-size:25px;font-weight:800;padding:10px 20px;border-radius:999px;background:#eef3ff;color:#1a3d8f;border:1.5px solid #d7e2ff}
+.pts{margin-top:14px;display:flex;gap:10px}
+.pt{font-size:22px;font-weight:800;padding:8px 16px;white-space:nowrap;border-radius:999px;background:rgba(21,163,107,.12);color:var(--green);border:1.5px solid rgba(21,163,107,.35)}
+.foot{margin-top:auto;display:flex;justify-content:space-between;align-items:baseline;font-size:26px;font-weight:800;color:var(--mute)}
+.foot .mono{font-family:Menlo,"SF Mono",Consolas,monospace;color:var(--fg);font-size:25px}
+</style>
+<body>
+<div id="bg"></div>
+<div class="wrap">
+  <div class="logo">kioku<small>記憶</small></div>
+  <div class="tag">Shared memory for AI coding agents, on your own server</div>
+  <div class="sub">すべてのマシン・すべてのエージェントで共有する、日本語ファーストの記憶サーバー</div>
+  <div class="chips"><span class="chip">Claude Code</span><span class="chip">Codex</span><span class="chip">Cursor</span><span class="chip">Antigravity</span></div>
+  <div class="pts"><span class="pt">Japanese-first search</span><span class="pt">single Rust binary</span><span class="pt">no LLM calls</span><span class="pt">Markdown in git</span></div>
+  <div class="foot"><span class="mono">github.com/misorafa/kioku</span><span>by misorafa</span></div>
+</div>

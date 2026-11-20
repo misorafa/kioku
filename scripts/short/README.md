@@ -20,3 +20,5 @@ table in `short.html` for on-screen copy. The MP4s are not committed (~9 MB each
 
 `diagram.html` + `node shoot.mjs` render the one-page flow diagram `docs/media/kioku-flow-{ja,en}.png` (1600×900 @2x).
 Post drafts live in `docs/marketing/x-posts.md`.
+
+`social.html` is the GitHub social preview (1280×640): render it with headless Chrome (command in the file's header) into `docs/media/social-preview.png`, then upload that file under the repository's Settings → Social preview (GitHub has no API for it).
