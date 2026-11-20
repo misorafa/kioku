@@ -237,3 +237,13 @@ schema with ja/en description, stored through the tool) and `tests/http_api.rs`
 before); `index::tests::{one_letter_tokens_are_noise_unless_alone,
 observed_query_needs_two_tokens, long_query_with_one_shared_token_falls_back_to_any_one}`
 and the evaluation.
+
+### Other (not part of this spec, same branch)
+
+- `test(install)`: `scripts/test-install.sh` asserted `lacks "iex"` on output that echoes
+  the random mktemp directory; on macos-latest it was `tmp.NIwN3iexGu` and the check
+  failed. The Git Bash check now asserts `lacks "ExecutionPolicy"` and `lacks "| iex"`
+  (what it means: no `-ExecutionPolicy Bypass`, no `irm … | iex`), and the source-build
+  check `lacks "downloading kioku-"` instead of `lacks "downloading"`. The other
+  `lacks` / `has` needles in `test-install.sh` and `test-scripts.sh` contain spaces,
+  brackets, `@`, `/` or non-ASCII and cannot occur in a mktemp name.
