@@ -643,9 +643,13 @@ fn replace(
     }
     // On Windows run the extracted `kioku.exe`: `kioku.exe.new` has no executable extension.
     let probe = if cfg!(windows) { &bin } else { new };
-    let out = kioku_core::util::quiet_command(&probe.display().to_string())
-        .arg("--version")
-        .output()?;
+    // The binary was written a moment ago: another thread's fork may still hold its write fd
+    // for an instant (ETXTBSY on unix), so a busy spawn is retried briefly.
+    let out = kioku_core::util::retry_text_busy(|| {
+        kioku_core::util::quiet_command(&probe.display().to_string())
+            .arg("--version")
+            .output()
+    })?;
     if !out.status.success() {
         bail!(
             "the new binary does not run here: {}",

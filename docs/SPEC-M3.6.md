@@ -247,3 +247,14 @@ and the evaluation.
   check `lacks "downloading kioku-"` instead of `lacks "downloading"`. The other
   `lacks` / `has` needles in `test-install.sh` and `test-scripts.sh` contain spaces,
   brackets, `@`, `/` or non-ASCII and cannot occur in a mktemp name.
+- `fix(cli)`: `update::tests::replace_verifies_the_checksum_before_touching_the_binary`
+  failed on ubuntu-latest with `Text file busy (os error 26)`: the just-written binary is
+  run for its `--version` probe while another test thread's fork still holds its write fd
+  (ETXTBSY). A real `kioku update` can hit the same race, so the fix is in the product:
+  `kioku_core::util::retry_text_busy` retries a spawn that fails with ETXTBSY (unix only,
+  up to 10 tries 50 ms apart; every other error and Windows unchanged). It wraps the update
+  probe and the spawn in `util::output_with_deadline`, which `update::binary_version` uses.
+  `binary_version` probes `<exe>.prev`, written by an earlier update (no race in
+  production), but its tests and the auto-update tests probe scripts written a moment
+  before, so the helper lives in `kioku-core` next to `output_with_deadline` rather than in
+  `update.rs`. Test: `util::tests::retry_text_busy_retries_only_etxtbsy_up_to_the_limit`.
