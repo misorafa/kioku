@@ -13,9 +13,10 @@
   no longer carried (they stay in the handoff and in `history`). The block's open
   questions section ends with a hint about `resolved`.
 - Less noise in search (SPEC-M3.6 §3): a single letter or digit (`X`, `1`) is ignored
-  unless it is the whole query, and a query of three or more words first returns only
-  pages that match at least two of them (falling back to any one word, then to the
-  partial match). No reindex needed.
+  unless it is the whole query, and a query of three or more words lists the pages that
+  match at least two of them first; pages that match only one fill the remaining places
+  after them, so nothing found before is lost while there is room. The partial match
+  runs only when neither finds anything. No reindex needed.
 
 ## v1.0.1 — 2026-11-20
 

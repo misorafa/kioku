@@ -87,13 +87,18 @@ Query side only; the index schema stays at version 3 and nothing is reindexed.
    of them, in any of title / body / `code` (tags do not count). Implement with one
    `BooleanQuery` of `Should` clauses per token, combined by
    `BooleanQuery::with_minimum_required_clauses(.., 2)`; the tag clauses and scoring stay
-   as today. When that returns nothing, retry with the present any-one-token query, then
-   the `ja_bigram` fallback as today (hits of the any-one retry are **not** flagged
-   partial). Queries using tantivy syntax are unaffected.
+   as today. Hits of the coverage query come first, re-ranked among themselves as today.
+   When they are fewer than `limit`, the remaining places are filled with hits of the
+   present any-one-token query that are not already listed, re-ranked among themselves —
+   so a page matching two tokens always ranks above a page matching one, and no page the
+   any-one query used to return is lost while there is room. Fill hits are **not** flagged
+   partial. Only when both return nothing does the `ja_bigram` fallback run, as today.
+   Queries using tantivy syntax are unaffected.
 3. **Evaluation**: add to `search-eval.json` at least 6 queries of five or more words
    whose expected page shares several words with the query while distractor pages share
-   exactly one incidental token (include the observed query with a page about 競合比較 and
-   distractors containing `x86_64` and 脆弱性; mixed ja/en; one with a one-letter token).
+   exactly one incidental token, which must rank below the expected page (include the
+   observed query with a page about 競合比較 and distractors containing `x86_64` and 脆弱性;
+   mixed ja/en; one with a one-letter token).
    Thresholds unchanged (Recall@3 ≥ 0.90, MRR@3 ≥ 0.80, every `top: true` first). Record
    Recall@3 / MRR@3 before and after in §5. **If rule 2 lowers either number on the
    existing corpus below its threshold, or makes a `top: true` query lose first place,
@@ -122,9 +127,9 @@ Tests (next to the code, `tempfile`, Japanese throughout):
   the hint line appears only with items; MCP and HTTP accept the field; a request without
   it behaves as before.
 - §3: the observed query on a fixture — the 競合比較 page first, the `x86_64` and 脆弱性
-  distractors absent; `X` alone still finds a page containing `x`; a five-word query whose
-  only matching page shares one token is still found through the any-one retry and is not
-  flagged partial; the evaluation thresholds.
+  distractors ranked below it and below every two-token hit; `X` alone still finds a page
+  containing `x`; a five-word query whose only matching page shares one token is still
+  found through the any-one tier and is not flagged partial; the evaluation thresholds.
 
 Record deviations and causes found in §5.
 
@@ -189,8 +194,20 @@ Record deviations and causes found in §5.
   ≥ `COVERAGE_MIN_TOKENS` (3) groups the first query is
   `Must(BooleanQuery::with_minimum_required_clauses(groups, MIN_COVERAGE = 2))` plus the
   tag clauses as `Should` (they score, they do not count); the second is today's flat OR
-  query. `search_with` tries them in order and uses the bigram fallback only when both
-  return nothing; snippets are generated from the query that produced the hits.
+  query.
+- **Two tiers (review correction of rule 2).** The first implementation used the any-one
+  query only when the coverage query returned nothing, so a long query silently dropped
+  every one-token page as soon as some page matched two (「winget トークン 再発行」 lost
+  the page that only says `WINGET_TOKEN を作り直す`). Rule 2 was corrected in the spec
+  above; `search_with` now runs the coverage query with the usual `3 × limit` pool and
+  re-ranks it (tier 1); when that gives fewer than `limit` hits it runs the any-one query
+  with the same pool, re-ranks it on its own, drops documents already listed (by stored
+  `path`) and appends the best of the rest (tier 2). Scores are comparable only within a
+  tier; a tier-2 hit is never sorted above a tier-1 hit. With fewer than three tokens
+  (or tantivy syntax) there is only the any-one tier, exactly as before M3.6. The
+  bigram fallback runs only when both tiers are empty. Snippets always come from the
+  any-one query, so every matched token is highlighted in both tiers. Re-ranking is the
+  free function `index::rerank`, shared by both tiers and the bigram fallback.
 - **Clarification found by a test:** a user-dictionary synonym is emitted at the same
   position as its word, so 「記憶装置」 with the synonym `kioku` produced three tokens and
   coverage dropped pages that only had the synonym
@@ -212,12 +229,17 @@ to a page that shares only `limit`), all `top: true`.
 |--------|------|----------|-------|
 | 53 pages / 53 queries (before) | before M3.6 | 1.000 | 0.991 |
 | 64 pages / 60 queries | before M3.6 | 1.000 | 0.992 |
-| 64 pages / 60 queries | M3.6 (rules 1 and 2) | 1.000 | 0.992 |
+| 64 pages / 60 queries | M3.6, exclusive fallback (first implementation) | 1.000 | 0.992 |
+| 64 pages / 60 queries | M3.6, two tiers (final) | 1.000 | 0.992 |
 
 No regression and every `top: true` query stays first, so rule 2 is kept. The old code
 already put the expected pages first: the observed noise was in hits 2–8, which Recall@3
-/ MRR@3 cannot see; `index::tests::observed_query_needs_two_tokens` checks it with
-`limit = 8` (only the 競合比較 page is returned).
+/ MRR@3 cannot see. `index::tests::observed_query_needs_two_tokens` checks it with
+`limit = 8`: the 競合比較 page first, the `x86_64` page not found at all (rule 1 removes
+`X`), and one-token pages (脆弱性 via 性, 投稿) only after every two-token hit. The numbers
+are the same with the two tiers: tier 2 only adds hits below position 1 for these queries
+and fills places 2–3 where the exclusive fallback left them empty, which Recall@3 / MRR@3
+does not penalise either way.
 
 ### Tests
 
@@ -235,8 +257,9 @@ the updated M3.0 goldens (hint line); `kioku-server` `tests/mcp.rs` (`resolved` 
 schema with ja/en description, stored through the tool) and `tests/http_api.rs`
 (`resolved` in the body, rendered after the decisions; a body without it renders as
 before); `index::tests::{one_letter_tokens_are_noise_unless_alone,
-observed_query_needs_two_tokens, long_query_with_one_shared_token_falls_back_to_any_one}`
-and the evaluation.
+observed_query_needs_two_tokens, long_query_with_one_shared_token_falls_back_to_any_one,
+one_token_hits_follow_two_token_hits, a_full_first_tier_gets_no_one_token_hits}` and the
+evaluation.
 
 ### Other (not part of this spec, same branch)
 

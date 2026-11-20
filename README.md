@@ -859,11 +859,12 @@ write a handoff before stopping.
   `score × recency × kind weight` — recency halves every 30 days (never below 0.25),
   pages weigh 1.0, STATE.md 0.8, session pages 0.6, and a page tagged `pinned` ×1.5 —
   so the newer of two near-duplicate pages comes first.
-- **Long queries**: a query of three or more words (tokens) only returns pages that
-  match at least two of them, so 「競合 比較 claude-mem 優位性 宣伝 X 投稿」 no longer
-  lists pages that share one incidental word; when nothing matches two, any one word
-  is enough again. A single letter or digit (`X`, `1`) is ignored unless it is the
-  whole query (SPEC-M3.6 §3).
+- **Long queries**: for a query of three or more words (tokens), pages that match at
+  least two of them come first; pages that match only one fill the remaining places
+  after them. So for 「競合 比較 claude-mem 優位性 宣伝 X 投稿」 a page that shares one
+  incidental word never ranks above the page about the comparison, and nothing found
+  before is lost while there is room. A single letter or digit (`X`, `1`) is ignored
+  unless it is the whole query (SPEC-M3.6 §3).
 - **Filters**: `since: "2026-09-01"` keeps what was updated on or after that day;
   `kinds: ["page", "session"]` keeps those kinds. From the terminal:
   `kioku search --since 2026-09-01 --kind page 索引`.

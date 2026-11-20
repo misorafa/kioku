@@ -434,12 +434,79 @@ fn observed_query_needs_two_tokens() {
         )
         .unwrap();
     let got: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
-    assert_eq!(
-        got,
-        ["p/compete.md"],
-        "x86_64, 脆弱性 and 投稿-only pages are noise"
-    );
-    assert!(!hits[0].partial);
+    // the comparison page (the only two-token hit) first; one-token hits only after it
+    assert_eq!(got[0], "p/compete.md", "{got:?}");
+    // `X` is noise next to the other words: the x86_64 page is not found at all
+    assert!(!got.contains(&"p/x86.md"), "{got:?}");
+    assert!(!got.contains(&"p/flutter.md"), "{got:?}");
+    assert!(hits.iter().all(|h| !h.partial), "{got:?}");
+}
+
+/// The review of M3.6: a page matching one token must not be lost because another page
+/// matches two — it comes after it (「winget トークン 再発行」).
+#[test]
+fn one_token_hits_follow_two_token_hits() {
+    let dir = tempfile::tempdir().unwrap();
+    let (idx, _) = SearchIndex::open(dir.path()).unwrap();
+    idx.upsert_many(
+        &[
+            doc(
+                "p/reissue.md",
+                Some("p"),
+                "認証",
+                "API のトークンを再発行する手順。",
+            ),
+            doc(
+                "p/winget.md",
+                Some("p"),
+                "公開",
+                "WINGET_TOKEN を作り直す。",
+            ),
+            doc("p/other.md", Some("p"), "夕食", "牛乳と卵を買う。"),
+        ],
+        false,
+    )
+    .unwrap();
+    let hits = idx
+        .search("winget トークン 再発行", &SearchScope::All, 5)
+        .unwrap();
+    let got: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+    assert_eq!(got, ["p/reissue.md", "p/winget.md"]);
+    assert!(hits.iter().all(|h| !h.partial));
+}
+
+/// When two-token hits already fill `limit`, no one-token hit is appended.
+#[test]
+fn a_full_first_tier_gets_no_one_token_hits() {
+    let dir = tempfile::tempdir().unwrap();
+    let (idx, _) = SearchIndex::open(dir.path()).unwrap();
+    idx.upsert_many(
+        &[
+            doc("p/a.md", Some("p"), "検索の改善", "索引と検索を速くした。"),
+            doc(
+                "p/b.md",
+                Some("p"),
+                "索引の再構築",
+                "索引を作り直して検索を確かめた。",
+            ),
+            doc("p/c.md", Some("p"), "日本語", "形態素解析の辞書を足した。"),
+        ],
+        false,
+    )
+    .unwrap();
+    let q = "検索 索引 辞書";
+    let mut two: Vec<String> = idx
+        .search(q, &SearchScope::All, 2)
+        .unwrap()
+        .into_iter()
+        .map(|h| h.path)
+        .collect();
+    two.sort();
+    assert_eq!(two, ["p/a.md", "p/b.md"]);
+    // with room, the one-token page follows
+    let all = paths(&idx, q);
+    assert_eq!(all.len(), 3, "{all:?}");
+    assert_eq!(all[2], "p/c.md");
 }
 
 #[test]

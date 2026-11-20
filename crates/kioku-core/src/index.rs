@@ -649,10 +649,11 @@ impl SearchIndex {
     }
 
     /// Full-text search (spec §6.3, SPEC-M3.1 §2, SPEC-M3.6 §3): OR semantics over the
-    /// `ja` title (×2) and body, the `code` field (×0.7) and tags — a query of
-    /// [`COVERAGE_MIN_TOKENS`] or more meaningful tokens first requiring [`MIN_COVERAGE`] of
-    /// them, then any one; scope / kind / `since` filters; the best `3 × limit` BM25 hits
-    /// re-ranked by recency, kind and `pinned`; when nothing matches, a character-bigram
+    /// `ja` title (×2) and body, the `code` field (×0.7) and tags; scope / kind / `since`
+    /// filters; the best `3 × limit` BM25 hits re-ranked by recency, kind and `pinned`. A
+    /// query of [`COVERAGE_MIN_TOKENS`] or more meaningful tokens lists the hits matching
+    /// [`MIN_COVERAGE`] of them first and fills the remaining places with hits matching
+    /// one, each tier re-ranked on its own; when nothing matches, a character-bigram
     /// partial match (hits flagged `partial`).
     pub fn search_with(
         &self,
@@ -670,54 +671,45 @@ impl SearchIndex {
         let filter = filter_query(&f, scope, opts);
         let searcher = inner.reader.searcher();
         let pool = TopDocs::with_limit(limit.saturating_mul(RERANK_POOL)).order_by_score();
-        // The coverage query first (long queries, SPEC-M3.6 §3), then any one token.
-        let mut user_query: Option<Box<dyn Query>> = None;
-        let mut top = Vec::new();
-        for q in build_queries(&inner, query)? {
-            top = searcher
+        let now = opts.now.unwrap_or_else(Utc::now);
+        let queries = build_queries(&inner, query)?;
+        let run = |q: &dyn Query, what: &'static str| {
+            searcher
                 .search(&*with_filter(q.box_clone(), &filter), &pool)
-                .context("running search")?;
-            user_query = Some(q);
-            if !top.is_empty() {
-                break;
-            }
+                .context(what)
+        };
+        // SPEC-M3.6 §3 rule 2: hits matching two tokens first (tier 1), then — while there
+        // is room — hits of the any-one query not already listed (tier 2); each tier
+        // re-ranked on its own, so a tier-2 hit never sorts above a tier-1 hit.
+        let mut ranked = match &queries.coverage {
+            Some(q) => rerank(&searcher, f, run(&**q, "running search")?, now, limit)?,
+            None => Vec::new(),
+        };
+        if ranked.len() < limit
+            && let Some(q) = &queries.any
+        {
+            let listed: HashSet<String> = ranked
+                .iter()
+                .map(|(_, _, doc, _)| stored_text(doc, f.path))
+                .collect();
+            let fill = rerank(&searcher, f, run(&**q, "running search")?, now, usize::MAX)?;
+            let room = limit - ranked.len();
+            ranked.extend(
+                fill.into_iter()
+                    .filter(|(_, _, doc, _)| !listed.contains(&stored_text(doc, f.path)))
+                    .take(room),
+            );
         }
         let mut partial = false;
         let grams = query_bigrams(query);
-        if top.is_empty()
+        if ranked.is_empty()
             && let Some(q) = bigram_query(&f, &grams)
         {
-            top = searcher
-                .search(&*with_filter(q, &filter), &pool)
-                .context("running partial-match search")?;
+            let top = run(&*q, "running partial-match search")?;
             partial = !top.is_empty();
+            ranked = rerank(&searcher, f, top, now, limit)?;
         }
-
-        // Re-rank: BM25 × recency × kind weight × pinned; ties keep BM25 order.
-        let now = opts.now.unwrap_or_else(Utc::now);
-        let mut ranked = Vec::with_capacity(top.len());
-        for (i, (score, addr)) in top.into_iter().enumerate() {
-            let doc: TantivyDocument = searcher.doc(addr).context("loading hit")?;
-            let kind = stored_text(&doc, f.kind);
-            let pinned = doc
-                .get_all(f.tags)
-                .filter_map(|v| v.as_str())
-                .any(|t| t.eq_ignore_ascii_case(crate::carry::PINNED_TAG));
-            let updated = doc
-                .get_first(f.updated)
-                .and_then(|v| v.as_datetime())
-                .and_then(|d| DateTime::<Utc>::from_timestamp(d.into_timestamp_secs(), 0));
-            let factor = updated.map_or(1.0, |u| recency(u, now))
-                * kind_weight(&kind)
-                * if pinned { PINNED_BOOST } else { 1.0 };
-            ranked.push((score * factor, i, doc, updated));
-        }
-        ranked.sort_by(|a, b| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(Ordering::Equal)
-                .then(a.1.cmp(&b.1))
-        });
-        ranked.truncate(limit);
+        let user_query = queries.any;
 
         let snippets = match (&user_query, partial) {
             (Some(q), false) => {
@@ -761,6 +753,41 @@ impl SearchIndex {
         }
         Ok(hits)
     }
+}
+
+/// Re-ranks BM25 hits by recency × kind weight × `pinned` (ties keep BM25 order) and
+/// keeps the best `limit`.
+fn rerank(
+    searcher: &tantivy::Searcher,
+    f: Fields,
+    top: Vec<(f32, tantivy::DocAddress)>,
+    now: DateTime<Utc>,
+    limit: usize,
+) -> anyhow::Result<Vec<Ranked>> {
+    let mut ranked = Vec::with_capacity(top.len());
+    for (i, (score, addr)) in top.into_iter().enumerate() {
+        let doc: TantivyDocument = searcher.doc(addr).context("loading hit")?;
+        let kind = stored_text(&doc, f.kind);
+        let pinned = doc
+            .get_all(f.tags)
+            .filter_map(|v| v.as_str())
+            .any(|t| t.eq_ignore_ascii_case(crate::carry::PINNED_TAG));
+        let updated = doc
+            .get_first(f.updated)
+            .and_then(|v| v.as_datetime())
+            .and_then(|d| DateTime::<Utc>::from_timestamp(d.into_timestamp_secs(), 0));
+        let factor = updated.map_or(1.0, |u| recency(u, now))
+            * kind_weight(&kind)
+            * if pinned { PINNED_BOOST } else { 1.0 };
+        ranked.push((score * factor, i, doc, updated));
+    }
+    ranked.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(Ordering::Equal)
+            .then(a.1.cmp(&b.1))
+    });
+    ranked.truncate(limit);
+    Ok(ranked)
 }
 
 /// `index/user-dict.lindera.csv`: the lindera CSV generated from `dict/user.csv`.
@@ -853,15 +880,33 @@ fn with_filter(query: Box<dyn Query>, filter: &Option<Box<dyn Query>>) -> Box<dy
     }
 }
 
-/// The user queries to try in order (SPEC-M3.6 §3): tantivy syntax when the query uses it
-/// (one query), else [`term_queries`].
-fn build_queries(inner: &Inner, query: &str) -> anyhow::Result<Vec<Box<dyn Query>>> {
+/// A re-ranked hit: score, BM25 rank, document, update time.
+type Ranked = (f32, usize, TantivyDocument, Option<DateTime<Utc>>);
+
+/// The two tiers of a user query (SPEC-M3.6 §3 rule 2).
+#[derive(Default)]
+struct UserQueries {
+    /// Hits matching at least [`MIN_COVERAGE`] tokens; only for a query of
+    /// [`COVERAGE_MIN_TOKENS`] or more tokens.
+    coverage: Option<Box<dyn Query>>,
+    /// Hits matching any one token (or the tantivy-syntax query); also the snippet query.
+    any: Option<Box<dyn Query>>,
+}
+
+/// The user queries (SPEC-M3.6 §3): tantivy syntax when the query uses it (one tier), else
+/// [`term_queries`].
+fn build_queries(inner: &Inner, query: &str) -> anyhow::Result<UserQueries> {
     if uses_query_syntax(query) {
         let f = inner.fields;
         let mut parser = QueryParser::for_index(&inner.index, vec![f.title, f.body]);
         parser.set_field_boost(f.title, TITLE_BOOST);
         match parser.parse_query(query) {
-            Ok(q) => return Ok(vec![q]),
+            Ok(q) => {
+                return Ok(UserQueries {
+                    coverage: None,
+                    any: Some(q),
+                });
+            }
             Err(e) => tracing::debug!(error = %e, "query parse failed; falling back to terms"),
         }
     }
@@ -878,10 +923,10 @@ struct TokenGroup {
     clauses: Vec<(Occur, Box<dyn Query>)>,
 }
 
-/// Token-by-token queries over title (boosted), body, `code` (×0.7) and tags: with
-/// [`COVERAGE_MIN_TOKENS`] or more distinct meaningful tokens, first one requiring
-/// [`MIN_COVERAGE`] of them (tags do not count), then the any-one-token OR query.
-fn term_queries(inner: &Inner, query: &str) -> anyhow::Result<Vec<Box<dyn Query>>> {
+/// Token-by-token queries over title (boosted), body, `code` (×0.7) and tags: the
+/// any-one-token OR query, and with [`COVERAGE_MIN_TOKENS`] or more distinct meaningful
+/// tokens also one requiring [`MIN_COVERAGE`] of them (tags do not count).
+fn term_queries(inner: &Inner, query: &str) -> anyhow::Result<UserQueries> {
     let f = inner.fields;
     let mut analyzer = inner.analyzer.clone();
     let mut tokens: Vec<String> = Vec::new();
@@ -1010,7 +1055,7 @@ fn term_queries(inner: &Inner, query: &str) -> anyhow::Result<Vec<Box<dyn Query>
         .split_whitespace()
         .map(|word| (Occur::Should, term(f.tags, word)))
         .collect();
-    let mut out: Vec<Box<dyn Query>> = Vec::new();
+    let mut out = UserQueries::default();
     if groups.len() >= COVERAGE_MIN_TOKENS {
         let per_token: Vec<(Occur, Box<dyn Query>)> = groups
             .iter()
@@ -1027,13 +1072,13 @@ fn term_queries(inner: &Inner, query: &str) -> anyhow::Result<Vec<Box<dyn Query>
             )),
         )];
         clauses.extend(tags.iter().map(|(o, q)| (*o, q.box_clone())));
-        out.push(Box::new(BooleanQuery::new(clauses)));
+        out.coverage = Some(Box::new(BooleanQuery::new(clauses)));
     }
     let mut any: Vec<(Occur, Box<dyn Query>)> =
         groups.into_iter().flat_map(|g| g.clauses).collect();
     any.extend(tags);
     if !any.is_empty() {
-        out.push(Box::new(BooleanQuery::new(any)));
+        out.any = Some(Box::new(BooleanQuery::new(any)));
     }
     Ok(out)
 }
