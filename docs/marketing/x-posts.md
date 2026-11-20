@@ -109,3 +109,42 @@ https://github.com/misorafa/kioku
 - Why no LLM calls: summaries stay deterministic, fast and free; the agent's own handoff (requested automatically at the end of a session) carries the judgement.
 - One server = one person by design; team sharing is out of scope.
 - The Windows binary is unsigned for now (SmartScreen warns); code signing is in progress.
+
+---
+
+## Zenn 記事の告知（日本語）
+
+記事の下書き: `docs/marketing/zenn-kioku.md`。公開後の URL を `<記事の URL>` に入れる。
+添付は `docs/media/kioku-flow-ja.png`（1 枚図）か `kioku-short-ja.mp4`。
+
+### C. 運用の数字で告知（単発）
+
+AI コーディングエージェントの記憶を全マシンで共有するサーバーを自作して、2 か月使いました。
+
+・3 台、341 セッション、観測 21,316 件
+・11 月のサーバーログは警告・エラー 0
+・ただし「未受領の引き継ぎが 214 件たまる」など、使い続けて初めて見えた問題が 4 つ
+
+設計、作り方、失敗をまとめました。
+<記事の URL>
+
+### D. 日本語検索で告知（単発）
+
+「京都」で検索して「東京都」が出てくるのが嫌で、エージェントの記憶を単語単位で検索できるようにしました。
+
+・京都 →「東京都」は出ない
+・ログ →「ログイン」は出ない
+・引継 →「引き継ぎ書」が出る
+・決めた →「決定」は出ない（意味の検索ではないので）
+
+できることとできないことを書きました。
+<記事の URL>
+
+### E. 正直な比較で告知（単発）
+
+エージェントの記憶ツールは、star が 10 万を超えるものもある混んだ分野です。自作の kioku は star 0。
+
+それでも作って使い続けている理由（日本語、Windows、小ささ）と、機能では勝っていないことを記事に書きました。
+<記事の URL>
+
+投稿の順番の案: C（公開当日）→ D（2〜3 日後）→ E（1 週間後）。同じ記事を切り口を変えて 3 回出す。
