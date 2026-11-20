@@ -2,7 +2,7 @@
 
 [日本語](README.ja.md) | English
 
-**Status: v1.0.1 — stable. In daily use on the author's three machines (Mac mini server, Mac
+**Status: v1.0.2 — stable. In daily use on the author's three machines (Mac mini server, Mac
 and Windows clients); see [Roadmap](#roadmap) and [CHANGELOG.md](CHANGELOG.md).** Config
 formats and the HTTP/MCP API are kept compatible within 1.x.
 
@@ -1170,12 +1170,9 @@ Shipped (details in [CHANGELOG.md](CHANGELOG.md), specs in [docs/INDEX.md](docs/
 - **M3.3** (v0.9.3) Docker image on ghcr.io, `kioku uninstall`, fixture freshness checks,
   Homebrew formula (tap published 2026-11-20) · **M3.4** (v0.9.4) app-only
   machines follow the server's version, readable page names · **v1.0.0** first stable
-  release; winget (`misorafa.kioku`) · **M3.5** (v1.0.1) handoff and session hygiene.
-
-In progress:
-
-- **M3.6**: a resumed session gets its own latest handoff back, carried open questions
-  can be closed, less noise in multi-word searches ([SPEC-M3.6](docs/SPEC-M3.6.md)).
+  release; winget (`misorafa.kioku`) · **M3.5** (v1.0.1) handoff and session hygiene · **M3.6**
+  (v1.0.2) a resumed session gets its own latest handoff back, carried open questions can
+  be closed, less noise in multi-word searches.
 
 Ideas for M4 and later (not committed): web UI, embeddings and bi-temporal facts, optional
 LLM consolidation, ingest adapters (mail, calendar), an evaluation harness beyond the

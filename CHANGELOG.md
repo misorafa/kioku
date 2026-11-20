@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.0.2 — 2026-11-20
 
 - Homebrew: the tap `misorafa/homebrew-tap` is published (2026-11-20, starting with
   v1.0.1), so `brew install misorafa/tap/kioku` works; releases update it through
