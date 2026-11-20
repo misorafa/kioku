@@ -901,6 +901,26 @@ pub fn newest_handoff_accepted_by(
         .optional()?)
 }
 
+/// The newest agent handoff written by `session` on `project` and `lane`, whatever its
+/// status (SPEC-M3.6 §1: what a resumed session last said itself).
+pub fn newest_own_agent_handoff(
+    conn: &Connection,
+    session: &str,
+    project: &str,
+    lane: Option<&str>,
+) -> anyhow::Result<Option<Handoff>> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "{HANDOFF_SELECT} WHERE h.session_id = ?1 AND h.project_id = ?2 AND h.lane IS ?3
+                 AND h.source = 'agent' {HANDOFF_ORDER}"
+            ),
+            params![session, project, lane],
+            handoff_from_row,
+        )
+        .optional()?)
+}
+
 /// Sessions with a cached digest (SPEC-M2.8 §1) whose JSON contains `needle`, of `project`
 /// (every project when `None`), newest start first, with that JSON.
 pub fn sessions_with_digest_containing(

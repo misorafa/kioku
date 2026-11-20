@@ -109,7 +109,7 @@ Priority:
    differently named directories still agree), else
    `<slug(name)>-<first 8 hex of sha256(canonical root path)>` (`name` = basename
    of root). With a remote, `name` = `repo` verbatim (folder `proj`, remote
-   `…/chord-life` → id `chord-life-ace9dc4a`, name `chord-life`), so the
+   `…/sample-app` → id `sample-app-ace9dc4a`, name `sample-app`), so the
    SessionStart line and STATE.md title match the id; if `repo` has no ASCII
    (the id then uses the root basename's slug) `name` is the root basename too.
    `.kioku.toml` `name` always wins.

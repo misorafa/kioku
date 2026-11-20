@@ -164,6 +164,7 @@ fn consumption_matrix_on_two_lanes() {
 
 /// Rule 2: the handoff a session wrote itself (its previous turn's Stop) is never accepted
 /// by it, neither at start nor through an explicit accept; it waits for the next session.
+/// (Since SPEC-M3.6 §1 a resume shows it again, flagged `own_handoff`, without accepting.)
 #[test]
 fn a_session_never_accepts_its_own_handoff() {
     let tmp = tempfile::tempdir().unwrap();
@@ -174,7 +175,10 @@ fn a_session_never_accepts_its_own_handoff() {
         work(&store, &me, 1);
         let mine = write(&store, &me, "自分の引き継ぎ");
         let resp = start_with(&store, &me, lane, "startup");
-        assert!(resp.pending_handoff.is_none());
+        // SPEC-M3.6 §1: a known id is a resume, which gets its own handoff re-presented
+        // (`own_handoff`), never accepted and never as a reference
+        assert_eq!(resp.pending_handoff.as_ref().unwrap().id, mine.id);
+        assert!(resp.own_handoff);
         assert!(
             resp.reference_handoff.is_none(),
             "own handoff is not even a reference: {:?}",
@@ -517,4 +521,112 @@ fn inserted_rules_handoff_supersedes_the_sessions_older_pending_ones() {
     let id = store.finalize_session("long").unwrap().handoff_id.unwrap();
     assert_eq!(id, fresh.id);
     assert_eq!(pending_of(&store, "long", HandoffSource::Rules).len(), 1);
+}
+
+/// Distinct millisecond `created_at`s for handoffs written back to back.
+fn tick() {
+    std::thread::sleep(std::time::Duration::from_millis(5));
+}
+
+/// A session that accepted `A` from "前任" on `lane`; "前任" is idle by then.
+fn accepted_a(store: &Store, me: &str, lane: Option<&str>) -> Handoff {
+    let prev = format!("{me}-prev");
+    start(store, &prev, lane);
+    work(store, &prev, 120);
+    let a = write(store, &prev, "前任の引き継ぎ（古い）");
+    store.finalize_session(&prev).unwrap();
+    tick();
+    let resp = start(store, me, lane);
+    assert_eq!(resp.pending_handoff.unwrap().id, a.id);
+    work(store, me, 1);
+    a
+}
+
+/// SPEC-M3.6 §1: a session that accepted A and then wrote its own agent handoff B gets B
+/// back after a compact, flagged `own_handoff`, with nothing newly accepted, A still
+/// accepted by it, and `session_context` agreeing.
+#[test]
+fn resumed_session_gets_its_own_newer_handoff() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(Config::for_data_dir(tmp.path())).unwrap();
+    for lane in [None, Some(CRYPT_LANE)] {
+        let me = s(lane, "long-lived");
+        let a = accepted_a(&store, &me, lane);
+        tick();
+        let b = write(&store, &me, "自分の直近の引き継ぎ");
+        // another session's pending handoff on the lane must stay pending
+        let other = s(lane, "other");
+        start(&store, &other, lane);
+        work(&store, &other, 120);
+        tick();
+        let x = write(&store, &other, "別セッションの引き継ぎ");
+
+        let resp = start_with(&store, &me, lane, "compact");
+        assert_eq!(resp.pending_handoff.as_ref().unwrap().id, b.id);
+        assert!(resp.own_handoff);
+        assert!(resp.reference_handoff.is_none());
+        assert!(
+            row(&store, &b.id).accepted_at.is_none(),
+            "own is never accepted"
+        );
+        assert_eq!(row(&store, &a.id).accepted_by.as_deref(), Some(me.as_str()));
+        assert!(
+            row(&store, &x.id).accepted_at.is_none(),
+            "nothing newly accepted"
+        );
+
+        let ctx = store.session_context(&me).unwrap();
+        assert_eq!(ctx.pending_handoff.as_ref().unwrap().id, b.id);
+        assert!(ctx.own_handoff);
+        // the JSON carries the flag; without it the field is absent
+        let json = serde_json::to_value(&ctx).unwrap();
+        assert_eq!(json["own_handoff"], true);
+        store.finalize_session(&other).unwrap();
+        store.finalize_session(&me).unwrap();
+    }
+}
+
+/// SPEC-M3.6 §1: without an own agent handoff the resume gets A back as before; an own
+/// *rules* handoff newer than A is not a candidate; an own agent handoff on another lane
+/// is not a candidate either.
+#[test]
+fn resumed_session_without_own_agent_handoff_gets_the_accepted_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(Config::for_data_dir(tmp.path())).unwrap();
+    let me = "quiet";
+    let a = accepted_a(&store, me, None);
+    let resp = start_with(&store, me, None, "compact");
+    assert_eq!(resp.pending_handoff.as_ref().unwrap().id, a.id);
+    assert!(!resp.own_handoff);
+    let json = serde_json::to_value(&resp).unwrap();
+    assert!(json.get("own_handoff").is_none(), "{json}");
+
+    // finalize writes the session's rules handoff, newer than A
+    tick();
+    let rules = store.finalize_session(me).unwrap().handoff_id.unwrap();
+    assert_eq!(row(&store, &rules).source, HandoffSource::Rules);
+    assert!(row(&store, &rules).created_at > a.created_at);
+    // an own agent handoff on another lane, newer still
+    tick();
+    let elsewhere = Handoff {
+        id: "h-other-lane".into(),
+        project_id: project().id,
+        session_id: Some(me.into()),
+        source: HandoffSource::Agent,
+        content_md: "## 引き継ぎ（claude-code, 今日）\n### 要約\n別のレーンで書いた".into(),
+        created_at: util::now_ts(),
+        accepted_at: None,
+        accepted_by: None,
+        agent: None,
+        updated_at: None,
+        lane: Some("別のブランチ".into()),
+    };
+    db::insert_handoff(&store.db.lock(), &elsewhere, None).unwrap();
+
+    let resp = start_with(&store, me, None, "resume");
+    assert_eq!(resp.pending_handoff.as_ref().unwrap().id, a.id);
+    assert!(!resp.own_handoff);
+    let ctx = store.session_context(me).unwrap();
+    assert_eq!(ctx.pending_handoff.as_ref().unwrap().id, a.id);
+    assert!(!ctx.own_handoff);
 }

@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+- Homebrew: the tap `misorafa/homebrew-tap` is published (2026-11-20, starting with
+  v1.0.1), so `brew install misorafa/tap/kioku` works; releases update it through
+  `TAP_TOKEN`. The formula no longer states a `version` that Homebrew reads from the URL
+  (`brew audit --strict`).
+- Fresh memory at session start (SPEC-M3.6 §1): after a compact or resume, a session gets
+  back the newer of the handoff it accepted and the last handoff it wrote itself, under
+  「このセッションの直近の引き継ぎ（再開）」 / "This session's latest handoff (resumed)"
+  (`own_handoff` in the start / context response). A long-lived session no longer gets a
+  weeks-old handoff back after a compact.
+- Carried open questions close (SPEC-M3.6 §2): `kioku_handoff_write` and
+  `POST /api/v1/handoffs` accept `resolved` (解決済み): carried open questions or gotchas
+  that no longer hold, by their text or its start. Open questions older than 30 days are
+  no longer carried (they stay in the handoff and in `history`). The block's open
+  questions section ends with a hint about `resolved`.
+- Less noise in search (SPEC-M3.6 §3): a single letter or digit (`X`, `1`) is ignored
+  unless it is the whole query, and a query of three or more words lists the pages that
+  match at least two of them first; pages that match only one fill the remaining places
+  after them, so nothing found before is lost while there is room. The partial match
+  runs only when neither finds anything. No reindex needed.
+
 ## v1.0.1 — 2026-11-20
 
 - kioku is in winget: `winget install misorafa.kioku` (first submission merged

@@ -110,8 +110,10 @@ SessionEnd        finalize（冪等）
   次に始まる*新しい*セッションが一度だけ受領します。そのレーンの古い未受領のものは `superseded`
   （置き換え済み）になります。次の 3 つの場合は何も受領しません:
   - セッションの **compact / resume**（または kioku が既に知っているセッション id）は、以前に
-    受領した引き継ぎをもう一度受け取ります。まだ何も受領していなければ、レーンの未受領の引き継ぎを
-    参考として表示するだけです。
+    受領した引き継ぎと、自分で `kioku_handoff_write` に書いた最後の引き継ぎのうち新しい方を
+    受け取ります（SPEC-M3.6 §1。後者は「このセッションの直近の引き継ぎ（再開）」として表示。長く続く
+    セッションが compact の後に何週間も前の引き継ぎを受け取ることはありません）。どちらも無ければ、
+    レーンの未受領の引き継ぎを参考として表示するだけです。
   - セッションは**自分の書いた引き継ぎを受領しません**（前のターンの Stop が書いた自動生成の引き継ぎは、
     次のセッションのために未受領のまま残ります）。
   - **同じレーンで別のセッションが作業中**（30 分以内に観測があり、finalize されていない）の間は、
@@ -133,7 +135,8 @@ SessionEnd        finalize（冪等）
 3. **決定事項（これまでの引き継ぎ）**: プロジェクトの直近 20 件のエージェントの引き継ぎ（全レーン）から、
    新しい順・重複除去（NFKC と大文字小文字を無視）・日付付き。続いて **確認済みの事実**（`✓`）。
    2 に表示済みの項目は除きます
-4. **未解決（これまでの引き継ぎ）**: 後の決定事項で解決していない質問。続いて **落とし穴**（`⚠`）
+4. **未解決（これまでの引き継ぎ）**: 後の決定事項で解決しておらず、30 日以内の質問。続いて **落とし穴**（`⚠`）。
+   後の `kioku_handoff_write` の `resolved` に書いた項目は消え（SPEC-M3.6 §2）、末尾にその旨の一行が付きます
 5. **ピン留め**: プロジェクトまたは `_global` の `pinned` タグ付きページ（新しい順に 3 件、本文の先頭 400 字）。
    毎回守ってほしいルールに使います
 6. **最近のセッション**: `日付 エージェント [レーン] @マシン — タイトル (パス)`
@@ -169,6 +172,7 @@ server: http://192.168.1.20:7391
 ## 未解決（これまでの引き継ぎ）
 - Windows の CI が遅い (09-29)
 - ⚠ Windows ではパス区切りが \ になる (09-29)
+（解決したものは kioku_handoff_write の resolved に書くと消える）
 
 ## ピン留め
 - 作業ルール (_global/page-1935be.md)
@@ -224,10 +228,6 @@ curl -fsSL https://raw.githubusercontent.com/misorafa/kioku/main/install.sh | sh
 バージョン管理されません）。
 
 ### Homebrew
-
-> **まだ使えません。** tap（`misorafa/homebrew-tap`）が未公開のため、下のコマンドは現時点では
-> 失敗します。formula とリリース時の更新ジョブは用意済みです。公開までは上の `install.sh` を
-> 使ってください。
 
 ```sh
 brew install misorafa/tap/kioku
@@ -760,7 +760,7 @@ docker compose pull && docker compose up -d     # または docker pull ghcr.io/
 | `kioku_query` | `query`、`project?`、`scope?`（`project`/`global`/`all`）、`limit?`（既定 8）、`since?`（`YYYY-MM-DD`）、`kinds?`（`page`/`session`/`state`）、`path_prefix?` | 全文検索（日本語・英語。下の「検索」を参照）。`project` を渡すとそのプロジェクトとグローバルのページに絞る。各結果は `1. <path> — <title> (session, 2026-09-28, @mini)` の形。`path_prefix` を渡すと、そのパス以下のファイルを編集したセッションを返す |
 | `kioku_read` | `path` | wiki 内の相対パス（検索結果に表示されるもの）でページを読む。`revision` も返す |
 | `kioku_write_page` | `title`、`content`、`project?`、`scope?`（`project`/`global`）、`tags?`、`path?`、`slug?`、`expected_revision?` | 検索可能な Markdown ページを保存する。同じ title/path/slug なら置き換える。`expected_revision`（`kioku_read` の `revision`）を渡すと、その後に誰かが変更していた場合は置き換えずに競合エラーになる。`pinned` タグを付けると、そのプロジェクト（グローバルなら全プロジェクト）の SessionStart のブロックに毎回表示される |
-| `kioku_handoff_write` | `project`、`session?`（SessionStart のブロックにある id）、`summary`、`next_steps`、`open_questions`、`decisions`、`verified?`、`gotchas?` | そのプロジェクトの次のセッションが受け取る引き継ぎを記録する。決定事項・確認済みの事実（`verified`）・未解決の質問・落とし穴（`gotchas`）は後のセッションにも引き継がれる |
+| `kioku_handoff_write` | `project`、`session?`（SessionStart のブロックにある id）、`summary`、`next_steps`、`open_questions`、`decisions`、`verified?`、`gotchas?`、`resolved?` | そのプロジェクトの次のセッションが受け取る引き継ぎを記録する。決定事項・確認済みの事実（`verified`）・未解決の質問・落とし穴（`gotchas`）は後のセッションにも引き継がれる。`resolved`（解決済み）には、引き継がれている未解決・落とし穴のうちもう当てはまらないもの（文の全体か先頭部分）を書くと、次回から表示されなくなる |
 | `kioku_handoff_pending` | `project`、`accept?`（既定 false）、`session?`、`lane?`、`history?`（最大 20） | 未受領の引き継ぎを覗く（または受領する）。既定はメインライン、`session` / `lane` でブランチのレーンを読む。`history` でそのレーンの直近の引き継ぎを状態つきで返す |
 | `kioku_status` | — | 件数、データディレクトリ、登録済みプロジェクト id |
 
@@ -779,6 +779,10 @@ ASCII の単語だけのタイトルはそのまま（`Design Notes` → `design
 - **並べ替え**: BM25 の上位 `3 × limit` 件を `スコア × 新しさ × 種類の重み` で並べ直します。新しさは
   30 日ごとに半分（0.25 未満にはならない）、重みはページ 1.0・STATE.md 0.8・セッションページ 0.6、
   `pinned` タグ付きのページは ×1.5。よく似た新旧のページがあれば新しい方が先に来ます。
+- **長い検索語**: 3 語（トークン）以上の検索では、2 語以上に一致するページを先に並べ、一語だけ一致する
+  ページは残りの枠にその後ろで並べます。「競合 比較 claude-mem 優位性 宣伝 X 投稿」で、たまたま一語だけ
+  共通するページが比較のページより上に来ることはなく、枠に余裕があれば以前見つかったものも失われません。
+  英数字一文字（`X`、`1`）は、それだけの検索でない限り無視します（SPEC-M3.6 §3）。
 - **絞り込み**: `since: "2026-09-01"` でその日以降の更新だけ、`kinds: ["page", "session"]` で種類を
   絞れます。ターミナルからは `kioku search --since 2026-09-01 --kind page 索引`。
 - **識別子**: `kioku_handoff_write`、`Store::open`、`src/index.rs`、`write_lock`、`SearchIndex` は
@@ -908,8 +912,8 @@ auto = true             # `kioku serve` が毎日この方針を適用する
    ```
 
 2. `origin` リモートのある git リポジトリ: `<repo>-<sha256(正規化したリモート) の先頭 8 桁>`。
-   例: フォルダ `proj`、リモート `git@github.com:me/chord-life.git` → id `chord-life-…`、
-   名前 `chord-life`。リモートは正規化される（スキーム、認証情報、ポート、`.git` を除去し、
+   例: フォルダ `proj`、リモート `git@github.com:me/sample-app.git` → id `sample-app-…`、
+   名前 `sample-app`。リモートは正規化される（スキーム、認証情報、ポート、`.git` を除去し、
    ホスト名を小文字化）ので、あるマシンの SSH クローンと、別のマシンの別名フォルダにある
    HTTPS クローンが同じ記憶を共有します。
 3. それ以外（リモートの無い git、または git 以外）: `<フォルダ名>-<sha256(正規化パス) の先頭 8 桁>` —
@@ -1050,7 +1054,7 @@ kioku が代わりに選んだこと:
   （v0.9.1）引き継ぎの消費ルール、検索の改善 · **M3.2**（v0.9.2）メトリクス、フックの稼働確認、
   `doctor --fix`、ドキュメントの索引。
 - **M3.3**（v0.9.3）ghcr.io の Docker イメージ、`kioku uninstall`、フィクスチャの鮮度チェック、Homebrew の
-  formula（tap 自体は未公開）· **M3.4**（v0.9.4）アプリだけのマシンもサーバーの版に追従、読みやすい
+  formula（tap は 2026-11-20 に公開）· **M3.4**（v0.9.4）アプリだけのマシンもサーバーの版に追従、読みやすい
   ページ名 · **v1.0.0** 最初の安定版、winget（`misorafa.kioku`）· **M3.5**（v1.0.1）引き継ぎと
   セッションの整理。
 

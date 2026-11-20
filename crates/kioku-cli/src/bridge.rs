@@ -373,6 +373,7 @@ impl KiokuBridge {
             "decisions": p.decisions,
             "verified": p.verified,
             "gotchas": p.gotchas,
+            "resolved": p.resolved,
         });
         let v = self.call(move |c| c.post(&["handoffs"], &body)).await?;
         // `project_id` is additive (M2 §20.1); an older server only returns `id`.

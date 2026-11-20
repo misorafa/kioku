@@ -72,6 +72,8 @@ pub struct Strings {
     pub handoff_verified: &'static str,
     /// Sub-heading: gotchas (SPEC-M3.0 §2).
     pub handoff_gotchas: &'static str,
+    /// Sub-heading: carried items that no longer hold (SPEC-M3.6 §2).
+    pub handoff_resolved: &'static str,
     /// Placeholder for an empty list or missing value.
     pub none: &'static str,
     /// Placeholder title when the session had no prompt.
@@ -110,6 +112,8 @@ pub struct Strings {
     /// STATE.md and `<kioku>` block: open questions (and gotchas) carried from earlier
     /// handoffs (SPEC-M3.0 §1 section 4).
     pub carried_open_questions: &'static str,
+    /// `<kioku>` block: last line of section 4 when it lists items (SPEC-M3.6 §2 rule 3).
+    pub carried_resolve_hint: &'static str,
     /// STATE.md and `<kioku>` block: pages tagged `pinned` (SPEC-M3.0 §1 section 5).
     pub pinned_pages: &'static str,
     /// `{n}`: marker for lines a section had no room for (SPEC-M3.0 §1).
@@ -131,6 +135,9 @@ pub struct Strings {
     /// SessionStart context: heading of this lane's pending handoff shown for reference to a
     /// resumed / compacted session that never accepted one (SPEC-M3.1 §1 rule 1).
     pub start_resumed_reference_heading: &'static str,
+    /// SessionStart context: heading of the resumed session's own newest agent handoff,
+    /// shown instead of the older one it accepted (SPEC-M3.6 §1).
+    pub start_own_handoff_heading: &'static str,
     /// SessionStart context: heading of the STATE.md excerpt.
     pub start_state_heading: &'static str,
     /// SessionStart context: the last reply of the previous session (SPEC-M3.0 §1 section 7).
@@ -167,6 +174,7 @@ pub const JA: Strings = Strings {
     handoff_decisions: "### 決定事項",
     handoff_verified: "### 確認済みの事実",
     handoff_gotchas: "### 落とし穴・注意点",
+    handoff_resolved: "### 解決済み",
     none: "（なし）",
     no_prompt: "（指示なし）",
     session_overview: "## 概要",
@@ -185,6 +193,7 @@ pub const JA: Strings = Strings {
     state_hot_files: "## よく触るファイル（直近10セッション）",
     carried_decisions: "## 決定事項（これまでの引き継ぎ）",
     carried_open_questions: "## 未解決（これまでの引き継ぎ）",
+    carried_resolve_hint: "（解決したものは kioku_handoff_write の resolved に書くと消える）",
     pinned_pages: "## ピン留め",
     more_items: "…（ほか {n} 件）",
     start_project_line: "project: {name} (id: {id})  ← kioku_* ツールの project 引数にはこの id を渡すこと",
@@ -194,6 +203,7 @@ pub const JA: Strings = Strings {
     start_reference_heading: "## メインの引き継ぎ（参考）\n（このブランチ宛ての引き継ぎはまだない。既定ブランチ向けのものを参考として表示しており、受領はしていない）",
     start_concurrent_heading: "## 未受領の引き継ぎ（参考）\n（同じブランチで別のセッションが作業中のため、引き継ぎは消費していません）",
     start_resumed_reference_heading: "## 未受領の引き継ぎ（参考）\n（再開したセッションのため、新しい引き継ぎは受領していません）",
+    start_own_handoff_heading: "## このセッションの直近の引き継ぎ（再開）",
     start_state_heading: "## 現在の状態（STATE.md 抜粋）",
     start_last_reply_heading: "## 最後の回答（前回のセッション）",
     start_footer: "セッション終了前に kioku_handoff_write（上の project と session を渡す）で要約・次の一手・未解決点を書くこと。\n関連する過去の記録は kioku_query で検索できる。",
@@ -221,6 +231,7 @@ pub const EN: Strings = Strings {
     handoff_decisions: "### Decisions",
     handoff_verified: "### Verified",
     handoff_gotchas: "### Gotchas",
+    handoff_resolved: "### Resolved",
     none: "(none)",
     no_prompt: "(no instruction)",
     session_overview: "## Overview",
@@ -239,6 +250,7 @@ pub const EN: Strings = Strings {
     state_hot_files: "## Frequently touched files (last 10 sessions)",
     carried_decisions: "## Decisions (carried)",
     carried_open_questions: "## Open questions (carried)",
+    carried_resolve_hint: "(list what is settled in `resolved` of kioku_handoff_write to clear it)",
     pinned_pages: "## Pinned pages",
     more_items: "…({n} more)",
     start_project_line: "project: {name} (id: {id})  ← pass this id as `project` to kioku_* tools",
@@ -248,6 +260,7 @@ pub const EN: Strings = Strings {
     start_reference_heading: "## Main line handoff (for reference)\n(No handoff for this branch yet. This one belongs to the default branch; it is shown for reference and was not accepted.)",
     start_concurrent_heading: "## Pending handoff (for reference)\n(another session is active on this lane; the handoff was left pending)",
     start_resumed_reference_heading: "## Pending handoff (for reference)\n(this is a resumed session; no new handoff was accepted)",
+    start_own_handoff_heading: "## This session's latest handoff (resumed)",
     start_state_heading: "## Current state (STATE.md excerpt)",
     start_last_reply_heading: "## Last reply (previous session)",
     start_footer: "Before ending the session, record a summary, next steps and open questions with kioku_handoff_write (pass the project and session above).\nSearch past records with kioku_query.",

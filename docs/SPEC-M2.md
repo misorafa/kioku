@@ -791,7 +791,7 @@ created it and it is empty afterwards):
 ```
 
 `{project_line}`: project-level snippets embed the id from `identify(root)`
-(e.g. `chord-life-ace9dc4a`); global snippets say「`kioku project id` の出力」/
+(e.g. `sample-app-ace9dc4a`); global snippets say「`kioku project id` の出力」/
 "the output of `kioku project id`". English variant has the same four bullets.
 Size < 1 KiB.
 

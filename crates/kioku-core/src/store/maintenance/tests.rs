@@ -238,6 +238,7 @@ fn forget_session_removes_everything_of_it() {
         .write_handoff(&HandoffInput {
             gotchas: Vec::new(),
             verified: Vec::new(),
+            resolved: Vec::new(),
             project: project().id,
             session: Some("drop".into()),
             summary: "忘れるべき引き継ぎ".into(),

@@ -194,6 +194,34 @@ pub fn canonical_plain(p: &std::path::Path) -> std::io::Result<std::path::PathBu
     std::fs::canonicalize(p).map(|c| plain_path(&c))
 }
 
+/// Attempts of a spawn that fails because the program is still open for writing.
+pub const TEXT_BUSY_TRIES: u32 = 10;
+/// Pause between those attempts.
+pub const TEXT_BUSY_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// True for `ETXTBSY` (os error 26 on Linux and macOS): executing a file that some process
+/// still holds open for writing — typically another thread's fork that inherited the fd of
+/// a binary just written. Never true on Windows.
+pub fn is_text_busy(err: &std::io::Error) -> bool {
+    cfg!(unix) && err.raw_os_error() == Some(26)
+}
+
+/// Runs `attempt` (a spawn of a just-written binary) again while it fails with
+/// [`is_text_busy`], at most [`TEXT_BUSY_TRIES`] times [`TEXT_BUSY_WAIT`] apart; any other
+/// result, and the last busy error, is returned as is.
+pub fn retry_text_busy<T>(mut attempt: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let mut tries = 1;
+    loop {
+        match attempt() {
+            Err(e) if is_text_busy(&e) && tries < TEXT_BUSY_TRIES => {
+                tries += 1;
+                std::thread::sleep(TEXT_BUSY_WAIT);
+            }
+            other => return other,
+        }
+    }
+}
+
 /// A `Command` for a background child (git, tar, …): on Windows it gets `CREATE_NO_WINDOW`
 /// so a hook never flashes a console window; elsewhere it is a plain `Command::new`.
 pub fn quiet_command(program: &str) -> std::process::Command {
@@ -217,12 +245,10 @@ pub fn output_with_deadline(
     deadline: std::time::Duration,
 ) -> Option<std::process::Output> {
     use std::process::Stdio;
-    let mut child = cmd
-        .stdin(Stdio::null())
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::piped());
+    let mut child = retry_text_busy(|| cmd.spawn()).ok()?;
     let start = std::time::Instant::now();
     loop {
         match child.try_wait() {
@@ -242,6 +268,40 @@ pub fn output_with_deadline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn retry_text_busy_retries_only_etxtbsy_up_to_the_limit() {
+        let busy = || std::io::Error::from_raw_os_error(26);
+        // busy twice, then success: three calls
+        let mut calls = 0;
+        let r = retry_text_busy(|| {
+            calls += 1;
+            if calls < 3 {
+                Err(busy())
+            } else {
+                Ok("起動した")
+            }
+        });
+        assert_eq!(r.unwrap(), "起動した");
+        assert_eq!(calls, 3);
+        // another error is returned at once
+        let mut calls = 0;
+        let r: std::io::Result<()> = retry_text_busy(|| {
+            calls += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        });
+        assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(calls, 1);
+        // busy forever: gives up after the limit with the busy error
+        let mut calls = 0;
+        let r: std::io::Result<()> = retry_text_busy(|| {
+            calls += 1;
+            Err(busy())
+        });
+        assert!(is_text_busy(&r.unwrap_err()));
+        assert_eq!(calls, TEXT_BUSY_TRIES);
+    }
 
     #[test]
     fn output_with_deadline_returns_output_or_gives_up() {

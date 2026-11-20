@@ -47,6 +47,8 @@ check() {
     if "$@"; then pass "$c_name"; else fail "$c_name"; fi
 }
 has() { printf '%s\n' "$OUT" | grep -F -- "$1" >/dev/null; }
+# Needles of `lacks` must not be short alphanumeric strings: the output contains mktemp
+# paths with random letters (`tmp.NIwN3iexGu` once made `lacks "iex"` fail).
 lacks() { ! has "$1"; }
 
 # ---------------------------------------------------------------- fixtures
@@ -344,7 +346,7 @@ OUT=$(cd "$H" && env HOME="$H" SHELL=/bin/bash PATH="$FAKEBIN:$PATH0" KIOKU_UNAM
     "$TEST_SH" "$ROOT/install.sh" 2>&1) || RC=$?
 check "Git Bash on Windows -> install.ps1 via PowerShell from a file, invite passed as KIOKU_JOIN" \
     eval '[ "$RC" = 0 ] && has "PS-JOIN: [http://192.168.1.240:7391/K7Q2M9XD]" && has "PS-FILE: # fixture install.ps1" &&
-        has "-NoProfile -Command" && lacks "Bypass" && lacks "iex" && nothing_installed'
+        has "-NoProfile -Command" && lacks "ExecutionPolicy" && lacks "| iex" && nothing_installed'
 rm -f "$FAKEBIN/powershell.exe"
 
 
@@ -395,7 +397,7 @@ newhome
 : >"$CARGO_LOG"
 T_PATH="$FAKEBIN:$FAKECARGO:$PATH0" inst Linux x86_64 --no-setup --from-source --version v9.9.9
 check "--from-source skips the binaries" \
-    eval '[ "$RC" = 0 ] && lacks "downloading" && grep -F -- "--tag v9.9.9" "$CARGO_LOG" >/dev/null && installed_is 0.0.0-source'
+    eval '[ "$RC" = 0 ] && lacks "downloading kioku-" && grep -F -- "--tag v9.9.9" "$CARGO_LOG" >/dev/null && installed_is 0.0.0-source'
 
 # ---------------------------------------------------------------- setup hand-off
 

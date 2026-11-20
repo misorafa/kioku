@@ -1027,13 +1027,13 @@ mod tests {
     fn snippet_is_small_and_mdc_is_exact() {
         for lang in [Lang::Ja, Lang::En] {
             let block = wrap(
-                &instructions_body(lang, Some("chord-life-ace9dc4a")),
+                &instructions_body(lang, Some("sample-app-ace9dc4a")),
                 MD_MARKERS,
             );
             assert!(block.len() < 1024, "{lang:?}: {} bytes", block.len());
             assert_eq!(block.matches("\n- ").count(), 4, "four bullets");
         }
-        let body = instructions_body(Lang::Ja, Some("chord-life-ace9dc4a"));
+        let body = instructions_body(Lang::Ja, Some("sample-app-ace9dc4a"));
         let mdc = mdc_content(&body);
         assert_eq!(
             mdc,

@@ -129,12 +129,16 @@ pub struct HandoffInput {
     /// Facts that were checked and hold (SPEC-M3.0 §2); older clients omit it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verified: Vec<String>,
+    /// Carried open questions or gotchas that no longer hold, as their text or its leading
+    /// part (SPEC-M3.6 §2); they stop being carried. Older clients omit it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolved: Vec<String>,
 }
 
 /// Renders an agent-written handoff as Markdown (spec §7.5). `agent` is the heading label
-/// (`claude-code@mini` when the machine is known, SPEC-M3.0 §6). `verified` and `gotchas`
-/// (SPEC-M3.0 §2) get their sections only when non-empty, so a handoff without them renders
-/// exactly as before. A multi-line item is written on one line, so every item stays one
+/// (`claude-code@mini` when the machine is known, SPEC-M3.0 §6). `resolved` (SPEC-M3.6 §2,
+/// right after the decisions), `verified` and `gotchas` (SPEC-M3.0 §2) get their sections
+/// only when non-empty, so a handoff without them renders exactly as before. A multi-line item is written on one line, so every item stays one
 /// `- ` line that [`crate::carry::handoff_items`] can read back.
 pub fn render_agent_handoff(lang: Lang, agent: &str, date: &str, input: &HandoffInput) -> String {
     let s = strings(lang);
@@ -147,6 +151,7 @@ pub fn render_agent_handoff(lang: Lang, agent: &str, date: &str, input: &Handoff
         (s.handoff_next_steps, &input.next_steps, true),
         (s.handoff_open_questions, &input.open_questions, true),
         (s.handoff_decisions, &input.decisions, true),
+        (s.handoff_resolved, &input.resolved, false),
         (s.handoff_verified, &input.verified, false),
         (s.handoff_gotchas, &input.gotchas, false),
     ];

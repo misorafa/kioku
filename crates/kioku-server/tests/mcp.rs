@@ -65,6 +65,20 @@ async fn mcp_tools_over_streamable_http() {
         assert!(!desc.is_empty() && desc.is_char_boundary(0), "{}", t.name);
         assert!(desc.lines().count() >= 2, "{}: ja + en lines", t.name);
     }
+    // SPEC-M3.6 §2: `resolved` is a parameter of kioku_handoff_write, described ja + en
+    let write = tools
+        .iter()
+        .find(|t| t.name == "kioku_handoff_write")
+        .unwrap();
+    let schema = serde_json::to_value(&*write.input_schema).unwrap();
+    let resolved = schema["properties"]["resolved"]["description"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        resolved.contains("もう当てはまらないものを書くと次回から表示されなくなる")
+            && resolved.contains("no longer hold"),
+        "{schema}"
+    );
 
     // kioku_status
     let status = client
@@ -286,12 +300,25 @@ async fn mcp_handoff_pending_reads_a_lane() {
         .call_tool(
             CallToolRequestParams::new("kioku_handoff_write").with_arguments(args(json!({
                 "project": PROJECT, "session": "wt-a", "summary": "検索のレーンで作業した",
-                "verified": ["日本語の検索が通る"], "gotchas": ["レーン名は大文字小文字を区別する"]
+                "verified": ["日本語の検索が通る"], "gotchas": ["レーン名は大文字小文字を区別する"],
+                "resolved": ["索引の再構築はいつやるか"]
             }))),
         )
         .await
         .unwrap();
     assert_eq!(text(&wrote), format!("handoff recorded for {PROJECT}"));
+    // SPEC-M3.6 §2: `resolved` reaches the stored handoff
+    let stored = srv
+        .store
+        .handoff_history(PROJECT, Some("wt-a"), None, 1)
+        .unwrap();
+    assert!(
+        stored[0]
+            .content_md
+            .contains("### 解決済み\n- 索引の再構築はいつやるか\n"),
+        "{}",
+        stored[0].content_md
+    );
 
     // without session / lane: the main line, which has nothing
     let out = text(

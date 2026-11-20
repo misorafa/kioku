@@ -311,11 +311,33 @@ async fn agent_handoff_write_and_accept() {
     assert_eq!(body["handoff"]["id"], id.as_str());
     assert_eq!(body["handoff"]["source"], "agent");
     assert_eq!(body["handoff"]["accepted_by"], "s-next");
+    let md = body["handoff"]["content_md"].as_str().unwrap();
+    assert!(md.contains("### 要約\nHTTP API を実装した"));
+    // a request without `resolved` renders as before (SPEC-M3.6 §2)
+    assert!(!md.contains("解決済み"), "{md}");
+
+    // SPEC-M3.6 §2: the body accepts `resolved`, rendered after the decisions
+    let (status, body) = srv
+        .post(
+            "/api/v1/handoffs",
+            json!({
+                "project": PROJECT,
+                "summary": "タグを打った",
+                "decisions": ["タグは CI の後"],
+                "resolved": ["v1.0.0 のタグはいつ打つか"]
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let (_, body) = srv
+        .get(&format!(
+            "/api/v1/handoffs/pending?project={PROJECT}&accept=true&session=s-third"
+        ))
+        .await;
+    let md = body["handoff"]["content_md"].as_str().unwrap();
     assert!(
-        body["handoff"]["content_md"]
-            .as_str()
-            .unwrap()
-            .contains("### 要約\nHTTP API を実装した")
+        md.contains("### 決定事項\n- タグは CI の後\n### 解決済み\n- v1.0.0 のタグはいつ打つか\n"),
+        "{md}"
     );
     let (_, body) = srv
         .get(&format!("/api/v1/handoffs/pending?project={PROJECT}"))
@@ -636,10 +658,23 @@ async fn session_context_is_read_only() {
     assert_eq!(info["status"], "open");
     assert_eq!(info["counts"], json!({"prompts": 0, "tool_uses": 0}));
 
-    // a session that accepted nothing gets pending_handoff: null
+    // a session that accepted nothing but wrote an agent handoff gets its own back
+    // (SPEC-M3.6 §1), flagged, still pending
     let (status, ctx) = srv.get("/api/v1/sessions/codex-0001/context").await;
     assert_eq!(status, 200);
+    assert_eq!(ctx["pending_handoff"]["session_id"], "codex-0001", "{ctx}");
+    assert!(ctx["pending_handoff"]["accepted_at"].is_null(), "{ctx}");
+    assert_eq!(ctx["own_handoff"], true, "{ctx}");
+    // one that accepted nothing and wrote nothing gets pending_handoff: null
+    let mut start = start_body("codex-0003");
+    start["agent"] = json!("codex");
+    start["source"] = json!("offline-replay");
+    let (status, _) = srv.post("/api/v1/sessions/start", start).await;
+    assert_eq!(status, 200);
+    let (status, ctx) = srv.get("/api/v1/sessions/codex-0003/context").await;
+    assert_eq!(status, 200);
     assert!(ctx["pending_handoff"].is_null(), "{ctx}");
+    assert!(ctx.get("own_handoff").is_none(), "{ctx}");
 }
 
 #[tokio::test]

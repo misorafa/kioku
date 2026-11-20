@@ -266,8 +266,13 @@ pub const CONTEXT_VERSION: u32 = 1;
 pub struct SessionStartResponse {
     /// Project id the session was attached to.
     pub project_id: String,
-    /// The handoff consumed by this session, if one was pending.
+    /// The handoff consumed by this session, if one was pending; for a resumed session the
+    /// newer of the one it accepted and its own latest agent handoff (SPEC-M3.6 §1).
     pub pending_handoff: Option<Handoff>,
+    /// True when `pending_handoff` is the resumed session's own agent handoff (SPEC-M3.6
+    /// §1); absent (false) otherwise and from an older server.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub own_handoff: bool,
     /// First 60 lines of STATE.md (body only), if it exists.
     pub state_excerpt: Option<String>,
     /// Latest session pages of the project, newest first.
@@ -305,6 +310,10 @@ pub struct SessionStartResponse {
     /// The last reply of the previous session on this lane (§1 section 7, ≤ 600 chars).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_reply: Option<String>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Prompt / tool-use counts of a session.

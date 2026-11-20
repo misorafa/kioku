@@ -788,6 +788,7 @@ mod tests {
             .write_handoff(&HandoffInput {
                 gotchas: Vec::new(),
                 verified: Vec::new(),
+                resolved: Vec::new(),
                 project: "test-project".into(),
                 session: Some(id.into()),
                 summary: "日本語の引き継ぎ".into(),

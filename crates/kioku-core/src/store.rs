@@ -504,7 +504,7 @@ impl Store {
         let lane = req.lane.as_deref().and_then(normalize_lane);
         let machine = req.machine.as_deref().and_then(normalize_machine);
         let now = now_ts();
-        let (project_id, routed, recent) = {
+        let (project_id, routed, own_handoff, recent) = {
             let mut conn = self.db.lock();
             let tx = conn.transaction().context("starting transaction")?;
             let project_id = canonical_for_start(&tx, &req.project, &now)?;
@@ -533,8 +533,8 @@ impl Store {
             )?;
             // A session re-created by an offline replay is not a person starting work: it
             // must not consume the handoff meant for the next real session (SPEC-M2.6 §3).
-            let routed = if req.source == OFFLINE_REPLAY_SOURCE {
-                PendingHandoff::default()
+            let (routed, own_handoff) = if req.source == OFFLINE_REPLAY_SOURCE {
+                (PendingHandoff::default(), false)
             } else {
                 let resumed = known || RESUME_SOURCES.contains(&req.source.as_str());
                 route_for_start(
@@ -554,11 +554,12 @@ impl Store {
                     .take(RECENT_SESSIONS)
                     .collect();
             tx.commit().context("committing session start")?;
-            (project_id, routed, recent)
+            (project_id, routed, own_handoff, recent)
         };
         let mut resp = SessionStartResponse {
             project_id: project_id.clone(),
             pending_handoff: routed.handoff,
+            own_handoff,
             state_excerpt: self.state_excerpt(&project_id),
             recent_sessions: recent.into_iter().map(recent_entry).collect(),
             lane,
@@ -601,7 +602,7 @@ impl Store {
             };
             (sources, pinned, last_reply)
         };
-        let carried = carry(&sources, &shown_items);
+        let carried = carry(&sources, &shown_items, util::now());
         resp.context_version = CONTEXT_VERSION;
         resp.decisions = carried.decisions;
         resp.verified = carried.verified;
@@ -628,19 +629,19 @@ impl Store {
     }
 
     /// The SessionStart context of an existing session, without side effects (M2 §9.1):
-    /// the handoff that session accepted (newest), the STATE.md excerpt and the project's
-    /// recent session pages (the session's own page excluded).
+    /// the handoff a resume would get back (the newer of the one it accepted and its own
+    /// latest agent handoff, SPEC-M3.6 §1), the STATE.md excerpt and the project's recent
+    /// session pages (the session's own page excluded).
     pub fn session_context(&self, id: &str) -> Result<SessionStartResponse> {
-        let (session, pending_handoff, reference_handoff, recent) = {
+        let (session, pending_handoff, own_handoff, reference_handoff, recent) = {
             let conn = self.db.lock();
             let session = db::get_session(&conn, id)?
                 .ok_or_else(|| Error::not_found(format!("session {id}")))?;
-            let pending = db::newest_handoff_accepted_by(
-                &conn,
-                id,
-                &session.project_id,
-                session.lane.as_deref(),
-            )?;
+            let (pending, own) =
+                match resumed_handoff(&conn, &session.project_id, session.lane.as_deref(), id)? {
+                    Some((h, own)) => (Some(h), own),
+                    None => (None, false),
+                };
             // A branch lane without a handoff of its own sees the project lane's pending one
             // for reference (§1.4 rule 2), without consuming it.
             let reference = match (&pending, &session.lane) {
@@ -655,12 +656,13 @@ impl Store {
                     .filter(|(s, _)| s.id != session.id)
                     .take(RECENT_SESSIONS)
                     .collect();
-            (session, pending, reference, recent)
+            (session, pending, own, reference, recent)
         };
         let mut resp = SessionStartResponse {
             state_excerpt: self.state_excerpt(&session.project_id),
             project_id: session.project_id,
             pending_handoff,
+            own_handoff,
             recent_sessions: recent.into_iter().map(recent_entry).collect(),
             lane: session.lane,
             reference_reason: reference_handoff
@@ -1047,6 +1049,7 @@ impl Store {
             decisions: redact_all(&input.decisions),
             gotchas: redact_all(&input.gotchas),
             verified: redact_all(&input.verified),
+            resolved: redact_all(&input.resolved),
         };
         let conn = self.db.lock();
         let project_id = resolve_id(&conn, &input.project)?;
@@ -1801,7 +1804,7 @@ impl Store {
             .as_ref()
             .map(|h| handoff_items(&h.content_md))
             .unwrap_or_default();
-        let carried: Carried = carry(&sources, &shown);
+        let carried: Carried = carry(&sources, &shown, util::now());
         let pinned = self.pinned_pages(&pinned);
         let prefix = format!("{}/", project.id);
         let recent: Vec<StateSession> = recent
@@ -1932,10 +1935,11 @@ fn pending_as_reference(
     Ok(routed)
 }
 
-/// SessionStart routing (SPEC-M2.4 §1.4 as extended by SPEC-M3.1 §1): a resumed session
-/// gets back what it accepted (else the lane's pending handoff as a reference); while
-/// another session is active on the lane the pending handoff is only a reference;
-/// otherwise the newest pending handoff is accepted.
+/// SessionStart routing (SPEC-M2.4 §1.4 as extended by SPEC-M3.1 §1 and SPEC-M3.6 §1): a
+/// resumed session gets back the newer of what it accepted and its own latest agent
+/// handoff (else the lane's pending handoff as a reference); while another session is
+/// active on the lane the pending handoff is only a reference; otherwise the newest
+/// pending handoff is accepted. The flag is true when the handoff is the session's own.
 fn route_for_start(
     conn: &Connection,
     project: &str,
@@ -1943,21 +1947,44 @@ fn route_for_start(
     session: &str,
     resumed: bool,
     now: &str,
-) -> Result<PendingHandoff> {
+) -> Result<(PendingHandoff, bool)> {
     if resumed {
-        if let Some(h) = db::newest_handoff_accepted_by(conn, session, project, lane)? {
-            return Ok(PendingHandoff {
+        if let Some((h, own)) = resumed_handoff(conn, project, lane, session)? {
+            let routed = PendingHandoff {
                 handoff: Some(h),
                 ..PendingHandoff::default()
-            });
+            };
+            return Ok((routed, own));
         }
-        return pending_as_reference(conn, project, lane, session, REFERENCE_RESUMED);
+        let routed = pending_as_reference(conn, project, lane, session, REFERENCE_RESUMED)?;
+        return Ok((routed, false));
     }
     let since = util::fmt_ts(util::now() - chrono::Duration::minutes(ACTIVE_SESSION_MINUTES));
     if db::other_active_session(conn, project, lane, session, &since)?.is_some() {
-        return pending_as_reference(conn, project, lane, session, REFERENCE_CONCURRENT);
+        let routed = pending_as_reference(conn, project, lane, session, REFERENCE_CONCURRENT)?;
+        return Ok((routed, false));
     }
-    route_pending(conn, project, lane, session, now)
+    Ok((route_pending(conn, project, lane, session, now)?, false))
+}
+
+/// What a resumed session gets back (SPEC-M3.6 §1): the newer of the handoff it accepted
+/// last on `lane` and its own newest agent handoff there (any status), the accepted one
+/// on a tie; `true` with the own one. Nothing is accepted.
+fn resumed_handoff(
+    conn: &Connection,
+    project: &str,
+    lane: Option<&str>,
+    session: &str,
+) -> Result<Option<(Handoff, bool)>> {
+    let accepted = db::newest_handoff_accepted_by(conn, session, project, lane)?;
+    let own = db::newest_own_agent_handoff(conn, session, project, lane)?;
+    let ts = |h: &Handoff| util::parse_ts(&h.created_at);
+    Ok(match (accepted, own) {
+        (Some(a), Some(o)) if ts(&o) > ts(&a) => Some((o, true)),
+        (Some(a), _) => Some((a, false)),
+        (None, Some(o)) => Some((o, true)),
+        (None, None) => None,
+    })
 }
 
 /// Recent substantive sessions with their page titles (sessions without a page are skipped).
@@ -2411,6 +2438,7 @@ mod tests {
         HandoffInput {
             gotchas: Vec::new(),
             verified: Vec::new(),
+            resolved: Vec::new(),
             project: project.into(),
             session: session.map(str::to_string),
             summary: summary.into(),
@@ -3775,6 +3803,7 @@ mod tests {
             .write_handoff(&HandoffInput {
                 gotchas: Vec::new(),
                 verified: Vec::new(),
+                resolved: vec![format!("PAT_RESOLVED={token} の件")],
                 project: project().id,
                 session: Some("s-redact".into()),
                 summary: format!("token は {token}"),
@@ -3787,6 +3816,12 @@ mod tests {
         assert!(!h.content_md.contains("hunter2"), "{}", h.content_md);
         assert!(!h.content_md.contains("x1Y2z3x1Y2z3"), "{}", h.content_md);
         assert!(h.content_md.contains(REDACTED_MARK));
+        // SPEC-M3.6 §2: `resolved` is redacted like the other lists
+        assert!(
+            h.content_md.contains("### 解決済み\n- PAT_RESOLVED="),
+            "{}",
+            h.content_md
+        );
 
         if crate::git::git_available() {
             let out = std::process::Command::new("git")
