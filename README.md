@@ -243,6 +243,10 @@ optional at runtime (without it the wiki is not versioned).
 
 ### Homebrew
 
+> **Not available yet.** The tap `misorafa/homebrew-tap` has not been published, so the
+> command below fails today. The formula and the release job are ready; until the tap
+> exists, use `install.sh` above.
+
 ```sh
 brew install misorafa/tap/kioku
 kioku setup            # or paste the line `kioku invite` prints on your server
@@ -1116,12 +1120,31 @@ shared across branches.
 
 ## Comparison
 
-Other projects give coding agents persistent memory — ai-memory, claude-mem
-and memorix among them — and are worth a look. kioku's differences: Japanese
-tokenization (lindera/IPADIC) so Japanese text is actually searchable,
-Markdown-in-git as the source of truth, no LLM calls by default, and one
-self-hosted server shared by every machine. On the roadmap: whole-life ingest
-(mail, calendar) and bi-temporal facts.
+Many projects give coding agents persistent memory, and several are far more widely used
+than kioku. What their READMEs say as of 2026-11-20:
+
+| | design | LLM | several machines | Japanese search |
+|---|---|---|---|---|
+| [claude-mem](https://github.com/thedotmack/claude-mem) | an observer agent turns tool activity into observations; SQLite + Chroma | required (the observer) | opt-in cloud sync | not stated |
+| [agentmemory](https://github.com/rohitg00/agentmemory) | BM25 + vector + graph, 54 MCP tools | optional | team sharing, mesh sync | optional segmenters to install; whole-run tokens without them |
+| [ai-memory](https://github.com/akitaonrails/ai-memory) | git-backed Markdown wiki, hooks, handoffs, one Rust binary | optional, off by default | self-hosted server, multi-user | substring match on unspaced text |
+| kioku | git-backed Markdown, hooks, handoffs, one Rust binary | none | self-hosted server, one person | words (lindera/IPADIC), user dictionary with synonyms |
+
+**ai-memory is the closest in design and does more**: over twenty agents, teams with
+accounts, a web UI, optional embeddings. If you need any of those, use it.
+
+What kioku chooses instead:
+
+- **Japanese first.** Text is segmented into words, so 「京都」 does not find 「東京都」 and
+  「ログ」 does not find 「ログイン」, while 「引継」 finds 「引き継ぎ書」 and 「サーバー」 finds
+  half-width 「ｻｰﾊﾞｰ」. Summaries, handoffs, messages and this documentation are written
+  in Japanese first. It is word search, not meaning search: 「決めた」 does not find 「決定」
+  unless you add the pair to the user dictionary.
+- **Windows is a first-class client**: a native binary, `winget install misorafa.kioku`,
+  checked end to end on a real machine (unsigned for now, see [Windows](#windows-client-only)).
+- **Small on purpose**: six MCP tools, one person on several machines, no accounts, no
+  web UI, no LLM. A new machine joins with one pasted line, and clients follow the
+  server's version by themselves.
 
 ## Roadmap
 
@@ -1136,11 +1159,15 @@ Shipped (details in [CHANGELOG.md](CHANGELOG.md), specs in [docs/INDEX.md](docs/
   **M2.7** (v0.8.1) hardening · **M2.8** (v0.8.2) per-turn cost, retention · **M3.0**
   (v0.9.0) richer session-start block · **M3.1** (v0.9.1) handoff consumption rules,
   better search · **M3.2** (v0.9.2) metrics, hook liveness, `doctor --fix`, document index.
+- **M3.3** (v0.9.3) Docker image on ghcr.io, `kioku uninstall`, fixture freshness checks,
+  Homebrew formula (the tap itself is not published yet) · **M3.4** (v0.9.4) app-only
+  machines follow the server's version, readable page names · **v1.0.0** first stable
+  release; winget (`misorafa.kioku`) · **M3.5** (v1.0.1) handoff and session hygiene.
 
-Planned:
+In progress:
 
-- **M3.3** (in progress): Homebrew tap, Docker image on ghcr.io, `kioku uninstall`,
-  fixture freshness checks.
+- **M3.6**: a resumed session gets its own latest handoff back, carried open questions
+  can be closed, less noise in multi-word searches ([SPEC-M3.6](docs/SPEC-M3.6.md)).
 
 Ideas for M4 and later (not committed): web UI, embeddings and bi-temporal facts, optional
 LLM consolidation, ingest adapters (mail, calendar), an evaluation harness beyond the
@@ -1236,6 +1263,12 @@ last backup (warns when older than 7 days), wiki git commit failures, drift betw
 files, metadata and the search index, pages that cannot be parsed, and the offline queue.
 The Japanese retrieval evaluation runs in CI; print Recall@3 / MRR@3 with
 `cargo test -p kioku-core search_evaluation -- --nocapture`.
+
+## Author
+
+kioku is made and run by [misorafa](https://github.com/misorafa), the name its author
+releases software under. It was built specification first (the specs are in [docs/](docs/INDEX.md))
+with AI coding agents, and it is the memory those agents use every day.
 
 ## License
 
