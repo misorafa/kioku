@@ -11,6 +11,7 @@ Files: [SPEC-M1](SPEC-M1.md) · [SPEC-M2](SPEC-M2.md) · [SPEC-M2.1](SPEC-M2.1.m
 [SPEC-M2.5](SPEC-M2.5.md) · [SPEC-M2.6](SPEC-M2.6.md) · [SPEC-M2.7](SPEC-M2.7.md) ·
 [SPEC-M2.8](SPEC-M2.8.md) · [SPEC-M3.0](SPEC-M3.0.md) · [SPEC-M3.1](SPEC-M3.1.md) ·
 [SPEC-M3.2](SPEC-M3.2.md) · [SPEC-M3.3](SPEC-M3.3.md) · [SPEC-M3.4](SPEC-M3.4.md) · [SPEC-M3.5](SPEC-M3.5.md) ·
+[SPEC-M3.6](SPEC-M3.6.md) ·
 decisions: [adr/](adr/)
 
 | topic | authoritative section(s) | notes |
@@ -23,8 +24,8 @@ decisions: [adr/](adr/)
 | Project identity | SPEC-M1 §4, SPEC-M2.7 §8 | identity cache `state/projects.json` |
 | Project aliases, `kioku project merge` | SPEC-M2.4 §2 | |
 | Handoff lanes per branch | SPEC-M2.4 §1 | default branch: SPEC-M2.4 §1.2 |
-| Handoff routing and consumption | SPEC-M3.1 §1, SPEC-M3.5 §1 | supersedes SPEC-M2.4 §1.4 and the acceptance rule of SPEC-M1 §7.1; a session superseding its own older pending handoffs: SPEC-M3.5 §1 |
-| Handoff contents (`gotchas`, `verified`) | SPEC-M1 §7.5, SPEC-M3.0 §2 | |
+| Handoff routing and consumption | SPEC-M3.1 §1, SPEC-M3.5 §1, SPEC-M3.6 §1 | supersedes SPEC-M2.4 §1.4 and the acceptance rule of SPEC-M1 §7.1; a session superseding its own older pending handoffs: SPEC-M3.5 §1; what a resumed session gets back (own newer handoff, `own_handoff`): SPEC-M3.6 §1 |
+| Handoff contents (`gotchas`, `verified`, `resolved`) | SPEC-M1 §7.5, SPEC-M3.0 §2, SPEC-M3.6 §2 | carried items closing (`resolved`, 30-day open questions): SPEC-M3.6 §2 |
 | SQLite schema | SPEC-M1 §5 | updated listing with the SPEC that added each column |
 | Schema version, downgrade refusal | SPEC-M2.7 §5 | `PRAGMA user_version`; `kioku serve` exits 78 |
 | One process per data directory | SPEC-M2.7 §6 | `kioku.lock`, `needs_reindex` self-heal |
@@ -33,9 +34,9 @@ decisions: [adr/](adr/)
 | Session page name | SPEC-M2.6 §1 | `YYYY-MM-DD-<8>-<12 hex>.md`, redirects |
 | Page revisions, `expected_revision` (409) | SPEC-M2.6 §1 | |
 | tantivy schema, analyzers | SPEC-M1 §6.2, SPEC-M3.1 §2 | index schema v3 (`code`, `ja_bigram`) |
-| Search query, re-rank, `since` / `kinds` | SPEC-M3.1 §2 | amends SPEC-M1 §6.3 |
+| Search query, re-rank, `since` / `kinds` | SPEC-M3.1 §2, SPEC-M3.6 §3 | amends SPEC-M1 §6.3; one-letter tokens and two-token coverage: SPEC-M3.6 §3 |
 | User dictionary `dict/user.csv` | SPEC-M3.1 §2 | |
-| Required Japanese search tests, evaluation | SPEC-M1 §6.4, SPEC-M3.1 §2 | thresholds in SPEC-M3.1 §5 |
+| Required Japanese search tests, evaluation | SPEC-M1 §6.4, SPEC-M3.1 §2, SPEC-M3.6 §3 | thresholds in SPEC-M3.1 §5; long-query cases SPEC-M3.6 §3 |
 | Sessions of a file (`path_prefix`) | SPEC-M3.1 §3 | |
 | Search result line format | SPEC-M3.0 §5, SPEC-M3.1 §2 | |
 | Session lifecycle | SPEC-M1 §7.1, SPEC-M3.0 §4 | finalize on every Stop |
@@ -43,7 +44,7 @@ decisions: [adr/](adr/)
 | One commit per turn | SPEC-M2.8 §2 | |
 | Digest rules | SPEC-M1 §7.2, SPEC-M2.8 §6 | last reply: SPEC-M3.0 §3 |
 | Session page / STATE.md contents | SPEC-M1 §7.3, SPEC-M1 §7.4, SPEC-M3.0 §1 | STATE.md carries block sections 3–6 |
-| The `<kioku>` block at SessionStart | SPEC-M3.0 §1 | supersedes SPEC-M1 §8.3 |
+| The `<kioku>` block at SessionStart | SPEC-M3.0 §1, SPEC-M3.6 §1, SPEC-M3.6 §2 | supersedes SPEC-M1 §8.3; resumed heading SPEC-M3.6 §1; section 4 hint line SPEC-M3.6 §2 |
 | Stop nudge | SPEC-M3.0 §4 | supersedes SPEC-M1 §8.4 conditions |
 | Agent's last reply | SPEC-M3.0 §3 | |
 | Machine identity (`@machine`) | SPEC-M3.0 §6 | |
@@ -70,7 +71,7 @@ decisions: [adr/](adr/)
 | `kioku mcp` stdio bridge | SPEC-M2 §20 | default MCP registration; version following and liveness SPEC-M3.4 §1 |
 | HTTP API | SPEC-M1 §9, SPEC-M2 §9 | additions in SPEC-M2.3 §3.2, SPEC-M2.6 §3, SPEC-M2.8 §3, SPEC-M3.1 §2, SPEC-M3.2 §1 |
 | Error responses and exit codes | SPEC-M1 §9 | 409; exit 78 (newer schema), 75 (restart after update), 2 (Stop nudge) |
-| MCP tools | SPEC-M1 §10 | parameters added by SPEC-M2.6 §1, SPEC-M3.0 §2, SPEC-M3.1 §1, SPEC-M3.1 §2, SPEC-M3.1 §3, SPEC-M3.4 §2 (`slug`) |
+| MCP tools | SPEC-M1 §10 | parameters added by SPEC-M2.6 §1, SPEC-M3.0 §2, SPEC-M3.1 §1, SPEC-M3.1 §2, SPEC-M3.1 §3, SPEC-M3.4 §2 (`slug`), SPEC-M3.6 §2 (`resolved`) |
 | CLI commands | SPEC-M1 §11, SPEC-M2 §14 | full list: CLAUDE.md "Directory layout" and `kioku --help` |
 | Metrics endpoint, request log, `status --watch` | SPEC-M3.2 §1, SPEC-M3.5 §3 | |
 | Positive liveness (`state/last-hook.json`, `status --agents`) | SPEC-M3.2 §2 | `mcp` entry of the stdio bridge: SPEC-M3.4 §1 |

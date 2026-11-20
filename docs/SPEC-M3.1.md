@@ -8,6 +8,8 @@ SPEC-M2.4.md, SPEC-M3.0.md first. Source: the v0.8.0 audit. Depends on M3.0 (sec
 ## 1. Who consumes a handoff (SPEC-M2.4 §1.4 extended)
 
 > Amended by SPEC-M3.5 §1: a session's newer handoff supersedes its own older pending handoffs of the same source on the lane.
+>
+> Amended by SPEC-M3.6 §1: rule 1 — a resumed session gets back the newer of the handoff it accepted and its own latest agent handoff (`own_handoff`).
 
 Today every SessionStart except `offline-replay` routes and accepts the newest pending
 handoff of its lane. Three cases are wrong:
@@ -37,6 +39,8 @@ Tests: the matrix (new / compact / resume / second concurrent session / own rule
 handoff / explicit accept) on two lanes; `history`; Japanese text throughout.
 
 ## 2. Search: re-rank, show time, index what matters (SPEC-M1 §6 extended)
+
+> Amended by SPEC-M3.6 §3: one-letter tokens are noise; a query of three or more tokens first requires two of them.
 
 Index schema version 3 (reindex automatically at start, M2.8 §5).
 

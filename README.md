@@ -121,8 +121,11 @@ SessionEnd        finalize (idempotent)
   next *new* session of the same project and lane (branch); older pending ones of
   that lane are marked `superseded`. Three cases do not accept anything:
   - **compact / resume** of a session (or a session id kioku has seen
-    before) gets back the handoff it accepted earlier; if it never accepted one, the
-    lane's pending handoff is shown for reference only;
+    before) gets back the newer of the handoff it accepted earlier and the last
+    handoff it wrote itself with `kioku_handoff_write` (SPEC-M3.6 §1; the latter under
+    「このセッションの直近の引き継ぎ（再開）」 / "This session's latest handoff (resumed)",
+    so a long-lived session does not get a weeks-old handoff back after a compact);
+    with neither, the lane's pending handoff is shown for reference only;
   - a session **never receives its own handoff** (the rule-based one its previous
     turn's Stop wrote stays pending for the next session);
   - while **another session is active on the same lane** (an observation in the last
@@ -146,8 +149,10 @@ own cap and ends with `…(N more)` when it is cut, and the handoff gets whateve
 3. **decisions carried** from the last 20 agent handoffs of the project (all lanes),
    newest first, de-duplicated (NFKC, case-folded), each with its date, then the
    **verified** facts (`✓`); items already shown in section 2 are left out;
-4. **open questions carried** — those no later decision resolves — then the
-   **gotchas** (`⚠`);
+4. **open questions carried** — those no later decision resolves and not older than
+   30 days — then the **gotchas** (`⚠`); an item listed in `resolved` of a later
+   `kioku_handoff_write` disappears (SPEC-M3.6 §2), and the section ends with a hint
+   saying so;
 5. **pinned pages**: pages tagged `pinned` in the project or `_global` (newest 3,
    first 400 characters) — use it for rules every session must know;
 6. **recent sessions**: `date agent [lane] @machine — title (path)`;
@@ -183,6 +188,7 @@ server: http://192.168.1.20:7391
 ## 未解決（これまでの引き継ぎ）
 - Windows の CI が遅い (09-29)
 - ⚠ Windows ではパス区切りが \ になる (09-29)
+（解決したものは kioku_handoff_write の resolved に書くと消える）
 
 ## ピン留め
 - 作業ルール (_global/page-1935be.md)
@@ -832,7 +838,7 @@ version as usual. The same TLS advice applies: the container speaks plain HTTP.
 | `kioku_query` | `query`, `project?`, `scope?` (`project`/`global`/`all`), `limit?` (default 8), `since?` (`YYYY-MM-DD`), `kinds?` (`page`/`session`/`state`), `path_prefix?` | full-text search (Japanese and English; see [Search](#search)); `project` narrows to that project plus global pages; each hit reads `1. <path> — <title> (session, 2026-09-28, @mini)`; with `path_prefix` it lists the sessions that edited files under that path |
 | `kioku_read` | `path` | reads a page by its wiki-relative path (as shown in query results), with its `revision` |
 | `kioku_write_page` | `title`, `content`, `project?`, `scope?` (`project`/`global`), `tags?`, `path?`, `slug?`, `expected_revision?` | saves a searchable Markdown page; the same title/path/slug replaces it — with `expected_revision` (the `revision` from `kioku_read`) only if nobody changed it since (else a conflict error); tag it `pinned` to show it in every SessionStart block of the project (or of every project, for a global page) |
-| `kioku_handoff_write` | `project`, `session?` (from the SessionStart block), `summary`, `next_steps`, `open_questions`, `decisions`, `verified?`, `gotchas?` | records the handoff the next session of the project receives; decisions, verified facts (確認済みの事実), open questions and gotchas (落とし穴・注意点) are also carried into later sessions |
+| `kioku_handoff_write` | `project`, `session?` (from the SessionStart block), `summary`, `next_steps`, `open_questions`, `decisions`, `verified?`, `gotchas?`, `resolved?` | records the handoff the next session of the project receives; decisions, verified facts (確認済みの事実), open questions and gotchas (落とし穴・注意点) are also carried into later sessions; `resolved` (解決済み) lists carried open questions or gotchas that no longer hold (their text or its start), which stops carrying them |
 | `kioku_handoff_pending` | `project`, `accept?` (default false), `session?`, `lane?`, `history?` (≤ 20) | peeks at (or consumes) the pending handoff of the main line, or of a session's / named branch lane; `history` adds the lane's last handoffs with their status |
 | `kioku_status` | — | counts, data dir and known project ids |
 
@@ -853,6 +859,11 @@ write a handoff before stopping.
   `score × recency × kind weight` — recency halves every 30 days (never below 0.25),
   pages weigh 1.0, STATE.md 0.8, session pages 0.6, and a page tagged `pinned` ×1.5 —
   so the newer of two near-duplicate pages comes first.
+- **Long queries**: a query of three or more words (tokens) only returns pages that
+  match at least two of them, so 「競合 比較 claude-mem 優位性 宣伝 X 投稿」 no longer
+  lists pages that share one incidental word; when nothing matches two, any one word
+  is enough again. A single letter or digit (`X`, `1`) is ignored unless it is the
+  whole query (SPEC-M3.6 §3).
 - **Filters**: `since: "2026-09-01"` keeps what was updated on or after that day;
   `kinds: ["page", "session"]` keeps those kinds. From the terminal:
   `kioku search --since 2026-09-01 --kind page 索引`.

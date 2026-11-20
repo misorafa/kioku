@@ -13,6 +13,8 @@ digest cannot say what the agent concluded, so the automatic handoff says "次�
 
 ## 1. The `<kioku>` block (SPEC-M1 §8.3 replaced)
 
+> Amended by SPEC-M3.6 §1 and §2: a resumed session's own handoff has its own heading; section 4 drops `resolved` items and open questions older than 30 days, and ends with a hint line.
+
 Order and caps (total cap `SESSION_START_CAP` 6,000 → 8,000 chars; each section has its
 own cap and is truncated with `…(N more)`):
 
@@ -47,6 +49,8 @@ page, and a duplicate decision; cap behaviour; a server response without the new
 renders as before (compatibility).
 
 ## 2. Handoff schema additions
+
+> Amended by SPEC-M3.6 §2: `resolved` (解決済み / Resolved) closes carried open questions and gotchas.
 
 `HandoffInput` gains optional `gotchas: Vec<String>`（落とし穴・注意点）and
 `verified: Vec<String>`（確認済みの事実）. Rendered in the handoff Markdown and carried like

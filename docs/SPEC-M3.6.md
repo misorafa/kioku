@@ -128,6 +128,112 @@ Tests (next to the code, `tempfile`, Japanese throughout):
 
 Record deviations and causes found in §5.
 
-## 5. Implementation notes
+## 5. Implementation notes (2026-11-20, branch `m3.6-fresh-memory`)
 
-(to be filled by the implementation)
+### A resumed session's own handoff (§1)
+
+- `db::newest_own_agent_handoff` (session, project, lane, `source = 'agent'`, any status,
+  the usual handoff order) and `store::resumed_handoff`, used by both `route_for_start`
+  (resumed branch) and `Store::session_context`, so the two always agree. The newer
+  `created_at` wins (parsed, not compared as text); on a tie the accepted one wins.
+  `route_for_start` now returns the flag next to the `PendingHandoff`; the `PendingHandoff`
+  type of `GET /handoffs/pending` is unchanged.
+- `SessionStartResponse.own_handoff` is `#[serde(default, skip_serializing_if = "is_false")]`.
+  The client renders the new heading in the SPEC-M3.0 layout **and** in the legacy layout
+  (an older server never sends the flag, so this only matters for a hand-built response).
+- With neither candidate, `route_for_start` keeps the resumed reference (lane's pending,
+  `reference_reason = resumed`) and `session_context` keeps the main line's reference on
+  a branch lane, as before.
+- **Two existing expectations changed, as the amendment intends:**
+  `store::handoff_tests::a_session_never_accepts_its_own_handoff` restarted the same
+  session id with `startup` after it wrote a handoff and expected nothing back; a known id
+  is a resume (SPEC-M3.1 §1 rule 1), so it now gets that handoff back with `own_handoff`,
+  still unaccepted (the rest of the test — never accepted, the next session receives it —
+  is unchanged). `kioku-server` `tests/http_api.rs::session_context_is_read_only` expected
+  `pending_handoff: null` for a session that accepted nothing but had written an agent
+  handoff; it now expects that handoff with `own_handoff: true`, and a new session that
+  wrote nothing (started by an offline replay) checks the `null` case.
+
+### `resolved` and the age limit (§2)
+
+- `HandoffInput.resolved` (serde default, skipped when empty), redacted in `write_handoff`
+  like the other lists, rendered as `### 解決済み` / `### Resolved` **directly after
+  決定事項** (before 確認済みの事実 / 落とし穴), only when non-empty, so a handoff without it
+  renders byte-for-byte as before. `carry::handoff_items` reads it back
+  (`HandoffItems.resolved`).
+- `carry::resolves(r, item)` implements the three match forms on normalised text.
+  The closers of handoff *i* are the `resolved` items of `shown` and of the handoffs newer
+  than *i*; a handoff's own `resolved` does not close its own items. As with the existing
+  decision rule, when the newest occurrence of an item is closed, older duplicates of it
+  are not carried either.
+- `carry` takes `now`; `SourceHandoff` gained `created_at` (RFC 3339; unparsable counts
+  as new). The store passes `util::now()` both for the block and for STATE.md, so
+  STATE.md drops a 30-day-old question the next time it is rewritten, not at the moment
+  it turns 30 days old.
+- Hint line: the section is rendered with `OPEN_QUESTIONS_CAP` minus the hint's length,
+  then the hint is appended, so it counts against the cap and comes after a
+  `…(N more)` line. Not shown when the section is empty; STATE.md (`render::state_body`)
+  does not get it.
+- MCP: `resolved` is a field of `HandoffWriteParams` (ja/en description as specified),
+  shared by the server's MCP and the `kioku mcp` stdio bridge (which forwards it in the
+  `POST /handoffs` body); the tool description mentions it too.
+
+### Search (§3)
+
+- `is_noise_token` also matches a single ASCII letter or digit. The `code` field drops
+  one-character identifier parts when the query has a meaningful `ja` token or a longer
+  identifier token; `X` alone still searches `x` in both fields.
+- `term_queries` builds one *token group* per meaningful token: its title (×2) / body
+  clauses, plus the `code` clauses of an identifier run whose forms include that token;
+  a run with no matching `ja` token is its own group (whole + parts = one token). With
+  ≥ `COVERAGE_MIN_TOKENS` (3) groups the first query is
+  `Must(BooleanQuery::with_minimum_required_clauses(groups, MIN_COVERAGE = 2))` plus the
+  tag clauses as `Should` (they score, they do not count); the second is today's flat OR
+  query. `search_with` tries them in order and uses the bigram fallback only when both
+  return nothing; snippets are generated from the query that produced the hits.
+- **Clarification found by a test:** a user-dictionary synonym is emitted at the same
+  position as its word, so 「記憶装置」 with the synonym `kioku` produced three tokens and
+  coverage dropped pages that only had the synonym
+  (`store::search_tests::user_dictionary_is_used_and_doctor_sees_it_change`). Tokens at
+  the same position now form one group: *n* counts words, not their synonyms.
+- Note: *n* counts analyzer tokens, so 脆弱性 is two (脆弱 + 性) and 「投稿 脆弱性」 is
+  already a three-token query. That is what the spec says; it is mentioned because it is
+  easy to misread as "words".
+- Index schema stays at 3, DB schema unchanged; nothing is reindexed.
+
+### Evaluation (§3 rule 3)
+
+Seven queries of five to seven words added (11 pages: the 競合比較 page, `x86_64` and 脆弱性
+distractors, Docker multi-arch, PowerShell signing, a C extension next to a "C drive"
+page for the one-letter case, SQLite WAL, MCP timeout, an English rate-limit query next
+to a page that shares only `limit`), all `top: true`.
+
+| corpus | code | Recall@3 | MRR@3 |
+|--------|------|----------|-------|
+| 53 pages / 53 queries (before) | before M3.6 | 1.000 | 0.991 |
+| 64 pages / 60 queries | before M3.6 | 1.000 | 0.992 |
+| 64 pages / 60 queries | M3.6 (rules 1 and 2) | 1.000 | 0.992 |
+
+No regression and every `top: true` query stays first, so rule 2 is kept. The old code
+already put the expected pages first: the observed noise was in hits 2–8, which Recall@3
+/ MRR@3 cannot see; `index::tests::observed_query_needs_two_tokens` checks it with
+`limit = 8` (only the 競合比較 page is returned).
+
+### Tests
+
+`carry::tests::{resolved_items_close_questions_and_gotchas, resolved_match_forms,
+old_open_questions_expire_but_decisions_do_not}` and the `resolved` round trip in
+`items_round_trip_through_markdown_in_both_languages`;
+`store::handoff_tests::{resumed_session_gets_its_own_newer_handoff,
+resumed_session_without_own_agent_handoff_gets_the_accepted_one}` (both lanes; own rules
+handoff newer than A, own agent handoff on another lane; `session_context`);
+`store::context_tests::resolved_items_stop_being_carried` (block and STATE.md, no hint in
+STATE.md); the redaction test in `store.rs` covers `resolved`;
+`kioku-cli` `context::m36_tests::{own_handoff_heading_golden_ja_and_en,
+response_without_own_handoff_uses_the_usual_heading, resolve_hint_only_with_items}` and
+the updated M3.0 goldens (hint line); `kioku-server` `tests/mcp.rs` (`resolved` in the
+schema with ja/en description, stored through the tool) and `tests/http_api.rs`
+(`resolved` in the body, rendered after the decisions; a body without it renders as
+before); `index::tests::{one_letter_tokens_are_noise_unless_alone,
+observed_query_needs_two_tokens, long_query_with_one_shared_token_falls_back_to_any_one}`
+and the evaluation.
