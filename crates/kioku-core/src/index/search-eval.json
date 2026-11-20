@@ -62,7 +62,18 @@
     {"id":"travel", "title":"出張の準備", "body":"新幹線と宿を予約した。"},
     {"id":"budget", "title":"予算の見直し", "body":"クラウドの費用を減らすためにインスタンスを小さくした。"},
     {"id":"handoff-words", "title":"handoff と write の話", "body":"kioku の handoff を write する流れ。handoff は session ごとに write する。"},
-    {"id":"lock-words", "title":"lock と write の注意", "body":"write の前に lock を取る。lock は短く持つ。"}
+    {"id":"lock-words", "title":"lock と write の注意", "body":"write の前に lock を取る。lock は短く持つ。"},
+    {"id":"compete", "title":"claude-mem との競合比較", "body":"競合の claude-mem と kioku を比較した。優位性は日本語検索、自己ホスト、複数エージェントの共有。宣伝として X に投稿する文面を用意する。"},
+    {"id":"x86-build", "title":"x86_64 向けのリリースビルド", "body":"x86_64 の Linux バイナリを musl で静的リンクしてビルドする。aarch64 も同じ手順。"},
+    {"id":"vuln", "title":"依存クレートの脆弱性", "body":"cargo audit で脆弱性を確認した。該当クレートを更新して再ビルドした。"},
+    {"id":"docker-multiarch", "title":"Docker イメージのマルチアーキ対応", "body":"Docker イメージを arm64 と amd64 のマルチアーキでビルドする手順。buildx を使い、ghcr.io に push する。"},
+    {"id":"ps-sign", "title":"install.ps1 の署名エラー", "body":"Windows で PowerShell のインストーラを実行すると署名エラーになる。実行ポリシーを変えずに対処する方法を調べた。"},
+    {"id":"c-ext", "title":"C 言語の拡張モジュール", "body":"C 言語で書いた拡張モジュールのビルドが失敗した。原因は cc クレートに渡す環境変数だった。"},
+    {"id":"c-drive", "title":"C ドライブの空き容量", "body":"Windows の C ドライブが一杯になった。古いログを消した。"},
+    {"id":"wal-bloat", "title":"WAL ファイルの肥大化", "body":"SQLite の WAL ファイルが肥大化した。定期的にチェックポイントを実行する対策を入れた。"},
+    {"id":"mcp-timeout", "title":"MCP 接続のタイムアウト", "body":"MCP サーバーへの接続がタイムアウトする。再接続の間隔と設定を見直した。"},
+    {"id":"backoff", "title":"HTTP client retry policy", "body":"The HTTP client retries with exponential backoff and jitter when the server answers with a rate limit."},
+    {"id":"rate-card", "title":"料金表の更新", "body":"有料プランの料金表を更新した。月額の limit を見直す。"}
   ],
   "queries": [
     {"q":"引き継ぎ書", "relevant":["handoff","handoff-format"]},
@@ -126,6 +137,13 @@
 
     {"q":"週次の進捗", "relevant":["meeting"], "top":true},
     {"q":"新幹線 予約", "relevant":["travel"], "top":true},
-    {"q":"クラウドの費用", "relevant":["budget"], "top":true}
+    {"q":"クラウドの費用", "relevant":["budget"], "top":true},
+    {"q":"競合 比較 claude-mem 優位性 宣伝 X 投稿", "relevant":["compete"], "top":true},
+    {"q":"Docker イメージ arm64 マルチアーキ ビルド 手順", "relevant":["docker-multiarch"], "top":true},
+    {"q":"Windows PowerShell インストーラ 署名 エラー 対処", "relevant":["ps-sign"], "top":true},
+    {"q":"C 言語 拡張 ビルド 失敗 原因", "relevant":["c-ext"], "top":true},
+    {"q":"SQLite WAL チェックポイント 肥大化 対策", "relevant":["wal-bloat"], "top":true},
+    {"q":"MCP サーバー タイムアウト 再接続 設定 見直し", "relevant":["mcp-timeout"], "top":true},
+    {"q":"rate limit retry backoff jitter HTTP client", "relevant":["backoff"], "top":true}
   ]
 }

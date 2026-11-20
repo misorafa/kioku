@@ -364,3 +364,95 @@ fn tokenizer_segments_japanese() {
     assert!(toks.contains(&"自宅".to_string()), "{toks:?}");
     assert!(toks.contains(&"wireguard".to_string()), "{toks:?}");
 }
+
+/// The review of 2026-11-20 (SPEC-M3.6 §3): a page about the comparison next to pages that
+/// share one incidental token each (`X` ↔ `x86_64`, 性 ↔ 脆弱性, 投稿 alone).
+fn noise_fixture() -> (tempfile::TempDir, SearchIndex) {
+    let dir = tempfile::tempdir().unwrap();
+    let (idx, _) = SearchIndex::open(dir.path()).unwrap();
+    idx.upsert_many(
+        &[
+            doc(
+                "p/compete.md",
+                Some("p"),
+                "claude-mem との競合比較",
+                "競合の claude-mem と比較した。優位性は日本語検索と自己ホスト。宣伝として X に投稿する。",
+            ),
+            doc(
+                "p/x86.md",
+                Some("p"),
+                "x86_64 向けビルド",
+                "x86_64 の Linux バイナリを musl でビルドする。",
+            ),
+            doc(
+                "p/vuln.md",
+                Some("p"),
+                "依存クレートの脆弱性",
+                "cargo audit で脆弱性を確認した。",
+            ),
+            doc(
+                "p/blog.md",
+                Some("p"),
+                "ブログ",
+                "週末にブログへ投稿した。",
+            ),
+            doc(
+                "p/flutter.md",
+                Some("p"),
+                "Flutter のアプリ",
+                "Flutter で画面を作った。",
+            ),
+        ],
+        false,
+    )
+    .unwrap();
+    (dir, idx)
+}
+
+#[test]
+fn one_letter_tokens_are_noise_unless_alone() {
+    for t in ["x", "1", "を", "-"] {
+        assert!(is_noise_token(t), "{t}");
+    }
+    for t in ["x86", "性", "競合", "ab"] {
+        assert!(!is_noise_token(t), "{t}");
+    }
+    let (_d, idx) = noise_fixture();
+    // `X` alone still searches `x`
+    let alone = paths(&idx, "X");
+    assert!(alone.contains(&"p/compete.md".to_string()), "{alone:?}");
+}
+
+#[test]
+fn observed_query_needs_two_tokens() {
+    let (_d, idx) = noise_fixture();
+    let hits = idx
+        .search(
+            "競合 比較 claude-mem 優位性 宣伝 X 投稿",
+            &SearchScope::All,
+            8,
+        )
+        .unwrap();
+    let got: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+    assert_eq!(
+        got,
+        ["p/compete.md"],
+        "x86_64, 脆弱性 and 投稿-only pages are noise"
+    );
+    assert!(!hits[0].partial);
+}
+
+#[test]
+fn long_query_with_one_shared_token_falls_back_to_any_one() {
+    let (_d, idx) = noise_fixture();
+    let hits = idx
+        .search("Flutter 移行 検討 費用 見積もり", &SearchScope::All, 5)
+        .unwrap();
+    let got: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+    assert_eq!(got, ["p/flutter.md"]);
+    assert!(!hits[0].partial, "the any-one retry is not a partial match");
+    // a two-token query is not subject to coverage: either token is enough
+    let mut two = paths(&idx, "投稿 ビルド");
+    two.sort();
+    assert_eq!(two, ["p/blog.md", "p/compete.md", "p/x86.md"]);
+}
